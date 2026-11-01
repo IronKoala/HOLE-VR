@@ -101,9 +101,9 @@ Settings g_set;
 
 void LoadSettings() {
     g_set.enabled = config::GetBool("vr_controls", true);
-    g_set.smooth_turn = config::GetInt("turn_mode", 0) == 1;
+    g_set.smooth_turn = config::GetInt("turn_mode", 1) == 1;
     g_set.snap_degrees = config::GetFloat("snap_turn_degrees", 30.f);
-    g_set.smooth_speed = config::GetFloat("smooth_turn_speed", 180.f);
+    g_set.smooth_speed = config::GetFloat("smooth_turn_speed", 90.f);
     g_set.move_with_hand = config::GetInt("move_direction", 0) == 1;
     g_set.deadzone = config::GetFloat("stick_deadzone", 0.15f);
     g_set.gun_pitch = config::GetFloat("gun_pitch_offset", 0.f);
