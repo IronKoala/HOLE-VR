@@ -721,17 +721,38 @@ void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState& lh
     // was doing anyway). Touching it to the top of the gun does nothing.
     UObject well = 0;
     ue::GetProp(gun.Object(), "MagazinePoint", well);
+    // Into the magwell, in the gun frame: up the grip, raked about 18 degrees.
+    constexpr double kRake = 18.0 * 3.14159265358979 / 180.0;
+    const FVector in_g{std::sin(kRake), 0, std::cos(kRake)};
+    double aim_off_deg = 0;
+    FQuat seat_rot = show_rot;
+    if (well && W.have_pose) {
+        // Where the mag sits when seated (learned from the first insert;
+        // until then the magwell point's own rotation).
+        seat_rot = W.seat_learned ? W.actor_rot * W.seat_rot : ComponentToWorld(well).rotation;
+        // A fixed hold: the mag's top points where the controller points
+        // (index finger up the front of the mag), the gun's front side faces
+        // away from the back of the hand. So lining the mag up with the
+        // magwell is "point your left controller up into the grip".
+        FVector b_g = Norm(FVector{1, 0, 0} - in_g * DotV(FVector{1, 0, 0}, in_g));
+        FQuat gun_basis = FromAxes(in_g, b_g, Cross(in_g, b_g));
+        FVector hx = lh.aim.rotation.Rotate(FVector{1, 0, 0});
+        FVector hz = lh.aim.rotation.Rotate(FVector{0, 0, 1});
+        FVector f2 = Norm(hz * -1.0 - hx * DotV(hz * -1.0, hx));
+        FQuat hand_basis = FromAxes(hx, f2, Cross(hx, f2));
+        FQuat virtual_gun = hand_basis * gun_basis.Inverse();
+        show_rot = virtual_gun * (W.frame_rot.Inverse() * seat_rot);
+        FVector in_w = W.frame_rot.Rotate(in_g);
+        aim_off_deg = std::acos(std::fmax(-1.0, std::fmin(1.0, DotV(hx, in_w)))) * 180.0 / 3.14159265358979;
+    }
     const bool can_seat = well && W.have_pose && !gun.State().has_magazine;
     if (can_seat) {
         FVector seat = ComponentToWorld(well).translation;
         if (W.seat_learned) seat = seat + W.actor_rot.Rotate(W.seat_offset);
-        // Out of the magwell: down the grip, raked back about 18 degrees.
-        constexpr double kRake = 18.0 * 3.14159265358979 / 180.0;
-        FVector out = Norm(W.frame_rot.Rotate(FVector{-std::sin(kRake), 0, -std::cos(kRake)}));
+        FVector out = W.frame_rot.Rotate(in_g) * -1.0;
         FVector p = lh.grip.location - seat;
         double along = DotV(p, out);
         double lateral = Len(p - out * along);
-        FQuat seat_rot = W.seat_learned ? W.actor_rot * W.seat_rot : show_rot;
 
         if (W.mag_seating) {
             double t = std::fmin(1.0, (g_clock - W.seat_t0) / 0.1);
@@ -763,13 +784,13 @@ void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState& lh
             return;
         }
         if (!W.mag_engaged) {
-            if (along > 2.0 && along < 14.0 && lateral < 4.5) {
+            if (along > 2.0 && along < 14.0 && lateral < 4.5 && aim_off_deg < 35.0) {
                 W.mag_engaged = true;
                 input::Haptic(input::kLeft, 0.25f, 0.02f);
-                log::Info("controls: magazine lined up with the magwell (%.1f cm below, %.1f off axis)",
-                          along, lateral);
+                log::Info("controls: magazine lined up with the magwell (%.1f cm below, %.1f off axis, %.0f deg)",
+                          along, lateral, aim_off_deg);
             }
-        } else if (lateral > 7.0 || along > 17.0) {
+        } else if (lateral > 7.0 || along > 17.0 || aim_off_deg > 50.0) {
             W.mag_engaged = false;
         }
         if (W.mag_engaged) {
