@@ -22,6 +22,9 @@ add_library(hole_vr SHARED
     src/vr/input.cpp
     src/vr/controls.cpp
     src/vr/interact/slide.cpp
+    src/vr/body/ik_math.cpp
+    src/vr/body/hand_pose.cpp
+    src/vr/body/body.cpp
     src/ue/process_event.cpp
     src/ue/call.cpp
     src/game/game.cpp
