@@ -772,7 +772,9 @@ void PublishGrabs(game::Gun& gun, const hands::HandState& rh, const hands::HandS
         UObject main = 0;
         if (ue::GetProp(gun.Object(), "MainHandPosition", main) && main) {
             UETransform t = ComponentToWorld(main);
-            g[hands::kRight].target = {t.translation, t.rotation};
+            // Rotation = the gun's own frame (X barrel, Y right, Z up); the
+            // body builds the hand around the grip from it.
+            g[hands::kRight].target = {t.translation, W.have_pose ? W.frame_rot : t.rotation};
         } else {
             g[hands::kRight].target = rh.grip;
         }
@@ -824,6 +826,20 @@ void AfterChargeTimeline(UObject self, UObject, void*) {
     gun.SetSlideTravel(W.slide.Travel(), ue::Vec3d{-1, 0, 0});
 }
 
+// The game's recoil (BP_Player Recoil: camera, arm and control-rotation
+// kick timelines) moves the VR camera and aim. In VR the kick belongs to the
+// hand only, so the call is dropped while motion controls are on.
+bool BeforePlayerRecoil(UObject, UObject, void*) { return !g_set.enabled; }
+
+void HookPlayerRecoil(UObject player) {
+    static bool done = false;
+    if (done || !player) return;
+    UObject fn = ue::FindFunction(ue::GetClass(player), "Recoil");
+    if (fn) ue::process_event::On(fn, &BeforePlayerRecoil, nullptr);
+    done = true;
+    log::Info("controls: game camera recoil %s", fn ? "disabled" : "function not found");
+}
+
 void HookChargeTimeline() {
     static bool done = false;
     UObject cls = game::GunBaseClass();
@@ -854,6 +870,7 @@ void OnTick(UObject player, float dt) {
         return;
     }
     HookChargeTimeline();
+    HookPlayerRecoil(player);
     if (!W.timeline_fast) {
         // The game's charge timeline only has to update its ammo state; the
         // hand already moved the slide. Run it 10x faster so the round is
