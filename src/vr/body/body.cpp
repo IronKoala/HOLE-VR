@@ -58,7 +58,10 @@ struct Settings {
     double finger_scale = 1.0;
     bool legs = true;
     double arm_scale = 0.0;       // 0 = learn from how far you reach; else fixed multiplier
-    double max_arm_scale = 1.35;
+    double max_arm_scale = 1.25;
+    double neck_down = 14.0;      // cm from the eyes down to the base of the neck, in head space
+    double neck_back = 8.0;       // cm from the eyes back to the base of the neck
+    double grip_angle = 20.0;     // pistol grip slant, degrees
     double wrist_twist_share = 0.75;  // how much of the wrist twist the forearm takes
     bool animated_upper_body = false; // false: spine/neck/shoulders ignore the game's animation (recoil etc.)
 } S;
@@ -83,18 +86,15 @@ void LoadSettings() {
     S.finger_scale = config::GetFloat("finger_curl_scale", 1.f);
     S.legs = config::GetBool("body_leg_ik", true);
     S.arm_scale = config::GetFloat("body_arm_scale", 0.f);
-    S.max_arm_scale = config::GetFloat("body_max_arm_scale", 1.35f);
+    S.max_arm_scale = config::GetFloat("body_max_arm_scale", 1.25f);
+    S.neck_down = config::GetFloat("body_neck_below_eyes_cm", 14.f);
+    S.neck_back = config::GetFloat("body_neck_behind_eyes_cm", 8.f);
+    S.grip_angle = config::GetFloat("hand_grip_angle", 20.f);
     S.wrist_twist_share = config::GetFloat("body_wrist_twist_share", 0.75f);
     S.animated_upper_body = config::GetBool("body_animated_upper_body", false);
 }
 
 // ---- engine helpers ----
-Xf CompToWorld(UObject comp) {
-    ue::Call c(comp, "K2_GetComponentToWorld");
-    if (!c.Invoke()) return Xf{};
-    return c.Result<Xf>();
-}
-
 void SetVisible(UObject comp, bool visible) {
     ue::Call c(comp, "SetVisibility");
     c.Set("bNewVisibility", visible).Set("bPropagateToChildren", false);
@@ -259,6 +259,11 @@ struct State {
     bool knee_known[2] = {false, false};
     bool failed = false;
     int frames = 0;
+    // Leg animation check: how much the game's animated feet move (relative
+    // to the pelvis) while the character walks.
+    double diag_time = 0, diag_moving = 0, diag_foot_travel = 0;
+    FVector diag_last_foot;
+    bool diag_have_foot = false;
 } G;
 
 UObject g_poseable_class = 0;
@@ -475,6 +480,19 @@ void SolveArm(int side, const hands::HandState& h, const FVector& body_fwd, cons
     FVector palm = h.palm_normal;
     fist = fist + h.grip.rotation.Rotate(FVector{S.hand_offset[0], S.hand_offset[1], S.hand_offset[2]});
 
+    if (grab.kind == hands::GrabKind::kGunGrip) {
+        // Wrap the hand around the gun's grip, not the controller: the gun
+        // sits pitched and shifted relative to the controller. target.rotation
+        // is the gun frame (X barrel, Y right, Z up). The fist axis runs up the
+        // grip, which slants back toward the bottom; the palm presses on the
+        // side of the grip facing across the gun.
+        const FQuat& g = grab.target.rotation;
+        FVector barrel = g.Rotate(FVector{1, 0, 0}), right = g.Rotate(FVector{0, 1, 0}), up = g.Rotate(FVector{0, 0, 1});
+        double a = S.grip_angle * kDegToRad;
+        fwd = Normalize(up * std::cos(a) + barrel * std::sin(a));
+        palm = side == kL ? right : right * -1.0;
+    }
+
     FQuat hand_rot;
     FVector hand_pos;
     if (G.frame[side].valid) {
@@ -504,7 +522,7 @@ void SolveArm(int side, const hands::HandState& h, const FVector& body_fwd, cons
     double reach = upper + lower;
     double a = 1.0 - std::exp(-dt / 0.15);
     G.reach_seen[side] += (dist - G.reach_seen[side]) * a;
-    if (G.reach_seen[side] < reach * 1.8) G.reach_max[side] = std::max(G.reach_max[side], G.reach_seen[side]);
+    if (G.reach_seen[side] < reach * 1.5) G.reach_max[side] = std::max(G.reach_max[side], G.reach_seen[side]);
     double want_scale = S.arm_scale > 0.0 ? S.arm_scale
                                           : std::clamp(G.reach_max[side] / (reach * 0.98), 1.0, S.max_arm_scale);
     if (want_scale > G.arm_scale[side] + 0.01) {
@@ -660,19 +678,23 @@ void OnTick(UObject player, float dt_f) {
     const FVector body_fwd = YawDir(actor_yaw + G.body_yaw);
     const FVector body_right = YawDir(actor_yaw + G.body_yaw + 90.0);
 
-    // Where the real head is relative to where the game thinks it is.
-    FVector delta{};
-    UObject cam = 0;
-    if (ue::GetProp(player, "Camera_Main", cam) && cam) delta = head.location - CompToWorld(cam).translation;
+    // Where the player's neck really is: a fixed offset below and behind
+    // the eyes, in head space (so nodding pivots around the neck). The body
+    // is moved and bent so the avatar's neck sits there, which puts its
+    // shoulders where the player's are.
+    FVector neck_anim_r = pelvis.translation + yaw_q.Rotate(neck_anim - pelvis.translation);
+    FVector neck_real = head.location + head.rotation.Rotate(FVector{-S.neck_back, 0, -S.neck_down});
+    FVector delta = k.neck.ok ? neck_real - neck_anim_r : FVector{};
     if (Length(delta) > 150.0) delta = FVector{};  // teleport / recenter in progress
     const double crouch = std::clamp(delta.Z, -S.max_crouch, 0.0);
-    FVector lean{delta.X, delta.Y, 0};
-    FVector pelvis_shift{};
-    if (Length(lean) > S.max_lean) {
-        pelvis_shift = Normalize(lean) * (Length(lean) - S.max_lean);
-        if (Length(pelvis_shift) > 40.0) pelvis_shift = Normalize(pelvis_shift) * 40.0;
-    }
-
+    // Most of a horizontal offset moves the whole body under the head (you
+    // stepped, or the game's body stands behind its camera); the spine leans
+    // for the rest, up to body_max_lean_cm.
+    FVector offset{delta.X, delta.Y, 0};
+    FVector pelvis_shift = offset * 0.7;
+    if (Length(pelvis_shift) > 60.0) pelvis_shift = Normalize(pelvis_shift) * 60.0;
+    FVector lean = offset - pelvis_shift;
+    if (Length(lean) > S.max_lean) lean = Normalize(lean) * S.max_lean;
     if (k.pelvis.ok) {
         Xf p = pelvis;
         p.rotation = Normalized(yaw_q * p.rotation);
@@ -682,8 +704,7 @@ void OnTick(UObject player, float dt_f) {
 
     // Spine leans toward the real head position.
     if (k.neck.ok && !k.spine.empty() && k.pelvis.ok) {
-        FVector neck_target = pelvis.translation + yaw_q.Rotate(neck_anim - pelvis.translation) +
-                              FVector{0, 0, std::max(delta.Z, -S.max_crouch - 30.0)} + lean;
+        FVector neck_target = neck_anim_r + pelvis_shift + FVector{0, 0, std::max(delta.Z, -S.max_crouch - 30.0)} + lean;
         FVector base = BoneW(k.spine[0]).translation;
         FVector neck_now = BoneW(k.neck).translation;
         FQuat bend = ClampAngle(Arc(neck_now - base, neck_target - base), S.max_spine_bend * kDegToRad);
@@ -718,6 +739,21 @@ void OnTick(UObject player, float dt_f) {
             foot.rotation = foot_anim[s].rotation;
             SetBoneW(k.foot[s], foot);
         }
+
+    if (k.legs_ok[0] && k.pelvis.ok) {
+        FVector rel = pelvis.translation - foot_anim[0].translation;
+        if (G.diag_have_foot) G.diag_foot_travel += Length(rel - G.diag_last_foot);
+        G.diag_last_foot = rel;
+        G.diag_have_foot = true;
+        G.diag_time += dt;
+        if (v.X * v.X + v.Y * v.Y > 50.0 * 50.0) G.diag_moving += dt;
+        if (G.diag_time >= 2.0) {
+            if (G.diag_moving > 1.0)
+                log::Info("body: walking %.1f s, animated left foot moved %.0f cm against the pelvis%s", G.diag_moving,
+                          G.diag_foot_travel, G.diag_foot_travel < 5.0 ? " (game legs not animating!)" : "");
+            G.diag_time = G.diag_moving = G.diag_foot_travel = 0;
+        }
+    }
 
     if (G.frames == 1 || G.frames % 3000 == 0)
         log::Info("body: frame %d yaw %.0f crouch %.0f lean %.0f", G.frames, G.body_yaw, crouch, Length(lean));
