@@ -62,6 +62,21 @@ const Block kBlocks[] = {
      "; The player's extra scene capture renders the level a second time\n"
      "; (the game's Capture2D option). Stopping it saves a lot of GPU time.\n"
      "vr_disable_player_scene_capture=1\n"},
+    {"vr_controls",
+     "\n"
+     "; --- Motion controls ---\n"
+     "; 1 = use the VR controllers, 0 = keyboard/mouse/gamepad only.\n"
+     "vr_controls=1\n"
+     "; Turning on the right stick: 0 = snap, 1 = smooth.\n"
+     "turn_mode=0\n"
+     "snap_turn_degrees=30\n"
+     "; Degrees per second at full stick for smooth turning.\n"
+     "smooth_turn_speed=180\n"
+     "; Left stick moves toward: 0 = where you look, 1 = where your left hand points.\n"
+     "move_direction=0\n"
+     "stick_deadzone=0.15\n"
+     "; Tilts the gun in your hand up (+) or down (-), degrees.\n"
+     "gun_pitch_offset=0\n"},
 };
 
 std::string Trim(const std::string& s) {

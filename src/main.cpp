@@ -17,6 +17,7 @@
 #include "ue/process_event.h"
 #include "ue/reflection.h"
 #include "vr/dxgi_hooks.h"
+#include "vr/controls.h"
 #include "vr/input.h"
 #include "vr/openxr.h"
 #include "vr/render_fixes.h"
@@ -111,7 +112,10 @@ DWORD WINAPI InitThread(LPVOID) {
     // game_hooks=0 in hole-vr.ini turns this off if it ever causes trouble.
     const bool hooks = config::GetBool("game_hooks", true) &&
                        WaitFor("ProcessEvent", ue::process_event::Init, timeout) && game::Init();
-    if (hooks) game::weapon_lab::Init();
+    if (hooks) {
+        game::weapon_lab::Init();
+        vr::controls::Init();
+    }
 
     // Development hotkeys. Polled rather than hooked so nothing here can
     // interfere with the game's own input.
