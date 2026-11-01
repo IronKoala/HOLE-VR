@@ -460,6 +460,13 @@ void SlideHandling(game::Gun& gun, const hands::HandState& lh, const input::Hand
                 log::Info("controls: slide locked open: %s", gun.State().Describe().c_str());
                 break;
             }
+            // Racked off the slide catch: the slide is free now. Clear the
+            // game's lock flag before it runs forward, or the slide stops at
+            // the catch until the flag is cleared later (the chamber hitch).
+            if (st.slide_locked) {
+                gun.ClearSlideLock();
+                W.slide.SetRest(0.0);
+            }
             gun.ChargeBoltRelease();
             W.end_charging_at = g_clock + 0.1;
             W.check_chamber_at = g_clock + 0.15;
@@ -585,15 +592,23 @@ void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState& lh
     // Right B: the slide stop lever. Pressed down on a locked slide it
     // releases it; with the slide held back by the left hand it pushes the
     // lever up so the slide stays open; otherwise it does nothing.
-    if (rin.secondary.pressed) {
-        game::GunState st = gun.State();
+    // B held at any moment while the slide is back far enough pushes the
+    // lever up (pressed before or during the rack, released before the slide).
+    if (rin.secondary.down && W.slide.Held() && !W.lock_on_release) {
         double len = gun.SlideBackLength() > 0.5 ? gun.SlideBackLength() : 4.7;
         double stop = gun.SlideStopLength() > 0 ? gun.SlideStopLength() / len : 0.75;
-        if (W.slide.Held() && W.slide.Travel() >= stop - 0.05) {
+        if (W.slide.Travel() >= stop - 0.05) {
             W.lock_on_release = true;
             input::Haptic(input::kRight, 0.3f, 0.03f);
             log::Info("controls: slide stop pushed up, slide will stay open");
-        } else if (st.slide_locked && !W.slide.Held()) {
+        }
+    }
+    if (rin.secondary.pressed && !W.slide.Held()) {
+        game::GunState st = gun.State();
+        // An empty magazine's follower holds the lever up: B can't drop it.
+        if (st.slide_locked && st.has_magazine && st.magazine == 0) {
+            log::Info("controls: slide release blocked by the empty magazine");
+        } else if (st.slide_locked) {
             log::Info("controls: slide release (B), before: %s", st.Describe().c_str());
             gun.ReleaseSlideCatch();
             W.dead_trigger = false;
