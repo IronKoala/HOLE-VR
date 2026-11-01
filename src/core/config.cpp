@@ -62,6 +62,21 @@ const Block kBlocks[] = {
      "; The player's extra scene capture renders the level a second time\n"
      "; (the game's Capture2D option). Stopping it saves a lot of GPU time.\n"
      "vr_disable_player_scene_capture=1\n"},
+    {"vr_anti_aliasing",
+     "\n"
+     "; --- Anti-aliasing and console variables ---\n"
+     "; Smoothing of jagged edges. The game's default (tsr) can leave after-images\n"
+     "; and shimmer on things that move fast, like your hands and gun.\n"
+     ";   fxaa = no after-images, slightly softer edges (VR default)\n"
+     ";   taa  = smoother edges, some ghosting\n"
+     ";   tsr  = the game's own, sharpest when still, most ghosting\n"
+     ";   off  = no smoothing, sharp but jagged\n"
+     ";   game = leave whatever the game set\n"
+     "; Ctrl+F10 in game cycles through these to compare (not saved).\n"
+     "vr_anti_aliasing=fxaa\n"
+     ";\n"
+     "; Any engine console variable can be set here with a cvar. prefix, e.g.\n"
+     "; cvar.r.Tonemapper.Sharpen=0.5\n"},
     {"vr_controls",
      "\n"
      "; --- Motion controls ---\n"
@@ -253,6 +268,19 @@ int GetInt(const char* key, int fallback) {
 float GetFloat(const char* key, float fallback) {
     const std::string* v = Find(key);
     return (v && !v->empty()) ? static_cast<float>(std::atof(v->c_str())) : fallback;
+}
+
+std::string GetString(const char* key, const char* fallback) {
+    const std::string* v = Find(key);
+    return (v && !v->empty()) ? *v : std::string(fallback);
+}
+
+std::vector<std::pair<std::string, std::string>> WithPrefix(const char* prefix) {
+    std::vector<std::pair<std::string, std::string>> out;
+    const size_t n = std::strlen(prefix);
+    for (const auto& [k, v] : g_values)
+        if (k.size() > n && k.compare(0, n, prefix) == 0) out.emplace_back(k.substr(n), v);
+    return out;
 }
 
 }  // namespace holevr::config
