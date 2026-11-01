@@ -58,6 +58,7 @@ struct Settings {
     bool hand_poses = true;
     double finger_scale = 1.0;
     bool legs = true;
+    bool game_grip = true;  // copy the game's own hand placement on the gun
     double arm_scale = 0.0;       // 0 = learn from how far you reach; else fixed multiplier
     double max_arm_scale = 1.25;
     double neck_down = 14.0;      // cm from the eyes down to the base of the neck, in head space
@@ -88,6 +89,7 @@ void LoadSettings() {
     S.hand_poses = config::GetBool("hand_poses", true);
     S.finger_scale = config::GetFloat("finger_curl_scale", 1.f);
     S.legs = config::GetBool("body_leg_ik", true);
+    S.game_grip = config::GetBool("hand_use_game_grip", true);
     S.arm_scale = config::GetFloat("body_arm_scale", 0.f);
     S.max_arm_scale = config::GetFloat("body_max_arm_scale", 1.25f);
     S.neck_down = config::GetFloat("body_neck_below_eyes_cm", 14.f);
@@ -265,6 +267,14 @@ struct State {
     bool knee_known[2] = {false, false};
     bool failed = false;
     int frames = 0;
+    // The game's own hand IK on the gun (hidden body), relative to the gun's
+    // grip frame; we copy it so the hand holds the gun exactly as the game does.
+    bool game_grip_known = false;
+    FQuat game_grip_rot;
+    FVector game_grip_loc;
+    bool have_prev_grip = false;
+    hands::Pose prev_grip;
+    bool use_game_grip = false;  // this frame
     // Leg animation check: how much the game's animated feet move (relative
     // to the pelvis) while the character walks.
     double stand_dz = -1e9;  // highest real-neck vs avatar-neck height seen: standing tall
@@ -397,6 +407,13 @@ void Activate() {
     CollectFollowers(G.source, G.source, 0, &G.followers);
     for (UObject f : G.followers) SetLeader(f, G.pose);
     SetVisible(G.pose, true);
+    // The posed copy's bounds don't follow our IK (arms reach outside them),
+    // so the engine culled it at some view angles. Inflate them.
+    {
+        ue::Call b(G.pose, "SetBoundsScale");
+        b.Set("NewBoundsScale", 4.0f);
+        b.Invoke();
+    }
     SetVisible(G.source, false);
     ApplyShadows();
     G.active = true;
@@ -503,6 +520,45 @@ void LogGunGeometry(uintptr_t gun, const hands::Pose& main) {
               ue::GetName(gun).c_str(), line.c_str());
 }
 
+// Learns where the game's own (hidden, animated) right hand sits on the gun.
+// The hidden body's pose is one frame old, so compare it with last frame's
+// gun frame.
+void LearnGameGrip(const hands::HandGrab& grab) {
+    const Skeleton& k = G.skel;
+    G.use_game_grip = false;
+    if (grab.kind != hands::GrabKind::kGunGrip || !k.hand[kR].ok || !S.game_grip) {
+        G.have_prev_grip = false;
+        return;
+    }
+    if (G.have_prev_grip) {
+        ue::Call c(G.source, "GetBoneTransform");
+        c.Set("InBoneName", k.hand[kR].name).Set("TransformSpace", static_cast<uint8_t>(0));  // RTS_World
+        if (c.Invoke()) {
+            Xf hand = c.Result<Xf>();
+            FQuat inv = G.prev_grip.rotation.Inverse();
+            FVector loc = inv.Rotate(hand.translation - G.prev_grip.location);
+            FQuat rot = Normalized(inv * hand.rotation);
+            if (Length(loc) < 25.0) {  // the game's arm actually reached the gun
+                if (!G.game_grip_known) {
+                    G.game_grip_loc = loc;
+                    G.game_grip_rot = rot;
+                    G.game_grip_known = true;
+                    log::Info("body: copying the game's hand on the gun (%.1f %.1f %.1f cm from its grip point)", loc.X,
+                              loc.Y, loc.Z);
+                } else {
+                    // Slow average: the game's attachment barely moves.
+                    G.game_grip_loc = G.game_grip_loc + (loc - G.game_grip_loc) * 0.05;
+                    FQuat step = Scale(Normalized(rot * G.game_grip_rot.Inverse()), 0.05);
+                    G.game_grip_rot = Normalized(step * G.game_grip_rot);
+                }
+            }
+        }
+    }
+    G.prev_grip = grab.target;
+    G.have_prev_grip = true;
+    G.use_game_grip = G.game_grip_known;
+}
+
 void SolveArm(int side, const hands::HandState& h, const FVector& body_fwd, const FVector& body_right,
               double dt) {
     const Skeleton& k = G.skel;
@@ -560,6 +616,11 @@ void SolveArm(int side, const hands::HandState& h, const FVector& body_fwd, cons
                               h.grip.rotation.Inverse() * hand_rot);
     }
     hand_pos = G.frame[side].valid ? fist - hand_rot.Rotate(G.frame[side].fist) : fist;
+    const bool game_grip = side == kR && grab.kind == hands::GrabKind::kGunGrip && G.use_game_grip;
+    if (game_grip) {
+        hand_rot = Normalized(grab.target.rotation * G.game_grip_rot);
+        hand_pos = grab.target.location + grab.target.rotation.Rotate(G.game_grip_loc);
+    }
 
     // Shoulder reach: when the hand is far out, the collarbone swings toward
     // it a little, like a real shoulder.
@@ -628,7 +689,9 @@ void SolveArm(int side, const hands::HandState& h, const FVector& body_fwd, cons
     hand.translation = sol.end;
     SetBoneW(k.hand[side], hand);
 
-    // Fingers.
+    // Fingers. On the gun with the game's grip copied, keep the game's own
+    // finger pose (it was made for this gun).
+    if (game_grip) return;
     if (!S.hand_poses || !k.fingers_ok[side] || !G.frame[side].valid) return;
     hand_pose::Curl target = hand_pose::Target(grab.kind, hands::GetFingers(hs));
     hand_pose::Smooth(&G.curl[side], target, dt);
@@ -681,12 +744,13 @@ void OnTick(UObject player, float dt_f) {
     ++G.frames;
 
     hands::HandState hs[2] = {hands::Get(hands::kLeft), hands::Get(hands::kRight)};
+    LearnGameGrip(hands::GetGrab(hands::kRight));
 
     // Fingers start from the skeleton's straight reference pose; hand poses
     // curl them from there.
     if (S.hand_poses)
         for (int side = 0; side < 2; ++side)
-            if (hs[side].valid && k.fingers_ok[side])
+            if (hs[side].valid && k.fingers_ok[side] && !(side == kR && G.use_game_grip))
                 for (auto& f : k.finger[side])
                     for (const Bone& b : f) ResetBone(b);
 
