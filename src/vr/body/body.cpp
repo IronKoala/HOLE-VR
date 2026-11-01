@@ -13,6 +13,7 @@
 #include "core/config.h"
 #include "core/log.h"
 #include "core/memory.h"
+#include "core/perf.h"
 #include "game/game.h"
 #include "ue/call.h"
 #include "ue/names.h"
@@ -84,7 +85,7 @@ struct Settings {
     bool animated_upper_body = false; // false: spine/neck/shoulders ignore the game's animation (recoil etc.)
     // Grip from the scanned gun shape (grip_probe.h).
     bool grip_scan = true;
-    int scan_rays = 160;              // traces per frame while scanning a new gun
+    double scan_ms = 2.0;             // CPU time per frame for scanning a new gun, ms
     double scan_palm_skin = 1.5;      // cm from the knuckle joints out to the palm skin
     double scan_knuckle_back = 0.5;   // middle knuckle behind the front strap, cm
     double scan_thumb_above = 2.0;    // thumb above the trigger guard bottom, cm
@@ -141,7 +142,7 @@ void LoadSettings() {
     S.wrist_twist_share = config::GetFloat("body_wrist_twist_share", 0.75f);
     S.animated_upper_body = config::GetBool("body_animated_upper_body", false);
     S.grip_scan = config::GetBool("hand_grip_from_gun_scan", true);
-    S.scan_rays = config::GetInt("hand_gun_scan_rays_per_frame", 160);
+    S.scan_ms = config::GetFloat("hand_gun_scan_ms_per_frame", 2.f);
     S.scan_palm_skin = config::GetFloat("hand_scan_palm_skin_cm", 1.5f);
     S.scan_knuckle_back = config::GetFloat("hand_scan_knuckle_behind_front_cm", 0.5f);
     S.scan_thumb_above = config::GetFloat("hand_scan_thumb_above_guard_cm", 2.f);
@@ -567,7 +568,23 @@ FVector g_catch_rel;  // magazine catch in the gun frame, from MainHandPosition
 struct BoxMinMax {
     FVector Min, Max;
 };
+bool LocalBoxRead(UObject comp, FVector* mn, FVector* mx);
+// Cached: asset reads cost real time and a part's mesh does not change.
+std::map<UObject, std::pair<bool, BoxMinMax>> g_box_cache;
 bool LocalBox(UObject comp, FVector* mn, FVector* mx) {
+    auto it = g_box_cache.find(comp);
+    if (it == g_box_cache.end()) {
+        BoxMinMax b{};
+        bool ok = LocalBoxRead(comp, &b.Min, &b.Max);
+        if (g_box_cache.size() > 512) g_box_cache.clear();
+        it = g_box_cache.emplace(comp, std::make_pair(ok, b)).first;
+    }
+    if (!it->second.first) return false;
+    *mn = it->second.second.Min;
+    *mx = it->second.second.Max;
+    return true;
+}
+bool LocalBoxRead(UObject comp, FVector* mn, FVector* mx) {
     UObject mesh = 0;
     {
         ue::Call g(comp, "GetStaticMesh");
@@ -834,7 +851,23 @@ struct GunScan {
     int hits = 0;
     int held_frames = 0;
     int reports = 0;
+    std::vector<UObject> parts;  // the parts worth scanning
+    bool right_missed = false;
+    hands::Pose frame;  // where the gun is this frame (gun frame)
+    double started = 0, cpu_ms = 0;
 } g_scan;
+perf::Counter g_perf_tick{"body tick"};
+perf::Counter g_perf_scan{"body gun scan"};
+perf::Counter g_perf_fingers{"body fingers"};
+
+// Parts that shape the outside of the grip and frame. Internals (barrel,
+// spring) and accessories (light, rail) only cost traces.
+bool ScanPart(UObject comp) {
+    std::string n = Lower(ue::GetName(comp));
+    for (const char* skip : {"barrel", "spring", "light", "rail", "laser", "optic", "sight"})
+        if (n.find(skip) != std::string::npos) return false;
+    return true;
+}
 const double kScanYCentre = -4.0, kScanYHalf = 16.0;
 
 // Nearest hit along a->b over the given parts, as a fraction of the way.
@@ -856,26 +889,38 @@ void StepScan(const hands::HandGrab& grab, const std::vector<UObject>& comps) {
     if (grab.object != g_scan.gun) {
         g_scan = GunScan{};
         g_scan.gun = grab.object;
-        g_scan.grid.Init(-12, 22, -8, 18, 0.5);
+        g_scan.grid.Init(-8, 22, -4, 17, 0.5);
+        for (UObject c : comps)
+            if (ScanPart(c)) g_scan.parts.push_back(c);
+        g_scan.started = perf::NowMs();
     }
-    if (g_scan.done || comps.empty()) return;
+    g_scan.frame = grab.target;
+    if (g_scan.done || g_scan.parts.empty()) return;
+    perf::Scope timer(g_perf_scan);
+    const double t_start = perf::NowMs();
     grip::Grid& g = g_scan.grid;
     const int total = g.nx * g.nz * 2;
     const FQuat& rot = grab.target.rotation;
     const FVector& org = grab.target.location;
-    for (int n = 0; n < S.scan_rays && g_scan.next < total; ++n, ++g_scan.next) {
+    // Time-boxed: a few milliseconds per frame, however slow traces are.
+    for (; g_scan.next < total && perf::NowMs() - t_start < S.scan_ms; ++g_scan.next) {
         int cell = g_scan.next / 2, from_left = g_scan.next % 2;
+        // Nothing from the right side: nothing from the left either.
+        if (from_left && g_scan.right_missed) continue;
         int ix = cell % g.nx, iz = cell / g.nx;
         double y0 = from_left ? kScanYCentre - kScanYHalf : kScanYCentre + kScanYHalf;
         double y1 = from_left ? kScanYCentre + kScanYHalf : kScanYCentre - kScanYHalf;
         FVector a = org + rot.Rotate(FVector{g.X(ix), y0, g.Z(iz)});
         FVector b = org + rot.Rotate(FVector{g.X(ix), y1, g.Z(iz)});
         double t;
-        if (!TraceNearest(comps, a, b, &t)) continue;
+        bool hit = TraceNearest(g_scan.parts, a, b, &t);
+        if (!from_left) g_scan.right_missed = !hit;
+        if (!hit) continue;
         ++g_scan.hits;
         double y = y0 + (y1 - y0) * t;
         (from_left ? g.yl : g.yr)[static_cast<size_t>(cell)] = y;
     }
+    g_scan.cpu_ms += perf::NowMs() - t_start;
     if (g_scan.next < total) return;
     g_scan.done = true;
     g_scan.shape = grip::Analyze(g, S.scan_thumb_above);
@@ -885,6 +930,8 @@ void StepScan(const hands::HandGrab& grab, const std::vector<UObject>& comps) {
                   ue::GetName(grab.object).c_str(), total, g_scan.hits, sh.why.c_str());
         return;
     }
+    log::Info("body: scan took %.0f ms of CPU over %.1f s (%zu parts)", g_scan.cpu_ms,
+              (perf::NowMs() - g_scan.started) / 1000.0, g_scan.parts.size());
     log::Info("body: scanned %s with %d rays (%d hit): gun %.1f cm long, %.1f cm tall; grip bottom %.1f, trigger guard "
               "bottom %.1f, front strap %.1f, back strap %.1f, grip %.1f cm wide (right side %.1f, left %.1f), slant %.0f "
               "deg; thumb spot (%.1f %.1f %.1f) (gun frame cm)",
@@ -896,14 +943,15 @@ void StepScan(const hands::HandGrab& grab, const std::vector<UObject>& comps) {
 bool ScanReady(const hands::HandGrab& grab) {
     return g_scan.gun == grab.object && g_scan.done && g_scan.shape.ok;
 }
-FVector GunLocal(const hands::HandGrab& grab, const FVector& w) {
-    return grab.target.rotation.Inverse().Rotate(w - grab.target.location);
+FVector GunLocal(const hands::Pose& frame, const FVector& w) {
+    return frame.rotation.Inverse().Rotate(w - frame.location);
 }
+FVector GunLocal(const hands::HandGrab& grab, const FVector& w) { return GunLocal(grab.target, w); }
 
 // While set, finger contact tests against the scanned gun instead of
 // tracing its parts (same answer, far cheaper, and the same model the clip
 // report checks).
-const hands::HandGrab* g_grid_grab = nullptr;
+const hands::Pose* g_grid_frame = nullptr;
 
 // First hit along a->b, as a fraction of the way (0..1). `first_only`: any
 // hit will do (cheaper), the fraction is then not the nearest.
@@ -939,8 +987,8 @@ bool RayHit(const FVector& a, const FVector& b, double* t_out, bool first_only) 
 }
 
 bool SegmentHits(const FVector& a, const FVector& b) {
-    if (g_grid_grab)
-        return grip::Penetration(g_scan.grid, {GunLocal(*g_grid_grab, a), GunLocal(*g_grid_grab, b)}, 0.0) > 0.0;
+    if (g_grid_frame)
+        return grip::Penetration(g_scan.grid, {GunLocal(*g_grid_frame, a), GunLocal(*g_grid_frame, b)}, 0.0) > 0.0;
     return RayHit(a, b, nullptr, true);
 }
 
@@ -1313,23 +1361,27 @@ void SolveArm(int side, const hands::HandState& h, const FVector& body_fwd, cons
     FVector palm_w = hand_rot.Rotate(G.frame[side].palm);
     FVector pinky_base = BoneW(k.finger[side][hand_pose::kPinky][0]).translation;
     // Fingers wrap until they touch what the hand holds.
+    perf::Scope finger_timer(g_perf_fingers);
+    // On the gun, fingers test the scanned shape (no traces: tracing every
+    // finger joint against every part cost ~25 ms a hand per frame). Until
+    // the scan is done they keep their full pose. Magazines use boxes.
+    const bool on_gun = grab.kind == hands::GrabKind::kGunGrip || grab.kind == hands::GrabKind::kSlideGrab;
+    const bool gun_grid = on_gun && grab.object && grab.object == g_scan.gun && g_scan.done && g_scan.shape.ok;
     const bool touch = S.finger_contact && grab.object &&
-                       (grab.kind == hands::GrabKind::kGunGrip || grab.kind == hands::GrabKind::kSlideGrab ||
-                        grab.kind == hands::GrabKind::kMagHeld || grab.kind == hands::GrabKind::kMagInsert);
-    if (touch && grab.object != g_c->actor)
-        CollectPrimitives(grab.object, grab.kind == hands::GrabKind::kGunGrip || grab.kind == hands::GrabKind::kSlideGrab);
+                       (gun_grid || grab.kind == hands::GrabKind::kMagHeld || grab.kind == hands::GrabKind::kMagInsert);
+    if (touch && !on_gun && grab.object != g_c->actor) CollectPrimitives(grab.object, false);
+    if (gun_grid) g_grid_frame = &g_scan.frame;
     if (!G.contact_init[side] || !touch) {
         for (auto& f : G.contact[side])
             for (double& v : f) v = 1.0;
         G.contact_init[side] = true;
     }
     const double follow = 1.0 - std::exp(-dt / 0.05);
-    if (touch) RefreshBoxes();
+    if (touch && !on_gun) RefreshBoxes();
     const bool index_straight = grab.kind == hands::GrabKind::kGunGrip && G.curl[side].finger[hand_pose::kIndex] < 0.15f;
     const FVector barrel_w = grab.target.rotation.Rotate(FVector{1, 0, 0});
     if (scanned) {
         PlaceGunThumb(grab, k.finger[side][hand_pose::kThumb], place);
-        g_grid_grab = &grab;  // fingers stop on the scanned gun
     }
     for (int f = 0; f < hand_pose::kFingerCount; ++f) {
         if (scanned && f == hand_pose::kThumb) continue;
@@ -1376,7 +1428,7 @@ void SolveArm(int side, const hands::HandState& h, const FVector& body_fwd, cons
                     want = 4.0 * kDegToRad;
                 }
             }
-            if (touch && !g_c->comps.empty() && want > 1e-3) {
+            if (touch && (gun_grid || !g_c->comps.empty()) && want > 1e-3) {
                 // Joint n turns the segment from bone n to bone n+1 (the tip
                 // segment is extended from the last bone's direction).
                 FVector p = BoneW(j[n]).translation;
@@ -1396,9 +1448,9 @@ void SolveArm(int side, const hands::HandState& h, const FVector& body_fwd, cons
             RotateBoneW(j[n], AxisAngle(axis, want * G.contact[side][f][n]));
         }
     }
-    g_grid_grab = nullptr;
+    g_grid_frame = nullptr;
     if (scanned) ClipReport(grab, side);
-    if (touch && !g_c->reported && g_c->traces > 2000) {
+    if (touch && !on_gun && !g_c->reported && g_c->traces > 2000) {
         g_c->reported = true;
         log::Info("body: finger contact on %s: %d of %d traces touched%s", ue::GetName(g_c->actor).c_str(),
                   g_c->hits, g_c->traces,
@@ -1419,6 +1471,14 @@ void PollToggle() {
 }
 
 void OnTick(UObject player, float dt_f) {
+    static bool registered = [] {
+        perf::Register(&g_perf_tick);
+        perf::Register(&g_perf_scan);
+        perf::Register(&g_perf_fingers);
+        return true;
+    }();
+    (void)registered;
+    perf::Scope tick_timer(g_perf_tick);
     const double dt = dt_f;
     PollToggle();
     hands::Pose head;
