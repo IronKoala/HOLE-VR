@@ -81,6 +81,19 @@ bool IsReadable(uintptr_t p, size_t len) {
     return true;
 }
 
+bool IsWritable(uintptr_t p, size_t len) {
+    if (p < 0x10000 || p >= 0x00007FFFFFFFFFFFull) return false;
+    uintptr_t end = p + len;
+    while (p < end) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (!VirtualQuery(reinterpret_cast<void*>(p), &mbi, sizeof(mbi))) return false;
+        if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) return false;
+        if (!(mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE))) return false;
+        p = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+    }
+    return true;
+}
+
 uintptr_t FindBytes(uintptr_t start, size_t size, const void* bytes, size_t len) {
     if (len == 0 || size < len) return 0;
     auto* hay = reinterpret_cast<const unsigned char*>(start);

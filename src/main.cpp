@@ -8,14 +8,16 @@
 #include "core/log.h"
 #include "core/memory.h"
 #include "proxy/dxgi_proxy.h"
+#include "version.h"
 #include "ue/dumper.h"
 #include "ue/names.h"
 #include "ue/objects.h"
 #include "ue/reflection.h"
+#include "vr/render_fixes.h"
 
 namespace {
 
-constexpr const char* kVersion = "0.1.0-foundation";
+constexpr const char* kVersion = HOLEVR_VERSION_STR;
 HMODULE g_self = nullptr;
 
 std::wstring ModuleDir(HMODULE m) {
@@ -71,13 +73,18 @@ DWORD WINAPI InitThread(LPVOID) {
     log::Info("Engine discovery complete");
 
     if (config::GetBool("dump_on_start", true)) ue::dumper::DumpAll(mod_dir);
+    const bool render_fixes = config::GetBool("vr_render_fixes", true) && vr::render_fixes::Init();
+
     log::Info("Press Ctrl+F9 in game to write a fresh dump (after loading a level, "
               "so weapon and player classes are included)");
 
     // Development hotkeys. Polled rather than hooked so nothing here can
     // interfere with the game's own input.
     bool was_down = false;
-    for (;;) {
+    for (int tick = 0;; ++tick) {
+        // New cameras, volumes and captures appear on every level load, so
+        // the fixes are re-applied once a second.
+        if (render_fixes && tick % 10 == 0) vr::render_fixes::Apply();
         bool down = (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_F9) & 0x8000);
         if (down && !was_down) {
             log::Info("Ctrl+F9: dumping (%d live objects)", ue::objects::Count());
