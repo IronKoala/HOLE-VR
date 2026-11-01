@@ -46,6 +46,7 @@ constexpr size_t kCalculateStereoViewOffset = 11;
 constexpr size_t kGetStereoProjectionMatrix = 12;
 constexpr size_t kRenderTextureRenderThread = 14;
 // IStereoRenderTargetManager slots.
+constexpr size_t kShouldUseSeparateRenderTarget = 0;
 constexpr size_t kCalculateRenderTargetSize = 2;
 constexpr size_t kNeedReAllocateViewportRenderTarget = 3;
 
@@ -54,6 +55,7 @@ using ProjectionFn = double* (*)(void*, double*, int32_t);
 using RenderTextureFn = void (*)(void*, void*, void*, void*, void*);
 using CalcRTSizeFn = void (*)(void*, const void*, uint32_t*, uint32_t*);
 using NeedReallocFn = bool (*)(void*, const void*);
+using ShouldUseSeparateRTFn = bool (*)(void*);
 
 uintptr_t g_device = 0;
 void* g_primary[kPrimarySlots];
@@ -63,6 +65,9 @@ ProjectionFn o_projection = nullptr;
 RenderTextureFn o_render_texture = nullptr;
 CalcRTSizeFn o_calc_rt_size = nullptr;
 NeedReallocFn o_need_realloc = nullptr;
+ShouldUseSeparateRTFn o_should_use_separate_rt = nullptr;
+std::atomic<bool> g_separate_rt{false};
+std::atomic<int> g_null_mirror_frames{0};
 
 const float* g_near_plane = nullptr;  // GNearClippingPlane, read from the original projection code
 std::atomic<bool> g_realloc{false};
@@ -322,10 +327,15 @@ ID3D12Resource* FindNativeTexture(void* engine_texture) {
 
 void HookRenderTexture(void* self, void* cmdlist, void* back_buffer, void* src_texture, void* window_size) {
     HOLEVR_FIRST_CALL("RenderTexture_RenderThread");
-    if (!src_texture) {
-        static bool told = false;
-        if (!told) log::Warn("stereo: engine passed no eye texture to RenderTexture");
-        told = true;
+    if (!src_texture || !back_buffer) {
+        // While the viewport switches to its separate eye texture there are
+        // frames with no texture yet. The engine's own mirror pass reads
+        // through these unchecked (the 0xe2 crash), so skip it this frame.
+        if (g_null_mirror_frames.fetch_add(1) == 0)
+            log::Info("stereo: no eye texture yet (eye %p, window %p); skipping the mirror until it exists",
+                      src_texture, back_buffer);
+        xr::SetEyeTexture(nullptr);
+        return;
     }
     if (src_texture && src_texture != g_last_src) {
         LearnResourceVtables();
@@ -348,6 +358,14 @@ void HookCalcRTSize(void* self, const void* viewport, uint32_t* x, uint32_t* y) 
         return;
     }
     o_calc_rt_size(self, viewport, x, y);
+}
+
+// A separate eye texture at headset resolution, instead of drawing both eyes
+// into the game window at monitor resolution.
+bool HookShouldUseSeparateRT(void* self) {
+    HOLEVR_FIRST_CALL("ShouldUseSeparateRenderTarget");
+    if (g_separate_rt.load()) return true;
+    return o_should_use_separate_rt(self);
 }
 
 bool HookNeedRealloc(void* self, const void* viewport) {
@@ -387,6 +405,7 @@ bool Install() {
     o_render_texture = reinterpret_cast<RenderTextureFn>(g_primary[kRenderTextureRenderThread]);
     o_calc_rt_size = reinterpret_cast<CalcRTSizeFn>(g_secondary[kCalculateRenderTargetSize]);
     o_need_realloc = reinterpret_cast<NeedReallocFn>(g_secondary[kNeedReAllocateViewportRenderTarget]);
+    o_should_use_separate_rt = reinterpret_cast<ShouldUseSeparateRTFn>(g_secondary[kShouldUseSeparateRenderTarget]);
     g_near_plane = FindNearPlane(reinterpret_cast<uintptr_t>(o_projection));
     if (!g_near_plane) log::Warn("stereo: near clip plane not found, using 10 cm");
 
@@ -395,6 +414,7 @@ bool Install() {
     g_primary[kRenderTextureRenderThread] = reinterpret_cast<void*>(&HookRenderTexture);
     g_secondary[kCalculateRenderTargetSize] = reinterpret_cast<void*>(&HookCalcRTSize);
     g_secondary[kNeedReAllocateViewportRenderTarget] = reinterpret_cast<void*>(&HookNeedRealloc);
+    g_secondary[kShouldUseSeparateRenderTarget] = reinterpret_cast<void*>(&HookShouldUseSeparateRT);
 
     xr::RecommendedEyeSize(&g_eye_w, &g_eye_h);
     if (g_eye_w && g_eye_h) {
@@ -408,6 +428,27 @@ bool Install() {
     g_device = dev;
     log::Info("stereo: hooked (render target %ux%u, near plane %.1f)", g_eye_w * 2, g_eye_h,
               g_near_plane ? *g_near_plane : 10.0f);
+    if (g_eye_w && config::GetBool("headset_resolution", true)) {
+        // Switch the viewport to a separate eye texture. It asks for its
+        // render target again when NeedReAllocate says so (g_realloc); if it
+        // still has none after a few seconds, a window resize forces it.
+        g_separate_rt = true;
+        log::Info("stereo: asking the engine for a %ux%u eye texture (headset_resolution=0 turns this off)",
+                  g_eye_w * 2, g_eye_h);
+        if (HANDLE t = CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
+                Sleep(4000);
+                if (!g_last_resource) {
+                    log::Info("stereo: still no eye texture after 4 s (%d frames without one)",
+                              g_null_mirror_frames.load());
+                    dxgi_hooks::NudgeWindow();
+                    Sleep(4000);
+                }
+                log::Info("stereo: eye texture %s (%d frames without one so far)",
+                          g_last_resource ? "in use" : "STILL MISSING", g_null_mirror_frames.load());
+                return 0;
+            }, nullptr, 0, nullptr))
+            CloseHandle(t);
+    }
     return true;
 }
 
