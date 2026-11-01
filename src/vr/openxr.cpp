@@ -8,6 +8,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <thread>
 
 #include "core/config.h"
 #include "core/log.h"
@@ -26,6 +27,22 @@ XrSessionState g_state = XR_SESSION_STATE_UNKNOWN;
 std::atomic<bool> g_running{false};
 std::atomic<bool> g_instance_ready{false};
 bool g_session_failed = false;
+
+// Frame calls (wait/begin/end) and session state changes happen under this
+// lock: the game's Present thread drives frames normally, and the keep-alive
+// thread fills in when the game stalls.
+std::mutex g_frame_mutex;
+// Last projection layer we submitted, re-sent by the keep-alive thread. The
+// runtime shows each swapchain's most recently released image, so re-sending
+// needs no GPU work; head motion is covered by the runtime's reprojection.
+XrCompositionLayerProjectionView g_last_views[2];
+bool g_have_last_layer = false;
+// Timing (QueryPerformanceCounter ticks).
+LARGE_INTEGER g_qpc_freq{};
+std::atomic<long long> g_last_frame_qpc{0};
+double g_max_gap_ms = 0.0;
+unsigned long long g_hitches = 0, g_keepalive_frames = 0;
+std::atomic<bool> g_keepalive_started{false};
 
 uint32_t g_eye_w = 0, g_eye_h = 0;
 std::vector<Listener*>& Listeners() {
@@ -224,6 +241,7 @@ bool CreateSwapchains(ID3D12Resource* source) {
                    static_cast<int>(desc.Format));
         return false;
     }
+    g_have_last_layer = false;
     for (auto& sc : g_swapchains) {
         if (sc.handle) destroy(sc.handle);
         sc = Swapchain{};
@@ -380,6 +398,7 @@ void PollEvents() {
             } else if (g_state == XR_SESSION_STATE_STOPPING) {
                 for (Listener* l : Listeners()) l->OnSessionEnding();
                 g_running = false;
+                g_have_last_layer = false;
                 Proc<PFN_xrEndSession>("xrEndSession")(g_session);
             } else if (g_state == XR_SESSION_STATE_EXITING || g_state == XR_SESSION_STATE_LOSS_PENDING) {
                 g_running = false;
@@ -404,7 +423,29 @@ void LocateViews(XrTime time) {
     g_have_latest = true;
 }
 
+double MsSince(long long qpc) {
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return (now.QuadPart - qpc) * 1000.0 / static_cast<double>(g_qpc_freq.QuadPart);
+}
+
+void MarkFrameDone() {
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    g_last_frame_qpc = now.QuadPart;
+}
+
 void RunFrame() {
+    // A long gap since the last frame means the game stalled; SteamVR hides
+    // the app (black screen) if no frame arrives for too long.
+    if (long long last = g_last_frame_qpc.load()) {
+        double gap = MsSince(last);
+        if (gap > g_max_gap_ms) g_max_gap_ms = gap;
+        if (gap > config::GetFloat("hitch_log_ms", 50.0f)) {
+            ++g_hitches;
+            log::Info("OpenXR: game frame gap %.0f ms (session state %d)", gap, static_cast<int>(g_state));
+        }
+    }
     XrFrameState fs{XR_TYPE_FRAME_STATE};
     XrFrameWaitInfo wi{XR_TYPE_FRAME_WAIT_INFO};
     if (XR_FAILED(Proc<PFN_xrWaitFrame>("xrWaitFrame")(g_session, &wi, &fs))) return;
@@ -472,17 +513,21 @@ void RunFrame() {
             layer.views = proj_views;
             layers.push_back(reinterpret_cast<XrCompositionLayerBaseHeader*>(&layer));
             ++(from_engine ? g_frames_engine : g_frames_fallback);
+            std::memcpy(g_last_views, proj_views, sizeof(g_last_views));
+            g_have_last_layer = true;
         }
     }
     ++g_frames;
     if (layers.empty()) ++g_frames_none;
     DWORD now = GetTickCount();
     if (now - g_last_stats > 10000) {
-        log::Info("OpenXR: %llu frames (engine eye texture %llu, window copy %llu, nothing %llu); "
-                  "eye texture %s, rendered views %s",
+        log::Info("OpenXR: %llu frames (engine eye texture %llu, window copy %llu, nothing %llu, keep-alive %llu); "
+                  "eye texture %s, rendered views %s; longest gap %.0f ms, %llu gaps over limit",
                   (unsigned long long)g_frames, (unsigned long long)g_frames_engine,
                   (unsigned long long)g_frames_fallback, (unsigned long long)g_frames_none,
-                  g_eye_texture.load() ? "found" : "missing", have_rendered ? "yes" : "no");
+                  g_keepalive_frames, g_eye_texture.load() ? "found" : "missing", have_rendered ? "yes" : "no",
+                  g_max_gap_ms, g_hitches);
+        g_max_gap_ms = 0.0;
         g_last_stats = now;
     }
     if (fs.shouldRender)
@@ -493,6 +538,47 @@ void RunFrame() {
     ei.layerCount = static_cast<uint32_t>(layers.size());
     ei.layers = layers.data();
     Proc<PFN_xrEndFrame>("xrEndFrame")(g_session, &ei);
+    MarkFrameDone();
+}
+
+// Re-sends the last frame while the game is stalled (shader compiles, level
+// streaming, loading), so SteamVR keeps showing the game instead of timing
+// it out and going black.
+void KeepAliveFrame() {
+    XrFrameState fs{XR_TYPE_FRAME_STATE};
+    XrFrameWaitInfo wi{XR_TYPE_FRAME_WAIT_INFO};
+    if (XR_FAILED(Proc<PFN_xrWaitFrame>("xrWaitFrame")(g_session, &wi, &fs))) return;
+    XrFrameBeginInfo bi{XR_TYPE_FRAME_BEGIN_INFO};
+    if (XR_FAILED(Proc<PFN_xrBeginFrame>("xrBeginFrame")(g_session, &bi))) return;
+    XrCompositionLayerProjection layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+    const XrCompositionLayerBaseHeader* layers[1] = {reinterpret_cast<XrCompositionLayerBaseHeader*>(&layer)};
+    XrFrameEndInfo ei{XR_TYPE_FRAME_END_INFO};
+    ei.displayTime = fs.predictedDisplayTime;
+    ei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+    if (fs.shouldRender && g_have_last_layer) {
+        layer.space = g_space;
+        layer.viewCount = 2;
+        layer.views = g_last_views;
+        ei.layerCount = 1;
+        ei.layers = layers;
+    }
+    Proc<PFN_xrEndFrame>("xrEndFrame")(g_session, &ei);
+    ++g_keepalive_frames;
+    MarkFrameDone();
+}
+
+void KeepAliveLoop() {
+    for (;;) {
+        Sleep(5);
+        long long last = g_last_frame_qpc.load();
+        if (!g_running || !last) continue;
+        if (MsSince(last) < config::GetFloat("keep_alive_after_ms", 40.0f)) continue;
+        std::lock_guard<std::mutex> lock(g_frame_mutex);
+        // Re-check under the lock: the game may have submitted meanwhile.
+        if (!g_running || MsSince(g_last_frame_qpc.load()) < config::GetFloat("keep_alive_after_ms", 40.0f))
+            continue;
+        KeepAliveFrame();
+    }
 }
 
 }  // namespace
@@ -582,6 +668,10 @@ void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* back_buffer) {
             return;
         }
     }
+    if (!g_qpc_freq.QuadPart) QueryPerformanceFrequency(&g_qpc_freq);
+    if (!g_keepalive_started.exchange(true) && config::GetBool("keep_alive", true))
+        std::thread(KeepAliveLoop).detach();
+    std::lock_guard<std::mutex> lock(g_frame_mutex);
     PollEvents();
     if (g_running) RunFrame();
 }
