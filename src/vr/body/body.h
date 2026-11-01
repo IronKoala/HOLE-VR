@@ -18,7 +18,26 @@
 //
 // F9 toggles it (falls back to the game's own body). Settings: body_* in
 // hole-vr.ini.
+#include "vr/hands.h"
+
 namespace holevr::vr::body {
+
+// Gear slots on the VR body, for holsters and pouches. They ride on the
+// IK'd body (pelvis for the belt, upper spine for chest/back), so they
+// crouch, lean and turn with it. Rotation: X = body forward, Y = body
+// right, Z = up. Updated every game frame after the body pose (body tick
+// runs after controls, so controls reads last frame's values).
+enum class Slot : int {
+    kRightHip,      // pistol holster
+    kLeftPouch1,    // belt mag pouches, front to back
+    kLeftPouch2,
+    kLeftPouch3,
+    kChest,         // rifle sling / chest rig
+    kBack,          // rifle on the back
+    kCount
+};
+// False while the VR body is off or not yet posed.
+bool GetSlot(Slot slot, hands::Pose* out);
 
 // Registers the game tick listener. Call after controls::Init() so hand
 // poses for this frame are already published.

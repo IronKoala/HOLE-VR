@@ -268,6 +268,23 @@ struct State {
     bool diag_have_foot = false;
 } G;
 
+// Gear slots: offsets in cm (forward, right, up) in the body's yawed frame,
+// from the pelvis (belt) or the top spine bone (chest/back).
+struct SlotDef {
+    bool chest;
+    FVector offset;
+};
+const SlotDef kSlots[static_cast<int>(Slot::kCount)] = {
+    {false, {2, 20, -6}},    // right hip holster
+    {false, {10, -15, 0}},   // left pouch 1 (front)
+    {false, {4, -18, 0}},    // left pouch 2
+    {false, {-3, -18, 0}},   // left pouch 3
+    {true, {14, 0, -2}},     // chest
+    {true, {-16, 0, 4}},     // back
+};
+hands::Pose g_slots[static_cast<int>(Slot::kCount)];
+bool g_slots_valid = false;
+
 UObject g_poseable_class = 0;
 UObject g_skinned_class = 0;
 
@@ -383,6 +400,7 @@ void Activate() {
 }
 
 void Deactivate() {
+    g_slots_valid = false;
     if (!G.active) return;
     for (UObject f : G.followers) SetLeader(f, G.source);
     G.followers.clear();
@@ -750,6 +768,18 @@ void OnTick(UObject player, float dt_f) {
             SetBoneW(k.foot[s], foot);
         }
 
+    // Gear slots on the posed body.
+    if (k.pelvis.ok) {
+        FQuat body_q = YawOnly(actor_yaw + G.body_yaw);
+        FVector belt = BoneW(k.pelvis).translation;
+        FVector chest = k.spine.empty() ? belt : BoneW(k.spine.back()).translation;
+        for (int i = 0; i < static_cast<int>(Slot::kCount); ++i) {
+            g_slots[i].location = (kSlots[i].chest ? chest : belt) + body_q.Rotate(kSlots[i].offset);
+            g_slots[i].rotation = body_q;
+        }
+        g_slots_valid = true;
+    }
+
     if (k.legs_ok[0] && k.pelvis.ok) {
         FVector rel = pelvis.translation - foot_anim[0].translation;
         if (G.diag_have_foot) G.diag_foot_travel += Length(rel - G.diag_last_foot);
@@ -770,6 +800,13 @@ void OnTick(UObject player, float dt_f) {
 }
 
 }  // namespace
+
+bool GetSlot(Slot slot, hands::Pose* out) {
+    int i = static_cast<int>(slot);
+    if (!g_slots_valid || i < 0 || i >= static_cast<int>(Slot::kCount)) return false;
+    *out = g_slots[i];
+    return true;
+}
 
 void Init() {
     LoadSettings();
