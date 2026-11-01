@@ -7,15 +7,18 @@
 #include "core/config.h"
 #include "core/log.h"
 #include "core/memory.h"
+#include "game/game.h"
+#include "game/weapon_lab.h"
 #include "proxy/dxgi_proxy.h"
 #include "ue/dumper.h"
 #include "ue/names.h"
 #include "ue/objects.h"
+#include "ue/process_event.h"
 #include "ue/reflection.h"
 
 namespace {
 
-constexpr const char* kVersion = "0.1.0-foundation";
+constexpr const char* kVersion = "0.2.0-weaponlab";
 HMODULE g_self = nullptr;
 
 std::wstring ModuleDir(HMODULE m) {
@@ -74,17 +77,27 @@ DWORD WINAPI InitThread(LPVOID) {
     log::Info("Press Ctrl+F9 in game to write a fresh dump (after loading a level, "
               "so weapon and player classes are included)");
 
+    // Game hooks: a game-thread tick and the ability to call game functions.
+    // game_hooks=0 in hole-vr.ini turns this off if it ever causes trouble.
+    const bool hooks = config::GetBool("game_hooks", true) &&
+                       WaitFor("ProcessEvent", ue::process_event::Init, timeout) && game::Init();
+    if (hooks) game::weapon_lab::Init();
+
     // Development hotkeys. Polled rather than hooked so nothing here can
     // interfere with the game's own input.
     bool was_down = false;
-    for (;;) {
+    for (int frame = 0;; ++frame) {
+        if (hooks) {
+            game::weapon_lab::PollHotkeys();
+            if (frame % 60 == 0) game::Maintain();
+        }
         bool down = (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_F9) & 0x8000);
         if (down && !was_down) {
             log::Info("Ctrl+F9: dumping (%d live objects)", ue::objects::Count());
             ue::dumper::DumpAll(mod_dir);
         }
         was_down = down;
-        Sleep(100);
+        Sleep(16);
     }
 }
 

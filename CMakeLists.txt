@@ -14,6 +14,11 @@ add_library(hole_vr SHARED
     src/ue/objects.cpp
     src/ue/reflection.cpp
     src/ue/dumper.cpp
+    src/ue/process_event.cpp
+    src/ue/call.cpp
+    src/game/game.cpp
+    src/game/gun.cpp
+    src/game/weapon_lab.cpp
     src/main.cpp
 )
 
