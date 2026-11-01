@@ -73,6 +73,9 @@ struct Params {
     double finger_radius = 1.0;  // middle finger centre below the trigger guard
     double knuckle_back = 0.5;   // middle knuckle behind the front strap
     double clearance = 0.2;      // gap between palm and grip
+    // Most the hand may turn around the grip axis so the wrist sits behind
+    // the gun's centre line (gun in line with the forearm), degrees.
+    double inline_max_yaw = 35.0;
 };
 
 struct Placement {
@@ -81,11 +84,16 @@ struct Placement {
     FVector thumb;  // where the thumb's knuckle goes: back left corner of the frame
     FVector thumb_dir;  // direction the thumb lies along (forward)
     double pushed = 0;  // how far the palm had to be moved out of the grip, cm
+    double yaw_deg = 0; // how far the hand turned around the grip to line up the wrist
 };
 
 // Right hand on a pistol grip. The grid is used to make sure no palm point
 // ends up inside the gun.
 Placement PlaceRightHand(const Grid& g, const Shape& s, const HandGeo& h, const Params& p);
+
+// Rightmost surface (largest Y) of the scan within an X/Z window; NaN if
+// nothing is there.
+double RightSide(const Grid& g, double x0, double x1, double z0, double z1);
 
 // Deepest point of a polyline (gun frame) inside the scanned gun: returns
 // the depth (0 = clear) and the sample's index along the line in *at.

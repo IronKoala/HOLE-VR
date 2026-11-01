@@ -90,6 +90,8 @@ struct Settings {
     double scan_knuckle_back = 0.5;   // middle knuckle behind the front strap, cm
     double scan_thumb_above = 2.0;    // thumb above the trigger guard bottom, cm
     double scan_clearance = 0.2;      // gap kept between skin and gun, cm
+    double thumb_base_max = 35.0;     // degrees the thumb's base joint may swing onto the gun
+    double inline_max_yaw = 35.0;     // degrees the hand may turn around the grip to put the wrist behind the gun
 } S;
 
 void LoadSettings() {
@@ -147,6 +149,8 @@ void LoadSettings() {
     S.scan_knuckle_back = config::GetFloat("hand_scan_knuckle_behind_front_cm", 0.5f);
     S.scan_thumb_above = config::GetFloat("hand_scan_thumb_above_guard_cm", 2.f);
     S.scan_clearance = config::GetFloat("hand_scan_clearance_cm", 0.2f);
+    S.thumb_base_max = config::GetFloat("hand_scan_thumb_base_max_deg", 35.f);
+    S.inline_max_yaw = config::GetFloat("hand_scan_wrist_inline_max_deg", 35.f);
 }
 
 // ---- engine helpers ----
@@ -859,6 +863,8 @@ struct GunScan {
 perf::Counter g_perf_tick{"body tick"};
 perf::Counter g_perf_scan{"body gun scan"};
 perf::Counter g_perf_fingers{"body fingers"};
+perf::Counter g_perf_copy{"body copy pose"};
+perf::Counter g_perf_arms{"body arms (incl. fingers)"};
 
 // Parts that shape the outside of the grip and frame. Internals (barrel,
 // spring) and accessories (light, rail) only cost traces.
@@ -1054,39 +1060,93 @@ bool MagHold(FVector* fist, FVector* up, FVector* front) {
     return true;
 }
 
+// A finger's three joints, read once and posed in plain math, then written
+// back once. Every bone read or write rebuilds the whole skeleton's pose in
+// the engine (~40 us each), so this replaces ~20 engine calls per finger
+// with 6.
+struct Chain {
+    Xf w[3];
+    void Read(const Bone* j) {
+        for (int n = 0; n < 3; ++n) w[n] = BoneW(j[n]);
+    }
+    void Write(const Bone* j) const {
+        for (int n = 0; n < 3; ++n) SetBoneW(j[n], w[n]);
+    }
+    FVector P(int n) const { return w[n].translation; }
+    // Where the last bone ends (no bone there: extend the middle one).
+    FVector Tip() const { return w[2].translation + (w[2].translation - w[1].translation) * 0.8; }
+    FVector End(int n) const { return n < 2 ? w[n + 1].translation : Tip(); }
+    // Turns joint n (and everything after it) by q, about the joint.
+    void Rotate(int n, const FQuat& q) {
+        FVector pivot = w[n].translation;
+        for (int m = n; m < 3; ++m) {
+            w[m].rotation = Normalized(q * w[m].rotation);
+            if (m > n) w[m].translation = pivot + q.Rotate(w[m].translation - pivot);
+        }
+    }
+};
+
 // Thumb on a pistol (owner's reference photos): from the web of the hand
 // around the back of the grip to the gun's LEFT side, then straight forward
-// along the frame under the slide. Aimed in the gun frame and checked against
-// the scanned gun so it never goes through the grip or over the slide.
-void PlaceGunThumb(const hands::HandGrab& grab, const Bone* j, const grip::Placement& place) {
-    FVector p0 = GunLocal(grab, BoneW(j[0]).translation);
-    FVector p1 = GunLocal(grab, BoneW(j[1]).translation);
-    FVector p2 = GunLocal(grab, BoneW(j[2]).translation);
-    double l1 = Length(p1 - p0), l2 = Length(p2 - p1), l3 = l2 * 0.8;
-    if (l1 < 0.5 || l2 < 0.5) return;
-    const FVector fwd = place.thumb_dir;
+// along the frame under the slide. Each joint turns only as far as a real
+// thumb can, and the whole thumb is checked against the scanned gun.
+void PlaceGunThumb(const hands::HandGrab& grab, Chain* c, const grip::Placement& place) {
+    const FQuat& r = grab.target.rotation;
+    const FVector fwd = r.Rotate(place.thumb_dir);
+    auto world = [&](const FVector& local) { return grab.target.location + r.Rotate(local); };
+    const double lim[3] = {S.thumb_base_max * kDegToRad, 60.0 * kDegToRad, 30.0 * kDegToRad};
     FVector target = place.thumb;
-    FVector k1, k2, tip;
+    Chain best = *c;
     for (int it = 0; it < 10; ++it) {
-        k1 = p0 + Normalize(target - p0) * l1;
-        k2 = k1 + fwd * l2;
-        tip = k2 + fwd * l3;
+        Chain t = *c;
+        FVector goal = world(target);
+        // Base: swing toward the spot on the left side of the frame.
+        t.Rotate(0, ClampAngle(Arc(t.P(1) - t.P(0), goal - t.P(0)), lim[0]));
+        // Middle: lie along the side, toward a point ahead of the spot.
+        t.Rotate(1, ClampAngle(Arc(t.P(2) - t.P(1), goal + fwd * 2.5 - t.P(1)), lim[1]));
+        // Tip: straight forward.
+        t.Rotate(2, ClampAngle(Arc(t.Tip() - t.P(2), fwd), lim[2]));
+        best = t;
         int at = -1;
-        double d = grip::Penetration(g_scan.grid, {p0, k1, k2, tip}, S.finger_radius, &at);
+        double d = grip::Penetration(g_scan.grid,
+                                     {GunLocal(grab, t.P(0)), GunLocal(grab, t.P(1)), GunLocal(grab, t.P(2)),
+                                      GunLocal(grab, t.Tip())},
+                                     S.finger_radius + S.scan_clearance, &at);
         if (d <= 0.0) break;
         // Through the back of the grip: swing further back; along the side:
         // further out to the left.
         if (at == 0) target.X -= 0.4;
         target.Y -= 0.3;
     }
+    *c = best;
+}
+
+// Index finger off the trigger on a scanned pistol: straight, lying along
+// the right side of the frame above the trigger guard (owner's reference).
+void PlaceGunIndex(const hands::HandGrab& grab, Chain* c, const FVector& curl_axis) {
     const FQuat& r = grab.target.rotation;
-    RotateBoneW(j[0], Arc(r.Rotate(p1 - p0), r.Rotate(k1 - p0)));
-    FVector n1 = GunLocal(grab, BoneW(j[1]).translation), n2 = GunLocal(grab, BoneW(j[2]).translation);
-    RotateBoneW(j[1], Arc(r.Rotate(n2 - n1), r.Rotate(k2 - k1)));
-    // Tip joint straight: same orientation as the bone before it.
-    Xf t2 = BoneW(j[2]);
-    t2.rotation = BoneW(j[1]).rotation;
-    SetBoneW(j[2], t2);
+    FVector base = GunLocal(grab, c->P(0));
+    // Right surface of the frame a few cm ahead, at the knuckle's height.
+    double side = grip::RightSide(g_scan.grid, base.X + 3.0, base.X + 8.0, base.Z - 1.0, base.Z + 1.0);
+    if (std::isnan(side)) side = g_scan.shape.y_right;
+    FVector aim{base.X + 7.0, side + S.finger_radius + S.scan_clearance, base.Z};
+    Chain best = *c;
+    for (int it = 0; it < 8; ++it) {
+        Chain t = *c;
+        FVector goal = grab.target.location + r.Rotate(aim);
+        t.Rotate(0, ClampAngle(Arc(t.P(1) - t.P(0), goal - t.P(0)), 45.0 * kDegToRad));
+        // Joints 1 and 2 nearly straight, bending the natural way.
+        t.Rotate(1, AxisAngle(curl_axis, 4.0 * kDegToRad));
+        t.Rotate(2, AxisAngle(curl_axis, 4.0 * kDegToRad));
+        best = t;
+        double d = grip::Penetration(g_scan.grid,
+                                     {GunLocal(grab, t.P(0)), GunLocal(grab, t.P(1)), GunLocal(grab, t.P(2)),
+                                      GunLocal(grab, t.Tip())},
+                                     S.finger_radius);
+        if (d <= 0.0) break;
+        aim.Y += 0.3;
+    }
+    *c = best;
 }
 
 // How deep any finger or palm point sits inside the scanned gun, logged a
@@ -1242,6 +1302,7 @@ void SolveArm(int side, const hands::HandState& h, const FVector& body_fwd, cons
             gp.finger_radius = S.finger_radius + S.scan_clearance;
             gp.knuckle_back = S.scan_knuckle_back;
             gp.clearance = S.scan_clearance;
+            gp.inline_max_yaw = S.inline_max_yaw;
             place = grip::PlaceRightHand(g_scan.grid, g_scan.shape, G.geo[side], gp);
             hand_rot = Normalized(grab.target.rotation * place.rot);
             hand_pos = grab.target.location + grab.target.rotation.Rotate(place.pos);
@@ -1249,8 +1310,9 @@ void SolveArm(int side, const hands::HandState& h, const FVector& body_fwd, cons
             if (g_scan.held_frames == 0) {
                 FVector mid = place.pos + place.rot.Rotate(G.geo[side].mcp[hand_pose::kMiddle]);
                 log::Info("body: right hand on the scanned grip: wrist (%.1f %.1f %.1f), middle knuckle (%.1f %.1f "
-                          "%.1f), palm moved out %.1f cm to clear the grip (gun frame cm)",
-                          place.pos.X, place.pos.Y, place.pos.Z, mid.X, mid.Y, mid.Z, place.pushed);
+                          "%.1f), turned %.0f deg around the grip to line the wrist up, palm moved out %.1f cm to "
+                          "clear the grip (gun frame cm)",
+                          place.pos.X, place.pos.Y, place.pos.Z, mid.X, mid.Y, mid.Z, place.yaw_deg, place.pushed);
             }
         }
     }
@@ -1380,18 +1442,26 @@ void SolveArm(int side, const hands::HandState& h, const FVector& body_fwd, cons
     if (touch && !on_gun) RefreshBoxes();
     const bool index_straight = grab.kind == hands::GrabKind::kGunGrip && G.curl[side].finger[hand_pose::kIndex] < 0.15f;
     const FVector barrel_w = grab.target.rotation.Rotate(FVector{1, 0, 0});
-    if (scanned) {
-        PlaceGunThumb(grab, k.finger[side][hand_pose::kThumb], place);
-    }
     for (int f = 0; f < hand_pose::kFingerCount; ++f) {
-        if (scanned && f == hand_pose::kThumb) continue;
         const Bone* j = k.finger[side][f];
-        FVector a = BoneW(j[0]).translation, b = BoneW(j[1]).translation;
+        Chain ch;
+        ch.Read(j);
+        if (scanned && f == hand_pose::kThumb) {
+            PlaceGunThumb(grab, &ch, place);
+            ch.Write(j);
+            continue;
+        }
+        FVector a = ch.P(0), b = ch.P(1);
         FVector toward = palm_w;
         if (f == hand_pose::kThumb) toward = Normalize(Normalize(pinky_base - a) + palm_w * 0.5);
         FVector axis = Cross(b - a, toward);
         if (Length(axis) < 1e-4) continue;
         axis = Normalize(axis);
+        if (scanned && index_straight && f == hand_pose::kIndex) {
+            PlaceGunIndex(grab, &ch, axis);
+            ch.Write(j);
+            continue;
+        }
         hand_pose::JointLimits lim = hand_pose::Limits(static_cast<hand_pose::Finger>(f));
         double c = std::min(1.2, G.curl[side].finger[f] * S.finger_scale);
         const double deg[3] = {lim.base, lim.middle, lim.tip};
@@ -1408,9 +1478,9 @@ void SolveArm(int side, const hands::HandState& h, const FVector& body_fwd, cons
             const bool gun_thumb = grab.kind == hands::GrabKind::kGunGrip && f == hand_pose::kThumb;
             if (mag_point || gun_thumb) {
                 if (n == 0) {
-                    FVector dir = BoneW(j[1]).translation - BoneW(j[0]).translation;
+                    FVector dir = ch.P(1) - ch.P(0);
                     double lim = f == hand_pose::kIndex ? S.mag_index_aim_max : S.thumb_aim_max;
-                    RotateBoneW(j[0], ClampAngle(Arc(dir, mag_point ? mag_up : barrel_w), lim * kDegToRad));
+                    ch.Rotate(0, ClampAngle(Arc(dir, mag_point ? mag_up : barrel_w), lim * kDegToRad));
                     G.contact[side][f][0] = 1.0;
                     continue;
                 }
@@ -1431,22 +1501,15 @@ void SolveArm(int side, const hands::HandState& h, const FVector& body_fwd, cons
             if (touch && (gun_grid || !g_c->comps.empty()) && want > 1e-3) {
                 // Joint n turns the segment from bone n to bone n+1 (the tip
                 // segment is extended from the last bone's direction).
-                FVector p = BoneW(j[n]).translation;
-                FVector e;
-                if (n < 2) {
-                    e = BoneW(j[n + 1]).translation;
-                } else {
-                    FVector prev = BoneW(j[1]).translation;
-                    e = p + (p - prev) * 0.8;
-                }
-                double free = FreeAngle(p, e, axis, want, S.finger_radius) / want;
+                double free = FreeAngle(ch.P(n), ch.End(n), axis, want, S.finger_radius) / want;
                 double& sm = G.contact[side][f][n];
                 sm += (free - sm) * follow;
             } else {
                 G.contact[side][f][n] = 1.0;
             }
-            RotateBoneW(j[n], AxisAngle(axis, want * G.contact[side][f][n]));
+            ch.Rotate(n, AxisAngle(axis, want * G.contact[side][f][n]));
         }
+        ch.Write(j);
     }
     g_grid_frame = nullptr;
     if (scanned) ClipReport(grab, side);
@@ -1475,6 +1538,8 @@ void OnTick(UObject player, float dt_f) {
         perf::Register(&g_perf_tick);
         perf::Register(&g_perf_scan);
         perf::Register(&g_perf_fingers);
+        perf::Register(&g_perf_copy);
+        perf::Register(&g_perf_arms);
         return true;
     }();
     (void)registered;
@@ -1493,9 +1558,12 @@ void OnTick(UObject player, float dt_f) {
     g_pose = G.pose;
     const Skeleton& k = G.skel;
 
-    ue::Call copy(G.pose, "CopyPoseFromSkeletalComponent");
-    copy.Set("InComponentToCopy", G.source);
-    if (!copy.Invoke()) return;
+    {
+        perf::Scope t(g_perf_copy);
+        ue::Call copy(G.pose, "CopyPoseFromSkeletalComponent");
+        copy.Set("InComponentToCopy", G.source);
+        if (!copy.Invoke()) return;
+    }
     ++G.frames;
 
     hands::HandState hs[2] = {hands::Get(hands::kLeft), hands::Get(hands::kRight)};
@@ -1597,7 +1665,10 @@ void OnTick(UObject player, float dt_f) {
     }
 
     for (int side = 0; side < 2; ++side)
-        if (hs[side].valid) SolveArm(side, hs[side], body_fwd, body_right, dt);
+        if (hs[side].valid) {
+            perf::Scope t(g_perf_arms);
+            SolveArm(side, hs[side], body_fwd, body_right, dt);
+        }
 
     // Legs keep the animated feet where they were.
     if (S.legs && k.pelvis.ok)

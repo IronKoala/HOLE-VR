@@ -207,7 +207,7 @@ static void TestGripProbe() {
     h.mcp[4] = FVector{8.2, -3.4, 0};
     grip::Params p;
     grip::Placement pl = grip::PlaceRightHand(g, s, h, p);
-    EXPECT(Near(pl.rot.Rotate(h.palm), FVector{0, -1, 0}, 1e-3));
+    EXPECT(pl.rot.Rotate(h.palm).Y < -0.8);  // palm faces into the right side of the grip
     EXPECT(Near(pl.rot.Rotate(h.across), s.up, 1e-3));
     FVector mid = pl.pos + pl.rot.Rotate(h.mcp[2]);
     EXPECT(std::fabs(mid.Z - (s.z_guard - p.finger_radius)) < 0.05);
@@ -216,6 +216,17 @@ static void TestGripProbe() {
         EXPECT(!g.Inside(pl.pos + pl.rot.Rotate(lp)));
     FVector wrist = pl.pos;
     EXPECT(wrist.X < s.back);                       // wrist behind the grip, in line with the gun
+    // Wrist close to behind the centre line (traded against keeping the
+    // knuckles on the grip).
+    EXPECT(std::fabs(wrist.Y - 0.5 * (s.y_right + s.y_left)) < 2.0);
+    // The game's hand (log, 2026-11-01): 12 cm wrist to knuckles.
+    grip::HandGeo big = h;
+    for (auto& m : big.mcp) m = m * 1.3;
+    grip::Placement pb = grip::PlaceRightHand(g, s, big, p);
+    EXPECT(std::fabs(pb.pos.Y - 0.5 * (s.y_right + s.y_left)) < 2.0);
+    for (const FVector& lp : grip::PalmPoints(big, p.palm_skin))
+        EXPECT(!g.Inside(pb.pos + pb.rot.Rotate(lp)));
+    EXPECT(!std::isnan(grip::RightSide(g, 8, 12, 9.5, 11)));
     EXPECT(pl.thumb.Y < s.y_left);                  // thumb on the gun's LEFT side
     EXPECT(pl.thumb.Z > s.z_guard);
     // A finger through the grip is reported, one beside it is not.

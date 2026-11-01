@@ -230,10 +230,13 @@ std::vector<FVector> PalmPoints(const HandGeo& h, double palm_skin) {
     return out;
 }
 
-Placement PlaceRightHand(const Grid& g, const Shape& s, const HandGeo& h, const Params& p) {
+namespace {
+Placement PlaceAt(const Grid& g, const Shape& s, const HandGeo& h, const Params& p, double yaw) {
     Placement out;
-    // Pinky -> index runs up the grip, the palm faces into the gun's right side.
-    out.rot = AlignFrames(h.across, h.palm, s.up, FVector{0, -1, 0});
+    // Pinky -> index runs up the grip, the palm faces into the gun's right
+    // side, then the hand turns around the grip axis by `yaw`.
+    out.rot = AxisAngle(s.up, yaw * kDegToRad) * AlignFrames(h.across, h.palm, s.up, FVector{0, -1, 0});
+    out.yaw_deg = yaw;
     // Middle finger knuckle: one finger radius under the trigger guard, at the
     // front strap, palm skin on the right side of the grip.
     double z = s.z_guard - p.finger_radius;
@@ -252,11 +255,47 @@ Placement PlaceRightHand(const Grid& g, const Shape& s, const HandGeo& h, const 
         out.pos.Y += worst + p.clearance;
         out.pushed += worst + p.clearance;
     }
+    return out;
+}
+}  // namespace
+
+Placement PlaceRightHand(const Grid& g, const Shape& s, const HandGeo& h, const Params& p) {
+    // Turn the hand around the grip until the wrist is behind the gun's
+    // centre line: the gun in line with the forearm (reference photos).
+    const double centre = 0.5 * (s.y_right + s.y_left);
+    Placement out = PlaceAt(g, s, h, p, 0.0);
+    const double knuckle_y = s.y_right + p.palm_skin + p.clearance;
+    auto cost = [&](const Placement& c) {
+        FVector mid = c.pos + c.rot.Rotate(h.mcp[2]);
+        return std::fabs(c.pos.Y - centre) + 1.0 * std::max(0.0, mid.Y - knuckle_y) + 0.01 * std::fabs(c.yaw_deg);
+    };
+    double best = cost(out);
+    for (double yaw = -p.inline_max_yaw; yaw <= p.inline_max_yaw + 1e-9; yaw += 1.0) {
+        Placement c = PlaceAt(g, s, h, p, yaw);
+        double err = cost(c);
+        if (err < best) {
+            best = err;
+            out = c;
+        }
+    }
     // Thumb knuckle at the back left corner of the frame, just above the
     // guard; the thumb then runs forward along the left side.
     out.thumb = FVector{s.thumb_x + 0.5, s.thumb_y - p.finger_radius - p.clearance, s.thumb_z};
     out.thumb_dir = FVector{1, 0, 0};
     return out;
+}
+
+double RightSide(const Grid& g, double x0, double x1, double z0, double z1) {
+    double best = std::numeric_limits<double>::quiet_NaN();
+    for (int iz = 0; iz < g.nz; ++iz) {
+        if (g.Z(iz) < z0 || g.Z(iz) > z1) continue;
+        for (int ix = 0; ix < g.nx; ++ix) {
+            if (g.X(ix) < x0 || g.X(ix) > x1) continue;
+            double v = g.yr[static_cast<size_t>(iz) * g.nx + ix];
+            if (!std::isnan(v) && (std::isnan(best) || v > best)) best = v;
+        }
+    }
+    return best;
 }
 
 double Penetration(const Grid& g, const std::vector<FVector>& pts, double radius, int* at) {
