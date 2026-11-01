@@ -60,6 +60,7 @@ struct Settings {
     bool legs = true;
     bool finger_contact = true;   // fingers stop where they touch the held object
     double finger_radius = 0.8;   // cm, finger centre to skin on the curl side
+    double mag_hold_low = 0.15;   // fist below the magazine's middle, share of its height
     bool game_grip = false;  // copy the game's own hand placement on the gun (it does not wrap the grip)
     double arm_scale = 0.0;       // 0 = learn from how far you reach; else fixed multiplier
     double max_arm_scale = 1.25;
@@ -101,6 +102,7 @@ void LoadSettings() {
     S.game_grip = config::GetBool("hand_copy_game_grip", false);
     S.finger_contact = config::GetBool("finger_contact", true);
     S.finger_radius = config::GetFloat("finger_radius_cm", 0.8f);
+    S.mag_hold_low = config::GetFloat("hand_mag_hold_low", 0.15f);
     S.arm_scale = config::GetFloat("body_arm_scale", 0.f);
     S.max_arm_scale = config::GetFloat("body_max_arm_scale", 1.25f);
     S.neck_down = config::GetFloat("body_neck_below_eyes_cm", 14.f);
@@ -685,6 +687,48 @@ double FreeAngle(const FVector& pivot, const FVector& end, const FVector& axis, 
     return lo;
 }
 
+// Where and how to hold a magazine: around its lower body, the hand's
+// pinky->index axis up the magazine toward the feed lips, palm on the back
+// of the magazine facing its front. Measured from the magazine's own mesh
+// (largest part's local bounds), so the hand follows the magazine wherever
+// controls carries it. Needs CollectPrimitives(mag) first.
+bool MagHold(FVector* fist, FVector* up, FVector* front) {
+    UObject best = 0;
+    double best_size = 0;
+    FVector bmin, bmax;
+    for (UObject comp : g_contact.comps) {
+        ue::Call b(comp, "GetLocalBounds");
+        if (!b.Invoke()) continue;
+        FVector mn = b.Get<FVector>("Min"), mx = b.Get<FVector>("Max");
+        double size = Length(mx - mn);
+        if (size > best_size && size < 80.0) {
+            best = comp;
+            best_size = size;
+            bmin = mn;
+            bmax = mx;
+        }
+    }
+    if (!best || best_size < 3.0) return false;
+    ue::Call c(best, "K2_GetComponentToWorld");
+    if (!c.Invoke()) return false;
+    Xf t = c.Result<Xf>();
+    FVector centre = (bmin + bmax) * 0.5;
+    double height = (bmax.Z - bmin.Z) * t.scale.Z;
+    FVector u = t.rotation.Rotate(FVector{0, 0, 1});
+    FVector world_centre = t.translation + t.rotation.Rotate(FVector{centre.X * t.scale.X, centre.Y * t.scale.Y,
+                                                                         centre.Z * t.scale.Z});
+    *fist = world_centre - u * (height * S.mag_hold_low);
+    *up = u;
+    *front = t.rotation.Rotate(FVector{1, 0, 0});
+    static UObject logged = 0;
+    if (logged != best) {
+        logged = best;
+        log::Info("body: holding magazine %s by %s (%.1f x %.1f x %.1f cm)", ue::GetName(g_contact.actor).c_str(),
+                  ue::GetName(best).c_str(), (bmax.X - bmin.X) * t.scale.X, (bmax.Y - bmin.Y) * t.scale.Y, height);
+    }
+    return true;
+}
+
 void SolveArm(int side, const hands::HandState& h, const FVector& body_fwd, const FVector& body_right,
               double dt) {
     const Skeleton& k = G.skel;
@@ -727,13 +771,25 @@ void SolveArm(int side, const hands::HandState& h, const FVector& body_fwd, cons
         fist = grab.target.location + g.Rotate(GripCentre());
     }
 
+    const bool on_mag = (grab.kind == hands::GrabKind::kMagHeld || grab.kind == hands::GrabKind::kMagInsert) &&
+                        grab.object;
+    if (on_mag && grab.object != g_contact.actor) CollectPrimitives(grab.object);
+    if (on_mag && grab.object == g_contact.actor) {
+        FVector mag_fist, mag_up, mag_front;
+        if (MagHold(&mag_fist, &mag_up, &mag_front)) {
+            fist = mag_fist;
+            fwd = mag_up;
+            palm = mag_front;
+        }
+    }
+
     FQuat hand_rot;
     FVector hand_pos;
     // Point inside the hand that goes on the target. On a gun grip it sits
     // further toward the knuckles and closer to the palm than a controller
     // handle, so the curled fingers land on the grip instead of in it.
     FVector fist_local = G.frame[side].fist;
-    if (G.frame[side].valid && grab.kind == hands::GrabKind::kGunGrip)
+    if (G.frame[side].valid && (grab.kind == hands::GrabKind::kGunGrip || on_mag))
         fist_local = G.frame[side].middle * std::clamp(S.gun_fist_along, 0.0, 1.2) +
                      G.frame[side].palm * S.gun_palm_depth;
     if (G.frame[side].valid) {

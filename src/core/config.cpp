@@ -120,6 +120,8 @@ const Block kBlocks[] = {
      "finger_contact=1\n"
      "; Finger thickness used for that touch, cm (bigger = fingers stop sooner).\n"
      "finger_radius_cm=0.8\n"
+     "; How low on the magazine your hand holds it (share of its height below the middle).\n"
+     "hand_mag_hold_low=0.15\n"
      "; 1 = copy the game's own hand placement on the gun (it does not wrap the grip).\n"
      "hand_copy_game_grip=0\n"
      "; Where the fist closes on a pistol grip, measured from the gun's magazine catch (cm).\n"

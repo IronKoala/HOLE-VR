@@ -34,11 +34,13 @@ Curl Target(hands::GrabKind grab, const hands::FingerInput& in) {
             break;
         case GrabKind::kMagHeld:
         case GrabKind::kMagInsert:
-            c.finger[kThumb] = 0.45f;
-            c.finger[kIndex] = 0.22f;
-            c.finger[kMiddle] = 0.68f;
-            c.finger[kRing] = 0.72f;
-            c.finger[kPinky] = 0.75f;
+            // Wrapped round the magazine body; finger contact stops each
+            // finger on its surface.
+            c.finger[kThumb] = 0.6f;
+            c.finger[kIndex] = 0.85f;
+            c.finger[kMiddle] = 0.95f;
+            c.finger[kRing] = 0.97f;
+            c.finger[kPinky] = 1.0f;
             break;
         case GrabKind::kNone:
         case GrabKind::kHolster:
