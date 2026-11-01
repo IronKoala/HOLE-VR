@@ -93,6 +93,8 @@ struct Settings {
     double pouch_radius = 14.0;
     bool wall_collision = true;    // keep the gun out of walls
     double recoil_kick = 1.0;      // scale of the in-hand recoil kick, 0 = off
+    bool game_recoil = false;      // let the game's camera/aim recoil run
+    bool camera_shake = false;     // the game's camera shake option
     bool log_grabs = true;
 };
 Settings g_set;
@@ -109,6 +111,8 @@ void LoadSettings() {
     g_set.gun_roll = config::GetFloat("gun_roll_offset", 0.f);
     g_set.wall_collision = config::GetBool("gun_wall_collision", true);
     g_set.recoil_kick = config::GetFloat("gun_recoil_kick", 1.f);
+    g_set.game_recoil = config::GetBool("game_camera_recoil", false);
+    g_set.camera_shake = config::GetBool("game_camera_shake", false);
     g_set.gun_forward = config::GetFloat("gun_forward_offset_cm", 0.f);
     g_set.gun_right = config::GetFloat("gun_right_offset_cm", 0.f);
     g_set.pouch_forward = config::GetFloat("mag_pouch_forward_cm", 15.f);
@@ -908,15 +912,47 @@ void AfterChargeTimeline(UObject self, UObject, void*) {
 // The game's recoil (BP_Player Recoil: camera, arm and control-rotation
 // kick timelines) moves the VR camera and aim. In VR the kick belongs to the
 // hand only, so the call is dropped while motion controls are on.
-bool BeforePlayerRecoil(UObject, UObject, void*) { return !g_set.enabled; }
+// Blueprint-to-Blueprint calls skip ProcessEvent, so the Recoil call itself
+// may never reach the hook; its timelines always do (timeline updates are
+// delegates, which go through ProcessEvent). Block both.
+bool BeforePlayerRecoil(UObject, UObject fn, void*) {
+    if (!g_set.enabled || g_set.game_recoil) return true;
+    static int logged = 0;
+    if (logged < 3) {
+        ++logged;
+        log::Info("controls: blocked game recoil step %s", ue::GetName(fn).c_str());
+    }
+    return false;
+}
 
 void HookPlayerRecoil(UObject player) {
     static bool done = false;
     if (done || !player) return;
-    UObject fn = ue::FindFunction(ue::GetClass(player), "Recoil");
-    if (fn) ue::process_event::On(fn, &BeforePlayerRecoil, nullptr);
+    UObject cls = ue::GetClass(player);
+    int n = 0;
+    for (const char* name : {"Recoil", "TL_CameraRecoil_Up__UpdateFunc", "TL_CameraRecoil_Down__UpdateFunc",
+                             "TL_ControllerRecoil_Up__UpdateFunc", "TL_ControllerRecoil_Down__UpdateFunc",
+                             "TL_ControllerRecoil_FullAutoRecoilConvergence__UpdateFunc",
+                             "TL_ControllerRecoil_StopConvergence__UpdateFunc"}) {
+        UObject fn = ue::FindFunction(cls, name);
+        if (fn && ue::process_event::On(fn, &BeforePlayerRecoil, nullptr)) ++n;
+    }
     done = true;
-    log::Info("controls: game camera recoil %s", fn ? "disabled" : "function not found");
+    log::Info("controls: game camera/aim recoil blocked (%d steps hooked)", n);
+}
+
+// The game's own "camera shake" option (BP_Player.CameraShake): off in VR
+// unless the ini asks for it. Re-applied now and then in case the game's
+// settings menu writes it back.
+void ApplyCameraShakeSetting(UObject player) {
+    static double next = 0;
+    if (!player || g_clock < next) return;
+    next = g_clock + 2.0;
+    bool cur = true;
+    if (ue::GetProp(player, "CameraShake", cur) && cur != g_set.camera_shake) {
+        ue::SetProp<bool>(player, "CameraShake", g_set.camera_shake);
+        log::Info("controls: game camera shake %s", g_set.camera_shake ? "on" : "off");
+    }
 }
 
 void HookChargeTimeline() {
@@ -937,6 +973,7 @@ void OnTick(UObject player, float dt) {
     if (!s.valid || !g_set.enabled) return;
     UpdateHands(s);
     Locomotion(player, s, dt);
+    ApplyCameraShakeSetting(player);
 
     game::Gun gun = game::Gun::Current(player);
     if (gun.Object() != W.gun) {
