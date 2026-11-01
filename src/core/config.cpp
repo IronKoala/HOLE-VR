@@ -79,7 +79,13 @@ const Block kBlocks[] = {
      "gun_pitch_offset=0\n"
      "; Turns the gun left (-) or right (+), and rolls it left (-) or right (+), degrees.\n"
      "gun_yaw_offset=0\n"
-     "gun_roll_offset=0\n"},
+     "gun_roll_offset=0\n"
+     "; Spare magazine pouch, measured from your headset: forward, right (+) or\n"
+     "; left (-), and down, in cm. Grab within the radius to take a magazine.\n"
+     "mag_pouch_forward_cm=15\n"
+     "mag_pouch_side_cm=-15\n"
+     "mag_pouch_down_cm=55\n"
+     "mag_pouch_grab_radius_cm=14\n"},
     {"body_ik",
      "\n"
      "; --- VR body (full-body IK and hand poses). F9 in game toggles it. ---\n"

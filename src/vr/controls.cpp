@@ -79,6 +79,12 @@ struct Settings {
     double gun_pitch = 0.0;        // extra pitch on the held gun, degrees
     double gun_yaw = 0.0;
     double gun_roll = 0.0;
+    // Magazine pouch, relative to where you face: cm forward, right (+) /
+    // left (-), and below the headset.
+    double pouch_forward = 15.0;
+    double pouch_side = -15.0;
+    double pouch_down = 55.0;
+    double pouch_radius = 14.0;
     bool log_grabs = true;
 };
 Settings g_set;
@@ -93,6 +99,10 @@ void LoadSettings() {
     g_set.gun_pitch = config::GetFloat("gun_pitch_offset", 0.f);
     g_set.gun_yaw = config::GetFloat("gun_yaw_offset", 0.f);
     g_set.gun_roll = config::GetFloat("gun_roll_offset", 0.f);
+    g_set.pouch_forward = config::GetFloat("mag_pouch_forward_cm", 15.f);
+    g_set.pouch_side = config::GetFloat("mag_pouch_side_cm", -15.f);
+    g_set.pouch_down = config::GetFloat("mag_pouch_down_cm", 55.f);
+    g_set.pouch_radius = config::GetFloat("mag_pouch_grab_radius_cm", 14.f);
 }
 
 // ---- shared hand state for other systems ----
@@ -206,6 +216,8 @@ struct WeaponState {
     bool slide_was_moved = false;
     double end_charging_at = -1;
     UObject held_mag = 0;      // magazine in the left hand, not yet inserted
+    UObject pouch_mag = 0;     // spare magazine shown at the pouch, ready to grab
+    double refill_pouch_at = 0; // when to put a new magazine in the pouch
     bool trigger_down = false;
     bool have_frame = false;
     FQuat gun_frame;           // gun frame (X barrel, Z up) expressed in actor space
@@ -318,9 +330,11 @@ void HoldGun(game::Gun& gun, const hands::HandState& rh) {
     // The controller's pointing ray sits about 30 degrees above a pistol's
     // bore in a natural grip (second headset test: barrel at 10 o'clock
     // instead of 9 seen from the side), so pitch down by that first.
+    // Third test: barrel about 5 degrees left of where the hand points.
     constexpr double kBasePitch = -30.0;
-    FQuat hand = rh.aim.rotation *
-                 ToQuat(FRotator{kBasePitch + g_set.gun_pitch, g_set.gun_yaw, g_set.gun_roll});
+    constexpr double kBaseYaw = 5.0;
+    FQuat hand = rh.aim.rotation * ToQuat(FRotator{kBasePitch + g_set.gun_pitch,
+                                                   kBaseYaw + g_set.gun_yaw, g_set.gun_roll});
     FQuat rot = W.have_frame ? hand * W.gun_frame.Inverse() : hand;
     FVector loc = rh.grip.location - rot.Rotate(rel);
     SetActorTransform(g, loc, rot);
@@ -449,18 +463,48 @@ void MagazineHandling(game::Gun& gun, const hands::HandState& lh, const input::H
     }
     if (!lh.valid) return;
 
-    // Left grab low on the body (below the chest) with an empty gun: take a
-    // magazine from the pouch.
+    // A spare magazine always sits in a pouch at the left front of the belt,
+    // following where you face, so you can see where to reach.
     hands::Pose head;
-    bool low = hands::Head(&head) && lh.grip.location.Z < head.location.Z - 35.0;
-    if (lin.grip_button.pressed && !W.held_mag && !W.slide.Held() && low && !gun.State().has_magazine) {
+    bool have_head = hands::Head(&head);
+    FVector pouch_loc;
+    FQuat pouch_rot;
+    if (have_head) {
+        double yaw = YawOf(head.rotation);
+        pouch_rot = ToQuat(FRotator{0, yaw, 0});
+        pouch_loc = head.location + pouch_rot.Rotate(FVector{g_set.pouch_forward, g_set.pouch_side, 0}) -
+                    FVector{0, 0, g_set.pouch_down};
+    }
+    if (!W.pouch_mag && !W.held_mag && g_clock >= W.refill_pouch_at) {
+        // The game's "take a new magazine" step creates the spare.
         gun.TakeNewMagazine();
         UObject mag = 0;
         ue::GetProp(gun.Object(), "MagazineObj_Temp", mag);
-        if (!mag) ue::GetProp(gun.Object(), "MagazineObj", mag);
-        W.held_mag = mag;
-        input::Haptic(input::kLeft, 0.4f, 0.04f);
-        log::Info("controls: took a magazine (%s)", mag ? ue::GetName(mag).c_str() : "none found");
+        UObject inserted = 0;
+        ue::GetProp(gun.Object(), "MagazineObj", inserted);
+        if (mag && mag != inserted) {
+            W.pouch_mag = mag;
+            log::Info("controls: pouch magazine ready (%s): %s", ue::GetName(mag).c_str(),
+                      gun.State().Describe().c_str());
+        } else {
+            W.refill_pouch_at = g_clock + 2.0;   // try again later
+        }
+    }
+    if (W.pouch_mag && have_head) {
+        DetachIfAttached(W.pouch_mag);
+        { ue::Call v(W.pouch_mag, "SetVisibility"); v.Set("IsVisible", true); v.Invoke(); }
+        SetActorTransform(W.pouch_mag, pouch_loc, pouch_rot);
+    }
+
+    // Left grab at the pouch: take that magazine, whether or not the gun has one.
+    if (lin.grip_button.pressed && W.pouch_mag && !W.held_mag && !W.slide.Held() && have_head) {
+        FVector d = lh.grip.location - pouch_loc;
+        if (std::sqrt(d.X * d.X + d.Y * d.Y + d.Z * d.Z) <= g_set.pouch_radius) {
+            W.held_mag = W.pouch_mag;
+            W.pouch_mag = 0;
+            input::Haptic(input::kLeft, 0.4f, 0.04f);
+            log::Info("controls: took the pouch magazine");
+        }
     }
     if (!W.held_mag) return;
 
@@ -474,7 +518,9 @@ void MagazineHandling(game::Gun& gun, const hands::HandState& lh, const input::H
     ue::GetProp(gun.Object(), "MagazinePoint", well);
     if (well) {
         FVector d = ComponentToWorld(well).translation - lh.grip.location;
-        if (std::sqrt(d.X * d.X + d.Y * d.Y + d.Z * d.Z) < 9.0) {
+        // Only one magazine fits: with one already in, eject it first (A).
+        if (std::sqrt(d.X * d.X + d.Y * d.Y + d.Z * d.Z) < 9.0 && !gun.State().has_magazine) {
+            ue::SetProp<UObject>(gun.Object(), "MagazineObj_Temp", W.held_mag);
             gun.InsertMagazine();
             UObject mag = 0;
             if (ue::GetProp(gun.Object(), "MagazineObj", mag) && mag) {
@@ -483,6 +529,7 @@ void MagazineHandling(game::Gun& gun, const hands::HandState& lh, const input::H
                 v.Invoke();
             }
             W.held_mag = 0;
+            W.refill_pouch_at = g_clock + 0.5;
             input::Haptic(input::kLeft, 0.8f, 0.05f);
             input::Haptic(input::kRight, 0.6f, 0.05f);
             log::Info("controls: magazine inserted: %s", gun.State().Describe().c_str());
@@ -494,6 +541,7 @@ void MagazineHandling(game::Gun& gun, const hands::HandState& lh, const input::H
         ue::Call drop(W.held_mag, "DropMagazine");
         drop.Invoke();
         W.held_mag = 0;
+        W.refill_pouch_at = g_clock + 0.5;
         log::Info("controls: dropped the held magazine");
     }
 }
