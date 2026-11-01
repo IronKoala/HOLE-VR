@@ -43,10 +43,12 @@ bool InstanceReady();
 void RecommendedEyeSize(uint32_t* width, uint32_t* height);
 
 // Step 2, from the Present hook once the game's D3D12 queue is known.
-void OnPresent(ID3D12CommandQueue* queue);
+// back_buffer is the window image about to be presented (fallback source).
+void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* back_buffer);
 
 // The texture the engine rendered both eyes into (left half / right half).
 void SetEyeTexture(ID3D12Resource* texture);
+void SetFallbackTexture(ID3D12Resource* texture);
 
 struct EyeView {
     XrPosef pose;  // in tracking space

@@ -42,7 +42,15 @@ thread_local bool t_in_present = false;
 UINT BeforePresent(IDXGISwapChain* sc, UINT sync_interval) {
     if (t_in_present || sc != g_game_swapchain.load()) return sync_interval;
     t_in_present = true;
-    xr::OnPresent(g_queue.load());
+    ID3D12Resource* back_buffer = nullptr;
+    IDXGISwapChain3* sc3 = nullptr;
+    if (SUCCEEDED(sc->QueryInterface(IID_PPV_ARGS(&sc3)))) {
+        sc3->GetBuffer(sc3->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&back_buffer));
+        sc3->Release();
+    }
+    xr::OnPresent(g_queue.load(), back_buffer);
+    // The swap chain keeps its buffers alive; we only borrow this one for the frame.
+    if (back_buffer) back_buffer->Release();
     t_in_present = false;
     // The headset sets the pace now; waiting for the monitor's refresh as well
     // would cap the headset at the monitor's rate.
