@@ -37,6 +37,10 @@ FQuat AlignFrames(const FVector& a1, const FVector& a2, const FVector& b1, const
 // Fraction t of rotation q (slerp from identity).
 FQuat Scale(const FQuat& q, double t);
 
+// Signed angle (radians) of the part of q that turns about unit `axis`
+// (swing-twist decomposition).
+double TwistAngle(const FQuat& q, const FVector& axis);
+
 // Limits the angle of q to max_radians, keeping its axis.
 FQuat ClampAngle(const FQuat& q, double max_radians);
 

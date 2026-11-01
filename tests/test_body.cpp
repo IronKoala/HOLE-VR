@@ -47,6 +47,13 @@ static void TestScaleClamp() {
     EXPECT(Near(half, FVector{std::cos(0.5), std::sin(0.5), 0}));
     FVector c = ClampAngle(q, 0.25).Rotate(FVector{1, 0, 0});
     EXPECT(Near(c, FVector{std::cos(0.25), std::sin(0.25), 0}));
+    // Twist part of a swing+twist rotation.
+    FQuat twist = AxisAngle(FVector{1, 0, 0}, 0.7);
+    FQuat swing = AxisAngle(FVector{0, 0, 1}, 0.4);
+    EXPECT(Near(TwistAngle(twist, FVector{1, 0, 0}), 0.7));
+    EXPECT(Near(TwistAngle(AxisAngle(FVector{1, 0, 0}, -2.5), FVector{1, 0, 0}), -2.5));
+    EXPECT(Near(TwistAngle(swing, FVector{1, 0, 0}), 0.0));
+    EXPECT(std::fabs(TwistAngle(swing * twist, FVector{1, 0, 0}) - 0.7) < 0.1);
     EXPECT(Near(AngleBetween(FVector{1, 0, 0}, FVector{0, 3, 0}), kPi / 2));
 }
 

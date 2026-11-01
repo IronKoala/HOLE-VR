@@ -52,6 +52,17 @@ FQuat Scale(const FQuat& q_in, double t) {
     return AxisAngle(FVector{q.X, q.Y, q.Z}, angle * t);
 }
 
+double TwistAngle(const FQuat& q_in, const FVector& axis_in) {
+    FQuat q = Normalized(q_in);
+    FVector axis = Normalize(axis_in);
+    double p = q.X * axis.X + q.Y * axis.Y + q.Z * axis.Z;
+    double a = 2.0 * std::atan2(p, q.W);
+    // Shortest way round: -pi..pi.
+    if (a > kPi) a -= 2 * kPi;
+    if (a < -kPi) a += 2 * kPi;
+    return a;
+}
+
 FQuat ClampAngle(const FQuat& q_in, double max_radians) {
     FQuat q = Normalized(q_in);
     if (q.W < 0) q = {-q.X, -q.Y, -q.Z, -q.W};

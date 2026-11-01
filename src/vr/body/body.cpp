@@ -57,6 +57,10 @@ struct Settings {
     bool hand_poses = true;
     double finger_scale = 1.0;
     bool legs = true;
+    double arm_scale = 0.0;       // 0 = learn from how far you reach; else fixed multiplier
+    double max_arm_scale = 1.35;
+    double wrist_twist_share = 0.75;  // how much of the wrist twist the forearm takes
+    bool animated_upper_body = false; // false: spine/neck/shoulders ignore the game's animation (recoil etc.)
 } S;
 
 void LoadSettings() {
@@ -78,6 +82,10 @@ void LoadSettings() {
     S.hand_poses = config::GetBool("hand_poses", true);
     S.finger_scale = config::GetFloat("finger_curl_scale", 1.f);
     S.legs = config::GetBool("body_leg_ik", true);
+    S.arm_scale = config::GetFloat("body_arm_scale", 0.f);
+    S.max_arm_scale = config::GetFloat("body_max_arm_scale", 1.35f);
+    S.wrist_twist_share = config::GetFloat("body_wrist_twist_share", 0.75f);
+    S.animated_upper_body = config::GetBool("body_animated_upper_body", false);
 }
 
 // ---- engine helpers ----
@@ -117,7 +125,7 @@ struct Bone {
 struct Skeleton {
     Bone pelvis, neck, head;
     std::vector<Bone> spine;  // bottom to top
-    Bone clavicle[2], upperarm[2], lowerarm[2], hand[2];
+    Bone clavicle[2], upperarm[2], lowerarm[2], hand[2], forearm_twist[2], upperarm_twist[2];
     Bone thigh[2], calf[2], foot[2];
     Bone finger[2][hand_pose::kFingerCount][3];
     bool arms_ok[2] = {false, false};
@@ -176,6 +184,8 @@ Skeleton MapSkeleton(UObject mesh) {
         k.upperarm[side] = Pick(bones, {"upperarm_" + s, full + "arm", "upper_arm_" + s});
         k.lowerarm[side] = Pick(bones, {"lowerarm_" + s, full + "forearm", "forearm_" + s});
         k.hand[side] = Pick(bones, {"hand_" + s, full + "hand"});
+        k.forearm_twist[side] = Pick(bones, {"lowerarm_twist_01_" + s, "forearm_twist_" + s, full + "forearmroll"});
+        k.upperarm_twist[side] = Pick(bones, {"upperarm_twist_01_" + s, full + "armroll"});
         k.thigh[side] = Pick(bones, {"thigh_" + s, full + "upleg"});
         k.calf[side] = Pick(bones, {"calf_" + s, full + "leg"});
         k.foot[side] = Pick(bones, {"foot_" + s, full + "foot"});
@@ -242,6 +252,9 @@ struct State {
     HandFrame frame[2];
     FVector elbow_hinge_local[2];  // in upper-arm bone space
     bool hinge_known[2] = {false, false};
+    double reach_seen[2] = {0, 0};   // smoothed shoulder->hand distance
+    double reach_max[2] = {0, 0};    // longest reach seen this session
+    double arm_scale[2] = {1, 1};
     FVector knee_hinge_local[2];
     bool knee_known[2] = {false, false};
     bool failed = false;
@@ -408,7 +421,7 @@ FVector YawDir(double yaw_deg) {
 // middle bone toward `end`. hinge_local: remembered bend axis in the root
 // bone's space, for when the animated limb is straight.
 void SolveChain(const Bone& root_b, const Bone& mid_b, const Bone& end_b, const TwoBoneResult& sol,
-                FVector* hinge_local, bool* hinge_known) {
+                FVector* hinge_local, bool* hinge_known, bool place_mid = false) {
     Xf root = BoneW(root_b);
     FVector mid = BoneW(mid_b).translation, end = BoneW(end_b).translation;
     FVector hinge_now = Cross(mid - root.translation, end - mid);
@@ -428,6 +441,11 @@ void SolveChain(const Bone& root_b, const Bone& mid_b, const Bone& end_b, const 
     SetBoneW(root_b, root);
 
     Xf m = BoneW(mid_b);
+    if (place_mid) {
+        // Lengthened limb: put the middle joint exactly where the solver did.
+        m.translation = sol.mid;
+        SetBoneW(mid_b, m);
+    }
     FVector e = BoneW(end_b).translation;
     RotateBoneW(mid_b, Arc(e - m.translation, sol.end - m.translation));
 }
@@ -472,20 +490,67 @@ void SolveArm(int side, const hands::HandState& h, const FVector& body_fwd, cons
     }
     hand_pos = G.frame[side].valid ? fist - hand_rot.Rotate(G.frame[side].fist) : fist;
 
+    // Shoulder reach: when the hand is far out, the collarbone swings toward
+    // it a little, like a real shoulder.
     FVector shoulder = BoneW(k.upperarm[side]).translation;
     FVector elbow = BoneW(k.lowerarm[side]).translation;
     FVector wrist = BoneW(k.hand[side]).translation;
     double upper = Length(elbow - shoulder), lower = Length(wrist - elbow);
     if (upper < 1.0 || lower < 1.0) return;
 
+    // Arm length: learn from how far the player actually reaches, so the
+    // avatar's hands can always get to the controllers.
+    double dist = Length(hand_pos - shoulder);
+    double reach = upper + lower;
+    double a = 1.0 - std::exp(-dt / 0.15);
+    G.reach_seen[side] += (dist - G.reach_seen[side]) * a;
+    if (G.reach_seen[side] < reach * 1.8) G.reach_max[side] = std::max(G.reach_max[side], G.reach_seen[side]);
+    double want_scale = S.arm_scale > 0.0 ? S.arm_scale
+                                          : std::clamp(G.reach_max[side] / (reach * 0.98), 1.0, S.max_arm_scale);
+    if (want_scale > G.arm_scale[side] + 0.01) {
+        G.arm_scale[side] = want_scale;
+        log::Info("body: %s arm length x%.2f (reach %.0f cm, avatar %.0f cm)", side == kL ? "left" : "right",
+                  want_scale, G.reach_max[side], reach);
+    } else if (S.arm_scale > 0.0) {
+        G.arm_scale[side] = want_scale;
+    }
+    upper *= G.arm_scale[side];
+    lower *= G.arm_scale[side];
+    reach = upper + lower;
+
+    if (k.clavicle[side].ok && dist > 0.8 * reach) {
+        Xf clav = BoneW(k.clavicle[side]);
+        double f = std::clamp((dist / reach - 0.8) / 0.3, 0.0, 1.0);
+        FQuat q = Arc(shoulder - clav.translation, hand_pos - clav.translation);
+        RotateBoneW(k.clavicle[side], ClampAngle(Scale(q, 0.3 * f), 20.0 * kDegToRad));
+        shoulder = BoneW(k.upperarm[side]).translation;
+    }
+
     FVector outward = side == kL ? body_right * -1.0 : body_right;
     // Elbows hang down and a little out and back; raise the hand above the
     // shoulder and they swing further out.
-    double above = std::max(0.0, hand_pos.Z - shoulder.Z) / (upper + lower);
+    double above = std::max(0.0, hand_pos.Z - shoulder.Z) / reach;
     FVector pole = FVector{0, 0, -1} * (1.0 - 0.6 * above) + outward * (0.7 + 0.6 * above) - body_fwd * 0.3;
     TwoBoneResult sol = SolveTwoBone(shoulder, hand_pos, upper, lower, pole, S.arm_stretch);
     SolveChain(k.upperarm[side], k.lowerarm[side], k.hand[side], sol, &G.elbow_hinge_local[side],
-               &G.hinge_known[side]);
+               &G.hinge_known[side], G.arm_scale[side] > 1.001);
+
+    // Wrist twist: a real forearm rolls along its length when you turn your
+    // wrist. Give most of the roll to the forearm (and its twist bone) so
+    // the wrist doesn't pinch.
+    {
+        Xf fore = BoneW(k.lowerarm[side]);
+        Xf hand_now = BoneW(k.hand[side]);
+        FVector axis = Normalize(hand_now.translation - fore.translation);
+        double twist = TwistAngle(hand_rot * hand_now.rotation.Inverse(), axis);
+        double share = std::clamp(S.wrist_twist_share, 0.0, 1.0);
+        if (k.forearm_twist[side].ok) {
+            RotateBoneW(k.lowerarm[side], AxisAngle(axis, twist * share * 0.5));
+            RotateBoneW(k.forearm_twist[side], AxisAngle(axis, twist * share * 0.5));
+        } else {
+            RotateBoneW(k.lowerarm[side], AxisAngle(axis, twist * share));
+        }
+    }
 
     Xf hand = BoneW(k.hand[side]);
     hand.rotation = hand_rot;
@@ -553,6 +618,21 @@ void OnTick(UObject player, float dt_f) {
             if (hs[side].valid && k.fingers_ok[side])
                 for (auto& f : k.finger[side])
                     for (const Bone& b : f) ResetBone(b);
+
+    // The upper body belongs to the player, not the flat-screen animation:
+    // no recoil kick, aim pitch or idle sway in the spine and shoulders.
+    // Arms are solved by IK below; the spine only leans toward the real head.
+    if (!S.animated_upper_body) {
+        for (const Bone& b : k.spine) ResetBone(b);
+        if (k.neck.ok) ResetBone(k.neck);
+        if (k.head.ok) ResetBone(k.head);
+        for (int side = 0; side < 2; ++side) {
+            if (!hs[side].valid) continue;
+            if (k.clavicle[side].ok) ResetBone(k.clavicle[side]);
+            if (k.upperarm_twist[side].ok) ResetBone(k.upperarm_twist[side]);
+            if (k.forearm_twist[side].ok) ResetBone(k.forearm_twist[side]);
+        }
+    }
 
     // Animated pose, before we change anything.
     ue::Call ar(player, "K2_GetActorRotation");
