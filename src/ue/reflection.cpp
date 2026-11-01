@@ -80,10 +80,7 @@ bool Init() {
     UObject object = FindObject("Class /Script/CoreUObject.Object");
     UObject actor = FindObject("Class /Script/Engine.Actor");
     if (!object || !actor) return false;  // Engine still starting; caller retries.
-    if (!FindSuperOffset(actor, object)) {
-        log::Error("reflection: could not find UStruct::SuperStruct offset");
-        return false;
-    }
+    if (!FindSuperOffset(actor, object)) return false;
     const uintptr_t layouts[][2] = {{0x20, 0x28}, {0x18, 0x20}, {0x28, 0x30}};
     for (auto& l : layouts) {
         if (FFieldLayoutWorks(actor, l[0], l[1])) {
@@ -92,10 +89,9 @@ bool Init() {
             break;
         }
     }
-    if (!o_ffield_name) {
-        log::Error("reflection: could not work out the FField layout");
-        return false;
-    }
+    // Actor's properties can still be registering on the first few tries;
+    // the caller retries and reports a timeout if this never succeeds.
+    if (!o_ffield_name) return false;
     // FField ends with Name (8) + FlagsPrivate (8). FProperty then has
     // ArrayDim, ElementSize, PropertyFlags (8), RepIndex (2), RepCondition (1),
     // pad, Offset_Internal. Try the standard layout and a 4-byte-shifted one.
@@ -112,10 +108,7 @@ bool Init() {
             break;
         }
     }
-    if (!g_ready) {
-        log::Error("reflection: FProperty offsets did not validate");
-        return false;
-    }
+    if (!g_ready) return false;
     log::Info("reflection: SuperStruct=0x%llx ChildProperties=0x%llx FField.Next=0x%llx "
               "FField.Name=0x%llx FProperty.Offset=0x%llx sizeof(FProperty)=0x%llx",
               (unsigned long long)o_super, (unsigned long long)o_child_props,
