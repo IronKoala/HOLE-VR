@@ -17,6 +17,7 @@
 #include "ue/call.h"
 #include "ue/names.h"
 #include "ue/reflection.h"
+#include "vr/body/grip_probe.h"
 #include "vr/body/hand_pose.h"
 #include "vr/body/ik_math.h"
 #include "vr/hands.h"
@@ -81,6 +82,13 @@ struct Settings {
     double gun_fist_along = 0.75;    // grip centre along wrist -> middle knuckle (0-1)
     double wrist_twist_share = 0.75;  // how much of the wrist twist the forearm takes
     bool animated_upper_body = false; // false: spine/neck/shoulders ignore the game's animation (recoil etc.)
+    // Grip from the scanned gun shape (grip_probe.h).
+    bool grip_scan = true;
+    int scan_rays = 160;              // traces per frame while scanning a new gun
+    double scan_palm_skin = 1.5;      // cm from the knuckle joints out to the palm skin
+    double scan_knuckle_back = 0.5;   // middle knuckle behind the front strap, cm
+    double scan_thumb_above = 2.0;    // thumb above the trigger guard bottom, cm
+    double scan_clearance = 0.2;      // gap kept between skin and gun, cm
 } S;
 
 void LoadSettings() {
@@ -132,6 +140,12 @@ void LoadSettings() {
     S.gun_fist_along = config::GetFloat("hand_grip_fist_along", 0.75f);
     S.wrist_twist_share = config::GetFloat("body_wrist_twist_share", 0.75f);
     S.animated_upper_body = config::GetBool("body_animated_upper_body", false);
+    S.grip_scan = config::GetBool("hand_grip_from_gun_scan", true);
+    S.scan_rays = config::GetInt("hand_gun_scan_rays_per_frame", 160);
+    S.scan_palm_skin = config::GetFloat("hand_scan_palm_skin_cm", 1.5f);
+    S.scan_knuckle_back = config::GetFloat("hand_scan_knuckle_behind_front_cm", 0.5f);
+    S.scan_thumb_above = config::GetFloat("hand_scan_thumb_above_guard_cm", 2.f);
+    S.scan_clearance = config::GetFloat("hand_scan_clearance_cm", 0.2f);
 }
 
 // ---- engine helpers ----
@@ -312,6 +326,8 @@ struct State {
     double contact[2][hand_pose::kFingerCount][3];
     bool contact_init[2] = {false, false};
     FVector seat_off[2];  // palm seating correction, hand space
+    grip::HandGeo geo[2];  // knuckle positions in hand-bone space
+    bool geo_ok[2] = {false, false};
     // Leg animation check: how much the game's animated feet move (relative
     // to the pelvis) while the character walks.
     double stand_dz = -1e9;  // highest real-neck vs avatar-neck height seen: standing tall
@@ -804,6 +820,91 @@ void RefreshBoxes() {
     }
 }
 
+// ---- gun scan ----
+// The gun's parts report no size, so the gun is measured with rays: a grid
+// across its side (gun frame X/Z), one ray from the right and one from the
+// left per cell, a few hundred per frame until done. grip_probe.cpp turns
+// that into the grip's shape and the hand placement.
+struct GunScan {
+    UObject gun = 0;
+    grip::Grid grid;
+    int next = 0;
+    bool done = false;
+    grip::Shape shape;
+    int hits = 0;
+    int held_frames = 0;
+    int reports = 0;
+} g_scan;
+const double kScanYCentre = -4.0, kScanYHalf = 16.0;
+
+// Nearest hit along a->b over the given parts, as a fraction of the way.
+bool TraceNearest(const std::vector<UObject>& comps, const FVector& a, const FVector& b, double* t_out) {
+    double best = 2.0, len = Length(b - a);
+    if (len < 1e-6) return false;
+    for (UObject comp : comps) {
+        ue::Call c(comp, "K2_LineTraceComponent");
+        if (!c.Valid()) return false;
+        c.Set("TraceStart", a).Set("TraceEnd", b).Set("bTraceComplex", true);
+        if (c.Invoke() && c.Result<bool>()) best = std::min(best, Length(c.Get<FVector>("HitLocation") - a) / len);
+    }
+    if (best > 1.0) return false;
+    *t_out = best;
+    return true;
+}
+
+void StepScan(const hands::HandGrab& grab, const std::vector<UObject>& comps) {
+    if (grab.object != g_scan.gun) {
+        g_scan = GunScan{};
+        g_scan.gun = grab.object;
+        g_scan.grid.Init(-12, 22, -8, 18, 0.5);
+    }
+    if (g_scan.done || comps.empty()) return;
+    grip::Grid& g = g_scan.grid;
+    const int total = g.nx * g.nz * 2;
+    const FQuat& rot = grab.target.rotation;
+    const FVector& org = grab.target.location;
+    for (int n = 0; n < S.scan_rays && g_scan.next < total; ++n, ++g_scan.next) {
+        int cell = g_scan.next / 2, from_left = g_scan.next % 2;
+        int ix = cell % g.nx, iz = cell / g.nx;
+        double y0 = from_left ? kScanYCentre - kScanYHalf : kScanYCentre + kScanYHalf;
+        double y1 = from_left ? kScanYCentre + kScanYHalf : kScanYCentre - kScanYHalf;
+        FVector a = org + rot.Rotate(FVector{g.X(ix), y0, g.Z(iz)});
+        FVector b = org + rot.Rotate(FVector{g.X(ix), y1, g.Z(iz)});
+        double t;
+        if (!TraceNearest(comps, a, b, &t)) continue;
+        ++g_scan.hits;
+        double y = y0 + (y1 - y0) * t;
+        (from_left ? g.yl : g.yr)[static_cast<size_t>(cell)] = y;
+    }
+    if (g_scan.next < total) return;
+    g_scan.done = true;
+    g_scan.shape = grip::Analyze(g, S.scan_thumb_above);
+    const grip::Shape& sh = g_scan.shape;
+    if (!sh.ok) {
+        log::Info("body: scanned %s with %d rays (%d hit): could not find the grip (%s), using the old grip placement",
+                  ue::GetName(grab.object).c_str(), total, g_scan.hits, sh.why.c_str());
+        return;
+    }
+    log::Info("body: scanned %s with %d rays (%d hit): gun %.1f cm long, %.1f cm tall; grip bottom %.1f, trigger guard "
+              "bottom %.1f, front strap %.1f, back strap %.1f, grip %.1f cm wide (right side %.1f, left %.1f), slant %.0f "
+              "deg; thumb spot (%.1f %.1f %.1f) (gun frame cm)",
+              ue::GetName(grab.object).c_str(), total, g_scan.hits, sh.length, sh.height, sh.z_bottom, sh.z_guard,
+              sh.front, sh.back, sh.y_right - sh.y_left, sh.y_right, sh.y_left, sh.slant_deg, sh.thumb_x, sh.thumb_y,
+              sh.thumb_z);
+}
+
+bool ScanReady(const hands::HandGrab& grab) {
+    return g_scan.gun == grab.object && g_scan.done && g_scan.shape.ok;
+}
+FVector GunLocal(const hands::HandGrab& grab, const FVector& w) {
+    return grab.target.rotation.Inverse().Rotate(w - grab.target.location);
+}
+
+// While set, finger contact tests against the scanned gun instead of
+// tracing its parts (same answer, far cheaper, and the same model the clip
+// report checks).
+const hands::HandGrab* g_grid_grab = nullptr;
+
 // First hit along a->b, as a fraction of the way (0..1). `first_only`: any
 // hit will do (cheaper), the fraction is then not the nearest.
 bool RayHit(const FVector& a, const FVector& b, double* t_out, bool first_only) {
@@ -837,7 +938,11 @@ bool RayHit(const FVector& a, const FVector& b, double* t_out, bool first_only) 
     return true;
 }
 
-bool SegmentHits(const FVector& a, const FVector& b) { return RayHit(a, b, nullptr, true); }
+bool SegmentHits(const FVector& a, const FVector& b) {
+    if (g_grid_grab)
+        return grip::Penetration(g_scan.grid, {GunLocal(*g_grid_grab, a), GunLocal(*g_grid_grab, b)}, 0.0) > 0.0;
+    return RayHit(a, b, nullptr, true);
+}
 
 // Largest angle (0..max) joint `pivot` may turn about `axis` before the
 // segment pivot->end (offset by the finger's radius toward the curl side)
@@ -901,6 +1006,79 @@ bool MagHold(FVector* fist, FVector* up, FVector* front) {
     return true;
 }
 
+// Thumb on a pistol (owner's reference photos): from the web of the hand
+// around the back of the grip to the gun's LEFT side, then straight forward
+// along the frame under the slide. Aimed in the gun frame and checked against
+// the scanned gun so it never goes through the grip or over the slide.
+void PlaceGunThumb(const hands::HandGrab& grab, const Bone* j, const grip::Placement& place) {
+    FVector p0 = GunLocal(grab, BoneW(j[0]).translation);
+    FVector p1 = GunLocal(grab, BoneW(j[1]).translation);
+    FVector p2 = GunLocal(grab, BoneW(j[2]).translation);
+    double l1 = Length(p1 - p0), l2 = Length(p2 - p1), l3 = l2 * 0.8;
+    if (l1 < 0.5 || l2 < 0.5) return;
+    const FVector fwd = place.thumb_dir;
+    FVector target = place.thumb;
+    FVector k1, k2, tip;
+    for (int it = 0; it < 10; ++it) {
+        k1 = p0 + Normalize(target - p0) * l1;
+        k2 = k1 + fwd * l2;
+        tip = k2 + fwd * l3;
+        int at = -1;
+        double d = grip::Penetration(g_scan.grid, {p0, k1, k2, tip}, S.finger_radius, &at);
+        if (d <= 0.0) break;
+        // Through the back of the grip: swing further back; along the side:
+        // further out to the left.
+        if (at == 0) target.X -= 0.4;
+        target.Y -= 0.3;
+    }
+    const FQuat& r = grab.target.rotation;
+    RotateBoneW(j[0], Arc(r.Rotate(p1 - p0), r.Rotate(k1 - p0)));
+    FVector n1 = GunLocal(grab, BoneW(j[1]).translation), n2 = GunLocal(grab, BoneW(j[2]).translation);
+    RotateBoneW(j[1], Arc(r.Rotate(n2 - n1), r.Rotate(k2 - k1)));
+    // Tip joint straight: same orientation as the bone before it.
+    Xf t2 = BoneW(j[2]);
+    t2.rotation = BoneW(j[1]).rotation;
+    SetBoneW(j[2], t2);
+}
+
+// How deep any finger or palm point sits inside the scanned gun, logged a
+// few times per gun so a playtest log shows whether the hand clips.
+void ClipReport(const hands::HandGrab& grab, int side) {
+    ++g_scan.held_frames;
+    if (g_scan.reports >= 3 || (g_scan.held_frames != 90 && g_scan.held_frames != 900 &&
+                                g_scan.held_frames != 3600))
+        return;
+    ++g_scan.reports;
+    const Skeleton& k = G.skel;
+    static const char* names[] = {"thumb", "index", "middle", "ring", "pinky"};
+    std::string line;
+    double worst = 0;
+    for (int f = 0; f < hand_pose::kFingerCount; ++f) {
+        const Bone* j = k.finger[side][f];
+        FVector a = BoneW(j[0]).translation, b = BoneW(j[1]).translation, c = BoneW(j[2]).translation;
+        FVector tip = c + (c - b) * 0.8;
+        double d = grip::Penetration(g_scan.grid, {GunLocal(grab, a), GunLocal(grab, b), GunLocal(grab, c),
+                                                   GunLocal(grab, tip)}, S.finger_radius);
+        worst = std::max(worst, d);
+        char buf[48];
+        std::snprintf(buf, sizeof(buf), " %s %.1f", names[f], d);
+        line += buf;
+    }
+    Xf hand = BoneW(k.hand[side]);
+    double palm = 0;
+    for (const FVector& lp : grip::PalmPoints(G.geo[side], S.scan_palm_skin)) {
+        double d;
+        if (g_scan.grid.Inside(GunLocal(grab, hand.translation + hand.rotation.Rotate(lp)), &d))
+            palm = std::max(palm, d);
+    }
+    worst = std::max(worst, palm);
+    FVector wrist = GunLocal(grab, hand.translation);
+    log::Info("body: clip check on %s after %d frames: deepest %.1f cm inside the gun (fingers:%s, palm %.1f); wrist at "
+              "(%.1f %.1f %.1f) gun frame%s",
+              ue::GetName(grab.object).c_str(), g_scan.held_frames, worst, line.c_str(), palm, wrist.X, wrist.Y,
+              wrist.Z, worst < 0.3 ? " - clean" : "");
+}
+
 void SolveArm(int side, const hands::HandState& h, const FVector& body_fwd, const FVector& body_right,
               double dt) {
     const Skeleton& k = G.skel;
@@ -923,6 +1101,22 @@ void SolveArm(int side, const hands::HandState& h, const FVector& body_fwd, cons
             double scale = BoneW(k.hand[side]).scale.X;
             log::Info("body: measured the %s hand (wrist to middle fingertip joint %.1f cm, bone scale %.2f)",
                       side == kL ? "left" : "right", Length(tip - hs_now.translation), scale);
+            // Knuckles in hand-bone space, for placing the hand on a scanned gun.
+            grip::HandGeo& geo = G.geo[side];
+            geo.across = G.frame[side].across;
+            geo.palm = G.frame[side].palm;
+            FQuat inv = hs_now.rotation.Inverse();
+            for (int f = 0; f < hand_pose::kFingerCount; ++f)
+                geo.mcp[f] = inv.Rotate(BoneW(k.finger[side][f][0]).translation - hs_now.translation);
+            // A right hand has Cross(pinky->index, out of palm) pointing from
+            // the wrist to the knuckles; anything else means a bad reading.
+            double hand_ok = Dot(Normalize(Cross(geo.across, geo.palm)), Normalize(geo.mcp[hand_pose::kMiddle]));
+            G.geo_ok[side] = side == kL ? hand_ok < -0.5 : hand_ok > 0.5;
+            log::Info("body: %s hand knuckles (hand space cm): thumb (%.1f %.1f %.1f) index (%.1f %.1f %.1f) middle "
+                      "(%.1f %.1f %.1f) pinky (%.1f %.1f %.1f), handedness check %.2f%s",
+                      side == kL ? "left" : "right", geo.mcp[0].X, geo.mcp[0].Y, geo.mcp[0].Z, geo.mcp[1].X,
+                      geo.mcp[1].Y, geo.mcp[1].Z, geo.mcp[2].X, geo.mcp[2].Y, geo.mcp[2].Z, geo.mcp[4].X,
+                      geo.mcp[4].Y, geo.mcp[4].Z, hand_ok, G.geo_ok[side] ? "" : " (FAILED: no scanned grip)");
         }
     }
 
@@ -987,10 +1181,36 @@ void SolveArm(int side, const hands::HandState& h, const FVector& body_fwd, cons
     }
     hand_pos = G.frame[side].valid ? fist - hand_rot.Rotate(fist_local) : fist;
 
+    // Pistol grip from the scanned gun: hand placed from the gun's measured
+    // grip, trigger guard and sides (grip_probe.h).
+    bool scanned = false;
+    grip::Placement place;
+    if (side == kR && grab.kind == hands::GrabKind::kGunGrip && grab.object && S.grip_scan && G.geo_ok[side]) {
+        if (grab.object != g_c->actor) CollectPrimitives(grab.object, true);
+        StepScan(grab, g_c->comps);
+        if (ScanReady(grab)) {
+            grip::Params gp;
+            gp.palm_skin = S.scan_palm_skin;
+            gp.finger_radius = S.finger_radius + S.scan_clearance;
+            gp.knuckle_back = S.scan_knuckle_back;
+            gp.clearance = S.scan_clearance;
+            place = grip::PlaceRightHand(g_scan.grid, g_scan.shape, G.geo[side], gp);
+            hand_rot = Normalized(grab.target.rotation * place.rot);
+            hand_pos = grab.target.location + grab.target.rotation.Rotate(place.pos);
+            scanned = true;
+            if (g_scan.held_frames == 0) {
+                FVector mid = place.pos + place.rot.Rotate(G.geo[side].mcp[hand_pose::kMiddle]);
+                log::Info("body: right hand on the scanned grip: wrist (%.1f %.1f %.1f), middle knuckle (%.1f %.1f "
+                          "%.1f), palm moved out %.1f cm to clear the grip (gun frame cm)",
+                          place.pos.X, place.pos.Y, place.pos.Z, mid.X, mid.Y, mid.Z, place.pushed);
+            }
+        }
+    }
+
     // Seat the palm on the held object's surface: look from outside the palm
     // toward the grip centre, and put the palm's skin where the surface is.
     // Without it a big hand ends up with the grip inside its palm.
-    if (S.palm_seat && G.frame[side].valid && grab.object &&
+    if (S.palm_seat && !scanned && G.frame[side].valid && grab.object &&
         (grab.kind == hands::GrabKind::kGunGrip || on_mag)) {
         if (grab.object != g_c->actor) CollectPrimitives(grab.object, !on_mag);
         RefreshBoxes();
@@ -1107,7 +1327,12 @@ void SolveArm(int side, const hands::HandState& h, const FVector& body_fwd, cons
     if (touch) RefreshBoxes();
     const bool index_straight = grab.kind == hands::GrabKind::kGunGrip && G.curl[side].finger[hand_pose::kIndex] < 0.15f;
     const FVector barrel_w = grab.target.rotation.Rotate(FVector{1, 0, 0});
+    if (scanned) {
+        PlaceGunThumb(grab, k.finger[side][hand_pose::kThumb], place);
+        g_grid_grab = &grab;  // fingers stop on the scanned gun
+    }
     for (int f = 0; f < hand_pose::kFingerCount; ++f) {
+        if (scanned && f == hand_pose::kThumb) continue;
         const Bone* j = k.finger[side][f];
         FVector a = BoneW(j[0]).translation, b = BoneW(j[1]).translation;
         FVector toward = palm_w;
@@ -1171,6 +1396,8 @@ void SolveArm(int side, const hands::HandState& h, const FVector& body_fwd, cons
             RotateBoneW(j[n], AxisAngle(axis, want * G.contact[side][f][n]));
         }
     }
+    g_grid_grab = nullptr;
+    if (scanned) ClipReport(grab, side);
     if (touch && !g_c->reported && g_c->traces > 2000) {
         g_c->reported = true;
         log::Info("body: finger contact on %s: %d of %d traces touched%s", ue::GetName(g_c->actor).c_str(),
