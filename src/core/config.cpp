@@ -89,6 +89,11 @@ const Block kBlocks[] = {
      "mag_pouch_side_cm=-15\n"
      "mag_pouch_down_cm=55\n"
      "mag_pouch_grab_radius_cm=14\n"},
+    {"fixed_height",
+     "\n"
+     "; 1 = your in-game height is always the character's, seated or standing\n"
+     "; (real crouching does not lower you). 0 = follow your real head height.\n"
+     "fixed_height=1\n"},
     {"body_ik",
      "\n"
      "; --- VR body (full-body IK and hand poses). F9 in game toggles it. ---\n"

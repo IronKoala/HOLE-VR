@@ -710,7 +710,8 @@ void OnTick(UObject player, float dt_f) {
     // standing, not the avatar's height (people and the avatar differ).
     if (delta.Z > G.stand_dz) G.stand_dz = delta.Z;
     const double down = delta.Z - G.stand_dz;
-    const double crouch = std::clamp(down, -S.max_crouch, 0.0);
+    // With fixed_height the view never drops, so neither does the body.
+    const double crouch = config::GetBool("fixed_height", true) ? 0.0 : std::clamp(down, -S.max_crouch, 0.0);
     // Most of a horizontal offset moves the whole body under the head (you
     // stepped, or the game's body stands behind its camera); the spine leans
     // for the rest, up to body_max_lean_cm.
