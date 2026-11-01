@@ -13,4 +13,7 @@ struct ID3D12CommandQueue;
 namespace holevr::vr::dxgi_hooks {
 // The D3D12 queue the game presents on, once its swap chain exists.
 ID3D12CommandQueue* GameQueue();
+// Resize the game window by one pixel and back, so the engine re-creates its
+// viewport render targets.
+void NudgeWindow();
 }  // namespace holevr::vr::dxgi_hooks

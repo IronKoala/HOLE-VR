@@ -1,0 +1,16 @@
+#IncludeRegexLine: ^[ 	]*[#%][ 	]*(include|import)[ 	]*[<"]([^">]+)([">])
+
+#IncludeRegexScan: ^.*$
+
+#IncludeRegexComplain: ^$
+
+#IncludeRegexTransform: 
+
+/home/claude/hole-vr/build-c/setup.rc
+winver.h
+-
+version.h
+/home/claude/hole-vr/build-c/version.h
+
+/home/claude/hole-vr/src/version.h
+
