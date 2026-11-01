@@ -643,8 +643,19 @@ void CollectPrimitives(UObject actor) {
             ue::Call ce(comp, "GetCollisionEnabled");
             if (ce.Invoke()) coll = ce.Result<uint8_t>();
             g_contact.comps.push_back(comp);
-            char buf[96];
-            std::snprintf(buf, sizeof(buf), " %s(collision %d)", p.name.c_str(), coll);
+            // Size of the part (local bounds x scale), to compare the gun
+            // with a real one and with the avatar's hand.
+            FVector size{0, 0, 0};
+            ue::Call lb(comp, "GetLocalBounds");
+            ue::Call tw(comp, "K2_GetComponentToWorld");
+            if (lb.Invoke() && tw.Invoke()) {
+                FVector d = lb.Get<FVector>("Max") - lb.Get<FVector>("Min");
+                FVector sc = tw.Result<Xf>().scale;
+                size = FVector{d.X * sc.X, d.Y * sc.Y, d.Z * sc.Z};
+            }
+            char buf[160];
+            std::snprintf(buf, sizeof(buf), " %s(collision %d, %.1fx%.1fx%.1f cm)", p.name.c_str(), coll, size.X,
+                          size.Y, size.Z);
             names += buf;
         }
     }
@@ -744,7 +755,13 @@ void SolveArm(int side, const hands::HandState& h, const FVector& body_fwd, cons
                                     BoneW(k.finger[side][hand_pose::kMiddle][0]).translation,
                                     BoneW(k.finger[side][hand_pose::kPinky][0]).translation, side == kL,
                                     S.palm_depth);
-        if (G.frame[side].valid) log::Info("body: measured the %s hand", side == kL ? "left" : "right");
+        if (G.frame[side].valid) {
+            Xf hs_now = BoneW(k.hand[side]);
+            FVector tip = BoneW(k.finger[side][hand_pose::kMiddle][2]).translation;
+            double scale = BoneW(k.hand[side]).scale.X;
+            log::Info("body: measured the %s hand (wrist to middle fingertip joint %.1f cm, bone scale %.2f)",
+                      side == kL ? "left" : "right", Length(tip - hs_now.translation), scale);
+        }
     }
 
     FVector fist = h.grip.location;
