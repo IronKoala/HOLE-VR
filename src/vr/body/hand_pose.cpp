@@ -16,13 +16,14 @@ Curl Target(hands::GrabKind grab, const hands::FingerInput& in) {
     const float grip = Clamp01(in.grip);
     switch (grab) {
         case GrabKind::kGunGrip:
-            c.finger[kThumb] = 0.65f;
+            c.finger[kThumb] = 0.75f;
             // Trigger discipline: off the trigger the index lies straight
             // along the frame; touching it puts the pad on the trigger.
             c.finger[kIndex] = in.trigger_touch || trigger > 0.05f ? 0.38f + 0.27f * trigger : 0.05f;
-            c.finger[kMiddle] = 0.82f;
-            c.finger[kRing] = 0.85f;
-            c.finger[kPinky] = 0.88f;
+            // Fully wrapped round the grip.
+            c.finger[kMiddle] = 0.95f;
+            c.finger[kRing] = 0.97f;
+            c.finger[kPinky] = 1.0f;
             break;
         case GrabKind::kSlideGrab:
             c.finger[kThumb] = 0.6f;

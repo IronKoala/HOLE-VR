@@ -127,6 +127,7 @@ HandFrame MeasureHand(const FVector& hand_pos, const FQuat& hand_rot, const FVec
     FVector c = Cross(fwd, across);
     f.palm = left_hand ? c * -1.0 : c;
     f.across = across;
+    f.middle = middle;
     f.fist = middle * 0.6 + f.palm * palm_depth_cm;
     f.valid = true;
     return f;

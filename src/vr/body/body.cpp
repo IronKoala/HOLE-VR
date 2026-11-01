@@ -58,13 +58,18 @@ struct Settings {
     bool hand_poses = true;
     double finger_scale = 1.0;
     bool legs = true;
-    bool game_grip = true;  // copy the game's own hand placement on the gun
+    bool game_grip = false;  // copy the game's own hand placement on the gun (it does not wrap the grip)
     double arm_scale = 0.0;       // 0 = learn from how far you reach; else fixed multiplier
     double max_arm_scale = 1.25;
     double neck_down = 14.0;      // cm from the eyes down to the base of the neck, in head space
     double neck_back = 8.0;       // cm from the eyes back to the base of the neck
     double grip_angle = 20.0;     // pistol grip slant, degrees
-    double gun_hand[3] = {1.5, 0, 7};  // fist offset from MainHandPosition in the gun frame (barrel, right, up), cm
+    double gun_hand[3] = {3.5, -3.8, 6.2};  // fallback fist offset from MainHandPosition in the gun frame (barrel, right, up), cm
+    double grip_behind_catch = 2.5;  // grip centre behind the magazine catch, cm
+    double grip_below_catch = 4.5;   // grip centre down the grip from the magazine catch, cm
+    double grip_side = 0.0;          // sideways shift of the fist on the grip, cm (+ = gun's right)
+    double gun_palm_depth = 2.5;     // grip centre out from the palm, cm
+    double gun_fist_along = 0.75;    // grip centre along wrist -> middle knuckle (0-1)
     double wrist_twist_share = 0.75;  // how much of the wrist twist the forearm takes
     bool animated_upper_body = false; // false: spine/neck/shoulders ignore the game's animation (recoil etc.)
 } S;
@@ -89,15 +94,22 @@ void LoadSettings() {
     S.hand_poses = config::GetBool("hand_poses", true);
     S.finger_scale = config::GetFloat("finger_curl_scale", 1.f);
     S.legs = config::GetBool("body_leg_ik", true);
-    S.game_grip = config::GetBool("hand_use_game_grip", true);
+    // Renamed from hand_use_game_grip (default 1): the game's hand does not
+    // actually wrap the grip.
+    S.game_grip = config::GetBool("hand_copy_game_grip", false);
     S.arm_scale = config::GetFloat("body_arm_scale", 0.f);
     S.max_arm_scale = config::GetFloat("body_max_arm_scale", 1.25f);
     S.neck_down = config::GetFloat("body_neck_below_eyes_cm", 14.f);
     S.neck_back = config::GetFloat("body_neck_behind_eyes_cm", 8.f);
     S.grip_angle = config::GetFloat("hand_grip_angle", 20.f);
-    S.gun_hand[0] = config::GetFloat("hand_on_gun_forward_cm", 1.5f);
-    S.gun_hand[1] = config::GetFloat("hand_on_gun_right_cm", 0.f);
-    S.gun_hand[2] = config::GetFloat("hand_on_gun_up_cm", 7.f);
+    S.gun_hand[0] = config::GetFloat("hand_gun_fallback_forward_cm", 3.5f);
+    S.gun_hand[1] = config::GetFloat("hand_gun_fallback_right_cm", -3.8f);
+    S.gun_hand[2] = config::GetFloat("hand_gun_fallback_up_cm", 6.2f);
+    S.grip_behind_catch = config::GetFloat("hand_grip_behind_mag_catch_cm", 2.5f);
+    S.grip_below_catch = config::GetFloat("hand_grip_below_mag_catch_cm", 4.5f);
+    S.grip_side = config::GetFloat("hand_grip_side_cm", 0.f);
+    S.gun_palm_depth = config::GetFloat("hand_grip_palm_depth_cm", 2.5f);
+    S.gun_fist_along = config::GetFloat("hand_grip_fist_along", 0.75f);
     S.wrist_twist_share = config::GetFloat("body_wrist_twist_share", 0.75f);
     S.animated_upper_body = config::GetBool("body_animated_upper_body", false);
 }
@@ -501,9 +513,23 @@ void SolveChain(const Bone& root_b, const Bone& mid_b, const Bone& end_b, const 
 // MainHandPosition, so the hand-on-grip offset can be computed instead of
 // eyeballed.
 UObject g_logged_gun = 0;
+bool g_catch_known = false;
+FVector g_catch_rel;  // magazine catch in the gun frame, from MainHandPosition
+
+// Centre of the pistol grip (where the fist closes) in the gun frame, from
+// MainHandPosition. From the magazine catch: back to the middle of the grip,
+// then down the slanted grip. The game's MainHandPosition is where its wrist
+// goes, ~8 cm from the grip itself, which is why the hand used to float.
+FVector GripCentre() {
+    if (!g_catch_known) return FVector{S.gun_hand[0], S.gun_hand[1], S.gun_hand[2]};
+    double a = S.grip_angle * kDegToRad;
+    FVector down_grip{-std::sin(a), 0, -std::cos(a)};
+    return g_catch_rel + FVector{-S.grip_behind_catch, S.grip_side, 0} + down_grip * S.grip_below_catch;
+}
 void LogGunGeometry(uintptr_t gun, const hands::Pose& main) {
     if (!gun || gun == g_logged_gun) return;
     g_logged_gun = gun;
+    g_catch_known = false;
     std::string line;
     for (const char* name : {"MagazinePoint", "ChargingHandPoint", "GunParts_Trigger", "GunParts_Bolt(Slide)",
                              "GunParts_MagazineCatch", "MainHandPosition", "SubHandPosition"}) {
@@ -512,12 +538,26 @@ void LogGunGeometry(uintptr_t gun, const hands::Pose& main) {
         ue::Call c(comp, "K2_GetComponentToWorld");
         if (!c.Invoke()) continue;
         FVector rel = main.rotation.Inverse().Rotate(c.Result<Xf>().translation - main.location);
+        // The magazine catch sits at the top front of the grip, just behind
+        // the trigger guard: the landmark the fist is placed from. Only
+        // trust it if it is actually near the grip point.
+        if (std::string(name) == "GunParts_MagazineCatch" && Length(rel) > 0.5 && Length(rel) < 30.0) {
+            g_catch_rel = rel;
+            g_catch_known = true;
+        }
         char buf[128];
         std::snprintf(buf, sizeof(buf), " %s=(%.1f %.1f %.1f)", name, rel.X, rel.Y, rel.Z);
         line += buf;
     }
     log::Info("body: gun %s parts in gun frame from MainHandPosition (barrel, right, up cm):%s",
               ue::GetName(gun).c_str(), line.c_str());
+    if (g_catch_known) {
+        FVector c = GripCentre();
+        log::Info("body: holding %s by the grip at (%.1f %.1f %.1f) in the gun frame", ue::GetName(gun).c_str(), c.X,
+                  c.Y, c.Z);
+    } else {
+        log::Info("body: %s has no magazine catch part, using the fallback grip offset", ue::GetName(gun).c_str());
+    }
 }
 
 // Learns where the game's own (hidden, animated) right hand sits on the gun.
@@ -595,15 +635,21 @@ void SolveArm(int side, const hands::HandState& h, const FVector& body_fwd, cons
         double a = S.grip_angle * kDegToRad;
         fwd = Normalize(up * std::cos(a) + barrel * std::sin(a));
         palm = side == kL ? right : right * -1.0;
-        // The game's MainHandPosition sits below the middle of the grip
-        // (fourth headset test: fist about 7 cm low and 1.5 cm behind), so
-        // move the fist up the grip in the gun's own frame.
-        fist = fist + barrel * S.gun_hand[0] + right * S.gun_hand[1] + up * S.gun_hand[2];
+        // The fist closes on the grip's centre, found from the gun's own
+        // parts (see GripCentre), not on MainHandPosition.
         LogGunGeometry(grab.object, grab.target);
+        fist = grab.target.location + g.Rotate(GripCentre());
     }
 
     FQuat hand_rot;
     FVector hand_pos;
+    // Point inside the hand that goes on the target. On a gun grip it sits
+    // further toward the knuckles and closer to the palm than a controller
+    // handle, so the curled fingers land on the grip instead of in it.
+    FVector fist_local = G.frame[side].fist;
+    if (G.frame[side].valid && grab.kind == hands::GrabKind::kGunGrip)
+        fist_local = G.frame[side].middle * std::clamp(S.gun_fist_along, 0.0, 1.2) +
+                     G.frame[side].palm * S.gun_palm_depth;
     if (G.frame[side].valid) {
         hand_rot = HandRotation(G.frame[side], fwd, palm);
     } else {
@@ -615,7 +661,7 @@ void SolveArm(int side, const hands::HandState& h, const FVector& body_fwd, cons
                               ToQuat(FRotator{S.hand_rot[0], S.hand_rot[1] * mirror, S.hand_rot[2] * mirror}) *
                               h.grip.rotation.Inverse() * hand_rot);
     }
-    hand_pos = G.frame[side].valid ? fist - hand_rot.Rotate(G.frame[side].fist) : fist;
+    hand_pos = G.frame[side].valid ? fist - hand_rot.Rotate(fist_local) : fist;
     const bool game_grip = side == kR && grab.kind == hands::GrabKind::kGunGrip && G.use_game_grip;
     if (game_grip) {
         hand_rot = Normalized(grab.target.rotation * G.game_grip_rot);

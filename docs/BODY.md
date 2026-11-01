@@ -23,6 +23,12 @@ holds and where the hand should sit) and `GetFingers()` (trigger/grip/touch).
   - **Hands**: the avatar hand's frame is measured from its finger bases
     (index/middle/pinky), so any skeleton maps onto the controller grip axis
     and palm direction without per-mesh numbers.
+  - **Pistol grip**: the game's `MainHandPosition` is where its *wrist* goes
+    (the gun's parts all sit ~8 cm forward/left/up of it), and the game's own
+    hand does not wrap the grip, so neither is copied. The fist closes on the
+    grip centre found from the gun's `GunParts_MagazineCatch` (top front of
+    the grip): 2.5 cm back and 4.5 cm down the slanted grip, on the gun's
+    centre line. Settings `hand_grip_*`.
   - **Fingers**: reset to the reference pose, then curled about the palm
     hinge axis by `hand_pose::Target()` (gun grip with trigger discipline,
     trigger pull, slide pinch, magazine hold, free hand from the sensors).

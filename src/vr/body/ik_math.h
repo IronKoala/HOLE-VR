@@ -60,9 +60,10 @@ TwoBoneResult SolveTwoBone(const FVector& root, const FVector& target, double up
 // The avatar's hand measured in the hand bone's own space, from where its
 // finger bases sit. across: pinky base -> index base (toward the thumb side
 // of a fist). palm: out of the palm. fist: centre of the closed fist.
+// middle: wrist -> middle finger knuckle.
 struct HandFrame {
     bool valid = false;
-    FVector across, palm, fist;
+    FVector across, palm, fist, middle;
 };
 HandFrame MeasureHand(const FVector& hand_pos, const FQuat& hand_rot, const FVector& index_base,
                       const FVector& middle_base, const FVector& pinky_base, bool left_hand,
