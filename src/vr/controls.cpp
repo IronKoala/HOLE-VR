@@ -203,7 +203,85 @@ struct WeaponState {
     double end_charging_at = -1;
     UObject held_mag = 0;      // magazine in the left hand, not yet inserted
     bool trigger_down = false;
+    bool have_frame = false;
+    FQuat gun_frame;           // gun frame (X barrel, Z up) expressed in actor space
+    double check_chamber_at = -1;
 } W;
+
+double Len(const FVector& v) { return std::sqrt(v.X * v.X + v.Y * v.Y + v.Z * v.Z); }
+FVector Norm(const FVector& v) { double l = Len(v); return l > 1e-6 ? v * (1.0 / l) : FVector{1, 0, 0}; }
+double DotV(const FVector& a, const FVector& b) { return a.X * b.X + a.Y * b.Y + a.Z * b.Z; }
+FVector Cross(const FVector& a, const FVector& b) {
+    return {a.Y * b.Z - a.Z * b.Y, a.Z * b.X - a.X * b.Z, a.X * b.Y - a.Y * b.X};
+}
+
+// Rotation whose X/Y/Z axes are the given orthonormal vectors.
+FQuat FromAxes(const FVector& x, const FVector& y, const FVector& z) {
+    double m00 = x.X, m11 = y.Y, m22 = z.Z, tr = m00 + m11 + m22;
+    FQuat q;
+    if (tr > 0) {
+        double s = std::sqrt(tr + 1.0) * 2;
+        q.W = 0.25 * s;
+        q.X = (y.Z - z.Y) / s;
+        q.Y = (z.X - x.Z) / s;
+        q.Z = (x.Y - y.X) / s;
+    } else if (m00 > m11 && m00 > m22) {
+        double s = std::sqrt(1.0 + m00 - m11 - m22) * 2;
+        q.W = (y.Z - z.Y) / s;
+        q.X = 0.25 * s;
+        q.Y = (y.X + x.Y) / s;
+        q.Z = (z.X + x.Z) / s;
+    } else if (m11 > m22) {
+        double s = std::sqrt(1.0 + m11 - m00 - m22) * 2;
+        q.W = (z.X - x.Z) / s;
+        q.X = (y.X + x.Y) / s;
+        q.Y = 0.25 * s;
+        q.Z = (z.Y + y.Z) / s;
+    } else {
+        double s = std::sqrt(1.0 + m22 - m00 - m11) * 2;
+        q.W = (x.Y - y.X) / s;
+        q.X = (z.X + x.Z) / s;
+        q.Y = (z.Y + y.Z) / s;
+        q.Z = 0.25 * s;
+    }
+    return q;
+}
+
+// Works out which way the barrel and the top of the gun point in the gun
+// actor's own space, from its grip, muzzle and sight points, so any gun model
+// ends up pointing where the hand points.
+bool LearnGunFrame(UObject g, const FVector& actor_loc, const FQuat& actor_rot, const FVector& grip_world) {
+    UObject muzzle = 0, sight = 0;
+    ue::GetProp(g, "DefaultMuzzlePoint", muzzle);
+    if (!muzzle) ue::GetProp(g, "MuzzleFirePoint", muzzle);
+    ue::GetProp(g, "DefaultADSPoint", sight);
+    if (!muzzle) return false;
+    FQuat inv = actor_rot.Inverse();
+    FVector grip = inv.Rotate(grip_world - actor_loc);
+    FVector m = inv.Rotate(ComponentToWorld(muzzle).translation - actor_loc);
+    FVector fwd = Norm(m - grip);
+    // The slide runs exactly along the bore, so prefer it when there is one:
+    // it moves along -X of its parent component (measured in the weapon lab).
+    game::Gun gun(g);
+    UObject slide_parent = 0;
+    if (UObject sc = gun.SlideComponent()) ue::GetProp(sc, "AttachParent", slide_parent);
+    if (slide_parent) {
+        FVector bore = inv.Rotate(ComponentToWorld(slide_parent).rotation.Rotate(FVector{1, 0, 0}));
+        if (DotV(bore, fwd) < 0) bore = bore * -1.0;  // keep it pointing toward the muzzle
+        fwd = Norm(bore);
+    }
+    FVector up_guess{0, 0, 1};
+    if (sight) up_guess = inv.Rotate(ComponentToWorld(sight).translation - actor_loc) - grip;
+    FVector up = up_guess - fwd * DotV(up_guess, fwd);
+    if (Len(up) < 0.5) up = FVector{0, 0, 1} - fwd * fwd.Z;
+    up = Norm(up);
+    FVector right = Cross(up, fwd);
+    W.gun_frame = FromAxes(fwd, right, up);
+    W.have_frame = true;
+    log::Info("controls: %s barrel along (%.2f %.2f %.2f), top along (%.2f %.2f %.2f) in actor space",
+              ue::GetName(ue::GetClass(g)).c_str(), fwd.X, fwd.Y, fwd.Z, up.X, up.Y, up.Z);
+    return true;
+}
 
 
 void HoldGun(game::Gun& gun, const hands::HandState& rh) {
@@ -218,7 +296,9 @@ void HoldGun(game::Gun& gun, const hands::HandState& rh) {
     UETransform main_world = ComponentToWorld(main);
     FVector rel = actor_rot.Inverse().Rotate(main_world.translation - actor_loc);
 
-    FQuat rot = rh.aim.rotation * ToQuat(FRotator{g_set.gun_pitch, 0, 0});
+    if (!W.have_frame) LearnGunFrame(g, actor_loc, actor_rot, main_world.translation);
+    FQuat hand = rh.aim.rotation * ToQuat(FRotator{g_set.gun_pitch, 0, 0});
+    FQuat rot = W.have_frame ? hand * W.gun_frame.Inverse() : hand;
     FVector loc = rh.grip.location - rot.Rotate(rel);
     SetActorTransform(g, loc, rot);
 }
@@ -263,8 +343,10 @@ void SlideHandling(game::Gun& gun, const hands::HandState& lh, const input::Hand
             input::Haptic(input::kLeft, 0.7f, 0.05f);
             break;
         case SlideEvent::kRacked:
+            log::Info("controls: rack, before: %s", gun.State().Describe().c_str());
             gun.ChargeBoltRelease();
             W.end_charging_at = g_clock + 0.4;
+            W.check_chamber_at = g_clock + 0.6;
             input::Haptic(input::kLeft, 0.9f, 0.06f);
             input::Haptic(input::kRight, 0.5f, 0.05f);
             log::Info("controls: full rack");
@@ -286,12 +368,30 @@ void SlideHandling(game::Gun& gun, const hands::HandState& lh, const input::Hand
         gun.EndBoltCharging();
         W.end_charging_at = -1;
     }
+    // After an empty reload the slide sits on the slide catch and a rack
+    // alone may not chamber a round: drop the slide off the catch as well.
+    if (W.check_chamber_at > 0 && g_clock >= W.check_chamber_at) {
+        W.check_chamber_at = -1;
+        game::GunState st = gun.State();
+        if (st.chamber == 0 && st.has_magazine && st.magazine > 0) {
+            gun.ReleaseSlideCatch();
+            log::Info("controls: chamber still empty after rack, released the slide catch");
+            W.end_charging_at = g_clock + 0.4;
+        }
+        log::Info("controls: rack, after: %s", gun.State().Describe().c_str());
+    }
 }
 
 void MagazineHandling(game::Gun& gun, const hands::HandState& lh, const input::HandInput& lin,
                       const input::HandInput& rin) {
     // Right A / primary: magazine release.
+    if (rin.secondary.pressed) {
+        log::Info("controls: slide release (B), before: %s", gun.State().Describe().c_str());
+        gun.ReleaseSlideCatch();
+        W.end_charging_at = g_clock + 0.4;
+    }
     if (rin.primary.pressed && gun.State().has_magazine) {
+        log::Info("controls: mag release, before: %s", gun.State().Describe().c_str());
         gun.DropMagazine();
         input::Haptic(input::kRight, 0.4f, 0.04f);
     }
@@ -333,7 +433,7 @@ void MagazineHandling(game::Gun& gun, const hands::HandState& lh, const input::H
             W.held_mag = 0;
             input::Haptic(input::kLeft, 0.8f, 0.05f);
             input::Haptic(input::kRight, 0.6f, 0.05f);
-            log::Info("controls: magazine inserted");
+            log::Info("controls: magazine inserted: %s", gun.State().Describe().c_str());
             return;
         }
     }
