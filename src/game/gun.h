@@ -57,6 +57,12 @@ public:
     bool TakeNewMagazine();       // new magazine appears in the reload hand
     bool InsertMagazine();        // seat the magazine in the magwell
     bool ChargeBolt();            // full rack: eject the chambered round, feed a new one
+    // The two halves of a hand-driven full rack: pull (slide reaches the back,
+    // the chambered round ejects) and release (slide returns, feeds a round).
+    bool ChargeBoltPull();
+    bool ChargeBoltRelease();
+    // Clear the game's "charging" flag so the off-hand IK lets go of the slide.
+    bool EndBoltCharging();
     bool ReleaseSlideCatch();     // drop a locked-back slide, chambering a round
 
     // Calls a parameterless function on the gun by name (lab use).

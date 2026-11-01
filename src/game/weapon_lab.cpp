@@ -117,52 +117,22 @@ void RunScheduled() {
     }
 }
 
-// Which game call performs a full rack is not known yet, so each full rack
-// tries the next candidate and logs what changed a second later.
-int g_rack_method = 0;
-constexpr int kRackMethods = 4;
-const char* kRackNames[kRackMethods] = {
-    "A: weapon manager ChamberAction press/release (the game's own rack)",
-    "B: gun Gun_ChargeBolt pull/release",
-    "C: gun ChargeBolt event pull/release",
-    "D: gun SetIsBoltCharging + StartAnim_ChargeBolt",
-};
-
+// Full rack, as found in the second playtest: the gun-level charge call with
+// "pull" then "release" ejects the chambered round and feeds the next one
+// without playing the flat-screen hand animation. The game leaves its
+// "charging" flag set afterwards (normally cleared by the weapon manager's
+// timer), which kept the off hand stuck on the slide, so clear it ourselves.
 void FullRack(Gun gun) {
-    int m = g_rack_method;
-    g_rack_method = (g_rack_method + 1) % kRackMethods;
     GunState before = gun.State();
-    UObject manager = g_manager.load();
-    UObject g = gun.Object();
-    log::Info("lab: full rack, trying %s. Before: %s", kRackNames[m], before.Describe().c_str());
-    auto call_bool = [](UObject obj, const char* fn, const char* param, bool v) {
-        ue::Call c(obj, fn);
-        c.Set(param, v);
-        return c.Invoke();
-    };
-    switch (m) {
-        case 0:
-            call_bool(manager, "ChamberAction", "IsTriggerReleased", false);
-            After(0.35, [manager, call_bool] { call_bool(manager, "ChamberAction", "IsTriggerReleased", true); });
-            break;
-        case 1:
-            call_bool(g, "Gun_ChargeBolt", "IsTriggerReleased", false);
-            After(0.35, [g, call_bool] { call_bool(g, "Gun_ChargeBolt", "IsTriggerReleased", true); });
-            break;
-        case 2:
-            call_bool(g, "ChargeBolt", "IsTriggerReleased", false);
-            After(0.35, [g, call_bool] { call_bool(g, "ChargeBolt", "IsTriggerReleased", true); });
-            break;
-        case 3:
-            call_bool(g, "SetIsBoltCharging", "IsBoltCharging", true);
-            call_bool(g, "StartAnim_ChargeBolt", "IsTriggerReleased", true);
-            break;
-    }
-    After(1.5, [gun, m, before] {
-        GunState after = Gun(gun).State();
-        bool changed = !(after == before);
-        log::Info("lab: full rack %c result: %s. After: %s", 'A' + m,
-                  changed ? "STATE CHANGED" : "no change", after.Describe().c_str());
+    log::Info("lab: full rack. Before: %s", before.Describe().c_str());
+    gun.ChargeBoltPull();
+    After(0.35, [gun] { Gun(gun).ChargeBoltRelease(); });
+    After(0.75, [gun, before] {
+        Gun g(gun);
+        g.EndBoltCharging();
+        GunState after = g.State();
+        log::Info("lab: full rack result: %s. After: %s",
+                  after == before ? "no change" : "cycled", after.Describe().c_str());
     });
 }
 

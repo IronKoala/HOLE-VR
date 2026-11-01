@@ -77,3 +77,17 @@ once step 2 lands) and never opens its own session.
 | F8 | New magazine and insert. Shift+F8 tries the game's other load function. |
 
 Results go to `hole-vr/hole-vr.log` (lines starting `lab:`).
+
+## Playtest findings (2026-11-01)
+
+- Handgun `BP_HG_C`: slide moves along -X in its parent space, 4.70 cm full travel
+  (`Bolt(Slide)_BackLength`), catch stop at 3.60 cm. Writing the slide part's
+  relative location works and the game does not fight it while idle.
+- Full rack that matches the game's own logic: `Gun_ChargeBolt(IsTriggerReleased=false)`
+  at the back of the stroke (chamber empties), then `Gun_ChargeBolt(true)` on release
+  (round fed, magazine count drops by one). Afterwards call
+  `SetIsBoltCharging(false)`, or the game's off-hand IK stays on the slide.
+  `WeaponManager.ChamberAction` does the same but plays the flat-screen hand animation.
+- `Gun_MagazineDrop` drops the magazine. `ReloadMag_TakeNewMag` plus
+  `ReloadMag_InsertMag_Begin/End` loads a full magazine but leaves it hidden; call the
+  magazine's `SetVisibility(true)`.

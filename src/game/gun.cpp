@@ -132,6 +132,24 @@ bool Gun::ChargeBolt() {
     return c.Invoke();
 }
 
+bool Gun::ChargeBoltPull() {
+    ue::Call c(self_, "Gun_ChargeBolt");
+    c.Set("IsTriggerReleased", false);
+    return c.Invoke();
+}
+
+bool Gun::ChargeBoltRelease() {
+    ue::Call c(self_, "Gun_ChargeBolt");
+    c.Set("IsTriggerReleased", true);
+    return c.Invoke();
+}
+
+bool Gun::EndBoltCharging() {
+    ue::Call c(self_, "SetIsBoltCharging");
+    c.Set("IsBoltCharging", false);
+    return c.Invoke();
+}
+
 bool Gun::ReleaseSlideCatch() { return CallSimple("Gun_ReleaseBolt"); }
 
 }  // namespace holevr::game
