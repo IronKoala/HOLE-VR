@@ -132,7 +132,22 @@ static void TestHandPose() {
     EXPECT(c.finger[kMiddle] > 0.9f);
 }
 
+static void TestSegmentBox() {
+    Box b{FVector{10, 0, 0}, AxisAngle(FVector{0, 0, 1}, 0.5), FVector{1, 2, 3}};
+    double t = -1;
+    EXPECT(SegmentBox(FVector{0, 0, 0}, FVector{20, 0, 0}, b, &t));
+    EXPECT(t > 0.3 && t < 0.5);
+    EXPECT(!SegmentBox(FVector{0, 0, 0}, FVector{5, 0, 0}, b, &t));    // stops short
+    EXPECT(!SegmentBox(FVector{0, 10, 0}, FVector{20, 10, 0}, b, &t)); // passes beside
+    EXPECT(!SegmentBox(FVector{10, 0, 0}, FVector{20, 0, 0}, b, &t));  // starts inside
+    // Hit point lies on the surface.
+    Box a{FVector{0, 0, 0}, FQuat{}, FVector{1, 1, 1}};
+    EXPECT(SegmentBox(FVector{-5, 0.2, 0.3}, FVector{5, 0.2, 0.3}, a, &t));
+    EXPECT(Near(-5 + 10 * t, -1.0));
+}
+
 int main() {
+    TestSegmentBox();
     TestArc();
     TestAlignFrames();
     TestScaleClamp();

@@ -137,4 +137,27 @@ FQuat HandRotation(const HandFrame& frame, const FVector& forward, const FVector
     return AlignFrames(frame.across, frame.palm, forward, palm);
 }
 
+bool SegmentBox(const FVector& a_w, const FVector& b_w, const Box& box, double* t_hit) {
+    FQuat inv = box.rotation.Inverse();
+    FVector a = inv.Rotate(a_w - box.centre), d = inv.Rotate(b_w - a_w);
+    const double pa[3] = {a.X, a.Y, a.Z}, pd[3] = {d.X, d.Y, d.Z}, h[3] = {box.half.X, box.half.Y, box.half.Z};
+    bool inside = true;
+    double t0 = 0.0, t1 = 1.0;
+    for (int i = 0; i < 3; ++i) {
+        if (std::fabs(pa[i]) > h[i]) inside = false;
+        if (std::fabs(pd[i]) < 1e-12) {
+            if (std::fabs(pa[i]) > h[i]) return false;
+            continue;
+        }
+        double ta = (-h[i] - pa[i]) / pd[i], tb = (h[i] - pa[i]) / pd[i];
+        if (ta > tb) std::swap(ta, tb);
+        t0 = std::max(t0, ta);
+        t1 = std::min(t1, tb);
+        if (t0 > t1) return false;
+    }
+    if (inside) return false;
+    if (t_hit) *t_hit = t0;
+    return true;
+}
+
 }  // namespace holevr::vr::ik

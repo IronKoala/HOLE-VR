@@ -30,11 +30,17 @@ holds and where the hand should sit) and `GetFingers()` (trigger/grip/touch).
     the grip): 2.5 cm back and 4.5 cm down the slanted grip, on the gun's
     centre line. Settings `hand_grip_*`.
   - **Finger contact**: while holding a gun/slide/magazine, each finger joint
-    curls only until its segment (offset by `finger_radius_cm`) touches one of
-    the held actor's own primitive components (`K2_LineTraceComponent`, which
-    never touches the world). Binary search per joint, smoothed. Parts without
-    collision never hit, so fingers fall back to the fixed pose curls; the log
-    reports the parts, their collision state and the hit rate.
+    curls only until its segment (offset by `finger_radius_cm`) touches the
+    held object. The gun's parts have no collision in the game, so they get
+    query-only collision that ignores every channel (nothing in the game can
+    hit them) and are tested with `K2_LineTraceComponent` (one component,
+    never the world). Magazines use boxes from their mesh bounds, and their
+    collision is left alone so dropped ones still land.
+  - **Palm seat**: a ray from outside the palm toward the grip centre finds
+    the grip's surface and the palm skin (`hand_palm_skin_cm`) is put there,
+    so the grip never ends up inside a big hand.
+  - **Trigger discipline**: off the trigger the index finger's base joint
+    turns it parallel to the barrel, lying along the frame.
   - **Fingers**: reset to the reference pose, then curled about the palm
     hinge axis by `hand_pose::Target()` (gun grip with trigger discipline,
     trigger pull, slide pinch, magazine hold, free hand from the sensors).

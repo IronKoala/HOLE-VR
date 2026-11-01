@@ -74,4 +74,14 @@ HandFrame MeasureHand(const FVector& hand_pos, const FQuat& hand_rot, const FVec
 // index side (the OpenXR grip axis), `palm` is out of the player's palm.
 FQuat HandRotation(const HandFrame& frame, const FVector& forward, const FVector& palm);
 
+// Oriented box: centre, rotation (box axes = rotated X/Y/Z), half sizes.
+struct Box {
+    FVector centre;
+    FQuat rotation;
+    FVector half;
+};
+// First point where segment a->b enters the box, as a fraction 0..1 of the
+// way. False if it misses or starts inside.
+bool SegmentBox(const FVector& a, const FVector& b, const Box& box, double* t_hit);
+
 }  // namespace holevr::vr::ik
