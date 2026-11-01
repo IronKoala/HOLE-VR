@@ -12,6 +12,7 @@
 #include "game/weapon_lab.h"
 #include "ue/call.h"
 #include "ue/process_event.h"
+#include "vr/body/body.h"
 #include "vr/hands.h"
 #include "vr/input.h"
 #include "vr/interact/slide.h"
@@ -630,7 +631,13 @@ void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState& lh
     bool have_head = hands::Head(&head);
     FVector pouch_loc;
     FQuat pouch_rot;
-    if (have_head) {
+    hands::Pose slot;
+    if (body::GetSlot(body::Slot::kLeftPouch1, &slot)) {
+        // On the VR body's belt: moves with crouching and leaning.
+        have_head = true;
+        pouch_loc = slot.location;
+        pouch_rot = slot.rotation;
+    } else if (have_head) {
         double yaw = YawOf(head.rotation);
         pouch_rot = ToQuat(FRotator{0, yaw, 0});
         pouch_loc = head.location + pouch_rot.Rotate(FVector{g_set.pouch_forward, g_set.pouch_side, 0}) -
