@@ -233,7 +233,6 @@ struct WeaponState {
     bool retried_rack = false;
     bool dead_trigger = false;  // Glock: after a dry fire the trigger is dead until the slide moves
     bool trigger_sent = false;  // the game saw the current trigger press
-    double lock_after_shot_at = -1; // last round fired with no magazine: lock the slide
     bool lock_on_release = false; // B pressed while holding the slide back: lock it open
     bool timeline_fast = false;   // game's charge timeline sped up for this gun
     // Gun pose this frame (from HoldGun).
@@ -397,8 +396,6 @@ void Trigger(UObject player, game::Gun& gun, const input::HandInput& rin) {
         const bool dry = st.chamber == 0 && !st.slide_locked;
         send(false);
         W.trigger_sent = true;
-        if (st.chamber > 0 && !st.has_magazine && !st.slide_locked)
-            W.lock_after_shot_at = g_clock + 0.25;   // after the game's recoil animation
         if (dry) {
             W.dead_trigger = true;
             input::Haptic(input::kRight, 0.25f, 0.02f);
@@ -504,21 +501,6 @@ void SlideHandling(game::Gun& gun, const hands::HandState& lh, const input::Hand
         if (locked) gun.SetSlideTravel(rest, ue::Vec3d{cfg.axis.X, cfg.axis.Y, cfg.axis.Z});
         else gun.RestoreSlide();
         W.slide_was_moved = false;
-    }
-    // Owner's rule: firing the round in the chamber with no magazine locks the
-    // slide back, like the last round of a magazine.
-    if (W.lock_after_shot_at > 0 && g_clock >= W.lock_after_shot_at && !W.slide.Held()) {
-        W.lock_after_shot_at = -1;
-        game::GunState st = gun.State();
-        if (st.chamber == 0 && !st.has_magazine && !st.slide_locked && !st.firing) {
-            ue::SetProp<bool>(gun.Object(), "IsBolt(Slide)Stopped", true);
-            double r = stop > 0 ? std::fmin(0.95, stop / cfg.length) : 0.77;
-            W.slide.SetRest(r);
-            gun.SetSlideTravel(r, ue::Vec3d{cfg.axis.X, cfg.axis.Y, cfg.axis.Z});
-            log::Info("controls: last round fired with no magazine, slide locked back");
-        } else if (st.firing) {
-            W.lock_after_shot_at = g_clock + 0.05;
-        }
     }
     if (W.end_charging_at > 0 && g_clock >= W.end_charging_at) {
         gun.EndBoltCharging();
