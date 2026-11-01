@@ -61,6 +61,13 @@ public:
         return Get<T>("ReturnValue", fallback);
     }
 
+    // Raw bytes of a parameter (structs we don't model, e.g. FHitResult),
+    // or nullptr. *size receives its size.
+    uint8_t* Raw(const char* param, int32_t* size);
+    const uint8_t* Raw(const char* param, int32_t* size) const {
+        return const_cast<Call*>(this)->Raw(param, size);
+    }
+
     // Runs the function on the game thread's caller. Returns false if the
     // object or function could not be found.
     bool Invoke();

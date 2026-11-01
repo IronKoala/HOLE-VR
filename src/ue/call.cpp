@@ -132,6 +132,18 @@ int32_t Call::Offset(const char* param, size_t size) const {
     return o;
 }
 
+uint8_t* Call::Raw(const char* param, int32_t* size) {
+    if (size) *size = 0;
+    if (!fn_) return nullptr;
+    const ParamLayout& l = LayoutOf(fn_);
+    auto it = l.params.find(param);
+    if (it == l.params.end()) return nullptr;
+    auto [o, sz] = it->second;
+    if (o < 0 || o + sz > static_cast<int32_t>(buf_.size())) return nullptr;
+    if (size) *size = sz;
+    return buf_.data() + o;
+}
+
 bool Call::Invoke() {
     if (!Valid()) {
         log::Warn("call: function '%s' not found on %s", name_.c_str(), GetName(obj_).c_str());
