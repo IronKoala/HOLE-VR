@@ -120,4 +120,21 @@ void OnFactoryCreated(void* factory, REFIID riid) {
 
 ID3D12CommandQueue* GameQueue() { return g_queue.load(); }
 
+void NudgeWindow() {
+    IDXGISwapChain* sc = g_game_swapchain.load();
+    IDXGISwapChain1* sc1 = nullptr;
+    if (!sc || FAILED(sc->QueryInterface(IID_PPV_ARGS(&sc1)))) return;
+    HWND hwnd = nullptr;
+    sc1->GetHwnd(&hwnd);
+    sc1->Release();
+    RECT r;
+    if (!hwnd || !GetWindowRect(hwnd, &r)) return;
+    int w = r.right - r.left, h = r.bottom - r.top;
+    // Post rather than send: the window belongs to the game thread.
+    SetWindowPos(hwnd, nullptr, 0, 0, w, h - 1, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+    Sleep(300);
+    SetWindowPos(hwnd, nullptr, 0, 0, w, h, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+    log::Info("Nudged the game window (%dx%d) so the viewport rebuilds its render targets", w, h);
+}
+
 }  // namespace holevr::vr::dxgi_hooks
