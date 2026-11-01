@@ -21,6 +21,7 @@
 #include "vr/controls.h"
 #include "vr/input.h"
 #include "vr/openxr.h"
+#include "vr/cvars.h"
 #include "vr/render_fixes.h"
 #include "vr/stereo.h"
 
@@ -117,15 +118,17 @@ DWORD WINAPI InitThread(LPVOID) {
         game::weapon_lab::Init();
         vr::controls::Init();
         vr::body::Init();  // after controls: reads this frame's hand poses
+        vr::cvars::Init();
     }
 
     // Development hotkeys. Polled rather than hooked so nothing here can
     // interfere with the game's own input.
-    bool dump_was_down = false, recenter_was_down = false;
+    bool dump_was_down = false, recenter_was_down = false, aa_was_down = false;
     for (int frame = 0;; ++frame) {
         if (hooks) {
             game::weapon_lab::PollHotkeys();
             if (frame % 60 == 0) game::Maintain();
+            if (frame % 60 == 30) vr::cvars::Maintain();
         }
         // New cameras, volumes and captures appear on every level load, so
         // the render fixes are re-applied once a second.
@@ -133,6 +136,9 @@ DWORD WINAPI InitThread(LPVOID) {
         bool ctrl = GetAsyncKeyState(VK_CONTROL) & 0x8000;
         bool dump = ctrl && (GetAsyncKeyState(VK_F9) & 0x8000);
         bool recenter = ctrl && (GetAsyncKeyState(VK_F8) & 0x8000);
+        bool cycle_aa = ctrl && (GetAsyncKeyState(VK_F10) & 0x8000);
+        if (hooks && cycle_aa && !aa_was_down) vr::cvars::CycleAntiAliasing();
+        aa_was_down = cycle_aa;
         if (dump && !dump_was_down) {
             log::Info("Ctrl+F9: dumping (%d live objects)", ue::objects::Count());
             ue::dumper::DumpAll(mod_dir);
