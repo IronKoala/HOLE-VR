@@ -265,6 +265,24 @@ struct WeaponState {
     double learn_at = -1;
     double trace_until = -1;      // per-frame rack trace (diagnosing the chamber hitch)
     int last_rounds = -1;         // chamber + magazine last frame, to detect shots
+    // Per-gun kind. Pistols (BP_HG_*) have a slide; rifles (BP_AR_*: AR-15
+    // pattern) have a bolt carrier worked by a T charging handle at the back
+    // of the upper receiver, a bolt catch on the left, a vertical magwell
+    // and a handguard for the support hand.
+    bool is_pistol = true;
+    double muzzle_dist = 18.0;    // grip to muzzle along the bore, cm
+    FVector slide_axis{-1, 0, 0}; // bolt/slide pull direction in its parent's space
+    bool two_hand = false;        // support hand on the handguard
+    FVector support_local;        // support hand point in the gun frame, from the grip
+    FVector grip_world;           // gun-frame origin (the firing hand's grip point)
+    bool handle_moved = false;    // charging handle moved off its rest
+    double bore_height = 6.0;     // bore above the grip point, cm (gun frame Z)
+    bool have_handle_grab = false;
+    FVector handle_grab;          // charging handle at rest, in the bolt parent's space
+    bool have_handle_origin = false;
+    FVector handle_origin;        // charging handle relative location at rest
+    bool have_support_point = false;
+    FVector support_point;        // where the support hand holds the handguard, world
     bool last_has_mag = false;
     double kick_t0 = -1;          // time of the last shot, for the in-hand kick
     FVector gun_set_loc;          // where HoldGun put the gun this frame
@@ -309,6 +327,23 @@ FQuat FromAxes(const FVector& x, const FVector& y, const FVector& z) {
     return q;
 }
 
+// Shortest rotation taking direction a onto direction b (both unit length).
+FQuat FromTo(const FVector& a, const FVector& b) {
+    FVector c = Cross(a, b);
+    double d = DotV(a, b);
+    FQuat q;
+    if (d < -0.9999) {
+        // Opposite: half turn about any axis at right angles to a.
+        FVector axis = Norm(Cross(a, std::fabs(a.X) < 0.9 ? FVector{1, 0, 0} : FVector{0, 1, 0}));
+        q.X = axis.X; q.Y = axis.Y; q.Z = axis.Z; q.W = 0;
+        return q;
+    }
+    q.X = c.X; q.Y = c.Y; q.Z = c.Z; q.W = 1.0 + d;
+    double n = std::sqrt(q.X * q.X + q.Y * q.Y + q.Z * q.Z + q.W * q.W);
+    q.X /= n; q.Y /= n; q.Z /= n; q.W /= n;
+    return q;
+}
+
 // Works out which way the barrel and the top of the gun point in the gun
 // actor's own space, from its grip, muzzle and sight points, so any gun model
 // ends up pointing where the hand points.
@@ -330,7 +365,9 @@ bool LearnGunFrame(UObject g, const FVector& actor_loc, const FQuat& actor_rot, 
     if (slide_parent) {
         FVector bore = inv.Rotate(ComponentToWorld(slide_parent).rotation.Rotate(FVector{1, 0, 0}));
         if (DotV(bore, fwd) < 0) bore = bore * -1.0;  // keep it pointing toward the muzzle
-        fwd = Norm(bore);
+        // Only trust it when it agrees with the muzzle direction (a rifle's
+        // bolt parent may be oriented differently).
+        if (DotV(Norm(bore), fwd) > 0.9) fwd = Norm(bore);
     }
     // Gun models are built along one of the actor's own axes; the parts
     // under it can be tilted for the flat-screen animations (seen in the
@@ -352,6 +389,18 @@ bool LearnGunFrame(UObject g, const FVector& actor_loc, const FQuat& actor_rot, 
     FVector right = Cross(up, fwd);
     W.gun_frame = FromAxes(fwd, right, up);
     W.have_frame = true;
+    W.muzzle_dist = std::fmax(10.0, DotV(m - grip, fwd));
+    W.bore_height = DotV(m - grip, up);
+    // The slide/bolt is pulled straight back along the bore. Express that in
+    // the slide's parent space (the pistol's came out -X, as measured in the
+    // weapon lab); a rifle's bolt parent may be turned differently.
+    if (slide_parent) {
+        FVector back_w = actor_rot.Rotate(fwd * -1.0);
+        FVector back_p = Norm(ComponentToWorld(slide_parent).rotation.Inverse().Rotate(back_w));
+        W.slide_axis = snap(back_p);
+        log::Info("controls: slide/bolt pulls along (%.2f %.2f %.2f) in its parent's space", W.slide_axis.X,
+                  W.slide_axis.Y, W.slide_axis.Z);
+    }
     log::Info("controls: %s barrel along (%.2f %.2f %.2f), top along (%.2f %.2f %.2f) in actor space",
               ue::GetName(ue::GetClass(g)).c_str(), fwd.X, fwd.Y, fwd.Z, up.X, up.Y, up.Z);
     return true;
@@ -380,8 +429,7 @@ FVector WallPushback(UObject gun, const FQuat& frame, const FVector& grip) {
     hands::Pose head;
     UObject player = game::Player();
     if (!ksl || !gps || !player || !hands::Head(&head)) return FVector{};
-    constexpr double kMuzzleReach = 18.0;   // grip to muzzle, cm
-    FVector muzzle = grip + frame.Rotate(FVector{kMuzzleReach, 0, 0});
+    FVector muzzle = grip + frame.Rotate(FVector{W.muzzle_dist, 0, 0});
     UObject ignore[3] = {gun, W.held_mag, W.pouch_mag};
     int32_t n = 1 + (W.held_mag ? 1 : 0);
     if (W.pouch_mag) ignore[n++] = W.pouch_mag;
@@ -435,7 +483,8 @@ void HoldGun(game::Gun& gun, const hands::HandState& rh) {
         if (t > 0.4) W.kick_t0 = -1;
         else kick = g_set.recoil_kick * (1.0 - std::exp(-t / 0.012)) * std::exp(-t / 0.07) * 1.6;
     }
-    constexpr double kKickPitch = 7.0, kKickBack = 2.0;   // degrees, cm at full kick
+    // Pistol: sharp muzzle flip. Rifle (stock, 5.56): little flip, more push.
+    const double kKickPitch = W.is_pistol ? 7.0 : 2.5, kKickBack = W.is_pistol ? 2.0 : 3.0;
     FQuat hand = rh.aim.rotation * ToQuat(FRotator{kBasePitch + g_set.gun_pitch + kick * kKickPitch,
                                                    kBaseYaw + g_set.gun_yaw, g_set.gun_roll});
     FQuat rot = W.have_frame ? hand * W.gun_frame.Inverse() : hand;
@@ -445,8 +494,27 @@ void HoldGun(game::Gun& gun, const hands::HandState& rh) {
     constexpr double kBaseForward = -5.0, kBaseRight = 1.3, kBaseUp = -5.0;
     FVector shift = hand.Rotate(FVector{kBaseForward + g_set.gun_forward - kick * kKickBack,
                                         kBaseRight + g_set.gun_right, kBaseUp});
-    FVector loc = rh.grip.location + shift - rot.Rotate(rel);
-    loc = loc + WallPushback(g, hand, rh.grip.location + shift);
+    FVector grip_w = rh.grip.location + shift;
+    // Two hands: the support hand on the handguard steers the barrel. Turn
+    // the one-hand pose so the point the support hand grabbed lies toward
+    // where that hand is now; roll still comes from the firing hand.
+    hands::HandState lh2 = hands::Get(hands::kLeft);
+    if (W.two_hand && lh2.valid && Len(W.support_local) > 5.0) {
+        FVector v1 = Norm(hand.Rotate(W.support_local));
+        FVector v2 = Norm(lh2.grip.location - grip_w);
+        FQuat q = FromTo(v1, v2);
+        hand = q * hand;
+        rot = W.have_frame ? hand * W.gun_frame.Inverse() : hand;
+        shift = hand.Rotate(FVector{kBaseForward + g_set.gun_forward - kick * kKickBack,
+                                    kBaseRight + g_set.gun_right, kBaseUp});
+        grip_w = rh.grip.location + shift;
+    }
+    FVector loc = grip_w - rot.Rotate(rel);
+    FVector push = WallPushback(g, hand, grip_w);
+    loc = loc + push;
+    W.grip_world = grip_w + push;
+    W.have_support_point = W.two_hand && Len(W.support_local) > 5.0;
+    if (W.have_support_point) W.support_point = W.grip_world + hand.Rotate(W.support_local);
     SetActorTransform(g, loc, rot);
     W.have_pose = true;
     W.gun_set_loc = loc;
@@ -482,6 +550,37 @@ void Trigger(UObject player, game::Gun& gun, const input::HandInput& rin) {
     }
 }
 
+// AR-15 charging handle: it moves back with the hand and pulls the bolt
+// carrier with it, but the bolt does not pull it: when the bolt locks back
+// on an empty magazine, or the gun fires, the handle stays forward. Let go,
+// it rides forward with the bolt, or springs forward alone onto a locked bolt.
+void MoveChargingHandle(game::Gun& gun, bool bolt_locked) {
+    if (W.is_pistol) return;
+    UObject handle = 0;
+    ue::GetProp(gun.Object(), "GunParts_ChargingHandle", handle);
+    if (!handle || !W.have_pose) return;
+    if (!W.have_handle_origin) {
+        ue::Vec3d o;
+        ue::GetProp(gun.Object(), "ChargingHandle_OriginLoc", o);
+        if (o.x == 0 && o.y == 0 && o.z == 0) ue::GetProp(handle, "RelativeLocation", o);
+        W.handle_origin = FVector{o.x, o.y, o.z};
+        W.have_handle_origin = true;
+    }
+    double travel = W.slide.Held() ? W.slide.HandleTravel() : (bolt_locked ? 0.0 : W.slide.Travel());
+    if (travel < 0.001 && !W.handle_moved) return;
+    UObject parent = 0;
+    ue::GetProp(handle, "AttachParent", parent);
+    if (!parent) return;
+    FVector back_w = W.frame_rot.Rotate(FVector{-1, 0, 0});
+    FVector axis = Norm(ComponentToWorld(parent).rotation.Inverse().Rotate(back_w));
+    double len = gun.SlideBackLength() > 0.5 ? gun.SlideBackLength() : 8.0;
+    FVector p = W.handle_origin + axis * (len * travel);
+    ue::Call c(handle, "K2_SetRelativeLocation");
+    c.Set("NewLocation", ue::Vec3d{p.X, p.Y, p.Z}).Set("bSweep", false).Set("bTeleport", true);
+    c.Invoke();
+    W.handle_moved = travel >= 0.001;
+}
+
 void SlideHandling(game::Gun& gun, const hands::HandState& lh, const input::HandInput& lin, double dt) {
     UObject slide_comp = gun.SlideComponent();
     if (!slide_comp || !lh.valid) return;
@@ -492,11 +591,31 @@ void SlideHandling(game::Gun& gun, const hands::HandState& lh, const input::Hand
     FVector hand = ToLocal(pt, lh.grip.location);
 
     interact::SlideConfig cfg;
-    cfg.axis = FVector{-1, 0, 0};  // measured for the handgun in the weapon lab
-    cfg.length = gun.SlideBackLength() > 0.5 ? gun.SlideBackLength() : 4.7;
+    cfg.axis = W.slide_axis;  // straight back along the bore (pistol: -X, measured in the weapon lab)
+    cfg.length = gun.SlideBackLength() > 0.5 ? gun.SlideBackLength() : (W.is_pistol ? 4.7 : 8.0);
     ue::Vec3d o = gun.SlideOrigin();
     cfg.grab_center = FVector{o.x, o.y, o.z} + cfg.axis * 4.0;
     cfg.grab_radius = 8.0;
+    if (!W.is_pistol) {
+        // AR-15: the left hand works the T-shaped charging handle at the
+        // back of the upper receiver. It always sits forward (it does not
+        // stay back with a locked bolt), so it is grabbed at its rest point.
+        UObject handle = 0;
+        ue::GetProp(gun.Object(), "GunParts_ChargingHandle", handle);
+        if (!W.have_handle_grab) {
+            UObject point = handle;
+            if (!point) ue::GetProp(gun.Object(), "ChargingHandPoint", point);
+            if (point) {
+                W.handle_grab = ToLocal(pt, ComponentToWorld(point).translation);
+                W.have_handle_grab = true;
+                log::Info("controls: charging handle grab point (%.1f %.1f %.1f) in the bolt's parent space",
+                          W.handle_grab.X, W.handle_grab.Y, W.handle_grab.Z);
+            }
+        }
+        if (W.have_handle_grab) cfg.grab_center = W.handle_grab;
+        cfg.grab_radius = 9.0;
+        cfg.grab_at_closed = true;
+    }
     // Locked open (empty gun): the slide rests on the catch, and pulling it a
     // little further back and letting go releases it, like a real pistol.
     const bool locked = gun.State().slide_locked;
@@ -559,9 +678,10 @@ void SlideHandling(game::Gun& gun, const hands::HandState& lh, const input::Hand
         default: break;
     }
     // The hand snaps to the slide's grab point while it holds the slide.
-    W.slide_point = pt.translation +
-                    pt.rotation.Rotate(cfg.grab_center + cfg.axis * (W.slide.Travel() * cfg.length));
+    const double grab_travel = W.is_pistol ? W.slide.Travel() : W.slide.HandleTravel();
+    W.slide_point = pt.translation + pt.rotation.Rotate(cfg.grab_center + cfg.axis * (grab_travel * cfg.length));
     W.have_slide_point = true;
+    MoveChargingHandle(gun, locked);
     // Moving the slide a few mm resets a Glock's trigger after a dry fire.
     if (W.dead_trigger && W.slide.Travel() > rest + 0.12) {
         W.dead_trigger = false;
@@ -748,8 +868,9 @@ void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState& lh
     // was doing anyway). Touching it to the top of the gun does nothing.
     UObject well = 0;
     ue::GetProp(gun.Object(), "MagazinePoint", well);
-    // Into the magwell, in the gun frame: up the grip, raked about 18 degrees.
-    constexpr double kRake = 18.0 * 3.14159265358979 / 180.0;
+    // Into the magwell, in the gun frame: a Glock's runs up the grip, raked
+    // about 18 degrees; an AR-15's magwell is square to the bore.
+    const double kRake = (W.is_pistol ? 18.0 : 0.0) * 3.14159265358979 / 180.0;
     const FVector in_g{std::sin(kRake), 0, std::cos(kRake)};
     double aim_off_deg = 0;
     FQuat seat_rot = show_rot;
@@ -847,6 +968,44 @@ void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState& lh
     }
 }
 
+// Rifle support hand: grab the handguard (or the magwell, which many people
+// hold) with the left hand and the gun is held in both hands; the barrel
+// then points from the right hand toward the left. Let go to return to one hand.
+void SupportGrip(const hands::HandState& lh, const input::HandInput& lin) {
+    if (W.is_pistol) return;
+    if (W.two_hand && (!lh.valid || !lin.grip_button.down || W.slide.Held() || W.held_mag)) {
+        W.two_hand = false;
+        W.have_support_point = false;
+        log::Info("controls: support hand off the handguard");
+        return;
+    }
+    if (W.two_hand || !lin.grip_button.pressed || !lh.valid || !W.have_pose || W.slide.Held() || W.held_mag)
+        return;
+    FVector p = W.frame_rot.Inverse().Rotate(lh.grip.location - W.grip_world);
+    const bool along = p.X > 6.0 && p.X < W.muzzle_dist - 2.0;
+    const bool beside = std::fabs(p.Y) < 10.0;
+    const bool height = p.Z > W.bore_height - 14.0 && p.Z < W.bore_height + 7.0;
+    log::Info("controls: left grab at gun-frame (%.1f %.1f %.1f), %s the handguard zone", p.X, p.Y, p.Z,
+              along && beside && height ? "inside" : "outside");
+    if (!(along && beside && height)) return;
+    W.two_hand = true;
+    W.support_local = p;
+    input::Haptic(input::kLeft, 0.35f, 0.03f);
+}
+
+// Right stick click: fire selector (safe / semi / auto, as the gun allows).
+void FireSelector(game::Gun& gun, const input::HandInput& rin) {
+    // Rifles only: a Glock has no selector, and a stray click on the turn
+    // stick must never put the pistol on safe.
+    if (W.is_pistol || !rin.stick_click.pressed) return;
+    ue::Call c(gun.Object(), "Gun_SwitchFireMode");
+    c.Invoke();
+    uint8_t mode = 0;
+    ue::GetProp(gun.Object(), "SelectedFireMode", mode);
+    input::Haptic(input::kRight, 0.3f, 0.02f);
+    log::Info("controls: fire selector -> mode %d", mode);
+}
+
 void PublishGrabs(game::Gun& gun, const hands::HandState& rh, const hands::HandState& lh) {
     hands::HandGrab g[2];
     if (gun.Valid() && rh.valid) {
@@ -873,6 +1032,11 @@ void PublishGrabs(game::Gun& gun, const hands::HandState& rh, const hands::HandS
             g[hands::kLeft].object = W.held_mag;
             g[hands::kLeft].target = lh.grip;
             if (W.mag_engaged || W.mag_seating) g[hands::kLeft].target.location = W.mag_shown;
+        } else if (W.two_hand && W.have_support_point) {
+            g[hands::kLeft].kind = hands::GrabKind::kSupportGrip;
+            g[hands::kLeft].object = gun.Object();
+            g[hands::kLeft].target = lh.grip;
+            g[hands::kLeft].target.location = W.support_point;
         }
     }
     std::lock_guard<std::mutex> lock(g_hands_mutex);
@@ -906,7 +1070,9 @@ void RackTrace(game::Gun& gun, float dt) {
 void AfterChargeTimeline(UObject self, UObject, void*) {
     if (!g_set.enabled || !self || self != W.gun) return;
     game::Gun gun(self);
-    gun.SetSlideTravel(W.slide.Travel(), ue::Vec3d{-1, 0, 0});
+    gun.SetSlideTravel(W.slide.Travel(), ue::Vec3d{W.slide_axis.X, W.slide_axis.Y, W.slide_axis.Z});
+    W.handle_moved = true;  // the game's charge animation may move the handle too
+    MoveChargingHandle(gun, gun.State().slide_locked);
 }
 
 // The game's recoil (BP_Player Recoil: camera, arm and control-rotation
@@ -979,6 +1145,10 @@ void OnTick(UObject player, float dt) {
     if (gun.Object() != W.gun) {
         W = WeaponState();
         W.gun = gun.Object();
+        if (gun.Valid()) {
+            W.is_pistol = gun.ClassName().find("HG") != std::string::npos;
+            log::Info("controls: holding %s (%s)", gun.ClassName().c_str(), W.is_pistol ? "pistol" : "rifle");
+        }
     }
     if (!gun.Valid()) {
         hands::HandState none;
@@ -1043,6 +1213,8 @@ void OnTick(UObject player, float dt) {
     Trigger(player, gun, s.hand[input::kRight]);
     SlideHandling(gun, lh, s.hand[input::kLeft], dt);
     MagazineHandling(gun, player, lh, s.hand[input::kLeft], s.hand[input::kRight]);
+    SupportGrip(lh, s.hand[input::kLeft]);
+    FireSelector(gun, s.hand[input::kRight]);
     PublishGrabs(gun, rh, lh);
     RackTrace(gun, dt);
 }

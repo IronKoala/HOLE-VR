@@ -24,6 +24,11 @@ struct SlideConfig {
     double full_threshold = 0.9;      // fraction of travel that counts as racked
     double max_off_axis = 9.0;        // cm away from the axis before the hand slips
     double return_speed = 25.0;       // travel per second when springing forward
+    // Charging handle (AR-15): the part the hand grabs is always forward
+    // (travel 0), even when the bolt is locked back. The hand then has to
+    // pull the handle back to the bolt before the bolt moves. Pistol slide:
+    // false, the hand grabs the slide wherever it is.
+    bool grab_at_closed = false;
 };
 
 enum class SlideEvent { kNone, kGrabbed, kReachedBack, kRacked, kPartialRelease, kSlipped };
@@ -43,6 +48,9 @@ public:
     bool Held() const { return held_; }
     double Travel() const { return travel_; }   // 0 closed .. 1 fully back
     double Peak() const { return peak_; }       // furthest travel this stroke
+    // Where the grabbed part itself is (0..1): the same as Travel() for a
+    // slide; for a charging handle it can be ahead of a locked-back bolt.
+    double HandleTravel() const { return held_ ? handle_ : 0.0; }
     bool InZone(const FVector& hand) const;
 
 private:
@@ -54,6 +62,7 @@ private:
     double travel_ = 0.0;
     double rest_ = 0.0;
     double peak_ = 0.0;
+    double handle_ = 0.0;
 };
 
 double Dot(const FVector& a, const FVector& b);

@@ -28,7 +28,9 @@ HandState Get(Hand hand);
 
 // What each hand is holding, so body IK can snap the hand to the object
 // instead of the raw controller.
-enum class GrabKind { kNone, kGunGrip, kSlideGrab, kMagHeld, kMagInsert, kHolster };
+// kSupportGrip: left hand on a rifle's handguard (target = the point it holds,
+// rotation = the hand's own); the gun turns so that point follows the hand.
+enum class GrabKind { kNone, kGunGrip, kSlideGrab, kMagHeld, kMagInsert, kHolster, kSupportGrip };
 struct HandGrab {
     GrabKind kind = GrabKind::kNone;
     uintptr_t object = 0;   // gun or magazine UObject

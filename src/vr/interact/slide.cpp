@@ -25,7 +25,9 @@ SlideEvent Slide::Update(const FVector& hand, bool grab_down, double dt) {
             held_ = true;
             reached_back_ = false;
             peak_ = travel_;
-            start_ = along - travel_ * cfg_.length;
+            const double grabbed_at = cfg_.grab_at_closed ? 0.0 : travel_;
+            start_ = along - grabbed_at * cfg_.length;
+            handle_ = grabbed_at;
             return SlideEvent::kGrabbed;
         }
         return SlideEvent::kNone;
@@ -48,6 +50,7 @@ SlideEvent Slide::Update(const FVector& hand, bool grab_down, double dt) {
     if (off_axis > cfg_.max_off_axis) return let_go(SlideEvent::kSlipped);
 
     // A locked-open slide cannot go further forward than the catch.
+    handle_ = std::clamp((along - start_) / cfg_.length, 0.0, 1.0);
     travel_ = std::clamp((along - start_) / cfg_.length, rest_, 1.0);
     peak_ = std::max(peak_, travel_);
     if (!reached_back_ && travel_ >= cfg_.full_threshold) {
