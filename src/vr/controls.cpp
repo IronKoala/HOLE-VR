@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include <cmath>
+#include <cstring>
 #include <mutex>
 
 #include "core/config.h"
@@ -346,6 +347,50 @@ bool LearnGunFrame(UObject g, const FVector& actor_loc, const FQuat& actor_rot, 
 }
 
 
+// Keeps the gun out of walls, like Half-Life: Alyx: a trace from the head to
+// the muzzle; when it hits something the whole gun is pulled back along that
+// line so the muzzle rests at the surface (the hand on the gun follows it).
+// Returns the offset to add to the gun's location.
+struct TArrayRaw {
+    const UObject* data;
+    int32_t num, max;
+};
+FVector WallPushback(UObject gun, const FQuat& frame, const FVector& grip) {
+    static UObject ksl = 0;
+    if (!ksl) ksl = ue::FindObject("KismetSystemLibrary /Script/Engine.Default__KismetSystemLibrary");
+    static UObject gps = 0;
+    if (!gps) gps = ue::FindObject("GameplayStatics /Script/Engine.Default__GameplayStatics");
+    hands::Pose head;
+    UObject player = game::Player();
+    if (!ksl || !gps || !player || !hands::Head(&head)) return FVector{};
+    constexpr double kMuzzleReach = 18.0;   // grip to muzzle, cm
+    FVector muzzle = grip + frame.Rotate(FVector{kMuzzleReach, 0, 0});
+    UObject ignore[3] = {gun, W.held_mag, W.pouch_mag};
+    int32_t n = 1 + (W.held_mag ? 1 : 0);
+    if (W.pouch_mag) ignore[n++] = W.pouch_mag;
+    TArrayRaw arr{ignore, n, n};
+    ue::Call t(ksl, "LineTraceSingle");
+    t.Set("WorldContextObject", player).Set("Start", head.location).Set("End", muzzle)
+        .Set("TraceChannel", uint8_t{0}).Set("bTraceComplex", false).Set("ActorsToIgnore", arr)
+        .Set("bIgnoreSelf", true);
+    if (!t.Invoke() || !t.Result<bool>()) return FVector{};
+    int32_t hit_size = 0;
+    uint8_t* hit = t.Raw("OutHit", &hit_size);
+    if (!hit) return FVector{};
+    ue::Call b(gps, "BreakHitResult");
+    int32_t in_size = 0;
+    uint8_t* in = b.Raw("Hit", &in_size);
+    if (!in || in_size != hit_size) return FVector{};
+    std::memcpy(in, hit, static_cast<size_t>(hit_size));
+    if (!b.Invoke() || !b.Get<bool>("bBlockingHit")) return FVector{};
+    FVector at = b.Get<FVector>("Location");
+    FVector dir = Norm(muzzle - head.location);
+    // Muzzle rests 1 cm short of the surface.
+    double back = DotV(muzzle - at, dir) + 1.0;
+    if (back <= 0) return FVector{};
+    return dir * -back;
+}
+
 void HoldGun(game::Gun& gun, const hands::HandState& rh) {
     UObject g = gun.Object();
     UObject main = 0;
@@ -374,6 +419,7 @@ void HoldGun(game::Gun& gun, const hands::HandState& rh) {
     constexpr double kBaseForward = -5.0, kBaseRight = 1.3, kBaseUp = -5.0;
     FVector shift = hand.Rotate(FVector{kBaseForward + g_set.gun_forward, kBaseRight + g_set.gun_right, kBaseUp});
     FVector loc = rh.grip.location + shift - rot.Rotate(rel);
+    loc = loc + WallPushback(g, hand, rh.grip.location + shift);
     SetActorTransform(g, loc, rot);
     W.have_pose = true;
     W.gun_set_loc = loc;
