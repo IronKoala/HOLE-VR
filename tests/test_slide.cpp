@@ -120,6 +120,27 @@ int main() {
         for (int i = 0; i < 10; ++i) s.Update(FVector{0, 0, 0}, false, 0.011);
         EXPECT(s.Travel() == rest);
     }
+    {
+        // AR charging handle with the bolt locked back at 70%: the handle is
+        // grabbed forward and must travel to the bolt before the bolt moves.
+        SlideConfig c = Pistol();
+        c.length = 10.0;
+        c.grab_at_closed = true;
+        c.full_threshold = 0.78;
+        Slide s(c);
+        s.SetRest(0.7);
+        s.Update(FVector{-6, 0, 2}, false, 0.011);
+        EXPECT(s.Travel() == 0.7);
+        EXPECT(s.Update(FVector{-6, 0, 2}, true, 0.011) == SlideEvent::kGrabbed);
+        EXPECT(s.HandleTravel() == 0.0);
+        s.Update(FVector{-9, 0, 2}, true, 0.011);   // handle 30%, bolt still on the catch
+        EXPECT(s.HandleTravel() > 0.29 && s.HandleTravel() < 0.31);
+        EXPECT(s.Travel() == 0.7);
+        EXPECT(s.Update(FVector{-14, 0, 2}, true, 0.011) == SlideEvent::kReachedBack);
+        EXPECT(s.Travel() > 0.79);
+        EXPECT(s.Update(FVector{-14, 0, 2}, false, 0.011) == SlideEvent::kRacked);
+        EXPECT(s.HandleTravel() == 0.0);
+    }
     std::printf(failures ? "%d failure(s)\n" : "all slide tests passed\n", failures);
     return failures ? EXIT_FAILURE : EXIT_SUCCESS;
 }
