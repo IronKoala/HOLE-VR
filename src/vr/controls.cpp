@@ -233,6 +233,25 @@ struct WeaponState {
     bool dead_trigger = false;  // Glock: after a dry fire the trigger is dead until the slide moves
     bool trigger_sent = false;  // the game saw the current trigger press
     bool lock_on_release = false; // B pressed while holding the slide back: lock it open
+    bool timeline_fast = false;   // game's charge timeline sped up for this gun
+    // Gun pose this frame (from HoldGun).
+    bool have_pose = false;
+    FQuat actor_rot;              // gun actor rotation in the world
+    FQuat frame_rot;              // gun frame (X barrel, Z up) in the world
+    // Where the slide grab point is in the world, for snapping the hand to it.
+    bool have_slide_point = false;
+    FVector slide_point;
+    // Magazine seating, Half-Life: Alyx style: bring the mag up under the
+    // grip, it locks onto the magwell axis, push it in and it seats itself.
+    bool mag_engaged = false;
+    bool mag_seating = false;
+    double seat_from = 0, seat_t0 = 0;
+    FVector mag_shown;            // where the held mag is drawn
+    bool seat_learned = false;
+    FVector seat_offset;          // inserted mag origin minus MagazinePoint, actor space
+    FQuat seat_rot;               // inserted mag rotation, actor space
+    UObject learn_mag = 0;
+    double learn_at = -1;
 } W;
 
 double Len(const FVector& v) { return std::sqrt(v.X * v.X + v.Y * v.Y + v.Z * v.Z); }
@@ -351,6 +370,9 @@ void HoldGun(game::Gun& gun, const hands::HandState& rh) {
     FVector shift = hand.Rotate(FVector{kBaseForward + g_set.gun_forward, kBaseRight + g_set.gun_right, 0});
     FVector loc = rh.grip.location + shift - rot.Rotate(rel);
     SetActorTransform(g, loc, rot);
+    W.have_pose = true;
+    W.actor_rot = rot;
+    W.frame_rot = hand;
 }
 
 void Trigger(UObject player, game::Gun& gun, const input::HandInput& rin) {
@@ -431,8 +453,8 @@ void SlideHandling(game::Gun& gun, const hands::HandState& lh, const input::Hand
                 break;
             }
             gun.ChargeBoltRelease();
-            W.end_charging_at = g_clock + 0.4;
-            W.check_chamber_at = g_clock + 0.6;
+            W.end_charging_at = g_clock + 0.1;
+            W.check_chamber_at = g_clock + 0.15;
             input::Haptic(input::kLeft, 0.9f, 0.06f);
             input::Haptic(input::kRight, 0.5f, 0.05f);
             log::Info("controls: full rack");
@@ -445,6 +467,10 @@ void SlideHandling(game::Gun& gun, const hands::HandState& lh, const input::Hand
             break;
         default: break;
     }
+    // The hand snaps to the slide's grab point while it holds the slide.
+    W.slide_point = pt.translation +
+                    pt.rotation.Rotate(cfg.grab_center + cfg.axis * (W.slide.Travel() * cfg.length));
+    W.have_slide_point = true;
     // Moving the slide a few mm resets a Glock's trigger after a dry fire.
     if (W.dead_trigger && W.slide.Travel() > rest + 0.12) {
         W.dead_trigger = false;
@@ -472,7 +498,7 @@ void SlideHandling(game::Gun& gun, const hands::HandState& lh, const input::Hand
             // Still empty: cycle the action once more (this is what loads a round).
             W.retried_rack = true;
             gun.ChargeBoltPull();
-            W.pending_release_at = g_clock + 0.3;
+            W.pending_release_at = g_clock + 0.08;
             log::Info("controls: chamber still empty, cycling again");
         } else {
             W.retried_rack = false;
@@ -490,8 +516,8 @@ void SlideHandling(game::Gun& gun, const hands::HandState& lh, const input::Hand
     if (W.pending_release_at > 0 && g_clock >= W.pending_release_at) {
         W.pending_release_at = -1;
         gun.ChargeBoltRelease();
-        W.end_charging_at = g_clock + 0.4;
-        W.check_chamber_at = g_clock + 0.6;
+        W.end_charging_at = g_clock + 0.1;
+        W.check_chamber_at = g_clock + 0.15;
     }
 }
 
@@ -608,15 +634,37 @@ void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState& lh
     // Carry it in the left hand.
     DetachIfAttached(W.held_mag);
     { ue::Call v(W.held_mag, "SetVisibility"); v.Set("IsVisible", true); v.Invoke(); }
-    SetActorTransform(W.held_mag, lh.grip.location, lh.aim.rotation);
+    FVector show_loc = lh.grip.location;
+    FQuat show_rot = lh.aim.rotation;
 
-    // Insert when it reaches the magwell.
+    // Magwell: the mag must come up from under the grip along the magwell
+    // axis. Close enough to that axis it locks on and slides along it; pushed
+    // most of the way in, it seats itself (a short animation of what the hand
+    // was doing anyway). Touching it to the top of the gun does nothing.
     UObject well = 0;
     ue::GetProp(gun.Object(), "MagazinePoint", well);
-    if (well) {
-        FVector d = ComponentToWorld(well).translation - lh.grip.location;
-        // Only one magazine fits: with one already in, eject it first (A).
-        if (std::sqrt(d.X * d.X + d.Y * d.Y + d.Z * d.Z) < 9.0 && !gun.State().has_magazine) {
+    const bool can_seat = well && W.have_pose && !gun.State().has_magazine;
+    if (can_seat) {
+        FVector seat = ComponentToWorld(well).translation;
+        if (W.seat_learned) seat = seat + W.actor_rot.Rotate(W.seat_offset);
+        // Out of the magwell: down the grip, raked back about 18 degrees.
+        constexpr double kRake = 18.0 * 3.14159265358979 / 180.0;
+        FVector out = Norm(W.frame_rot.Rotate(FVector{-std::sin(kRake), 0, -std::cos(kRake)}));
+        FVector p = lh.grip.location - seat;
+        double along = DotV(p, out);
+        double lateral = Len(p - out * along);
+        FQuat seat_rot = W.seat_learned ? W.actor_rot * W.seat_rot : show_rot;
+
+        if (W.mag_seating) {
+            double t = std::fmin(1.0, (g_clock - W.seat_t0) / 0.1);
+            along = W.seat_from * (1.0 - t);
+            show_loc = seat + out * along;
+            show_rot = seat_rot;
+            SetActorTransform(W.held_mag, show_loc, show_rot);
+            W.mag_shown = show_loc;
+            if (t < 1.0) return;
+            W.mag_seating = false;
+            W.mag_engaged = false;
             ue::SetProp<UObject>(gun.Object(), "MagazineObj_Temp", W.held_mag);
             gun.InsertMagazine();
             UObject mag = 0;
@@ -624,17 +672,47 @@ void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState& lh
                 ue::Call v(mag, "SetVisibility");
                 v.Set("IsVisible", true);
                 v.Invoke();
+                if (!W.seat_learned) {
+                    W.learn_mag = mag;
+                    W.learn_at = g_clock + 0.05;
+                }
             }
             W.held_mag = 0;
             W.refill_pouch_at = g_clock + 0.5;
-            input::Haptic(input::kLeft, 0.8f, 0.05f);
-            input::Haptic(input::kRight, 0.6f, 0.05f);
-            log::Info("controls: magazine inserted: %s", gun.State().Describe().c_str());
+            input::Haptic(input::kLeft, 0.9f, 0.05f);
+            input::Haptic(input::kRight, 0.7f, 0.05f);
+            log::Info("controls: magazine seated: %s", gun.State().Describe().c_str());
             return;
         }
+        if (!W.mag_engaged) {
+            if (along > 2.0 && along < 14.0 && lateral < 4.5) {
+                W.mag_engaged = true;
+                input::Haptic(input::kLeft, 0.25f, 0.02f);
+                log::Info("controls: magazine lined up with the magwell (%.1f cm below, %.1f off axis)",
+                          along, lateral);
+            }
+        } else if (lateral > 7.0 || along > 17.0) {
+            W.mag_engaged = false;
+        }
+        if (W.mag_engaged) {
+            double a = std::fmax(0.0, along);
+            show_loc = seat + out * a;
+            show_rot = seat_rot;
+            if (a < 6.0 && lin.grip_button.down) {
+                W.mag_seating = true;
+                W.seat_from = a;
+                W.seat_t0 = g_clock;
+            }
+        }
+    } else {
+        W.mag_engaged = false;
     }
+    SetActorTransform(W.held_mag, show_loc, show_rot);
+    W.mag_shown = show_loc;
+
     // Let go of the grab: drop it.
     if (lin.grip_button.released) {
+        W.mag_engaged = false;
         ue::Call drop(W.held_mag, "DropMagazine");
         drop.Invoke();
         W.held_mag = 0;
@@ -661,10 +739,12 @@ void PublishGrabs(game::Gun& gun, const hands::HandState& rh, const hands::HandS
             g[hands::kLeft].kind = hands::GrabKind::kSlideGrab;
             g[hands::kLeft].object = gun.Object();
             g[hands::kLeft].target = lh.grip;
+            if (W.have_slide_point) g[hands::kLeft].target.location = W.slide_point;
         } else if (W.held_mag) {
             g[hands::kLeft].kind = hands::GrabKind::kMagHeld;
             g[hands::kLeft].object = W.held_mag;
             g[hands::kLeft].target = lh.grip;
+            if (W.mag_engaged || W.mag_seating) g[hands::kLeft].target.location = W.mag_shown;
         }
     }
     std::lock_guard<std::mutex> lock(g_hands_mutex);
@@ -711,6 +791,45 @@ void OnTick(UObject player, float dt) {
         return;
     }
     HookChargeTimeline();
+    if (!W.timeline_fast) {
+        // The game's charge timeline only has to update its ammo state; the
+        // hand already moved the slide. Run it 10x faster so the round is
+        // chambered the moment the slide closes (no hitch).
+        UObject tl = 0;
+        if (ue::GetProp(gun.Object(), "TL_ChargeBolt", tl) && tl) {
+            ue::Call r(tl, "SetPlayRate");
+            r.Set("NewRate", 10.0f);
+            r.Invoke();
+        }
+        W.timeline_fast = true;
+    }
+    if (W.learn_at > 0 && g_clock >= W.learn_at && W.have_pose) {
+        W.learn_at = -1;
+        UObject well = 0;
+        ue::GetProp(gun.Object(), "MagazinePoint", well);
+        UObject mag = 0;
+        ue::GetProp(gun.Object(), "MagazineObj", mag);
+        if (well && mag == W.learn_mag) {
+            FVector off = ActorLocation(mag) - ComponentToWorld(well).translation;
+            if (Len(off) < 15.0) {
+                FQuat inv = ActorRotation(gun.Object()).Inverse();
+                W.seat_offset = inv.Rotate(off);
+                W.seat_rot = inv * ActorRotation(mag);
+                W.seat_learned = true;
+                log::Info("controls: learned magazine seat (%.1f %.1f %.1f)", W.seat_offset.X,
+                          W.seat_offset.Y, W.seat_offset.Z);
+            }
+        }
+    }
+    {
+        // Left X: weapon light.
+        const input::HandInput& l = s.hand[input::kLeft];
+        if (l.primary.pressed || l.primary.released) {
+            ue::Call c(player, "PlayerInput_SwitchLight");
+            c.Set("IsPressed", l.primary.down);
+            c.Invoke();
+        }
+    }
     hands::HandState rh = hands::Get(hands::kRight), lh = hands::Get(hands::kLeft);
     if (rh.valid) HoldGun(gun, rh);
     Trigger(player, gun, s.hand[input::kRight]);
