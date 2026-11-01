@@ -74,6 +74,6 @@ once step 2 lands) and never opens its own session.
 | F6 (hold) | Pull the slide back by hand. Let go early = chamber check, at the end = full rack. |
 | Ctrl+F6 | Slide catch release. |
 | F7 | Magazine release (drops). Ctrl+F7 pulls it out instead. |
-| F8 | New magazine and insert. Ctrl+F8 tries the game's other load function. |
+| F8 | New magazine and insert. Shift+F8 tries the game's other load function. |
 
 Results go to `hole-vr/hole-vr.log` (lines starting `lab:`).

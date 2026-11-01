@@ -12,7 +12,7 @@
 //   F8        take a new magazine and insert it
 //   Ctrl+F6   slide catch release (drops a locked-open slide)
 //   Ctrl+F7   pull the magazine out by hand instead of dropping it
-//   Ctrl+F8   insert using the game's other load function
+//   Shift+F8   insert using the game's other load function
 namespace holevr::game::weapon_lab {
 
 // Registers the tick listener and ProcessEvent tracing. Call once after game::Init().

@@ -20,7 +20,22 @@ const char kDefaultIni[] =
     "dump_on_start=1\n"
     "\n"
     "; Seconds to wait for the engine to finish starting before giving up.\n"
-    "engine_wait_seconds=90\n";
+    "engine_wait_seconds=90\n"
+    "\n"
+    "; 1 = play in VR (needs SteamVR running), 0 = normal flat game.\n"
+    "vr_enabled=1\n"
+    "\n"
+    "; Render resolution relative to what the headset asks for (0.3 - 2.0).\n"
+    "resolution_scale=1.0\n"
+    "\n"
+    "; Show the eye view in the game window on the monitor.\n"
+    "desktop_mirror=1\n"
+    "\n"
+    "; 1 = let the game's mouse/stick pitch tilt your view (not recommended).\n"
+    "use_game_pitch=0\n"
+    "\n"
+    "; 1 = seated tracking space instead of standing/room scale.\n"
+    "seated_space=0\n";
 
 std::string Trim(const std::string& s) {
     size_t b = s.find_first_not_of(" \t\r\n");

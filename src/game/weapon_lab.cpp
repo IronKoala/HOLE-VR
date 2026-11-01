@@ -83,7 +83,7 @@ void RunActions(Gun& gun, int actions) {
         log::Info("lab: F8 new magazine %s, insert %s", a ? "ok" : "failed", b ? "ok" : "failed");
     }
     if (actions & kAltInsert)
-        log::Info("lab: Ctrl+F8 Gun_MagazineLoad -> %s", gun.CallSimple("Gun_MagazineLoad") ? "ok" : "failed");
+        log::Info("lab: Shift+F8 Gun_MagazineLoad -> %s", gun.CallSimple("Gun_MagazineLoad") ? "ok" : "failed");
     if (actions & kReleaseCatch)
         log::Info("lab: Ctrl+F6 slide catch release -> %s", gun.ReleaseSlideCatch() ? "ok" : "failed");
 }
@@ -205,7 +205,8 @@ void PollHotkeys() {
     g_pull_held = Down(VK_F6) && !ctrl;
     if (e6c.Pressed(Down(VK_F6) && ctrl)) g_pending |= kReleaseCatch;
     if (e7.Pressed(Down(VK_F7))) g_pending |= ctrl ? kDetachMag : kDropMag;
-    if (e8.Pressed(Down(VK_F8))) g_pending |= ctrl ? kAltInsert : kInsertMag;
+    bool shift = Down(VK_SHIFT);
+    if (e8.Pressed(Down(VK_F8) && !ctrl)) g_pending |= shift ? kAltInsert : kInsertMag;
 }
 
 }  // namespace holevr::game::weapon_lab
