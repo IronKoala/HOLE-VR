@@ -29,6 +29,12 @@ holds and where the hand should sit) and `GetFingers()` (trigger/grip/touch).
     grip centre found from the gun's `GunParts_MagazineCatch` (top front of
     the grip): 2.5 cm back and 4.5 cm down the slanted grip, on the gun's
     centre line. Settings `hand_grip_*`.
+  - **Finger contact**: while holding a gun/slide/magazine, each finger joint
+    curls only until its segment (offset by `finger_radius_cm`) touches one of
+    the held actor's own primitive components (`K2_LineTraceComponent`, which
+    never touches the world). Binary search per joint, smoothed. Parts without
+    collision never hit, so fingers fall back to the fixed pose curls; the log
+    reports the parts, their collision state and the hit rate.
   - **Fingers**: reset to the reference pose, then curled about the palm
     hinge axis by `hand_pose::Target()` (gun grip with trigger discipline,
     trigger pull, slide pinch, magazine hold, free hand from the sensors).

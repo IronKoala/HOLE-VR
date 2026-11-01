@@ -58,6 +58,8 @@ struct Settings {
     bool hand_poses = true;
     double finger_scale = 1.0;
     bool legs = true;
+    bool finger_contact = true;   // fingers stop where they touch the held object
+    double finger_radius = 0.8;   // cm, finger centre to skin on the curl side
     bool game_grip = false;  // copy the game's own hand placement on the gun (it does not wrap the grip)
     double arm_scale = 0.0;       // 0 = learn from how far you reach; else fixed multiplier
     double max_arm_scale = 1.25;
@@ -97,6 +99,8 @@ void LoadSettings() {
     // Renamed from hand_use_game_grip (default 1): the game's hand does not
     // actually wrap the grip.
     S.game_grip = config::GetBool("hand_copy_game_grip", false);
+    S.finger_contact = config::GetBool("finger_contact", true);
+    S.finger_radius = config::GetFloat("finger_radius_cm", 0.8f);
     S.arm_scale = config::GetFloat("body_arm_scale", 0.f);
     S.max_arm_scale = config::GetFloat("body_max_arm_scale", 1.25f);
     S.neck_down = config::GetFloat("body_neck_below_eyes_cm", 14.f);
@@ -287,6 +291,10 @@ struct State {
     bool have_prev_grip = false;
     hands::Pose prev_grip;
     bool use_game_grip = false;  // this frame
+    // Finger contact: share of each joint's curl that is free before the
+    // finger touches the held object (1 = curls all the way), smoothed.
+    double contact[2][hand_pose::kFingerCount][3];
+    bool contact_init[2] = {false, false};
     // Leg animation check: how much the game's animated feet move (relative
     // to the pelvis) while the character walks.
     double stand_dz = -1e9;  // highest real-neck vs avatar-neck height seen: standing tall
@@ -599,6 +607,84 @@ void LearnGameGrip(const hands::HandGrab& grab) {
     G.use_game_grip = G.game_grip_known;
 }
 
+
+// ---- finger contact ----
+// Fingers curl until they touch what the hand holds. The held actor's
+// primitive components (gun frame, slide, magazine...) are traced one by one
+// with K2_LineTraceComponent, which tests only that component, never the
+// world. If the object has no collision the traces never hit and the
+// fingers simply use their full pose curls.
+UObject g_prim_class = 0;
+struct ContactObject {
+    UObject actor = 0;
+    std::vector<UObject> comps;
+    int traces = 0, hits = 0;
+    bool reported = false;
+} g_contact;
+
+void CollectPrimitives(UObject actor) {
+    g_contact = ContactObject{};
+    g_contact.actor = actor;
+    if (!g_prim_class) g_prim_class = ue::FindObject("Class /Script/Engine.PrimitiveComponent");
+    if (!g_prim_class || !actor) return;
+    std::string names;
+    for (UObject cls = ue::GetClass(actor); cls; cls = ue::reflection::GetSuper(cls)) {
+        for (const auto& p : ue::reflection::GetProperties(cls)) {
+            if (p.type != "ObjectProperty" || p.array_dim != 1) continue;
+            UObject comp = 0;
+            if (!mem::Read(actor + p.offset, comp) || !comp) continue;
+            if (!ue::reflection::IsA(comp, g_prim_class)) continue;
+            if (ue::GetOuter(comp) != actor) continue;  // only the object's own parts
+            if (std::find(g_contact.comps.begin(), g_contact.comps.end(), comp) != g_contact.comps.end()) continue;
+            if (g_contact.comps.size() >= 16) break;
+            uint8_t coll = 0;
+            ue::Call ce(comp, "GetCollisionEnabled");
+            if (ce.Invoke()) coll = ce.Result<uint8_t>();
+            g_contact.comps.push_back(comp);
+            char buf[96];
+            std::snprintf(buf, sizeof(buf), " %s(collision %d)", p.name.c_str(), coll);
+            names += buf;
+        }
+    }
+    log::Info("body: finger contact on %s: %zu parts:%s", ue::GetName(actor).c_str(), g_contact.comps.size(),
+              names.c_str());
+}
+
+bool SegmentHits(const FVector& a, const FVector& b) {
+    for (UObject comp : g_contact.comps) {
+        ue::Call c(comp, "K2_LineTraceComponent");
+        if (!c.Valid()) return false;
+        c.Set("TraceStart", a).Set("TraceEnd", b).Set("bTraceComplex", true);
+        ++g_contact.traces;
+        if (c.Invoke() && c.Result<bool>()) {
+            ++g_contact.hits;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Largest angle (0..max) joint `pivot` may turn about `axis` before the
+// segment pivot->end (offset by the finger's radius toward the curl side)
+// touches the object. Returns max when nothing is in the way, or when the
+// segment already starts inside (nothing better to do).
+double FreeAngle(const FVector& pivot, const FVector& end, const FVector& axis, double max, double radius) {
+    auto blocked = [&](double ang) {
+        FQuat q = AxisAngle(axis, ang);
+        FVector seg = q.Rotate(end - pivot);
+        FVector side = Normalize(Cross(axis, seg)) * radius;
+        return SegmentHits(pivot + side, pivot + seg + side);
+    };
+    if (max <= 0.0 || !blocked(max)) return max;
+    if (blocked(0.0)) return max;
+    double lo = 0.0, hi = max;
+    for (int i = 0; i < 5; ++i) {
+        double mid = 0.5 * (lo + hi);
+        if (blocked(mid)) hi = mid; else lo = mid;
+    }
+    return lo;
+}
+
 void SolveArm(int side, const hands::HandState& h, const FVector& body_fwd, const FVector& body_right,
               double dt) {
     const Skeleton& k = G.skel;
@@ -743,6 +829,17 @@ void SolveArm(int side, const hands::HandState& h, const FVector& body_fwd, cons
     hand_pose::Smooth(&G.curl[side], target, dt);
     FVector palm_w = hand_rot.Rotate(G.frame[side].palm);
     FVector pinky_base = BoneW(k.finger[side][hand_pose::kPinky][0]).translation;
+    // Fingers wrap until they touch what the hand holds.
+    const bool touch = S.finger_contact && grab.object &&
+                       (grab.kind == hands::GrabKind::kGunGrip || grab.kind == hands::GrabKind::kSlideGrab ||
+                        grab.kind == hands::GrabKind::kMagHeld || grab.kind == hands::GrabKind::kMagInsert);
+    if (touch && grab.object != g_contact.actor) CollectPrimitives(grab.object);
+    if (!G.contact_init[side] || !touch) {
+        for (auto& f : G.contact[side])
+            for (double& v : f) v = 1.0;
+        G.contact_init[side] = true;
+    }
+    const double follow = 1.0 - std::exp(-dt / 0.05);
     for (int f = 0; f < hand_pose::kFingerCount; ++f) {
         const Bone* j = k.finger[side][f];
         FVector a = BoneW(j[0]).translation, b = BoneW(j[1]).translation;
@@ -750,10 +847,37 @@ void SolveArm(int side, const hands::HandState& h, const FVector& body_fwd, cons
         if (f == hand_pose::kThumb) toward = Normalize(Normalize(pinky_base - a) + palm_w * 0.5);
         FVector axis = Cross(b - a, toward);
         if (Length(axis) < 1e-4) continue;
+        axis = Normalize(axis);
         hand_pose::JointLimits lim = hand_pose::Limits(static_cast<hand_pose::Finger>(f));
         double c = std::min(1.2, G.curl[side].finger[f] * S.finger_scale);
         const double deg[3] = {lim.base, lim.middle, lim.tip};
-        for (int n = 0; n < 3; ++n) RotateBoneW(j[n], AxisAngle(axis, c * deg[n] * kDegToRad));
+        for (int n = 0; n < 3; ++n) {
+            double want = c * deg[n] * kDegToRad;
+            if (touch && !g_contact.comps.empty() && want > 1e-3) {
+                // Joint n turns the segment from bone n to bone n+1 (the tip
+                // segment is extended from the last bone's direction).
+                FVector p = BoneW(j[n]).translation;
+                FVector e;
+                if (n < 2) {
+                    e = BoneW(j[n + 1]).translation;
+                } else {
+                    FVector prev = BoneW(j[1]).translation;
+                    e = p + (p - prev) * 0.8;
+                }
+                double free = FreeAngle(p, e, axis, want, S.finger_radius) / want;
+                double& sm = G.contact[side][f][n];
+                sm += (free - sm) * follow;
+            } else {
+                G.contact[side][f][n] = 1.0;
+            }
+            RotateBoneW(j[n], AxisAngle(axis, want * G.contact[side][f][n]));
+        }
+    }
+    if (touch && !g_contact.reported && g_contact.traces > 2000) {
+        g_contact.reported = true;
+        log::Info("body: finger contact on %s: %d of %d traces touched%s", ue::GetName(g_contact.actor).c_str(),
+                  g_contact.hits, g_contact.traces,
+                  g_contact.hits ? "" : " (no collision on it: fingers use their full pose)");
     }
 }
 
