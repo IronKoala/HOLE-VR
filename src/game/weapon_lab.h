@@ -19,5 +19,7 @@ namespace holevr::game::weapon_lab {
 void Init();
 // Poll hotkeys. Call from the background thread about every 16 ms.
 void PollHotkeys();
+// Turns the weapon event/state trace on or off (also F5).
+void SetTrace(bool on);
 
 }  // namespace holevr::game::weapon_lab

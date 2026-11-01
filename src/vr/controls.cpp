@@ -9,6 +9,7 @@
 #include "core/log.h"
 #include "game/game.h"
 #include "game/gun.h"
+#include "game/weapon_lab.h"
 #include "ue/call.h"
 #include "ue/process_event.h"
 #include "vr/hands.h"
@@ -252,6 +253,8 @@ struct WeaponState {
     FQuat seat_rot;               // inserted mag rotation, actor space
     UObject learn_mag = 0;
     double learn_at = -1;
+    double trace_until = -1;      // per-frame rack trace (diagnosing the chamber hitch)
+    FVector gun_set_loc;          // where HoldGun put the gun this frame
 } W;
 
 double Len(const FVector& v) { return std::sqrt(v.X * v.X + v.Y * v.Y + v.Z * v.Z); }
@@ -366,11 +369,13 @@ void HoldGun(game::Gun& gun, const hands::HandState& rh) {
     FQuat rot = W.have_frame ? hand * W.gun_frame.Inverse() : hand;
     // `hand` is the gun's own frame in the world (X barrel, Y right, Z up).
     // Fourth test: gun sat about 5 cm too far forward and 1.3 cm too far left.
-    constexpr double kBaseForward = -5.0, kBaseRight = 1.3;
-    FVector shift = hand.Rotate(FVector{kBaseForward + g_set.gun_forward, kBaseRight + g_set.gun_right, 0});
+    // Fifth test: about 5 cm too high.
+    constexpr double kBaseForward = -5.0, kBaseRight = 1.3, kBaseUp = -5.0;
+    FVector shift = hand.Rotate(FVector{kBaseForward + g_set.gun_forward, kBaseRight + g_set.gun_right, kBaseUp});
     FVector loc = rh.grip.location + shift - rot.Rotate(rel);
     SetActorTransform(g, loc, rot);
     W.have_pose = true;
+    W.gun_set_loc = loc;
     W.actor_rot = rot;
     W.frame_rot = hand;
 }
@@ -434,7 +439,10 @@ void SlideHandling(game::Gun& gun, const hands::HandState& lh, const input::Hand
     using interact::SlideEvent;
     SlideEvent e = W.slide.Update(hand, lin.grip_button.down && W.held_mag == 0, dt);
     switch (e) {
-        case SlideEvent::kGrabbed: input::Haptic(input::kLeft, 0.3f, 0.03f); break;
+        case SlideEvent::kGrabbed:
+            input::Haptic(input::kLeft, 0.3f, 0.03f);
+            W.trace_until = g_clock + 30.0;   // until released + 1.5 s
+            break;
         case SlideEvent::kReachedBack:
             gun.ChargeBoltPull();
             input::Haptic(input::kLeft, 0.7f, 0.05f);
@@ -455,6 +463,7 @@ void SlideHandling(game::Gun& gun, const hands::HandState& lh, const input::Hand
             gun.ChargeBoltRelease();
             W.end_charging_at = g_clock + 0.1;
             W.check_chamber_at = g_clock + 0.15;
+            W.trace_until = g_clock + 1.5;
             input::Haptic(input::kLeft, 0.9f, 0.06f);
             input::Haptic(input::kRight, 0.5f, 0.05f);
             log::Info("controls: full rack");
@@ -463,6 +472,7 @@ void SlideHandling(game::Gun& gun, const hands::HandState& lh, const input::Hand
         case SlideEvent::kPartialRelease:
         case SlideEvent::kSlipped:
             W.lock_on_release = false;
+            W.trace_until = g_clock + 1.5;
             log::Info("controls: slide let go at %.0f%%", W.slide.Peak() * 100);
             break;
         default: break;
@@ -752,6 +762,26 @@ void PublishGrabs(game::Gun& gun, const hands::HandState& rh, const hands::HandS
     g_grab[1] = g[1];
 }
 
+// Per-frame trace while the slide is handled and 1.5 s after: frame time,
+// hand travel, where the game has the slide, charging/chamber state, and how
+// far the gun actor sits from where HoldGun put it. Diagnoses the chamber hitch.
+void RackTrace(game::Gun& gun, float dt) {
+    if (W.trace_until < 0) return;
+    if (g_clock > W.trace_until) {
+        W.trace_until = -1;
+        game::weapon_lab::SetTrace(false);
+        log::Info("trace: end");
+        return;
+    }
+    game::weapon_lab::SetTrace(true);
+    game::GunState st = gun.State();
+    FVector at = ActorLocation(gun.Object());
+    log::Info("trace: dt=%.1fms held=%d travel=%.2f game_slide=%.2f charging=%d chamber=%d mag=%d locked=%d "
+              "gun_off=%.2fcm",
+              dt * 1000.0, W.slide.Held(), W.slide.Travel(), st.slide_location.x, st.bolt_charging,
+              st.chamber, st.magazine, st.slide_locked, Len(at - W.gun_set_loc));
+}
+
 // The game's charge-bolt step plays a short timeline that snaps the slide
 // back and forward. In VR the hand already moved the slide, so after each
 // timeline frame put the slide back where the hand (or its spring) has it.
@@ -836,6 +866,7 @@ void OnTick(UObject player, float dt) {
     SlideHandling(gun, lh, s.hand[input::kLeft], dt);
     MagazineHandling(gun, player, lh, s.hand[input::kLeft], s.hand[input::kRight]);
     PublishGrabs(gun, rh, lh);
+    RackTrace(gun, dt);
 }
 
 }  // namespace

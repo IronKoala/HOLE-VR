@@ -253,6 +253,8 @@ void Init() {
     log::Info("lab: weapon lab ready (F5 trace, hold F6 slide, F7 drop mag, F8 insert mag)");
 }
 
+void SetTrace(bool on) { g_trace = on; }
+
 void PollHotkeys() {
     // Only react while the game window has focus.
     DWORD pid = 0;
