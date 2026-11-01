@@ -72,7 +72,9 @@ struct Settings {
     double grip_angle = 20.0;     // pistol grip slant, degrees
     double gun_hand[3] = {3.5, -3.8, 6.2};  // fallback fist offset from MainHandPosition in the gun frame (barrel, right, up), cm
     double grip_behind_catch = 2.5;  // grip centre behind the magazine catch, cm
-    double grip_below_catch = 4.5;   // grip centre down the grip from the magazine catch, cm
+    double grip_below_catch = 4.5;   // grip centre down the grip from the magazine catch, cm (no guard found)
+    double grip_below_guard = 1.0;   // middle finger centre below the trigger guard, cm
+    double thumb_aim_max = 60.0;     // degrees the thumb may swing to point along the barrel
     double grip_side = 0.0;          // sideways shift of the fist on the grip, cm (+ = gun's right)
     double gun_palm_depth = 2.5;     // grip centre out from the palm, cm
     double gun_fist_along = 0.75;    // grip centre along wrist -> middle knuckle (0-1)
@@ -119,6 +121,8 @@ void LoadSettings() {
     S.gun_hand[2] = config::GetFloat("hand_gun_fallback_up_cm", 6.2f);
     S.grip_behind_catch = config::GetFloat("hand_grip_behind_mag_catch_cm", 2.5f);
     S.grip_below_catch = config::GetFloat("hand_grip_below_mag_catch_cm", 4.5f);
+    S.grip_below_guard = config::GetFloat("hand_grip_below_trigger_guard_cm", 1.f);
+    S.thumb_aim_max = config::GetFloat("hand_thumb_forward_max_deg", 60.f);
     S.grip_side = config::GetFloat("hand_grip_side_cm", 0.f);
     S.gun_palm_depth = config::GetFloat("hand_grip_palm_depth_cm", 2.5f);
     S.gun_fist_along = config::GetFloat("hand_grip_fist_along", 0.75f);
@@ -537,11 +541,53 @@ FVector g_catch_rel;  // magazine catch in the gun frame, from MainHandPosition
 // MainHandPosition. From the magazine catch: back to the middle of the grip,
 // then down the slanted grip. The game's MainHandPosition is where its wrist
 // goes, ~8 cm from the grip itself, which is why the hand used to float.
+bool g_guard_known = false;
+double g_guard_bottom = 0;  // lowest point of the trigger guard, gun frame Z from MainHandPosition
+
 FVector GripCentre() {
     if (!g_catch_known) return FVector{S.gun_hand[0], S.gun_hand[1], S.gun_hand[2]};
     double a = S.grip_angle * kDegToRad;
     FVector down_grip{-std::sin(a), 0, -std::cos(a)};
-    return g_catch_rel + FVector{-S.grip_behind_catch, S.grip_side, 0} + down_grip * S.grip_below_catch;
+    double along = S.grip_below_catch;
+    // A high grip (owner's reference photos): the middle finger sits right
+    // under the trigger guard, the web of the hand up under the slide. The
+    // fist point is on the middle finger's line, so put it one finger radius
+    // below the guard.
+    if (g_guard_known) {
+        double down = g_catch_rel.Z - (g_guard_bottom - S.grip_below_guard);
+        if (down > 0.5 && down < 10.0) along = down / std::cos(a);
+    }
+    return g_catch_rel + FVector{-S.grip_behind_catch, S.grip_side, 0} + down_grip * along;
+}
+
+// Lowest point of the gun's trigger guard in the gun frame (from its mesh
+// bounds), found by part name.
+void FindTriggerGuard(UObject gun, const hands::Pose& main) {
+    g_guard_known = false;
+    for (UObject cls = ue::GetClass(gun); cls && !g_guard_known; cls = ue::reflection::GetSuper(cls)) {
+        for (const auto& p : ue::reflection::GetProperties(cls)) {
+            if (p.type != "ObjectProperty" || Lower(p.name).find("triggerguard") == std::string::npos) continue;
+            UObject comp = 0;
+            if (!mem::Read(gun + p.offset, comp) || !comp) continue;
+            ue::Call lb(comp, "GetLocalBounds");
+            ue::Call tw(comp, "K2_GetComponentToWorld");
+            if (!lb.Invoke() || !tw.Invoke()) continue;
+            FVector mn = lb.Get<FVector>("Min"), mx = lb.Get<FVector>("Max");
+            Xf t = tw.Result<Xf>();
+            double low = 1e9;
+            for (int i = 0; i < 8; ++i) {
+                FVector c{(i & 1) ? mx.X : mn.X, (i & 2) ? mx.Y : mn.Y, (i & 4) ? mx.Z : mn.Z};
+                FVector w = t.translation + t.rotation.Rotate(FVector{c.X * t.scale.X, c.Y * t.scale.Y, c.Z * t.scale.Z});
+                low = std::min(low, main.rotation.Inverse().Rotate(w - main.location).Z);
+            }
+            if (low > -20.0 && low < 30.0) {
+                g_guard_bottom = low;
+                g_guard_known = true;
+                log::Info("body: trigger guard %s bottom at %.1f cm (gun frame)", p.name.c_str(), low);
+            }
+            break;
+        }
+    }
 }
 void LogGunGeometry(uintptr_t gun, const hands::Pose& main) {
     if (!gun || gun == g_logged_gun) return;
@@ -568,6 +614,7 @@ void LogGunGeometry(uintptr_t gun, const hands::Pose& main) {
     }
     log::Info("body: gun %s parts in gun frame from MainHandPosition (barrel, right, up cm):%s",
               ue::GetName(gun).c_str(), line.c_str());
+    FindTriggerGuard(gun, main);
     if (g_catch_known) {
         FVector c = GripCentre();
         log::Info("body: holding %s by the grip at (%.1f %.1f %.1f) in the gun frame", ue::GetName(gun).c_str(), c.X,
@@ -1028,6 +1075,17 @@ void SolveArm(int side, const hands::HandState& h, const FVector& body_fwd, cons
             double want = c * deg[n] * kDegToRad;
             // Trigger discipline: off the trigger the index finger lies along
             // the frame, pointing where the barrel points.
+            // Thumb on a pistol grip (reference photos): straight, high on the
+            // weak side of the frame, pointing forward like the barrel.
+            if (grab.kind == hands::GrabKind::kGunGrip && f == hand_pose::kThumb) {
+                if (n == 0) {
+                    FVector dir = BoneW(j[1]).translation - BoneW(j[0]).translation;
+                    RotateBoneW(j[0], ClampAngle(Arc(dir, barrel_w), S.thumb_aim_max * kDegToRad));
+                    G.contact[side][f][0] = 1.0;
+                    continue;
+                }
+                want = 6.0 * kDegToRad;
+            }
             if (index_straight && f == hand_pose::kIndex) {
                 if (n == 0) {
                     FVector dir = Normalize(b - a);
