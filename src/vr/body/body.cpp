@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <cmath>
 #include <map>
 #include <string>
@@ -62,6 +63,7 @@ struct Settings {
     double neck_down = 14.0;      // cm from the eyes down to the base of the neck, in head space
     double neck_back = 8.0;       // cm from the eyes back to the base of the neck
     double grip_angle = 20.0;     // pistol grip slant, degrees
+    double gun_hand[3] = {1.5, 0, 7};  // fist offset from MainHandPosition in the gun frame (barrel, right, up), cm
     double wrist_twist_share = 0.75;  // how much of the wrist twist the forearm takes
     bool animated_upper_body = false; // false: spine/neck/shoulders ignore the game's animation (recoil etc.)
 } S;
@@ -91,6 +93,9 @@ void LoadSettings() {
     S.neck_down = config::GetFloat("body_neck_below_eyes_cm", 14.f);
     S.neck_back = config::GetFloat("body_neck_behind_eyes_cm", 8.f);
     S.grip_angle = config::GetFloat("hand_grip_angle", 20.f);
+    S.gun_hand[0] = config::GetFloat("hand_on_gun_forward_cm", 1.5f);
+    S.gun_hand[1] = config::GetFloat("hand_on_gun_right_cm", 0.f);
+    S.gun_hand[2] = config::GetFloat("hand_on_gun_up_cm", 7.f);
     S.wrist_twist_share = config::GetFloat("body_wrist_twist_share", 0.75f);
     S.animated_upper_body = config::GetBool("body_animated_upper_body", false);
 }
@@ -475,6 +480,29 @@ void SolveChain(const Bone& root_b, const Bone& mid_b, const Bone& end_b, const 
     RotateBoneW(mid_b, Arc(e - m.translation, sol.end - m.translation));
 }
 
+// Once per gun: where its parts sit in the gun frame relative to
+// MainHandPosition, so the hand-on-grip offset can be computed instead of
+// eyeballed.
+UObject g_logged_gun = 0;
+void LogGunGeometry(uintptr_t gun, const hands::Pose& main) {
+    if (!gun || gun == g_logged_gun) return;
+    g_logged_gun = gun;
+    std::string line;
+    for (const char* name : {"MagazinePoint", "ChargingHandPoint", "GunParts_Trigger", "GunParts_Bolt(Slide)",
+                             "GunParts_MagazineCatch", "MainHandPosition", "SubHandPosition"}) {
+        UObject comp = 0;
+        if (!ue::GetProp(gun, name, comp) || !comp) continue;
+        ue::Call c(comp, "K2_GetComponentToWorld");
+        if (!c.Invoke()) continue;
+        FVector rel = main.rotation.Inverse().Rotate(c.Result<Xf>().translation - main.location);
+        char buf[128];
+        std::snprintf(buf, sizeof(buf), " %s=(%.1f %.1f %.1f)", name, rel.X, rel.Y, rel.Z);
+        line += buf;
+    }
+    log::Info("body: gun %s parts in gun frame from MainHandPosition (barrel, right, up cm):%s",
+              ue::GetName(gun).c_str(), line.c_str());
+}
+
 void SolveArm(int side, const hands::HandState& h, const FVector& body_fwd, const FVector& body_right,
               double dt) {
     const Skeleton& k = G.skel;
@@ -511,6 +539,11 @@ void SolveArm(int side, const hands::HandState& h, const FVector& body_fwd, cons
         double a = S.grip_angle * kDegToRad;
         fwd = Normalize(up * std::cos(a) + barrel * std::sin(a));
         palm = side == kL ? right : right * -1.0;
+        // The game's MainHandPosition sits below the middle of the grip
+        // (fourth headset test: fist about 7 cm low and 1.5 cm behind), so
+        // move the fist up the grip in the gun's own frame.
+        fist = fist + barrel * S.gun_hand[0] + right * S.gun_hand[1] + up * S.gun_hand[2];
+        LogGunGeometry(grab.object, grab.target);
     }
 
     FQuat hand_rot;
