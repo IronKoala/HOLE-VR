@@ -92,6 +92,7 @@ struct Settings {
     double pouch_down = 55.0;
     double pouch_radius = 14.0;
     bool wall_collision = true;    // keep the gun out of walls
+    double recoil_kick = 1.0;      // scale of the in-hand recoil kick, 0 = off
     bool log_grabs = true;
 };
 Settings g_set;
@@ -107,6 +108,7 @@ void LoadSettings() {
     g_set.gun_yaw = config::GetFloat("gun_yaw_offset", 0.f);
     g_set.gun_roll = config::GetFloat("gun_roll_offset", 0.f);
     g_set.wall_collision = config::GetBool("gun_wall_collision", true);
+    g_set.recoil_kick = config::GetFloat("gun_recoil_kick", 1.f);
     g_set.gun_forward = config::GetFloat("gun_forward_offset_cm", 0.f);
     g_set.gun_right = config::GetFloat("gun_right_offset_cm", 0.f);
     g_set.pouch_forward = config::GetFloat("mag_pouch_forward_cm", 15.f);
@@ -258,6 +260,9 @@ struct WeaponState {
     UObject learn_mag = 0;
     double learn_at = -1;
     double trace_until = -1;      // per-frame rack trace (diagnosing the chamber hitch)
+    int last_rounds = -1;         // chamber + magazine last frame, to detect shots
+    bool last_has_mag = false;
+    double kick_t0 = -1;          // time of the last shot, for the in-hand kick
     FVector gun_set_loc;          // where HoldGun put the gun this frame
 } W;
 
@@ -418,14 +423,24 @@ void HoldGun(game::Gun& gun, const hands::HandState& rh) {
     // Third test: barrel about 5 degrees left of where the hand points.
     constexpr double kBasePitch = -30.0;
     constexpr double kBaseYaw = 5.0;
-    FQuat hand = rh.aim.rotation * ToQuat(FRotator{kBasePitch + g_set.gun_pitch,
+    // Recoil kick: the muzzle flips up and the gun pushes back into the hand,
+    // then returns (about 20 ms up, 100 ms back). Visual only; aim is the hand.
+    double kick = 0;
+    if (W.kick_t0 >= 0 && g_set.recoil_kick > 0) {
+        double t = g_clock - W.kick_t0;
+        if (t > 0.4) W.kick_t0 = -1;
+        else kick = g_set.recoil_kick * (1.0 - std::exp(-t / 0.012)) * std::exp(-t / 0.07) * 1.6;
+    }
+    constexpr double kKickPitch = 7.0, kKickBack = 2.0;   // degrees, cm at full kick
+    FQuat hand = rh.aim.rotation * ToQuat(FRotator{kBasePitch + g_set.gun_pitch + kick * kKickPitch,
                                                    kBaseYaw + g_set.gun_yaw, g_set.gun_roll});
     FQuat rot = W.have_frame ? hand * W.gun_frame.Inverse() : hand;
     // `hand` is the gun's own frame in the world (X barrel, Y right, Z up).
     // Fourth test: gun sat about 5 cm too far forward and 1.3 cm too far left.
     // Fifth test: about 5 cm too high.
     constexpr double kBaseForward = -5.0, kBaseRight = 1.3, kBaseUp = -5.0;
-    FVector shift = hand.Rotate(FVector{kBaseForward + g_set.gun_forward, kBaseRight + g_set.gun_right, kBaseUp});
+    FVector shift = hand.Rotate(FVector{kBaseForward + g_set.gun_forward - kick * kKickBack,
+                                        kBaseRight + g_set.gun_right, kBaseUp});
     FVector loc = rh.grip.location + shift - rot.Rotate(rel);
     loc = loc + WallPushback(g, hand, rh.grip.location + shift);
     SetActorTransform(g, loc, rot);
@@ -935,6 +950,18 @@ void OnTick(UObject player, float dt) {
     }
     HookChargeTimeline();
     HookPlayerRecoil(player);
+    {
+        // A round leaving the gun while the trigger is held = a shot (works
+        // for full auto too). Racking also removes a round, but not with the
+        // trigger held and the slide untouched.
+        game::GunState st = gun.State();
+        int rounds = st.chamber + (st.magazine > 0 ? st.magazine : 0);
+        if (W.last_rounds >= 0 && rounds < W.last_rounds && st.has_magazine == W.last_has_mag &&
+            s.hand[input::kRight].trigger_button.down && !W.slide.Held())
+            W.kick_t0 = g_clock;
+        W.last_rounds = rounds;
+        W.last_has_mag = st.has_magazine;
+    }
     if (!W.timeline_fast) {
         // The game's charge timeline only has to update its ammo state; the
         // hand already moved the slide. Run it 10x faster so the round is

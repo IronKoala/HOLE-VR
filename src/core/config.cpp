@@ -85,6 +85,8 @@ const Block kBlocks[] = {
      "gun_right_offset_cm=0\n"
      "; 1 = the gun stops at walls instead of passing through them.\n"
      "gun_wall_collision=1\n"
+     "; Strength of the gun's kick in your hand when it fires (0 = off, 1 = normal).\n"
+     "gun_recoil_kick=1\n"
      "; Spare magazine pouch, measured from your headset: forward, right (+) or\n"
      "; left (-), and down, in cm. Grab within the radius to take a magazine.\n"
      "mag_pouch_forward_cm=15\n"
