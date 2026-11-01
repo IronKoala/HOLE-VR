@@ -150,6 +150,8 @@ bool Gun::EndBoltCharging() {
     return c.Invoke();
 }
 
+bool Gun::ClearSlideLock() { return ue::SetProp<bool>(self_, "IsBolt(Slide)Stopped", false); }
+
 bool Gun::ReleaseSlideCatch() { return CallSimple("Gun_ReleaseBolt"); }
 
 }  // namespace holevr::game

@@ -76,7 +76,10 @@ const Block kBlocks[] = {
      "move_direction=0\n"
      "stick_deadzone=0.15\n"
      "; Tilts the gun in your hand up (+) or down (-), degrees.\n"
-     "gun_pitch_offset=0\n"},
+     "gun_pitch_offset=0\n"
+     "; Turns the gun left (-) or right (+), and rolls it left (-) or right (+), degrees.\n"
+     "gun_yaw_offset=0\n"
+     "gun_roll_offset=0\n"},
     {"body_ik",
      "\n"
      "; --- VR body (full-body IK and hand poses). F9 in game toggles it. ---\n"

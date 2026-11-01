@@ -63,6 +63,8 @@ public:
     bool ChargeBoltRelease();
     // Clear the game's "charging" flag so the off-hand IK lets go of the slide.
     bool EndBoltCharging();
+    // Clear the game's "slide held open by the catch" flag.
+    bool ClearSlideLock();
     bool ReleaseSlideCatch();     // drop a locked-back slide, chambering a round
 
     // Calls a parameterless function on the gun by name (lab use).

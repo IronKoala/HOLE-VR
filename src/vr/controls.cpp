@@ -77,6 +77,8 @@ struct Settings {
     bool move_with_hand = false;   // false: head direction
     double deadzone = 0.15;
     double gun_pitch = 0.0;        // extra pitch on the held gun, degrees
+    double gun_yaw = 0.0;
+    double gun_roll = 0.0;
     bool log_grabs = true;
 };
 Settings g_set;
@@ -89,6 +91,8 @@ void LoadSettings() {
     g_set.move_with_hand = config::GetInt("move_direction", 0) == 1;
     g_set.deadzone = config::GetFloat("stick_deadzone", 0.15f);
     g_set.gun_pitch = config::GetFloat("gun_pitch_offset", 0.f);
+    g_set.gun_yaw = config::GetFloat("gun_yaw_offset", 0.f);
+    g_set.gun_roll = config::GetFloat("gun_roll_offset", 0.f);
 }
 
 // ---- shared hand state for other systems ----
@@ -206,6 +210,8 @@ struct WeaponState {
     bool have_frame = false;
     FQuat gun_frame;           // gun frame (X barrel, Z up) expressed in actor space
     double check_chamber_at = -1;
+    double pending_release_at = -1;
+    bool retried_rack = false;
 } W;
 
 double Len(const FVector& v) { return std::sqrt(v.X * v.X + v.Y * v.Y + v.Z * v.Z); }
@@ -270,11 +276,23 @@ bool LearnGunFrame(UObject g, const FVector& actor_loc, const FQuat& actor_rot, 
         if (DotV(bore, fwd) < 0) bore = bore * -1.0;  // keep it pointing toward the muzzle
         fwd = Norm(bore);
     }
+    // Gun models are built along one of the actor's own axes; the parts
+    // under it can be tilted for the flat-screen animations (seen in the
+    // first headset test: the bore came out 12 degrees off +Y). Snap to the
+    // nearest actor axis when it is close.
+    auto snap = [](FVector v) {
+        const FVector axes[6] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+        for (const FVector& a : axes)
+            if (DotV(v, a) > 0.9) return a;
+        return v;
+    };
+    fwd = snap(fwd);
     FVector up_guess{0, 0, 1};
     if (sight) up_guess = inv.Rotate(ComponentToWorld(sight).translation - actor_loc) - grip;
     FVector up = up_guess - fwd * DotV(up_guess, fwd);
     if (Len(up) < 0.5) up = FVector{0, 0, 1} - fwd * fwd.Z;
-    up = Norm(up);
+    up = snap(Norm(up));
+    if (std::fabs(DotV(up, fwd)) > 0.01) up = Norm(up - fwd * DotV(up, fwd));
     FVector right = Cross(up, fwd);
     W.gun_frame = FromAxes(fwd, right, up);
     W.have_frame = true;
@@ -297,7 +315,7 @@ void HoldGun(game::Gun& gun, const hands::HandState& rh) {
     FVector rel = actor_rot.Inverse().Rotate(main_world.translation - actor_loc);
 
     if (!W.have_frame) LearnGunFrame(g, actor_loc, actor_rot, main_world.translation);
-    FQuat hand = rh.aim.rotation * ToQuat(FRotator{g_set.gun_pitch, 0, 0});
+    FQuat hand = rh.aim.rotation * ToQuat(FRotator{g_set.gun_pitch, g_set.gun_yaw, g_set.gun_roll});
     FQuat rot = W.have_frame ? hand * W.gun_frame.Inverse() : hand;
     FVector loc = rh.grip.location - rot.Rotate(rel);
     SetActorTransform(g, loc, rot);
@@ -373,12 +391,30 @@ void SlideHandling(game::Gun& gun, const hands::HandState& lh, const input::Hand
     if (W.check_chamber_at > 0 && g_clock >= W.check_chamber_at) {
         W.check_chamber_at = -1;
         game::GunState st = gun.State();
-        if (st.chamber == 0 && st.has_magazine && st.magazine > 0) {
-            gun.ReleaseSlideCatch();
-            log::Info("controls: chamber still empty after rack, released the slide catch");
-            W.end_charging_at = g_clock + 0.4;
+        if (st.chamber == 0 && st.has_magazine && st.magazine > 0 && !W.retried_rack) {
+            // Still empty: cycle the action once more (this is what loads a round).
+            W.retried_rack = true;
+            gun.ChargeBoltPull();
+            W.pending_release_at = g_clock + 0.3;
+            log::Info("controls: chamber still empty, cycling again");
+        } else {
+            W.retried_rack = false;
+            // A rack always takes the slide off the slide catch. The game only
+            // clears its "slide stopped" flag through its own animation, and a
+            // gun with that flag set will not fire, so clear it here.
+            if (st.slide_locked) {
+                gun.ClearSlideLock();
+                gun.RestoreSlide();
+                log::Info("controls: cleared the slide lock");
+            }
+            log::Info("controls: rack, after: %s", gun.State().Describe().c_str());
         }
-        log::Info("controls: rack, after: %s", gun.State().Describe().c_str());
+    }
+    if (W.pending_release_at > 0 && g_clock >= W.pending_release_at) {
+        W.pending_release_at = -1;
+        gun.ChargeBoltRelease();
+        W.end_charging_at = g_clock + 0.4;
+        W.check_chamber_at = g_clock + 0.6;
     }
 }
 
@@ -389,6 +425,8 @@ void MagazineHandling(game::Gun& gun, const hands::HandState& lh, const input::H
         log::Info("controls: slide release (B), before: %s", gun.State().Describe().c_str());
         gun.ReleaseSlideCatch();
         W.end_charging_at = g_clock + 0.4;
+        W.check_chamber_at = g_clock + 0.6;
+        input::Haptic(input::kRight, 0.5f, 0.04f);
     }
     if (rin.primary.pressed && gun.State().has_magazine) {
         log::Info("controls: mag release, before: %s", gun.State().Describe().c_str());
