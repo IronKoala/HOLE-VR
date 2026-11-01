@@ -1,79 +1,114 @@
-# VR body: full-body IK and hand poses
+# VR body: full-body IK and hand grips (version 2)
 
-Code: `src/vr/body/` (`body.cpp` engine glue, `ik_math.*` and `hand_pose.*` pure
-logic with tests in `tests/test_body.cpp`). Inputs come from `src/vr/hands.h`
-(owned by the controls work): hand/head poses, `GetGrab()` (what each hand
-holds and where the hand should sit) and `GetFingers()` (trigger/grip/touch).
+Code: `src/vr/body/`. `body.cpp` is the engine glue; everything else is pure
+logic with tests (`tests/test_body.cpp`, `tests/test_grip.cpp`):
 
-## How it works
+| File | What it does |
+|---|---|
+| `skeleton.*` | The whole pose in our own memory: local + component transforms, parent links, subtree updates |
+| `finger_solve.*` | Fingers solved once to fingertip targets, within joint limits, keeping out of the object's outline |
+| `grip_record.*` | Stored grips (Into the Radius 1 format), the built-in pistol grip, file format, mirroring, clip depth |
+| `grip_editor.*` | In-headset grip editor state machine |
+| `ik_math.*` | Vectors, rotations, two-bone solver |
+| `hand_pose.*` | Simple finger curls for empty hands and objects without a stored grip |
+| `grip_probe.*` | The old ray scan of a gun, no longer used at runtime; kept as a measuring tool |
 
-- The game's `BodyMesh` (ALS animation, game camera on its head) keeps running
-  but is hidden, forced to LOD0 and to refresh bones while hidden.
-- A `PoseableMeshComponent` with the same mesh and materials is added to the
-  player and attached to `BodyMesh`. Every game frame it copies the animated
-  pose, then we overwrite:
-  - **Pelvis**: yaw follows the headset with a dead zone (`body_turn_deadzone`),
-    catching up while moving; drops when you crouch; shifts when you lean past
-    `body_max_lean_cm`.
-  - **Spine**: bends (spread over all spine bones) so the neck sits under the
-    real head.
-  - **Arms**: analytic two-bone IK from the animated shoulder to the hand
-    target, elbow bending in the arm's own hinge plane, pole down/out/back.
-    While a hand holds something (`GrabKind`) the target is the held point.
-  - **Hands**: the avatar hand's frame is measured from its finger bases
-    (index/middle/pinky), so any skeleton maps onto the controller grip axis
-    and palm direction without per-mesh numbers.
-  - **Pistol grip**: the game's `MainHandPosition` is where its *wrist* goes
-    (the gun's parts all sit ~8 cm forward/left/up of it), and the game's own
-    hand does not wrap the grip, so neither is copied. The fist closes on the
-    grip centre found from the gun's `GunParts_MagazineCatch` (top front of
-    the grip): 2.5 cm back and 4.5 cm down the slanted grip, on the gun's
-    centre line. Settings `hand_grip_*`.
-  - **Scanned pistol grip** (`grip_probe.cpp`, default on,
-    `hand_grip_from_gun_scan`): the parts report no size, so the gun is
-    measured with rays when picked up: a 0.5 cm grid over its side in the gun
-    frame, one ray from the right and one from the left per cell (~7300 rays,
-    160 per frame, about half a second). That gives the gun's outline and
-    both side surfaces. From it: grip bottom, the trigger guard (first thing
-    right in front of the front strap), front/back strap, grip width and
-    slant. The right hand is then placed from the avatar's measured knuckles:
-    pinky->index up the grip axis, palm facing the grip's right side, middle
-    knuckle one finger radius under the guard at the front strap, palm skin
-    on the right side, pushed out if any palm point is inside. The thumb
-    swings from the web around the back of the grip to the LEFT side and lies
-    straight forward under the slide; its path is checked against the scan.
-    Finger contact then tests the scan instead of traces. The log shows the
-    measurements (`body: scanned ...`) and a clip check (`body: clip check`,
-    deepest finger/palm point inside the gun) a few times per gun. If the scan
-    fails the old placement below is used.
-  - **Finger contact**: while holding a gun/slide/magazine, each finger joint
-    curls only until its segment (offset by `finger_radius_cm`) touches the
-    held object. The gun's parts have no collision in the game, so they get
-    query-only collision that ignores every channel (nothing in the game can
-    hit them) and are tested with `K2_LineTraceComponent` (one component,
-    never the world). Magazines use boxes from their mesh bounds, and their
-    collision is left alone so dropped ones still land.
-  - **Palm seat**: a ray from outside the palm toward the grip centre finds
-    the grip's surface and the palm skin (`hand_palm_skin_cm`) is put there,
-    so the grip never ends up inside a big hand.
-  - **Trigger discipline**: off the trigger the index finger's base joint
-    turns it parallel to the barrel, lying along the frame.
-  - **Fingers**: reset to the reference pose, then curled about the palm
-    hinge axis by `hand_pose::Target()` (gun grip with trigger discipline,
-    trigger pull, slide pinch, magazine hold, free hand from the sensors).
-  - **Legs**: two-bone IK keeps the animated feet planted.
-  - **Head**: scaled to zero so it never blocks the view.
-- Clothing/hair meshes that used `BodyMesh` as their leader pose are switched to
-  the copy. F9 (or `body_ik=0`) puts the game's own body back.
+Version 1 tried to work the grip out from the gun's shape every frame
+(scans, finger traces, palm seating). It never matched the reference photos
+and cost 13-17 ms a frame. Version 2 follows what shipped VR shooters do
+(research: "How six VR games put hands on guns and swords", and the
+Half-Life: Alyx write-up in `research/`).
 
-Bones are found by name (UE4/UE5 mannequin and Mixamo spellings); the full bone
-list is logged on first use (`body:` lines in `hole-vr.log`).
+## Speed: one read and one write per frame
 
-## To check in the first playtest
+Every `Get/SetBoneTransformByName` on the poseable mesh rebuilds the whole
+skeleton (~40 us), and version 1 made ~300 of them a frame. Now:
 
-- Log: bone list, `skeleton ... arms L1 R1 ... fingers L1 R1`, `VR body on`.
-- Hands sit on the controllers and the right hand wraps the pistol grip;
-  index finger rests along the frame until you touch the trigger.
-- Elbows bend naturally (down and out); no twisted wrists.
-- Fingers curl the right way (if they bend backwards, the palm sign is off).
-- Crouch in real life: the body crouches, feet stay on the floor.
+1. `CopyPoseFromSkeletalComponent` (the game's animated pose),
+2. one memory copy of the bone array (`BoneSpaceTransforms`, found once at
+   startup by scanning the component and proving the engine reads it:
+   log `body: fast pose path on (bone array at +0x...)`),
+3. all IK in `skel::Pose` (about 10 us of maths),
+4. one memory copy back of the bones that changed, plus one engine call so
+   the renderer picks it up.
+
+If the array can't be found the slow per-bone calls are used and the log says
+so. The `perf:` line has `body tick`, `body engine read+write`, `body solve`
+and `body grip solve (once per grip)`.
+
+## Hands on objects: stored grips
+
+A grip record (`hole-vr/grips/<class>.<kind>.ini`, e.g. `BP_HG_C.grip.ini`)
+holds, in the object's frame: the middle knuckle position, the
+wrist->knuckle and pinky->index directions, and a target point per fingertip
+(thumb, index off the trigger / resting on it / pulled, middle, ring, pinky),
+plus an outline of boxes for the clip check. When the hand takes the object,
+the fingers are solved to the targets once (a few ms, cached per record) and
+held. Only the index finger is live: it blends between its three stored
+states from trigger touch and the analog trigger.
+
+- Pistol grip: built in (`grip_record::DefaultPistol`), from the owner's
+  reference photos and the measured pistol: high grip, middle finger just
+  under the trigger guard, thumb forward along the LEFT side of the frame,
+  index straight along the right side above the guard. The thumb's side is a
+  stored choice, so it can't flip.
+- Magazine, slide, charging handle, rifle handguard: no built-in grip yet;
+  the hand sits on the controller with a simple curl until a grip is made in
+  the editor.
+- Object frames: gun = X barrel, Y right, Z up at `MainHandPosition`;
+  slide/handguard = gun frame at the point held; magazine = the magazine
+  actor.
+
+The log shows, for each grip: how far each fingertip ended from its target
+and how deep anything sits inside the object's outline
+(`body: grip ... clip check: deepest 0.2 cm ...`).
+
+## Grip editor (in the headset)
+
+Hold **left Y for 1 s** while holding the pistol: the editor is on and the
+left controller becomes the editing hand (its buttons stop reaching the game,
+and the gun won't fire). Squeeze grip near a fingertip and move it: that
+finger re-solves live. Squeeze near the palm: the whole hand moves and turns
+with the controller. Pull the real trigger to edit the "resting" and
+"pulled" index poses. **Tap Y** to save, **click the left stick** to undo to
+the saved grip, **hold Y 1 s** to save and finish. With a magazine, the slide
+or a handguard in the left hand, the same buttons edit that grip and the
+right controller does the moving.
+
+## Body
+
+- **Arm length is measured once**: stand straight, arms straight out to the
+  sides, hold the left stick click for 2 s, keep the pose through three
+  buzzes. Saved in `hole-vr/body-measure.ini`. No more live arm growth.
+  Before measuring, arms may stretch up to 15 %; after, 4 %
+  (`body_max_arm_stretch*`). Stretch moves bones, never scales them.
+- **Shoulders from the head** (Blade & Sorcery): one head unit (eye height /
+  7.5) below the eyes and half a unit behind, along the head's level facing.
+  The pelvis moves and the spine bends to put the avatar's shoulders there.
+- **Body turn**: 25° threshold (Into the Radius 1 / Final IK), leaning 30 %
+  toward where the hands are, catching up while walking.
+- **Collarbones** move only when reaching (from 85 % of arm length, up to
+  25°, smoothed).
+- **Elbows** hang down/out/back and follow the hand's pinky side (palm down
+  swings the elbow out); if the wrist would still bend past ~55° (flex) or
+  ~25° (sideways), the elbow swings further, up to 60°.
+- **Forearm roll**: the hand's twist about the forearm is split: forearm bone
+  50 %, forearm twist bone 100 %, then the hand gets its exact rotation, so
+  the wrist never twists.
+- Legs keep the animated feet planted; head hidden; fixed player height
+  unchanged.
+- `body fit:` log line every 10 s: arm scale and whether it was measured,
+  reach as % of arm, gap between hand and target, wrist bend, forearm twist,
+  elbow swing, body yaw lag.
+
+## Settings
+
+New keys (an old key keeps its old value in existing ini files, so changed
+defaults get new names): `body_turn_threshold_deg`, `body_turn_toward_hands`,
+`body_arm_scale_override`, `body_max_arm_stretch`,
+`body_max_arm_stretch_unmeasured`, `body_shoulder_below_eyes_cm`,
+`body_shoulder_behind_eyes_cm`, `body_forearm_roll_share`,
+`body_forearm_twist_bone_share`, `body_elbow_follow_hand`,
+`body_elbow_relieves_wrist`, `hand_grip_records`, `hand_finger_radius_cm`,
+`body_fit_log`. Version 1 keys (scan, palm seat, contact, grip offsets) are
+ignored.

@@ -288,9 +288,17 @@ public:
             }
             parent.push_back(pi);
         }
-        Locate();
         return true;
     }
+
+    // Looks for the bone array; call after the component has a pose. Gives
+    // up (slow path) after a few tries.
+    void TryLocate() {
+        if (Fast() || locate_tries >= 10) return;
+        ++locate_tries;
+        Locate(locate_tries == 10);
+    }
+    int locate_tries = 0;
 
     bool Fast() const { return local_off >= 0; }
     int Count() const { return static_cast<int>(names.size()); }
@@ -367,7 +375,7 @@ private:
         return Length(a.translation - b.translation) < 0.05 && dot > 0.9999;
     }
 
-    void Locate() {
+    void Locate(bool last_try) {
         const int n = Count();
         // Bones deep in the tree make the test strict.
         std::vector<int> probe = {n - 1, n / 2, n / 3};
@@ -415,7 +423,8 @@ private:
             log::Info("body: fast pose path on (bone array at +0x%x, %d bones)", off, n);
             return;
         }
-        log::Error("body: bone array not found, using the slow per-bone engine calls (expect several ms per frame)");
+        if (last_try)
+            log::Error("body: bone array not found, using the slow per-bone engine calls (expect several ms per frame)");
     }
 };
 
@@ -778,18 +787,19 @@ int TipFinger(int tip) {
 
 bool IsGrab(hands::GrabKind k) {
     return k == hands::GrabKind::kGunGrip || k == hands::GrabKind::kSlideGrab || k == hands::GrabKind::kMagHeld ||
-           k == hands::GrabKind::kMagInsert;
+           k == hands::GrabKind::kMagInsert || k == hands::GrabKind::kSupportGrip;
 }
 
 // The frame a grip is stored in. Gun: the gun frame at its grip point.
-// Slide: the gun frame at the point where the hand took the slide. Magazine:
-// the magazine itself.
+// Slide / charging handle / rifle handguard: the gun frame at the point the
+// hand holds. Magazine: the magazine itself.
 bool ObjectFrame(const hands::HandGrab& grab, const hands::HandGrab& right, hands::Pose* out) {
     switch (grab.kind) {
         case hands::GrabKind::kGunGrip:
             *out = grab.target;
             return true;
         case hands::GrabKind::kSlideGrab:
+        case hands::GrabKind::kSupportGrip:
             out->location = grab.target.location;
             out->rotation = right.kind == hands::GrabKind::kGunGrip && right.object == grab.object
                                 ? right.target.rotation
@@ -815,6 +825,7 @@ std::string RecordKey(const hands::HandGrab& grab) {
     switch (grab.kind) {
         case hands::GrabKind::kGunGrip: return cls + ".grip";
         case hands::GrabKind::kSlideGrab: return cls + ".slide";
+        case hands::GrabKind::kSupportGrip: return cls + ".support";
         default: return cls + ".mag";
     }
 }
@@ -926,6 +937,7 @@ int g_edit_side = -1;      // hand whose grip is edited
 int g_edit_ctrl = -1;      // controller doing the editing
 FVector g_tip_world[2][gr::kTipCount];
 FVector g_palm_world[2];
+Xf g_hand_world[2];
 bool g_tips_valid[2] = {false, false};
 
 void StopEditor() {
@@ -996,7 +1008,7 @@ void UpdateEditor(const hands::HandGrab grab[2], const hands::HandState hs[2], d
             g.rec = gr::Record{};
             g.rec.name = g.key;
             g.rec.right_hand = side == kR;
-            Xf hw = WX(G.skel.hand[side]);
+            const Xf& hw = g_hand_world[side];  // last frame's posed hand
             gr::StoreHand(&g.rec, G.rig[side].geo, Normalized(inv * hw.rotation), local(hw.translation));
             for (int t = 0; t < gr::kTipCount; ++t) g.rec.tip[t] = sc.tip[t];
             g.have = true;
@@ -1330,6 +1342,7 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
         g_tip_world[side][t] = skel::Apply(hw, tip);
     }
     g_palm_world[side] = skel::Apply(hw, rig.palm_centre);
+    g_hand_world[side] = hw;
     g_tips_valid[side] = true;
 }
 
@@ -1402,16 +1415,21 @@ void OnTick(UObject player, float dt_f) {
 
     {
         perf::Scope t(g_perf_engine);
+        auto copy_pose = [] {
+            ue::Call copy(G.pose_comp, "CopyPoseFromSkeletalComponent");
+            copy.Set("InComponentToCopy", G.source);
+            return copy.Invoke();
+        };
+        if (!copy_pose()) return;
+        G.engine.TryLocate();
         if (G.ref_pending) {
             CaptureReference();
             if (G.failed) {
                 Deactivate();
                 return;
             }
+            copy_pose();
         }
-        ue::Call copy(G.pose_comp, "CopyPoseFromSkeletalComponent");
-        copy.Set("InComponentToCopy", G.source);
-        if (!copy.Invoke()) return;
         if (!G.engine.Read(&G.frame_local)) return;
         g_w = ComponentToWorld(G.pose_comp);
     }

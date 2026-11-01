@@ -1,10 +1,12 @@
 // Native unit tests for the skeleton pose, fingertip solver and grip records.
 //   g++ -std=c++20 -Isrc tests/test_grip.cpp src/vr/body/ik_math.cpp src/vr/body/skeleton.cpp
 //       src/vr/body/finger_solve.cpp src/vr/body/grip_record.cpp -o /tmp/test_grip && /tmp/test_grip
+#include <chrono>
 #include <cstdio>
 #include <string>
 
 #include "vr/body/finger_solve.h"
+#include "vr/body/grip_editor.h"
 #include "vr/body/grip_record.h"
 #include "vr/body/skeleton.h"
 
@@ -188,7 +190,80 @@ static void TestDefaultPistolOnHand() {
     EXPECT(worst < 0.5);
 }
 
+static void TestEditor() {
+    grip_editor::Editor ed;
+    grip_record::Record rec = grip_record::DefaultPistol();
+    FQuat hr;
+    FVector hp{1, 2, 3};
+    grip_editor::Scene sc;
+    for (int t = 0; t < grip_record::kTipCount; ++t) sc.tip[t] = rec.tip[t];
+    sc.palm = {0, 0, 8};
+    grip_editor::Input in;
+    in.dt = 0.1;
+    // Short Y taps do nothing while off; a 1 s hold turns it on.
+    in.y_down = true;
+    grip_editor::Output o;
+    for (int i = 0; i < 5; ++i) o = ed.Update(in, sc, &rec, &hr, &hp);
+    EXPECT(!ed.Active());
+    for (int i = 0; i < 6; ++i) o = ed.Update(in, sc, &rec, &hr, &hp);
+    EXPECT(ed.Active());
+    in.y_down = false;
+    o = ed.Update(in, sc, &rec, &hr, &hp);
+    EXPECT(!o.save);  // releasing after the long hold is not a tap
+    // Grab near the thumb tip and drag 1 cm forward: only the thumb target moves.
+    FVector thumb0 = rec.tip[grip_record::kThumb], mid0 = rec.tip[grip_record::kMiddle];
+    in.pointer = thumb0 + FVector{0, -1, 0};
+    in.grab_down = true;
+    o = ed.Update(in, sc, &rec, &hr, &hp);
+    EXPECT(o.grabbed == grip_record::kThumb);
+    in.pointer = in.pointer + FVector{1, 0, 0};
+    o = ed.Update(in, sc, &rec, &hr, &hp);
+    EXPECT(o.changed && Near(rec.tip[grip_record::kThumb], thumb0 + FVector{1, 0, 0}));
+    EXPECT(Near(rec.tip[grip_record::kMiddle], mid0));
+    in.grab_down = false;
+    ed.Update(in, sc, &rec, &hr, &hp);
+    // Grab the palm and turn: the hand turns with the controller.
+    in.pointer = sc.palm;
+    in.grab_down = true;
+    ed.Update(in, sc, &rec, &hr, &hp);
+    in.pointer_rot = AxisAngle({0, 0, 1}, 0.2);
+    o = ed.Update(in, sc, &rec, &hr, &hp);
+    EXPECT(o.grabbed == grip_editor::kHandItem && Near(hr.Z, std::sin(0.1), 1e-6));
+    in.grab_down = false;
+    // A tap saves; a long hold saves and stops.
+    in.y_down = true;
+    ed.Update(in, sc, &rec, &hr, &hp);
+    in.y_down = false;
+    o = ed.Update(in, sc, &rec, &hr, &hp);
+    EXPECT(o.save && ed.Active());
+    in.y_down = true;
+    bool saved = false;
+    for (int i = 0; i < 11; ++i) saved |= ed.Update(in, sc, &rec, &hr, &hp).exited;
+    EXPECT(saved && !ed.Active());
+}
+
+// Rough cost of a frame's pose math: a 68-bone tree, ~60 bone edits with
+// subtree updates, as the body tick does. Printed, not asserted.
+static void BenchPose() {
+    std::vector<int> parent(68);
+    parent[0] = -1;
+    for (int i = 1; i < 68; ++i) parent[i] = (i % 4 == 1) ? 0 : i - 1;
+    skel::Pose pose;
+    pose.Init(parent);
+    std::vector<Xf> local(68, X({5, 1, 0}, AxisAngle({0, 1, 1}, 0.1)));
+    auto t0 = std::chrono::steady_clock::now();
+    const int frames = 2000;
+    for (int f = 0; f < frames; ++f) {
+        pose.SetAllLocal(local.data(), 68);
+        for (int k = 0; k < 60; ++k) pose.RotateC(1 + (k * 7) % 67, AxisAngle({1, 0, 0}, 0.01));
+    }
+    double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / frames;
+    std::printf("pose math: %.0f us per frame (68 bones, 60 edits)\n", us);
+}
+
 int main() {
+    TestEditor();
+    BenchPose();
     TestCompose();
     TestPose();
     TestFingerSolve();
