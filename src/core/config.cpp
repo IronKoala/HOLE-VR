@@ -101,7 +101,7 @@ const Block kBlocks[] = {
      "body_max_lean_cm=30\n"
      "body_max_spine_bend=45\n"
      "; Hands may follow the controller this far past full arm reach (cm).\n"
-     "body_arm_stretch_cm=8\n"
+     "body_hand_reach_extra_cm=30\n"
      "; Arm length: 0 = learn it from how far you reach, or a fixed multiplier\n"
      "; such as 1.15. body_max_arm_scale caps the learned value.\n"
      "body_arm_scale=0\n"

@@ -48,7 +48,7 @@ struct Settings {
     double max_crouch = 70.0;     // cm the pelvis may drop
     double max_lean = 30.0;       // cm the head may lean away from the body before the pelvis follows
     double max_spine_bend = 45.0; // degrees
-    double arm_stretch = 8.0;     // cm the hand may still follow past full arm reach
+    double arm_stretch = 30.0;    // cm the hand may still follow past full arm reach
     double hand_offset[3] = {0, 0, 0};  // cm, in the controller's frame (fwd, right, up)
     double hand_rot[3] = {0, 0, 0};     // degrees pitch, yaw, roll applied to the hand
     double palm_depth = 3.0;
@@ -72,7 +72,8 @@ void LoadSettings() {
     S.max_crouch = config::GetFloat("body_max_crouch_cm", 70.f);
     S.max_lean = config::GetFloat("body_max_lean_cm", 30.f);
     S.max_spine_bend = config::GetFloat("body_max_spine_bend", 45.f);
-    S.arm_stretch = config::GetFloat("body_arm_stretch_cm", 8.f);
+    // Renamed from body_arm_stretch_cm (8): the hand must stay on the gun.
+    S.arm_stretch = config::GetFloat("body_hand_reach_extra_cm", 30.f);
     S.hand_offset[0] = config::GetFloat("hand_offset_forward_cm", 0.f);
     S.hand_offset[1] = config::GetFloat("hand_offset_right_cm", 0.f);
     S.hand_offset[2] = config::GetFloat("hand_offset_up_cm", 0.f);
@@ -261,6 +262,7 @@ struct State {
     int frames = 0;
     // Leg animation check: how much the game's animated feet move (relative
     // to the pelvis) while the character walks.
+    double stand_dz = -1e9;  // highest real-neck vs avatar-neck height seen: standing tall
     double diag_time = 0, diag_moving = 0, diag_foot_travel = 0;
     FVector diag_last_foot;
     bool diag_have_foot = false;
@@ -551,7 +553,7 @@ void SolveArm(int side, const hands::HandState& h, const FVector& body_fwd, cons
     FVector pole = FVector{0, 0, -1} * (1.0 - 0.6 * above) + outward * (0.7 + 0.6 * above) - body_fwd * 0.3;
     TwoBoneResult sol = SolveTwoBone(shoulder, hand_pos, upper, lower, pole, S.arm_stretch);
     SolveChain(k.upperarm[side], k.lowerarm[side], k.hand[side], sol, &G.elbow_hinge_local[side],
-               &G.hinge_known[side], G.arm_scale[side] > 1.001);
+               &G.hinge_known[side], G.arm_scale[side] > 1.001 || Length(sol.end - shoulder) > reach);
 
     // Wrist twist: a real forearm rolls along its length when you turn your
     // wrist. Give most of the roll to the forearm (and its twist bone) so
@@ -686,7 +688,11 @@ void OnTick(UObject player, float dt_f) {
     FVector neck_real = head.location + head.rotation.Rotate(FVector{-S.neck_back, 0, -S.neck_down});
     FVector delta = k.neck.ok ? neck_real - neck_anim_r : FVector{};
     if (Length(delta) > 150.0) delta = FVector{};  // teleport / recenter in progress
-    const double crouch = std::clamp(delta.Z, -S.max_crouch, 0.0);
+    // Crouch is measured against how high the player's neck has been while
+    // standing, not the avatar's height (people and the avatar differ).
+    if (delta.Z > G.stand_dz) G.stand_dz = delta.Z;
+    const double down = delta.Z - G.stand_dz;
+    const double crouch = std::clamp(down, -S.max_crouch, 0.0);
     // Most of a horizontal offset moves the whole body under the head (you
     // stepped, or the game's body stands behind its camera); the spine leans
     // for the rest, up to body_max_lean_cm.
@@ -704,7 +710,7 @@ void OnTick(UObject player, float dt_f) {
 
     // Spine leans toward the real head position.
     if (k.neck.ok && !k.spine.empty() && k.pelvis.ok) {
-        FVector neck_target = neck_anim_r + pelvis_shift + FVector{0, 0, std::max(delta.Z, -S.max_crouch - 30.0)} + lean;
+        FVector neck_target = neck_anim_r + pelvis_shift + FVector{0, 0, std::max(down, -S.max_crouch - 30.0)} + lean;
         FVector base = BoneW(k.spine[0]).translation;
         FVector neck_now = BoneW(k.neck).translation;
         FQuat bend = ClampAngle(Arc(neck_now - base, neck_target - base), S.max_spine_bend * kDegToRad);
@@ -732,11 +738,15 @@ void OnTick(UObject player, float dt_f) {
             double upper = Length(knee - hip), lower = Length(ankle - knee);
             if (upper < 1.0 || lower < 1.0) continue;
             FVector outward = s == kL ? body_right * -1.0 : body_right;
-            TwoBoneResult sol = SolveTwoBone(hip, foot_anim[s].translation, upper, lower,
+            // The walk animation turns and moves with the body: feet go
+            // where the animation puts them, relative to the turned pelvis.
+            FVector foot_target = pelvis.translation + pelvis_shift +
+                                  yaw_q.Rotate(foot_anim[s].translation - pelvis.translation);
+            TwoBoneResult sol = SolveTwoBone(hip, foot_target, upper, lower,
                                              body_fwd + outward * 0.15, 0.0);
             SolveChain(k.thigh[s], k.calf[s], k.foot[s], sol, &G.knee_hinge_local[s], &G.knee_known[s]);
             Xf foot = BoneW(k.foot[s]);
-            foot.rotation = foot_anim[s].rotation;
+            foot.rotation = Normalized(yaw_q * foot_anim[s].rotation);
             SetBoneW(k.foot[s], foot);
         }
 
