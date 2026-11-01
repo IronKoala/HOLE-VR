@@ -10,6 +10,7 @@
 #include "game/game.h"
 #include "game/gun.h"
 #include "ue/call.h"
+#include "ue/process_event.h"
 #include "vr/hands.h"
 #include "vr/input.h"
 #include "vr/interact/slide.h"
@@ -352,8 +353,9 @@ void HoldGun(game::Gun& gun, const hands::HandState& rh) {
 void Trigger(UObject player, const input::HandInput& rin) {
     if (rin.trigger_button.pressed || rin.trigger_button.released) {
         bool pressed = rin.trigger_button.down;
+        // The parameter means "trigger released": false on press, true on release.
         ue::Call c(player, "PlayerInput_UseWeapon");
-        c.Set("Press Released", pressed);
+        c.Set("Press Released", !pressed);
         c.Invoke();
         if (pressed) input::Haptic(input::kRight, 0.8f, 0.05f);
     }
@@ -619,6 +621,27 @@ void PublishGrabs(game::Gun& gun, const hands::HandState& rh, const hands::HandS
     g_grab[1] = g[1];
 }
 
+// The game's charge-bolt step plays a short timeline that snaps the slide
+// back and forward. In VR the hand already moved the slide, so after each
+// timeline frame put the slide back where the hand (or its spring) has it.
+void AfterChargeTimeline(UObject self, UObject, void*) {
+    if (!g_set.enabled || !self || self != W.gun) return;
+    game::Gun gun(self);
+    gun.SetSlideTravel(W.slide.Travel(), ue::Vec3d{-1, 0, 0});
+}
+
+void HookChargeTimeline() {
+    static bool done = false;
+    UObject cls = game::GunBaseClass();
+    if (done || !cls) return;
+    UObject update = ue::FindFunction(cls, "TL_ChargeBolt__UpdateFunc");
+    UObject finished = ue::FindFunction(cls, "TL_ChargeBolt__FinishedFunc");
+    if (update) ue::process_event::On(update, nullptr, &AfterChargeTimeline);
+    if (finished) ue::process_event::On(finished, nullptr, &AfterChargeTimeline);
+    done = true;
+    log::Info("controls: charge timeline %s", update ? "overridden by the hand" : "not found");
+}
+
 void OnTick(UObject player, float dt) {
     g_clock += dt;
     input::Snapshot s = input::Consume();
@@ -636,6 +659,7 @@ void OnTick(UObject player, float dt) {
         PublishGrabs(gun, none, none);
         return;
     }
+    HookChargeTimeline();
     hands::HandState rh = hands::Get(hands::kRight), lh = hands::Get(hands::kLeft);
     if (rh.valid) HoldGun(gun, rh);
     Trigger(player, s.hand[input::kRight]);
