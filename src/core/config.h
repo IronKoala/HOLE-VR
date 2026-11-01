@@ -8,5 +8,4 @@ void Load(const std::wstring& mod_dir);
 bool GetBool(const char* key, bool fallback);
 int GetInt(const char* key, int fallback);
 float GetFloat(const char* key, float fallback);
-std::string GetString(const char* key, const std::string& fallback);
 }  // namespace holevr::config

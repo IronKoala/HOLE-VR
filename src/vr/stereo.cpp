@@ -46,7 +46,6 @@ constexpr size_t kCalculateStereoViewOffset = 11;
 constexpr size_t kGetStereoProjectionMatrix = 12;
 constexpr size_t kRenderTextureRenderThread = 14;
 // IStereoRenderTargetManager slots.
-constexpr size_t kShouldUseSeparateRenderTarget = 0;
 constexpr size_t kCalculateRenderTargetSize = 2;
 constexpr size_t kNeedReAllocateViewportRenderTarget = 3;
 
@@ -55,7 +54,6 @@ using ProjectionFn = double* (*)(void*, double*, int32_t);
 using RenderTextureFn = void (*)(void*, void*, void*, void*, void*);
 using CalcRTSizeFn = void (*)(void*, const void*, uint32_t*, uint32_t*);
 using NeedReallocFn = bool (*)(void*, const void*);
-using ShouldUseSeparateRTFn = bool (*)(void*);
 
 uintptr_t g_device = 0;
 void* g_primary[kPrimarySlots];
@@ -65,7 +63,6 @@ ProjectionFn o_projection = nullptr;
 RenderTextureFn o_render_texture = nullptr;
 CalcRTSizeFn o_calc_rt_size = nullptr;
 NeedReallocFn o_need_realloc = nullptr;
-ShouldUseSeparateRTFn o_should_use_separate_rt = nullptr;
 
 const float* g_near_plane = nullptr;  // GNearClippingPlane, read from the original projection code
 std::atomic<bool> g_realloc{false};
@@ -176,13 +173,9 @@ void HookCalcOffset(void* self, int32_t view_index, FRotator* rotation, float wo
     if (view_index == 1) xr::SetRenderedViews(views);
 
     if (g_recenter.exchange(false)) {
-        // Put the game camera exactly at the dominant eye, so weapon sights
-        // the game centres on its camera line up with that eye.
         const XrVector3f& a = views[0].pose.position;
         const XrVector3f& b = views[1].pose.position;
-        std::string eye = config::GetString("dominant_eye", "right");
-        float t = eye == "left" ? 0.0f : eye == "center" ? 0.5f : 1.0f;
-        g_origin_m = XrToUePosition(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t, 1.0);
+        g_origin_m = XrToUePosition((a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f, (a.z + b.z) * 0.5f, 1.0);
         const XrQuaternionf& q = views[0].pose.orientation;
         g_origin_yaw = YawOf(XrToUeQuat(q.x, q.y, q.z, q.w));
         log::Info("stereo: recentered (yaw %.1f)", g_origin_yaw);
@@ -199,9 +192,6 @@ void HookCalcOffset(void* self, int32_t view_index, FRotator* rotation, float wo
     // pitch and roll so the horizon never moves on its own.
     FQuat base = config::GetBool("use_game_pitch", false) ? ToQuat(*rotation) : YawOnly(rotation->Yaw);
     *rotation = ToRotator(base * local_q);
-    // The game's camera sits at the character's face, close to the weapon;
-    // pull the view back a little (positive = further back).
-    local_p.X -= config::GetFloat("camera_back_cm", 4.0f) * world_to_meters / 100.0;
     *location = *location + base.Rotate(local_p);
 }
 
@@ -342,14 +332,6 @@ void HookCalcRTSize(void* self, const void* viewport, uint32_t* x, uint32_t* y) 
     o_calc_rt_size(self, viewport, x, y);
 }
 
-// A separate eye texture at headset resolution, instead of drawing both eyes
-// into the game window at monitor resolution.
-bool HookShouldUseSeparateRT(void* self) {
-    HOLEVR_FIRST_CALL("ShouldUseSeparateRenderTarget");
-    if (config::GetBool("separate_render_target", false) && g_eye_w) return true;
-    return o_should_use_separate_rt(self);
-}
-
 bool HookNeedRealloc(void* self, const void* viewport) {
     HOLEVR_FIRST_CALL("NeedReAllocateViewportRenderTarget");
     return g_realloc.load() || o_need_realloc(self, viewport);
@@ -387,7 +369,6 @@ bool Install() {
     o_render_texture = reinterpret_cast<RenderTextureFn>(g_primary[kRenderTextureRenderThread]);
     o_calc_rt_size = reinterpret_cast<CalcRTSizeFn>(g_secondary[kCalculateRenderTargetSize]);
     o_need_realloc = reinterpret_cast<NeedReallocFn>(g_secondary[kNeedReAllocateViewportRenderTarget]);
-    o_should_use_separate_rt = reinterpret_cast<ShouldUseSeparateRTFn>(g_secondary[kShouldUseSeparateRenderTarget]);
     g_near_plane = FindNearPlane(reinterpret_cast<uintptr_t>(o_projection));
     if (!g_near_plane) log::Warn("stereo: near clip plane not found, using 10 cm");
 
@@ -396,7 +377,6 @@ bool Install() {
     g_primary[kRenderTextureRenderThread] = reinterpret_cast<void*>(&HookRenderTexture);
     g_secondary[kCalculateRenderTargetSize] = reinterpret_cast<void*>(&HookCalcRTSize);
     g_secondary[kNeedReAllocateViewportRenderTarget] = reinterpret_cast<void*>(&HookNeedRealloc);
-    g_secondary[kShouldUseSeparateRenderTarget] = reinterpret_cast<void*>(&HookShouldUseSeparateRT);
 
     xr::RecommendedEyeSize(&g_eye_w, &g_eye_h);
     if (g_eye_w && g_eye_h) {
@@ -408,10 +388,6 @@ bool Install() {
     *reinterpret_cast<void* volatile*>(dev) = g_primary;
     *reinterpret_cast<void* volatile*>(dev + 8) = g_secondary;
     g_device = dev;
-    // The game window's viewport only asks the stereo device for its render
-    // target setup when it is (re)initialised, which already happened before
-    // the headset connected. A one-pixel resize and back makes it ask again.
-    if (config::GetBool("separate_render_target", false)) dxgi_hooks::NudgeWindow();
     log::Info("stereo: hooked (render target %ux%u, near plane %.1f)", g_eye_w * 2, g_eye_h,
               g_near_plane ? *g_near_plane : 10.0f);
     return true;
