@@ -29,6 +29,23 @@ holds and where the hand should sit) and `GetFingers()` (trigger/grip/touch).
     grip centre found from the gun's `GunParts_MagazineCatch` (top front of
     the grip): 2.5 cm back and 4.5 cm down the slanted grip, on the gun's
     centre line. Settings `hand_grip_*`.
+  - **Scanned pistol grip** (`grip_probe.cpp`, default on,
+    `hand_grip_from_gun_scan`): the parts report no size, so the gun is
+    measured with rays when picked up: a 0.5 cm grid over its side in the gun
+    frame, one ray from the right and one from the left per cell (~7300 rays,
+    160 per frame, about half a second). That gives the gun's outline and
+    both side surfaces. From it: grip bottom, the trigger guard (first thing
+    right in front of the front strap), front/back strap, grip width and
+    slant. The right hand is then placed from the avatar's measured knuckles:
+    pinky->index up the grip axis, palm facing the grip's right side, middle
+    knuckle one finger radius under the guard at the front strap, palm skin
+    on the right side, pushed out if any palm point is inside. The thumb
+    swings from the web around the back of the grip to the LEFT side and lies
+    straight forward under the slide; its path is checked against the scan.
+    Finger contact then tests the scan instead of traces. The log shows the
+    measurements (`body: scanned ...`) and a clip check (`body: clip check`,
+    deepest finger/palm point inside the gun) a few times per gun. If the scan
+    fails the old placement below is used.
   - **Finger contact**: while holding a gun/slide/magazine, each finger joint
     curls only until its segment (offset by `finger_radius_cm`) touches the
     held object. The gun's parts have no collision in the game, so they get

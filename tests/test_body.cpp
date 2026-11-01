@@ -2,6 +2,7 @@
 //   g++ -std=c++20 -Isrc tests/test_body.cpp src/vr/body/ik_math.cpp src/vr/body/hand_pose.cpp -o /tmp/test_body && /tmp/test_body
 #include <cstdio>
 
+#include "vr/body/grip_probe.h"
 #include "vr/body/hand_pose.h"
 #include "vr/body/ik_math.h"
 
@@ -146,7 +147,84 @@ static void TestSegmentBox() {
     EXPECT(Near(-5 + 10 * t, -1.0));
 }
 
+// A model pistol in the gun frame (X barrel, Y right, Z up, cm): slide, dust
+// cover, trigger guard loop, and a grip slanted 20 degrees.
+static bool PistolSolid(double x, double y, double z) {
+    auto in = [](double v, double a, double b) { return v >= a && v <= b; };
+    if (in(x, 0, 18) && in(z, 11, 14) && in(y, -5.2, -2.4)) return true;    // slide
+    if (in(x, 1, 16) && in(z, 9.5, 11) && in(y, -5.1, -2.5)) return true;    // frame
+    if (in(x, 12.5, 17) && in(z, 7.0, 9.5) && in(y, -6.0, -1.6)) return true; // weapon light
+    if (in(x, 7, 12.1) && in(z, 7.5, 8.3) && in(y, -5.0, -2.6)) return true; // guard bar
+    if (in(x, 11.3, 12.1) && in(z, 7.5, 9.5) && in(y, -5.0, -2.6)) return true;
+    double xc = 4 + (z - 8) * std::tan(20 * kDegToRad);
+    if (in(z, 0, 9.5) && in(x, xc - 2.5, xc + 2.5) && in(y, -5.3, -2.3)) return true;  // grip
+    return false;
+}
+
+static grip::Grid ScanModel() {
+    grip::Grid g;
+    g.Init(-12, 22, -8, 18, 0.5);
+    for (int iz = 0; iz < g.nz; ++iz)
+        for (int ix = 0; ix < g.nx; ++ix) {
+            double x = g.X(ix), z = g.Z(iz);
+            size_t k = static_cast<size_t>(iz) * g.nx + ix;
+            for (double y = 15; y >= -15; y -= 0.05)
+                if (PistolSolid(x, y, z)) { g.yr[k] = y; break; }
+            for (double y = -15; y <= 15; y += 0.05)
+                if (PistolSolid(x, y, z)) { g.yl[k] = y; break; }
+        }
+    return g;
+}
+
+static void TestGripProbe() {
+    grip::Grid g = ScanModel();
+    grip::Shape s = grip::Analyze(g);
+    EXPECT(s.ok);
+    if (!s.ok) { std::printf("  why: %s\n", s.why.c_str()); return; }
+    EXPECT(std::fabs(s.z_bottom - 0) < 0.6);
+    EXPECT(std::fabs(s.z_guard - 7.5) < 0.6);
+    EXPECT(std::fabs(s.slant_deg - 20) < 3);
+    EXPECT(std::fabs(s.y_right + 2.3) < 0.2);
+    EXPECT(std::fabs(s.y_left + 5.3) < 0.2);
+    double xc = 4 + (7.0 - 8) * std::tan(20 * kDegToRad);
+    EXPECT(std::fabs(s.front - (xc + 2.5)) < 0.6);
+    EXPECT(std::fabs(s.back - (xc - 2.5)) < 0.6);
+    EXPECT(std::fabs(s.thumb_y + 5.1) < 0.3);  // frame side, above the guard
+    // Inside test.
+    double d;
+    EXPECT(g.Inside(FVector{4, -3.8, 5}, &d) && d > 1.2);
+    EXPECT(!g.Inside(FVector{4, -1.0, 5}));
+    EXPECT(!g.Inside(FVector{9, -3.8, 9}));  // inside the trigger guard's hole
+
+    // A right hand (bone space: X wrist->knuckles, Y pinky->index, Z out of the palm).
+    grip::HandGeo h;
+    h.across = FVector{0, 1, 0};
+    h.palm = FVector{0, 0, 1};  // a right hand: Cross(across, palm) = wrist->knuckles
+    h.mcp[0] = FVector{2.5, 2.5, 1.5};
+    h.mcp[1] = FVector{9.0, 2.2, 0};
+    h.mcp[2] = FVector{9.3, 0.2, 0};
+    h.mcp[3] = FVector{8.9, -1.7, 0};
+    h.mcp[4] = FVector{8.2, -3.4, 0};
+    grip::Params p;
+    grip::Placement pl = grip::PlaceRightHand(g, s, h, p);
+    EXPECT(Near(pl.rot.Rotate(h.palm), FVector{0, -1, 0}, 1e-3));
+    EXPECT(Near(pl.rot.Rotate(h.across), s.up, 1e-3));
+    FVector mid = pl.pos + pl.rot.Rotate(h.mcp[2]);
+    EXPECT(std::fabs(mid.Z - (s.z_guard - p.finger_radius)) < 0.05);
+    EXPECT(mid.Y > s.y_right);                      // knuckles outside the right side
+    for (const FVector& lp : grip::PalmPoints(h, p.palm_skin))
+        EXPECT(!g.Inside(pl.pos + pl.rot.Rotate(lp)));
+    FVector wrist = pl.pos;
+    EXPECT(wrist.X < s.back);                       // wrist behind the grip, in line with the gun
+    EXPECT(pl.thumb.Y < s.y_left);                  // thumb on the gun's LEFT side
+    EXPECT(pl.thumb.Z > s.z_guard);
+    // A finger through the grip is reported, one beside it is not.
+    EXPECT(grip::Penetration(g, {FVector{4, 0, 5}, FVector{4, -8, 5}}, 0.8) > 1.0);
+    EXPECT(grip::Penetration(g, {FVector{4, -0.5, 5}, FVector{8, -0.5, 5}}, 0.8) == 0.0);
+}
+
 int main() {
+    TestGripProbe();
     TestSegmentBox();
     TestArc();
     TestAlignFrames();
