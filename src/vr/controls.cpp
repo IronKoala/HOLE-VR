@@ -4,6 +4,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <atomic>
 #include <mutex>
 
 #include "core/config.h"
@@ -128,6 +129,8 @@ hands::HandGrab g_grab[2];
 hands::FingerInput g_fingers[2];
 hands::Pose g_head;
 bool g_head_valid = false;
+hands::EditButtons g_edit_buttons;
+std::atomic<int> g_editor_hand{-1};
 double g_clock = 0.0;
 
 bool ToWorld(const XrPosef& p, hands::Pose* out) {
@@ -168,7 +171,11 @@ void UpdateHands(const input::Snapshot& s) {
         g_fingers[i].trigger_touch = in.trigger_touch;
         g_fingers[i].grip = in.grip_value;
         g_fingers[i].thumb_touch = in.primary.down || in.secondary.down || in.stick_click.down;
+        g_edit_buttons.grip_down[i] = in.grip_value > 0.6f;
     }
+    g_edit_buttons.y_down = s.hand[input::kLeft].secondary.down;
+    g_edit_buttons.left_stick_pressed = s.hand[input::kLeft].stick_click.pressed;
+    g_edit_buttons.left_stick_down = s.hand[input::kLeft].stick_click.down;
     g_hands[0] = h[0];
     g_hands[1] = h[1];
     g_head = head;
@@ -972,6 +979,14 @@ void OnTick(UObject player, float dt) {
     input::Snapshot s = input::Consume();
     if (!s.valid || !g_set.enabled) return;
     UpdateHands(s);
+    // The grip editor (vr/body) borrows one controller: none of its buttons
+    // reach the game, and the gun does not fire while a grip is edited.
+    if (int eh = g_editor_hand.load(); eh == 0 || eh == 1) {
+        input::HandInput& e = s.hand[eh];
+        e.grip_button = e.trigger_button = e.primary = e.secondary = e.stick_click = input::Button{};
+        e.grip_value = e.trigger = 0.f;
+        s.hand[input::kRight].trigger_button = input::Button{};
+    }
     Locomotion(player, s, dt);
     ApplyCameraShakeSetting(player);
 
@@ -1071,6 +1086,12 @@ FingerInput GetFingers(Hand hand) {
     std::lock_guard<std::mutex> lock(controls::g_hands_mutex);
     return controls::g_fingers[hand];
 }
+EditButtons GetEditButtons() {
+    std::lock_guard<std::mutex> lock(controls::g_hands_mutex);
+    return controls::g_edit_buttons;
+}
+void SetEditorHand(int hand) { controls::g_editor_hand.store(hand); }
+int EditorHand() { return controls::g_editor_hand.load(); }
 bool Head(Pose* out) {
     std::lock_guard<std::mutex> lock(controls::g_hands_mutex);
     if (!controls::g_head_valid) return false;

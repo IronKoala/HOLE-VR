@@ -25,7 +25,10 @@ add_library(hole_vr SHARED
     src/vr/interact/slide.cpp
     src/vr/body/ik_math.cpp
     src/vr/body/hand_pose.cpp
-    src/vr/body/grip_probe.cpp
+    src/vr/body/skeleton.cpp
+    src/vr/body/finger_solve.cpp
+    src/vr/body/grip_record.cpp
+    src/vr/body/grip_editor.cpp
     src/vr/body/body.cpp
     src/ue/process_event.cpp
     src/ue/call.cpp
