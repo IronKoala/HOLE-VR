@@ -17,6 +17,7 @@
 #include "vr/hands.h"
 #include "vr/input.h"
 #include "vr/interact/slide.h"
+#include "vr/ui_panel.h"
 #include "vr/openxr.h"
 #include "vr/stereo.h"
 
@@ -1202,7 +1203,7 @@ void OnTick(UObject player, float dt) {
     {
         // Left X: weapon light.
         const input::HandInput& l = s.hand[input::kLeft];
-        if (l.primary.pressed || l.primary.released) {
+        if ((l.primary.pressed || l.primary.released) && !ui_panel::MenuOpen()) {
             ue::Call c(player, "PlayerInput_SwitchLight");
             c.Set("IsPressed", l.primary.down);
             c.Invoke();
@@ -1210,11 +1211,24 @@ void OnTick(UObject player, float dt) {
     }
     hands::HandState rh = hands::Get(hands::kRight), lh = hands::Get(hands::kLeft);
     if (rh.valid) HoldGun(gun, rh);
-    Trigger(player, gun, s.hand[input::kRight]);
-    SlideHandling(gun, lh, s.hand[input::kLeft], dt);
-    MagazineHandling(gun, player, lh, s.hand[input::kLeft], s.hand[input::kRight]);
-    SupportGrip(lh, s.hand[input::kLeft]);
-    FireSelector(gun, s.hand[input::kRight]);
+    if (ui_panel::MenuOpen()) {
+        // A game menu is up: the trigger is a laser-pointer click, so no
+        // firing, grabbing or gun buttons. Let go of anything held.
+        if (W.trigger_sent) {
+            ue::Call c(player, "PlayerInput_UseWeapon");
+            c.Set("Press Released", true);
+            c.Invoke();
+            W.trigger_sent = false;
+        }
+        W.two_hand = false;
+        W.have_support_point = false;
+    } else {
+        Trigger(player, gun, s.hand[input::kRight]);
+        SlideHandling(gun, lh, s.hand[input::kLeft], dt);
+        MagazineHandling(gun, player, lh, s.hand[input::kLeft], s.hand[input::kRight]);
+        SupportGrip(lh, s.hand[input::kLeft]);
+        FireSelector(gun, s.hand[input::kRight]);
+    }
     PublishGrabs(gun, rh, lh);
     RackTrace(gun, dt);
 }
