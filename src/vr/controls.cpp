@@ -79,6 +79,8 @@ struct Settings {
     double gun_pitch = 0.0;        // extra pitch on the held gun, degrees
     double gun_yaw = 0.0;
     double gun_roll = 0.0;
+    double gun_forward = 0.0;      // extra shift of the gun along the barrel, cm
+    double gun_right = 0.0;        // extra shift to the right, cm
     // Magazine pouch, relative to where you face: cm forward, right (+) /
     // left (-), and below the headset.
     double pouch_forward = 15.0;
@@ -99,6 +101,8 @@ void LoadSettings() {
     g_set.gun_pitch = config::GetFloat("gun_pitch_offset", 0.f);
     g_set.gun_yaw = config::GetFloat("gun_yaw_offset", 0.f);
     g_set.gun_roll = config::GetFloat("gun_roll_offset", 0.f);
+    g_set.gun_forward = config::GetFloat("gun_forward_offset_cm", 0.f);
+    g_set.gun_right = config::GetFloat("gun_right_offset_cm", 0.f);
     g_set.pouch_forward = config::GetFloat("mag_pouch_forward_cm", 15.f);
     g_set.pouch_side = config::GetFloat("mag_pouch_side_cm", -15.f);
     g_set.pouch_down = config::GetFloat("mag_pouch_down_cm", 55.f);
@@ -217,6 +221,7 @@ struct WeaponState {
     double end_charging_at = -1;
     UObject held_mag = 0;      // magazine in the left hand, not yet inserted
     UObject pouch_mag = 0;     // spare magazine shown at the pouch, ready to grab
+    UObject mag_class = 0;     // class of this gun's magazines, for spawning spares
     double refill_pouch_at = 0; // when to put a new magazine in the pouch
     bool trigger_down = false;
     bool have_frame = false;
@@ -336,7 +341,11 @@ void HoldGun(game::Gun& gun, const hands::HandState& rh) {
     FQuat hand = rh.aim.rotation * ToQuat(FRotator{kBasePitch + g_set.gun_pitch,
                                                    kBaseYaw + g_set.gun_yaw, g_set.gun_roll});
     FQuat rot = W.have_frame ? hand * W.gun_frame.Inverse() : hand;
-    FVector loc = rh.grip.location - rot.Rotate(rel);
+    // `hand` is the gun's own frame in the world (X barrel, Y right, Z up).
+    // Fourth test: gun sat about 5 cm too far forward and 1.3 cm too far left.
+    constexpr double kBaseForward = -5.0, kBaseRight = 1.3;
+    FVector shift = hand.Rotate(FVector{kBaseForward + g_set.gun_forward, kBaseRight + g_set.gun_right, 0});
+    FVector loc = rh.grip.location + shift - rot.Rotate(rel);
     SetActorTransform(g, loc, rot);
 }
 
@@ -446,7 +455,55 @@ void SlideHandling(game::Gun& gun, const hands::HandState& lh, const input::Hand
     }
 }
 
-void MagazineHandling(game::Gun& gun, const hands::HandState& lh, const input::HandInput& lin,
+// Creates a spare magazine actor of the same class as the gun's own. The
+// game's "take a new magazine" step can't be used while a magazine is in the
+// gun: it removes the inserted one (fourth test: inserted mags vanished).
+UObject SpawnMagazine(UObject player, UObject cls, const FVector& loc, const FQuat& rot) {
+    static UObject statics = 0;
+    if (!statics) statics = ue::FindObject("GameplayStatics /Script/Engine.Default__GameplayStatics");
+    if (!statics || !cls) return 0;
+    UETransform t;
+    t.rotation = rot;
+    t.translation = loc;
+    ue::Call begin(statics, "BeginDeferredActorSpawnFromClass");
+    const uint8_t always_spawn = 1;  // ESpawnActorCollisionHandlingMethod::AlwaysSpawn
+    begin.Set("WorldContextObject", player).Set("ActorClass", cls).Set("SpawnTransform", t)
+        .Set("CollisionHandlingOverride", always_spawn).Set("Owner", player);
+    if (!begin.Invoke()) return 0;
+    UObject actor = begin.Result<UObject>();
+    if (!actor) return 0;
+    ue::Call finish(statics, "FinishSpawningActor");
+    finish.Set("Actor", actor).Set("SpawnTransform", t);
+    finish.Invoke();
+    UObject done = finish.Result<UObject>();
+    return done ? done : actor;
+}
+
+void RefillPouch(game::Gun& gun, UObject player, const FVector& loc, const FQuat& rot) {
+    if (!W.mag_class) {
+        UObject m = 0;
+        if (ue::GetProp(gun.Object(), "MagazineObj", m) && m) W.mag_class = ue::GetClass(m);
+        else if (ue::GetProp(gun.Object(), "MagazineObj_Temp", m) && m) W.mag_class = ue::GetClass(m);
+    }
+    UObject mag = 0;
+    if (W.mag_class) {
+        mag = SpawnMagazine(player, W.mag_class, loc, rot);
+        if (mag) log::Info("controls: spawned pouch magazine %s", ue::GetName(mag).c_str());
+    } else if (!gun.State().has_magazine) {
+        // Empty gun and no class known yet: the game's own step is safe here.
+        gun.TakeNewMagazine();
+        ue::GetProp(gun.Object(), "MagazineObj_Temp", mag);
+        if (mag) W.mag_class = ue::GetClass(mag);
+        if (mag) log::Info("controls: took pouch magazine from the game (%s)", ue::GetName(mag).c_str());
+    }
+    if (mag) {
+        W.pouch_mag = mag;
+    } else {
+        W.refill_pouch_at = g_clock + 2.0;   // try again later
+    }
+}
+
+void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState& lh, const input::HandInput& lin,
                       const input::HandInput& rin) {
     // Right A / primary: magazine release.
     if (rin.secondary.pressed) {
@@ -475,21 +532,8 @@ void MagazineHandling(game::Gun& gun, const hands::HandState& lh, const input::H
         pouch_loc = head.location + pouch_rot.Rotate(FVector{g_set.pouch_forward, g_set.pouch_side, 0}) -
                     FVector{0, 0, g_set.pouch_down};
     }
-    if (!W.pouch_mag && !W.held_mag && g_clock >= W.refill_pouch_at) {
-        // The game's "take a new magazine" step creates the spare.
-        gun.TakeNewMagazine();
-        UObject mag = 0;
-        ue::GetProp(gun.Object(), "MagazineObj_Temp", mag);
-        UObject inserted = 0;
-        ue::GetProp(gun.Object(), "MagazineObj", inserted);
-        if (mag && mag != inserted) {
-            W.pouch_mag = mag;
-            log::Info("controls: pouch magazine ready (%s): %s", ue::GetName(mag).c_str(),
-                      gun.State().Describe().c_str());
-        } else {
-            W.refill_pouch_at = g_clock + 2.0;   // try again later
-        }
-    }
+    if (!W.pouch_mag && !W.held_mag && g_clock >= W.refill_pouch_at && have_head)
+        RefillPouch(gun, player, pouch_loc, pouch_rot);
     if (W.pouch_mag && have_head) {
         DetachIfAttached(W.pouch_mag);
         { ue::Call v(W.pouch_mag, "SetVisibility"); v.Set("IsVisible", true); v.Invoke(); }
@@ -596,7 +640,7 @@ void OnTick(UObject player, float dt) {
     if (rh.valid) HoldGun(gun, rh);
     Trigger(player, s.hand[input::kRight]);
     SlideHandling(gun, lh, s.hand[input::kLeft], dt);
-    MagazineHandling(gun, lh, s.hand[input::kLeft], s.hand[input::kRight]);
+    MagazineHandling(gun, player, lh, s.hand[input::kLeft], s.hand[input::kRight]);
     PublishGrabs(gun, rh, lh);
 }
 
