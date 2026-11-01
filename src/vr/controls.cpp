@@ -91,6 +91,7 @@ struct Settings {
     double pouch_side = -15.0;
     double pouch_down = 55.0;
     double pouch_radius = 14.0;
+    bool wall_collision = true;    // keep the gun out of walls
     bool log_grabs = true;
 };
 Settings g_set;
@@ -105,6 +106,7 @@ void LoadSettings() {
     g_set.gun_pitch = config::GetFloat("gun_pitch_offset", 0.f);
     g_set.gun_yaw = config::GetFloat("gun_yaw_offset", 0.f);
     g_set.gun_roll = config::GetFloat("gun_roll_offset", 0.f);
+    g_set.wall_collision = config::GetBool("gun_wall_collision", true);
     g_set.gun_forward = config::GetFloat("gun_forward_offset_cm", 0.f);
     g_set.gun_right = config::GetFloat("gun_right_offset_cm", 0.f);
     g_set.pouch_forward = config::GetFloat("mag_pouch_forward_cm", 15.f);
@@ -356,10 +358,16 @@ struct TArrayRaw {
     int32_t num, max;
 };
 FVector WallPushback(UObject gun, const FQuat& frame, const FVector& grip) {
-    static UObject ksl = 0;
-    if (!ksl) ksl = ue::FindObject("KismetSystemLibrary /Script/Engine.Default__KismetSystemLibrary");
-    static UObject gps = 0;
-    if (!gps) gps = ue::FindObject("GameplayStatics /Script/Engine.Default__GameplayStatics");
+    if (!g_set.wall_collision) return FVector{};
+    // Looked up once: FindObject is a full object scan, too slow per frame.
+    static UObject ksl = 0, gps = 0;
+    static int lookups = 0;
+    if ((!ksl || !gps) && lookups < 3) {
+        ++lookups;
+        if (!ksl) ksl = ue::FindObject("KismetSystemLibrary /Script/Engine.Default__KismetSystemLibrary");
+        if (!gps) gps = ue::FindObject("GameplayStatics /Script/Engine.Default__GameplayStatics");
+        if (!ksl || !gps) log::Warn("controls: wall check unavailable (trace library not found)");
+    }
     hands::Pose head;
     UObject player = game::Player();
     if (!ksl || !gps || !player || !hands::Head(&head)) return FVector{};
