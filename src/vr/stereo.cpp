@@ -162,6 +162,19 @@ bool FrameViews(bool new_sample, xr::EyeView out[2]) {
     return true;
 }
 
+// The tracking-space -> game-world mapping used for the latest left eye, so
+// hands and held objects land exactly where the eyes say they are.
+struct WorldMapping {
+    bool valid = false;
+    FVector camera_location;  // game camera before the headset offset
+    FQuat base;               // game yaw (or full rotation with use_game_pitch)
+    FQuat recenter;
+    FVector origin_m;
+    double world_to_meters = 100.0;
+};
+std::mutex g_world_mutex;
+WorldMapping g_world;
+
 void HookCalcOffset(void* self, int32_t view_index, FRotator* rotation, float world_to_meters, FVector* location) {
     HOLEVR_FIRST_CALL("CalculateStereoViewOffset");
     xr::EyeView views[2];
@@ -191,6 +204,11 @@ void HookCalcOffset(void* self, int32_t view_index, FRotator* rotation, float wo
     // The game keeps steering yaw (mouse/stick turning); the headset owns
     // pitch and roll so the horizon never moves on its own.
     FQuat base = config::GetBool("use_game_pitch", false) ? ToQuat(*rotation) : YawOnly(rotation->Yaw);
+    if (view_index == 0) {
+        std::lock_guard<std::mutex> lock(g_world_mutex);
+        g_world = {true, *location, base, FQuat{recenter.X, recenter.Y, recenter.Z, recenter.W}, g_origin_m,
+                   world_to_meters};
+    }
     *rotation = ToRotator(base * local_q);
     *location = *location + base.Rotate(local_p);
 }
@@ -394,5 +412,20 @@ bool Install() {
 }
 
 void Recenter() { g_recenter = true; }
+
+bool TrackingToWorld(const XrPosef& pose, FVector* world_location, FQuat* world_rotation) {
+    WorldMapping m;
+    {
+        std::lock_guard<std::mutex> lock(g_world_mutex);
+        m = g_world;
+    }
+    if (!m.valid) return false;
+    FQuat q = XrToUeQuat(pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w);
+    FVector p = XrToUePosition(pose.position.x, pose.position.y, pose.position.z, 1.0);
+    FVector local_p = m.recenter.Rotate(p - m.origin_m) * m.world_to_meters;
+    if (world_location) *world_location = m.camera_location + m.base.Rotate(local_p);
+    if (world_rotation) *world_rotation = m.base * (m.recenter * q);
+    return true;
+}
 
 }  // namespace holevr::vr::stereo
