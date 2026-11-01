@@ -9,6 +9,7 @@
 
 #include "core/log.h"
 #include "core/memory.h"
+#include "core/perf.h"
 #include "ue/call.h"
 #include "ue/process_event.h"
 
@@ -28,6 +29,12 @@ std::vector<std::function<void()>> g_queue;
 constexpr int kMaxListeners = 16;
 TickFn g_listeners[kMaxListeners];
 std::atomic<int> g_listener_count{0};
+const char* kListenerNames[kMaxListeners] = {"tick#0", "tick#1", "tick#2", "tick#3", "tick#4", "tick#5",
+                                             "tick#6", "tick#7", "tick#8", "tick#9", "tick#10", "tick#11",
+                                             "tick#12", "tick#13", "tick#14", "tick#15"};
+perf::Counter g_listener_perf[kMaxListeners];
+perf::Counter g_queue_perf{"posted work"};
+perf::Counter g_tick_perf{"mod tick total"};
 
 std::atomic<UObject> g_gun_class{0}, g_weapon_class{0}, g_mag_class{0};
 
@@ -38,15 +45,22 @@ void OnPlayerTick(UObject self, UObject, void* params) {
     g_player.store(self);
     g_last_tick_ms.store(GetTickCount());
 
+    perf::Scope total(g_tick_perf);
+    double t0 = perf::NowMs();
     std::vector<std::function<void()>> work;
     {
         std::lock_guard<std::mutex> lock(g_queue_mutex);
         work.swap(g_queue);
     }
     for (auto& w : work) w();
+    g_queue_perf.Add(perf::NowMs() - t0);
 
     int n = g_listener_count.load(std::memory_order_acquire);
-    for (int i = 0; i < n; ++i) g_listeners[i](self, dt);
+    for (int i = 0; i < n; ++i) {
+        perf::Scope s(g_listener_perf[i]);
+        g_listeners[i](self, dt);
+    }
+    perf::MaybeReport();
 }
 
 bool HookClassDefault(const char* full_name) {
@@ -110,6 +124,13 @@ void AddTickListener(TickFn fn) {
     int n = g_listener_count.load();
     if (n >= kMaxListeners) return;
     g_listeners[n] = fn;
+    if (n == 0) {
+        perf::Register(&g_tick_perf);
+        perf::Register(&g_queue_perf);
+    }
+    g_listener_perf[n].name = kListenerNames[n];
+    perf::Register(&g_listener_perf[n]);
+    log::Info("game: tick listener #%d registered (the next \"ready\" line names it)", n);
     g_listener_count.store(n + 1, std::memory_order_release);
 }
 

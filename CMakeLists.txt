@@ -11,6 +11,7 @@ add_library(hole_vr SHARED
     src/core/log.cpp
     src/core/config.cpp
     src/core/memory.cpp
+    src/core/perf.cpp
     src/ue/names.cpp
     src/ue/objects.cpp
     src/ue/reflection.cpp

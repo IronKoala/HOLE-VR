@@ -12,6 +12,7 @@
 
 #include "core/config.h"
 #include "core/log.h"
+#include "core/perf.h"
 
 namespace holevr::vr::xr {
 namespace {
@@ -435,7 +436,20 @@ void MarkFrameDone() {
     g_last_frame_qpc = now.QuadPart;
 }
 
+perf::Counter g_perf_game{"game frame (between submits)"};
+perf::Counter g_perf_wait{"xrWaitFrame"};
+perf::Counter g_perf_submit{"copy+submit"};
+
 void RunFrame() {
+    static bool registered = [] {
+        perf::Register(&g_perf_game);
+        perf::Register(&g_perf_wait);
+        perf::Register(&g_perf_submit);
+        return true;
+    }();
+    (void)registered;
+    if (long long last = g_last_frame_qpc.load()) g_perf_game.Add(MsSince(last));
+    double t_wait = perf::NowMs();
     // A long gap since the last frame means the game stalled; SteamVR hides
     // the app (black screen) if no frame arrives for too long.
     if (long long last = g_last_frame_qpc.load()) {
@@ -453,6 +467,8 @@ void RunFrame() {
     XrFrameState fs{XR_TYPE_FRAME_STATE};
     XrFrameWaitInfo wi{XR_TYPE_FRAME_WAIT_INFO};
     if (XR_FAILED(Proc<PFN_xrWaitFrame>("xrWaitFrame")(g_session, &wi, &fs))) return;
+    g_perf_wait.Add(perf::NowMs() - t_wait);
+    perf::Scope submit_scope(g_perf_submit);
     XrFrameBeginInfo bi{XR_TYPE_FRAME_BEGIN_INFO};
     if (XR_FAILED(Proc<PFN_xrBeginFrame>("xrBeginFrame")(g_session, &bi))) return;
 
@@ -543,6 +559,7 @@ void RunFrame() {
     ei.layers = layers.data();
     Proc<PFN_xrEndFrame>("xrEndFrame")(g_session, &ei);
     MarkFrameDone();
+    perf::MaybeReport();
 }
 
 // Re-sends the last frame while the game is stalled (shader compiles, level
