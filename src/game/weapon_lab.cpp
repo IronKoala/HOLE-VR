@@ -4,7 +4,9 @@
 
 #include <atomic>
 #include <cmath>
+#include <functional>
 #include <map>
+#include <vector>
 #include <string>
 
 #include "core/config.h"
@@ -80,6 +82,14 @@ void RunActions(Gun& gun, int actions) {
     if (actions & kInsertMag) {
         bool a = gun.TakeNewMagazine();
         bool b = gun.InsertMagazine();
+        // The game normally reveals the new magazine from its animation.
+        UObject mag = 0;
+        if (ue::GetProp(gun.Object(), "MagazineObj", mag) && mag) {
+            ue::Call v(mag, "SetVisibility");
+            v.Set("IsVisible", true);
+            v.Invoke();
+            log::Info("lab: new magazine %s, made visible", GetName(mag).c_str());
+        }
         log::Info("lab: F8 new magazine %s, insert %s", a ? "ok" : "failed", b ? "ok" : "failed");
     }
     if (actions & kAltInsert)
@@ -88,15 +98,86 @@ void RunActions(Gun& gun, int actions) {
         log::Info("lab: Ctrl+F6 slide catch release -> %s", gun.ReleaseSlideCatch() ? "ok" : "failed");
 }
 
+// Small game-thread scheduler so multi-step game actions can be spaced out.
+struct Scheduled {
+    double at;
+    std::function<void()> fn;
+};
+std::vector<Scheduled> g_scheduled;
+void After(double seconds, std::function<void()> fn) { g_scheduled.push_back({g_time + seconds, std::move(fn)}); }
+void RunScheduled() {
+    for (size_t i = 0; i < g_scheduled.size();) {
+        if (g_scheduled[i].at <= g_time) {
+            auto fn = std::move(g_scheduled[i].fn);
+            g_scheduled.erase(g_scheduled.begin() + i);
+            fn();
+        } else {
+            ++i;
+        }
+    }
+}
+
+// Which game call performs a full rack is not known yet, so each full rack
+// tries the next candidate and logs what changed a second later.
+int g_rack_method = 0;
+constexpr int kRackMethods = 4;
+const char* kRackNames[kRackMethods] = {
+    "A: weapon manager ChamberAction press/release (the game's own rack)",
+    "B: gun Gun_ChargeBolt pull/release",
+    "C: gun ChargeBolt event pull/release",
+    "D: gun SetIsBoltCharging + StartAnim_ChargeBolt",
+};
+
+void FullRack(Gun gun) {
+    int m = g_rack_method;
+    g_rack_method = (g_rack_method + 1) % kRackMethods;
+    GunState before = gun.State();
+    UObject manager = g_manager.load();
+    UObject g = gun.Object();
+    log::Info("lab: full rack, trying %s. Before: %s", kRackNames[m], before.Describe().c_str());
+    auto call_bool = [](UObject obj, const char* fn, const char* param, bool v) {
+        ue::Call c(obj, fn);
+        c.Set(param, v);
+        return c.Invoke();
+    };
+    switch (m) {
+        case 0:
+            call_bool(manager, "ChamberAction", "IsTriggerReleased", false);
+            After(0.35, [manager, call_bool] { call_bool(manager, "ChamberAction", "IsTriggerReleased", true); });
+            break;
+        case 1:
+            call_bool(g, "Gun_ChargeBolt", "IsTriggerReleased", false);
+            After(0.35, [g, call_bool] { call_bool(g, "Gun_ChargeBolt", "IsTriggerReleased", true); });
+            break;
+        case 2:
+            call_bool(g, "ChargeBolt", "IsTriggerReleased", false);
+            After(0.35, [g, call_bool] { call_bool(g, "ChargeBolt", "IsTriggerReleased", true); });
+            break;
+        case 3:
+            call_bool(g, "SetIsBoltCharging", "IsBoltCharging", true);
+            call_bool(g, "StartAnim_ChargeBolt", "IsTriggerReleased", true);
+            break;
+    }
+    After(1.5, [gun, m, before] {
+        GunState after = Gun(gun).State();
+        bool changed = !(after == before);
+        log::Info("lab: full rack %c result: %s. After: %s", 'A' + m,
+                  changed ? "STATE CHANGED" : "no change", after.Describe().c_str());
+    });
+}
+
 void UpdateSlidePull(Gun& gun, float dt) {
+    static double held_time = 0;
     bool held = g_pull_held.load();
     if (held) {
         if (!g_pulling) {
             g_pulling = true;
             g_peak_travel = 0;
             g_travel = 0;
+            held_time = 0;
             log::Info("lab: F6 grabbing the slide");
         }
+        held_time += dt;
         // About 0.6 s from closed to fully back, like a deliberate hand pull.
         g_travel = std::fmin(1.0, g_travel + dt / 0.6);
         g_peak_travel = std::fmax(g_peak_travel, g_travel);
@@ -105,16 +186,29 @@ void UpdateSlidePull(Gun& gun, float dt) {
     }
     if (!g_pulling) return;
     g_pulling = false;
+    // Read back where the slide part actually is, to confirm the write took.
+    GunState s = gun.State();
+    ue::Vec3d o = gun.SlideOrigin();
+    log::Info("lab: slide part at (%.2f %.2f %.2f), origin (%.2f %.2f %.2f)", s.slide_location.x,
+              s.slide_location.y, s.slide_location.z, o.x, o.y, o.z);
     if (g_peak_travel >= 0.9) {
         gun.RestoreSlide();
-        bool ok = gun.ChargeBolt();
-        log::Info("lab: F6 released at full travel: full rack -> %s", ok ? "ok" : "failed");
-    } else {
-        GunState s = gun.State();
-        gun.RestoreSlide();
-        log::Info("lab: F6 released at %.0f%% travel: chamber check, %s in the chamber",
-                  g_peak_travel * 100.0, s.chamber > 0 ? "a round is" : "nothing is");
+        FullRack(gun);
+        return;
     }
+    if (held_time < 0.25) {
+        // A tap: do a whole chamber check for the player. Pull to half way,
+        // hold for a second so the round is visible, then let it go.
+        ue::Vec3d axis = AxisFor(gun.ClassName());
+        Gun g = gun;
+        for (int i = 1; i <= 10; ++i) After(0.02 * i, [g, axis, i] { Gun(g).SetSlideTravel(0.05 * i, axis); });
+        for (int i = 0; i < 50; ++i) After(0.2 + 0.02 * i, [g, axis] { Gun(g).SetSlideTravel(0.5, axis); });
+        After(1.25, [g] { Gun(g).RestoreSlide(); });
+    } else {
+        gun.RestoreSlide();
+    }
+    log::Info("lab: F6 chamber check (%.0f%% travel): %s in the chamber", (held_time < 0.25 ? 50.0 : g_peak_travel * 100.0),
+              s.chamber > 0 ? "a round is" : "nothing is");
 }
 
 void OnTick(UObject player, float dt) {
@@ -137,6 +231,7 @@ void OnTick(UObject player, float dt) {
         LogGunSetup(gun);
     }
     RunActions(gun, actions);
+    RunScheduled();
     UpdateSlidePull(gun, dt);
 
     GunState s = gun.State();
@@ -147,7 +242,8 @@ void OnTick(UObject player, float dt) {
 }
 
 bool IsNoisy(const std::string& n) {
-    return n.find("Tick") != std::string::npos || n.find("__UpdateFunc") != std::string::npos ||
+    return n.find("Tick") != std::string::npos || n.rfind("InpAxisEvt", 0) == 0 ||
+           n.find("FinishedFunc") != std::string::npos || n.find("__UpdateFunc") != std::string::npos ||
            n.rfind("Get", 0) == 0 || n.rfind("BPI_Get", 0) == 0 || n.rfind("Update", 0) == 0 ||
            n.find("Overlap") != std::string::npos;
 }
