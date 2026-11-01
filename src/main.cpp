@@ -17,6 +17,7 @@
 #include "ue/process_event.h"
 #include "ue/reflection.h"
 #include "vr/dxgi_hooks.h"
+#include "vr/body/body.h"
 #include "vr/controls.h"
 #include "vr/input.h"
 #include "vr/openxr.h"
@@ -115,6 +116,7 @@ DWORD WINAPI InitThread(LPVOID) {
     if (hooks) {
         game::weapon_lab::Init();
         vr::controls::Init();
+        vr::body::Init();  // after controls: reads this frame's hand poses
     }
 
     // Development hotkeys. Polled rather than hooked so nothing here can

@@ -77,6 +77,36 @@ const Block kBlocks[] = {
      "stick_deadzone=0.15\n"
      "; Tilts the gun in your hand up (+) or down (-), degrees.\n"
      "gun_pitch_offset=0\n"},
+    {"body_ik",
+     "\n"
+     "; --- VR body (full-body IK and hand poses). F9 in game toggles it. ---\n"
+     "; 1 = show your character's body following the headset and controllers.\n"
+     "body_ik=1\n"
+     "; Degrees you can turn your head before the body turns with it.\n"
+     "body_turn_deadzone=45\n"
+     "; How far the body may crouch and lean with you (cm), and bend at the spine.\n"
+     "body_max_crouch_cm=70\n"
+     "body_max_lean_cm=30\n"
+     "body_max_spine_bend=45\n"
+     "; Hands may follow the controller this far past full arm reach (cm).\n"
+     "body_arm_stretch_cm=8\n"
+     "; Keep the feet planted with leg IK while crouching/turning.\n"
+     "body_leg_ik=1\n"
+     "; Hide the character's head so it never blocks the view.\n"
+     "body_hide_head=1\n"
+     "; Shadow: 0 none, 1 the game's animated body (has a head), 2 the VR body.\n"
+     "body_shadow=1\n"
+     "; Finger poses for gun grip, trigger, slide and magazine (1 = on).\n"
+     "hand_poses=1\n"
+     "finger_curl_scale=1.0\n"
+     "; Fine-tune where the avatar's hand sits on the controller.\n"
+     "hand_offset_forward_cm=0\n"
+     "hand_offset_right_cm=0\n"
+     "hand_offset_up_cm=0\n"
+     "hand_pitch_offset=0\n"
+     "hand_yaw_offset=0\n"
+     "hand_roll_offset=0\n"
+     "hand_palm_depth_cm=3\n"},
 };
 
 std::string Trim(const std::string& s) {
