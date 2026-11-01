@@ -346,7 +346,7 @@ void HookCalcRTSize(void* self, const void* viewport, uint32_t* x, uint32_t* y) 
 // into the game window at monitor resolution.
 bool HookShouldUseSeparateRT(void* self) {
     HOLEVR_FIRST_CALL("ShouldUseSeparateRenderTarget");
-    if (config::GetBool("separate_render_target", true) && g_eye_w) return true;
+    if (config::GetBool("separate_render_target", false) && g_eye_w) return true;
     return o_should_use_separate_rt(self);
 }
 
@@ -411,7 +411,7 @@ bool Install() {
     // The game window's viewport only asks the stereo device for its render
     // target setup when it is (re)initialised, which already happened before
     // the headset connected. A one-pixel resize and back makes it ask again.
-    if (config::GetBool("separate_render_target", true)) dxgi_hooks::NudgeWindow();
+    if (config::GetBool("separate_render_target", false)) dxgi_hooks::NudgeWindow();
     log::Info("stereo: hooked (render target %ux%u, near plane %.1f)", g_eye_w * 2, g_eye_h,
               g_near_plane ? *g_near_plane : 10.0f);
     return true;
