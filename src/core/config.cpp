@@ -62,16 +62,45 @@ const Block kBlocks[] = {
      "; The player's extra scene capture renders the level a second time\n"
      "; (the game's Capture2D option). Stopping it saves a lot of GPU time.\n"
      "vr_disable_player_scene_capture=1\n"},
+    {"vr_anti_aliasing",
+     "\n"
+     "; --- Anti-aliasing and console variables ---\n"
+     "; Smoothing of jagged edges. The game's default (tsr) can leave after-images\n"
+     "; and shimmer on things that move fast, like your hands and gun.\n"
+     ";   fxaa = no after-images, slightly softer edges (VR default)\n"
+     ";   taa  = smoother edges, some ghosting\n"
+     ";   tsr  = the game's own, sharpest when still, most ghosting\n"
+     ";   off  = no smoothing, sharp but jagged\n"
+     ";   game = leave whatever the game set\n"
+     "; Ctrl+F10 in game cycles through these to compare (not saved).\n"
+     "vr_anti_aliasing=fxaa\n"
+     ";\n"
+     "; Any engine console variable can be set here with a cvar. prefix, e.g.\n"
+     "; cvar.r.Tonemapper.Sharpen=0.5\n"},
+    {"menu_panel",
+     "\n"
+     "; --- Menus in the headset ---\n"
+     "; While a game menu is open, the game screen floats in front of you and\n"
+     "; either controller is a laser pointer: trigger clicks, thumbstick scrolls,\n"
+     "; B/Y goes back. The controller menu button opens/closes the pause menu.\n"
+     "menu_panel=1\n"
+     "menu_panel_width_m=1.6\n"
+     "menu_panel_distance_m=1.6\n"
+     "; How far below eye height the middle of the screen sits.\n"
+     "menu_panel_drop_m=0.1\n"
+     "; Turn further away than this and the screen comes back in front of you.\n"
+     "menu_panel_follow_deg=60\n"
+     "menu_button_pauses=1\n"},
     {"vr_controls",
      "\n"
      "; --- Motion controls ---\n"
      "; 1 = use the VR controllers, 0 = keyboard/mouse/gamepad only.\n"
      "vr_controls=1\n"
      "; Turning on the right stick: 0 = snap, 1 = smooth.\n"
-     "turn_mode=0\n"
+     "turn_mode=1\n"
      "snap_turn_degrees=30\n"
      "; Degrees per second at full stick for smooth turning.\n"
-     "smooth_turn_speed=180\n"
+     "smooth_turn_speed=90\n"
      "; Left stick moves toward: 0 = where you look, 1 = where your left hand points.\n"
      "move_direction=0\n"
      "stick_deadzone=0.15\n"
@@ -235,6 +264,19 @@ int GetInt(const char* key, int fallback) {
 float GetFloat(const char* key, float fallback) {
     const std::string* v = Find(key);
     return (v && !v->empty()) ? static_cast<float>(std::atof(v->c_str())) : fallback;
+}
+
+std::string GetString(const char* key, const char* fallback) {
+    const std::string* v = Find(key);
+    return (v && !v->empty()) ? *v : std::string(fallback);
+}
+
+std::vector<std::pair<std::string, std::string>> WithPrefix(const char* prefix) {
+    std::vector<std::pair<std::string, std::string>> out;
+    const size_t n = std::strlen(prefix);
+    for (const auto& [k, v] : g_values)
+        if (k.size() > n && k.compare(0, n, prefix) == 0) out.emplace_back(k.substr(n), v);
+    return out;
 }
 
 }  // namespace holevr::config

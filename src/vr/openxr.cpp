@@ -701,6 +701,7 @@ void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* back_buffer) {
 
 void SetEyeTexture(ID3D12Resource* texture) { g_eye_texture = texture; }
 void SetFallbackTexture(ID3D12Resource* texture) { g_fallback_texture = texture; }
+ID3D12Resource* WindowTexture() { return g_fallback_texture; }
 
 bool LatestViews(EyeView out[2]) {
     std::lock_guard<std::mutex> lock(g_view_mutex);

@@ -44,6 +44,9 @@ void Init();
 // Latest controller state, consumed by the game thread once per game frame:
 // the pressed/released edges accumulate between calls so short taps are not lost.
 Snapshot Consume();
+// Latest state without taking the button edges (for the menu pointer, which
+// runs on the render thread and keeps its own edge state).
+Snapshot Peek();
 
 // Vibration, queued from any thread and played on the next frame.
 void Haptic(Hand hand, float amplitude, float seconds, float frequency_hz = 0.f);
