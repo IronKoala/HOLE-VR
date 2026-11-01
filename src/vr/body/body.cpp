@@ -60,7 +60,8 @@ struct Settings {
     bool legs = true;
     bool finger_contact = true;   // fingers stop where they touch the held object
     double finger_radius = 0.8;   // cm, finger centre to skin on the curl side
-    double mag_hold_low = 0.15;
+    double mag_hold_low = 0.25;
+    double mag_index_aim_max = 75.0;  // degrees the index may swing to point up a held magazine
     bool palm_seat = true;        // put the palm on the held object's surface
     double palm_skin = 2.0;       // cm from the hand bone line out to the palm skin
     double palm_along = 0.5;      // where on the palm (0 wrist .. 1 knuckles) touches   // fist below the magazine's middle, share of its height
@@ -107,7 +108,10 @@ void LoadSettings() {
     S.game_grip = config::GetBool("hand_copy_game_grip", false);
     S.finger_contact = config::GetBool("finger_contact", true);
     S.finger_radius = config::GetFloat("finger_radius_cm", 0.8f);
-    S.mag_hold_low = config::GetFloat("hand_mag_hold_low", 0.15f);
+    // Renamed from hand_mag_hold_low (0.15): reference photos hold it lower,
+    // base in the palm.
+    S.mag_hold_low = config::GetFloat("hand_mag_grip_low", 0.25f);
+    S.mag_index_aim_max = config::GetFloat("hand_mag_index_up_max_deg", 75.f);
     S.palm_seat = config::GetBool("hand_palm_seat", true);
     S.palm_skin = config::GetFloat("hand_palm_skin_cm", 2.f);
     S.palm_along = config::GetFloat("hand_palm_seat_along", 0.5f);
@@ -909,9 +913,12 @@ void SolveArm(int side, const hands::HandState& h, const FVector& body_fwd, cons
     const bool on_mag = (grab.kind == hands::GrabKind::kMagHeld || grab.kind == hands::GrabKind::kMagInsert) &&
                         grab.object;
     if (on_mag && grab.object != g_c->actor) CollectPrimitives(grab.object, false);
+    FVector mag_up{0, 0, 1};
+    bool have_mag_up = false;
     if (on_mag && grab.object == g_c->actor) {
-        FVector mag_fist, mag_up, mag_front;
+        FVector mag_fist, mag_front;
         if (MagHold(&mag_fist, &mag_up, &mag_front)) {
+            have_mag_up = true;
             fist = mag_fist;
             fwd = mag_up;
             palm = mag_front;
@@ -1077,10 +1084,16 @@ void SolveArm(int side, const hands::HandState& h, const FVector& body_fwd, cons
             // the frame, pointing where the barrel points.
             // Thumb on a pistol grip (reference photos): straight, high on the
             // weak side of the frame, pointing forward like the barrel.
-            if (grab.kind == hands::GrabKind::kGunGrip && f == hand_pose::kThumb) {
+            // Magazine (owner's reference photos): base in the palm, index
+            // finger straight up the front, thumb up the side, both pointing
+            // toward the feed lips.
+            const bool mag_point = have_mag_up && (f == hand_pose::kIndex || f == hand_pose::kThumb);
+            const bool gun_thumb = grab.kind == hands::GrabKind::kGunGrip && f == hand_pose::kThumb;
+            if (mag_point || gun_thumb) {
                 if (n == 0) {
                     FVector dir = BoneW(j[1]).translation - BoneW(j[0]).translation;
-                    RotateBoneW(j[0], ClampAngle(Arc(dir, barrel_w), S.thumb_aim_max * kDegToRad));
+                    double lim = f == hand_pose::kIndex ? S.mag_index_aim_max : S.thumb_aim_max;
+                    RotateBoneW(j[0], ClampAngle(Arc(dir, mag_point ? mag_up : barrel_w), lim * kDegToRad));
                     G.contact[side][f][0] = 1.0;
                     continue;
                 }
