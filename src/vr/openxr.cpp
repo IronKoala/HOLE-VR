@@ -145,6 +145,12 @@ bool g_have_latest = false;
 bool g_have_rendered = false;
 
 std::atomic<ID3D12Resource*> g_eye_texture{nullptr};
+// The game window's current back buffer. While the engine draws both eyes
+// straight into the window (or before its eye texture is found) we copy from
+// here instead: lower resolution, but it gets a picture into the headset.
+ID3D12Resource* g_fallback_texture = nullptr;
+uint64_t g_frames = 0, g_frames_engine = 0, g_frames_fallback = 0, g_frames_none = 0;
+DWORD g_last_stats = 0;
 
 struct Swapchain {
     XrSwapchain handle = XR_NULL_HANDLE;
@@ -153,7 +159,10 @@ struct Swapchain {
 };
 Swapchain g_swapchains[2];
 DXGI_FORMAT g_swapchain_format = DXGI_FORMAT_UNKNOWN;
-ID3D12Resource* g_swapchain_source = nullptr;  // texture the swapchains were made for
+// Size/format the swapchains were made for; recreated only when these change.
+UINT64 g_source_width = 0;
+UINT g_source_height = 0;
+DXGI_FORMAT g_source_format = DXGI_FORMAT_UNKNOWN;
 
 // Our own copy commands, executed on the game's queue right before its Present
 // so they run after the frame's rendering in GPU order.
@@ -239,7 +248,9 @@ bool CreateSwapchains(ID3D12Resource* source) {
         sc.images.assign(n, XrSwapchainImageD3D12KHR{XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR});
         XR_CHECK(enum_images(sc.handle, n, &n, reinterpret_cast<XrSwapchainImageBaseHeader*>(sc.images.data())));
     }
-    g_swapchain_source = source;
+    g_source_width = desc.Width;
+    g_source_height = desc.Height;
+    g_source_format = desc.Format;
     log::Info("OpenXR: swapchains %ux%u per eye, format %d (eye texture format %d)", src_eye_w,
               static_cast<unsigned>(desc.Height), static_cast<int>(g_swapchain_format),
               static_cast<int>(desc.Format));
@@ -257,7 +268,7 @@ D3D12_RESOURCE_BARRIER Transition(ID3D12Resource* r, D3D12_RESOURCE_STATES befor
 }
 
 // Copies both halves of the eye texture into the acquired swapchain images.
-bool CopyEyes(ID3D12Resource* source, const uint32_t image_index[2]) {
+bool CopyEyes(ID3D12Resource* source, D3D12_RESOURCE_STATES src_state, const uint32_t image_index[2]) {
     int slot = g_frame_slot;
     g_frame_slot = (g_frame_slot + 1) % kFramesInFlight;
     if (g_fence->GetCompletedValue() < g_allocator_fence_value[slot]) {
@@ -266,11 +277,6 @@ bool CopyEyes(ID3D12Resource* source, const uint32_t image_index[2]) {
     }
     g_allocators[slot]->Reset();
     g_cmd->Reset(g_allocators[slot], nullptr);
-
-    // The engine leaves the eye texture readable by shaders after drawing the
-    // desktop mirror from it. Overridable while we confirm this on hardware.
-    auto src_state = static_cast<D3D12_RESOURCE_STATES>(config::GetInt(
-        "eye_texture_state", D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
 
     D3D12_RESOURCE_BARRIER before[3] = {
         Transition(source, src_state, D3D12_RESOURCE_STATE_COPY_SOURCE),
@@ -413,7 +419,16 @@ void RunFrame() {
     XrCompositionLayerProjection layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
     std::vector<const XrCompositionLayerBaseHeader*> layers;
 
+    // The engine leaves its eye texture readable by shaders after drawing the
+    // desktop mirror from it; a back buffer is in the PRESENT state.
     ID3D12Resource* source = g_eye_texture.load();
+    auto src_state = static_cast<D3D12_RESOURCE_STATES>(config::GetInt(
+        "eye_texture_state", D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
+    const bool from_engine = source != nullptr;
+    if (!source && config::GetBool("backbuffer_fallback", true)) {
+        source = g_fallback_texture;
+        src_state = D3D12_RESOURCE_STATE_PRESENT;
+    }
     EyeView rendered[2];
     bool have_rendered;
     {
@@ -422,7 +437,9 @@ void RunFrame() {
         std::memcpy(rendered, g_rendered, sizeof(rendered));
     }
     if (fs.shouldRender && source && have_rendered) {
-        bool ok = source == g_swapchain_source || CreateSwapchains(source);
+        D3D12_RESOURCE_DESC sd = source->GetDesc();
+        bool ok = (sd.Width == g_source_width && sd.Height == g_source_height && sd.Format == g_source_format) ||
+                  CreateSwapchains(source);
         uint32_t index[2] = {};
         auto acquire = Proc<PFN_xrAcquireSwapchainImage>("xrAcquireSwapchainImage");
         auto wait = Proc<PFN_xrWaitSwapchainImage>("xrWaitSwapchainImage");
@@ -437,7 +454,7 @@ void RunFrame() {
             wti.timeout = 100000000;  // 100 ms
             ok = XR_SUCCEEDED(wait(g_swapchains[eye].handle, &wti));
         }
-        if (ok) ok = CopyEyes(source, index);
+        if (ok) ok = CopyEyes(source, src_state, index);
         for (int eye = 0; eye < acquired; ++eye) {
             XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
             release(g_swapchains[eye].handle, &ri);
@@ -454,7 +471,19 @@ void RunFrame() {
             layer.viewCount = 2;
             layer.views = proj_views;
             layers.push_back(reinterpret_cast<XrCompositionLayerBaseHeader*>(&layer));
+            ++(from_engine ? g_frames_engine : g_frames_fallback);
         }
+    }
+    ++g_frames;
+    if (layers.empty()) ++g_frames_none;
+    DWORD now = GetTickCount();
+    if (now - g_last_stats > 10000) {
+        log::Info("OpenXR: %llu frames (engine eye texture %llu, window copy %llu, nothing %llu); "
+                  "eye texture %s, rendered views %s",
+                  (unsigned long long)g_frames, (unsigned long long)g_frames_engine,
+                  (unsigned long long)g_frames_fallback, (unsigned long long)g_frames_none,
+                  g_eye_texture.load() ? "found" : "missing", have_rendered ? "yes" : "no");
+        g_last_stats = now;
     }
     if (fs.shouldRender)
         for (Listener* l : Listeners()) l->AddLayers(g_session, g_space, fs.predictedDisplayTime, layers);
@@ -544,7 +573,8 @@ void RecommendedEyeSize(uint32_t* width, uint32_t* height) {
     *height = g_eye_h;
 }
 
-void OnPresent(ID3D12CommandQueue* queue) {
+void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* back_buffer) {
+    g_fallback_texture = back_buffer;
     if (!g_instance_ready || g_session_failed || !queue) return;
     if (!g_session) {
         if (!CreateSession(queue)) {
@@ -557,6 +587,7 @@ void OnPresent(ID3D12CommandQueue* queue) {
 }
 
 void SetEyeTexture(ID3D12Resource* texture) { g_eye_texture = texture; }
+void SetFallbackTexture(ID3D12Resource* texture) { g_fallback_texture = texture; }
 
 bool LatestViews(EyeView out[2]) {
     std::lock_guard<std::mutex> lock(g_view_mutex);

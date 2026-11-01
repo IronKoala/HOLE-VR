@@ -4,6 +4,7 @@
 #include <d3d12.h>
 
 #include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -77,6 +78,13 @@ bool g_have_frame_views = false;
 std::atomic<bool> g_recenter{true};
 FVector g_origin_m;
 double g_origin_yaw = 0.0;
+
+// Logs the first time each hook runs, so a log shows which engine paths are live.
+#define HOLEVR_FIRST_CALL(name)                                  \
+    do {                                                         \
+        static std::atomic<bool> seen{false};                    \
+        if (!seen.exchange(true)) log::Info("stereo: first call to %s", name); \
+    } while (0)
 
 bool InText(uintptr_t p) {
     const mem::Section* t = mem::Game().Find(".text");
@@ -155,6 +163,7 @@ bool FrameViews(bool new_sample, xr::EyeView out[2]) {
 }
 
 void HookCalcOffset(void* self, int32_t view_index, FRotator* rotation, float world_to_meters, FVector* location) {
+    HOLEVR_FIRST_CALL("CalculateStereoViewOffset");
     xr::EyeView views[2];
     // A left-eye request starts a new frame: take a fresh tracking sample.
     if (view_index < 0 || view_index > 1 || !FrameViews(view_index == 0, views)) {
@@ -187,6 +196,7 @@ void HookCalcOffset(void* self, int32_t view_index, FRotator* rotation, float wo
 }
 
 double* HookProjection(void* self, double* out, int32_t view_index) {
+    HOLEVR_FIRST_CALL("GetStereoProjectionMatrix");
     xr::EyeView views[2];
     if (view_index < 0 || view_index > 1 || !FrameViews(false, views))
         return o_projection(self, out, view_index);
@@ -253,30 +263,52 @@ bool IsD3D12Resource(uintptr_t p) {
     return false;
 }
 
-// FD3D12Texture -> (FD3D12Resource*) -> TRefCountPtr<ID3D12Resource>. Offsets
-// differ between engine builds, so search two pointer levels for an object
-// with the D3D12 runtime's resource vtable and the expected size.
-ID3D12Resource* FindNativeTexture(void* rhi_texture) {
-    auto base = reinterpret_cast<uintptr_t>(rhi_texture);
-    for (uintptr_t o1 = 8; o1 < 0x200; o1 += 8) {
-        uintptr_t p1 = mem::ReadOr<uintptr_t>(base + o1);
-        if (!mem::LooksLikePointer(p1)) continue;
-        for (uintptr_t o2 = 0; o2 < 0x100; o2 += 8) {
-            uintptr_t p2 = mem::ReadOr<uintptr_t>(p1 + o2);
-            if (!IsD3D12Resource(p2)) continue;
-            auto* res = reinterpret_cast<ID3D12Resource*>(p2);
+// The engine hands us an RDG or RHI texture wrapper. The ID3D12Resource sits a
+// few pointers below it (FRDGTexture -> pooled RHI texture -> FD3D12Resource ->
+// ID3D12Resource), at offsets that differ between engine builds. Search up to
+// three levels for an object with the D3D12 runtime's resource vtable that is
+// a side-by-side 2D texture.
+ID3D12Resource* SearchResource(uintptr_t obj, int depth, std::vector<uintptr_t>& path) {
+    const uintptr_t span = depth == 0 ? 0x200 : 0x100;
+    for (uintptr_t off = 0; off < span; off += 8) {
+        uintptr_t p = mem::ReadOr<uintptr_t>(obj + off);
+        if (!mem::LooksLikePointer(p) || p == obj) continue;
+        path.push_back(off);
+        if (IsD3D12Resource(p)) {
+            auto* res = reinterpret_cast<ID3D12Resource*>(p);
             D3D12_RESOURCE_DESC d = res->GetDesc();
-            if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.Width < 2 * d.Height / 3) continue;
-            log::Info("stereo: eye texture %llux%u format %d (RHI texture +0x%llx, +0x%llx)",
-                      static_cast<unsigned long long>(d.Width), d.Height, static_cast<int>(d.Format),
-                      static_cast<unsigned long long>(o1), static_cast<unsigned long long>(o2));
-            return res;
+            if (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.Width >= d.Height) return res;
+        } else if (depth < 2) {
+            if (ID3D12Resource* r = SearchResource(p, depth + 1, path)) return r;
         }
+        path.pop_back();
     }
     return nullptr;
 }
 
+ID3D12Resource* FindNativeTexture(void* engine_texture) {
+    std::vector<uintptr_t> path;
+    ID3D12Resource* res = SearchResource(reinterpret_cast<uintptr_t>(engine_texture), 0, path);
+    if (!res) return nullptr;
+    D3D12_RESOURCE_DESC d = res->GetDesc();
+    std::string chain;
+    char hex[24];
+    for (uintptr_t o : path) {
+        snprintf(hex, sizeof(hex), " +0x%llx", static_cast<unsigned long long>(o));
+        chain += hex;
+    }
+    log::Info("stereo: eye texture %llux%u format %d (pointer path%s)", static_cast<unsigned long long>(d.Width),
+              d.Height, static_cast<int>(d.Format), chain.c_str());
+    return res;
+}
+
 void HookRenderTexture(void* self, void* cmdlist, void* back_buffer, void* src_texture, void* window_size) {
+    HOLEVR_FIRST_CALL("RenderTexture_RenderThread");
+    if (!src_texture) {
+        static bool told = false;
+        if (!told) log::Warn("stereo: engine passed no eye texture to RenderTexture");
+        told = true;
+    }
     if (src_texture && src_texture != g_last_src) {
         LearnResourceVtables();
         g_last_resource = FindNativeTexture(src_texture);
@@ -290,6 +322,7 @@ void HookRenderTexture(void* self, void* cmdlist, void* back_buffer, void* src_t
 
 // Secondary-interface methods receive this = device + 8.
 void HookCalcRTSize(void* self, const void* viewport, uint32_t* x, uint32_t* y) {
+    HOLEVR_FIRST_CALL("CalculateRenderTargetSize");
     if (g_eye_w && g_eye_h) {
         *x = g_eye_w * 2;
         *y = g_eye_h;
@@ -300,6 +333,7 @@ void HookCalcRTSize(void* self, const void* viewport, uint32_t* x, uint32_t* y) 
 }
 
 bool HookNeedRealloc(void* self, const void* viewport) {
+    HOLEVR_FIRST_CALL("NeedReAllocateViewportRenderTarget");
     return g_realloc.load() || o_need_realloc(self, viewport);
 }
 
