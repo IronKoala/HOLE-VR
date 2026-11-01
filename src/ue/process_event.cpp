@@ -6,6 +6,7 @@
 #include <cstring>
 
 #include "core/log.h"
+#include "core/perf.h"
 #include "core/memory.h"
 #include "ue/reflection.h"
 
@@ -154,6 +155,8 @@ ProcessEventFn OriginalFor(uintptr_t vtable) {
 }
 
 thread_local int t_depth = 0;
+perf::Counter g_hook_perf{"ProcessEvent callbacks"};
+std::atomic<bool> g_hook_perf_registered{false};
 
 void Hook(UObject self, UObject function, void* params) {
     uintptr_t vt = *reinterpret_cast<uintptr_t*>(self);
@@ -165,6 +168,8 @@ void Hook(UObject self, UObject function, void* params) {
         original(self, function, params);
         return;
     }
+    if (!g_hook_perf_registered.exchange(true)) perf::Register(&g_hook_perf);
+    double t_pre = perf::NowMs();
     ++t_depth;
     const Callback* match = nullptr;
     int n = g_callback_count.load(std::memory_order_acquire);
@@ -177,13 +182,16 @@ void Hook(UObject self, UObject function, void* params) {
     bool run = true;
     if (match && match->pre) run = match->pre(self, function, params);
     --t_depth;
+    double t_mid = perf::NowMs();
 
     if (run) original(self, function, params);
 
+    double t_post = perf::NowMs();
     ++t_depth;
     if (PostFn any = g_any.load(std::memory_order_acquire)) any(self, function, params);
     if (match && match->post) match->post(self, function, params);
     --t_depth;
+    g_hook_perf.Add((t_mid - t_pre) + (perf::NowMs() - t_post));
 }
 
 }  // namespace
