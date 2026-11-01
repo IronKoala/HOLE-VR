@@ -94,6 +94,8 @@ void LoadSettings() {
 // ---- shared hand state for other systems ----
 std::mutex g_hands_mutex;
 hands::HandState g_hands[2];
+hands::HandGrab g_grab[2];
+hands::FingerInput g_fingers[2];
 hands::Pose g_head;
 bool g_head_valid = false;
 double g_clock = 0.0;
@@ -130,6 +132,13 @@ void UpdateHands(const input::Snapshot& s) {
         head_ok = ToWorld(c, &head);
     }
     std::lock_guard<std::mutex> lock(g_hands_mutex);
+    for (int i = 0; i < 2; ++i) {
+        const input::HandInput& in = s.hand[i];
+        g_fingers[i].trigger = in.trigger;
+        g_fingers[i].trigger_touch = in.trigger_touch;
+        g_fingers[i].grip = in.grip_value;
+        g_fingers[i].thumb_touch = in.primary.down || in.secondary.down || in.stick_click.down;
+    }
     g_hands[0] = h[0];
     g_hands[1] = h[1];
     g_head = head;
@@ -337,6 +346,35 @@ void MagazineHandling(game::Gun& gun, const hands::HandState& lh, const input::H
     }
 }
 
+void PublishGrabs(game::Gun& gun, const hands::HandState& rh, const hands::HandState& lh) {
+    hands::HandGrab g[2];
+    if (gun.Valid() && rh.valid) {
+        g[hands::kRight].kind = hands::GrabKind::kGunGrip;
+        g[hands::kRight].object = gun.Object();
+        UObject main = 0;
+        if (ue::GetProp(gun.Object(), "MainHandPosition", main) && main) {
+            UETransform t = ComponentToWorld(main);
+            g[hands::kRight].target = {t.translation, t.rotation};
+        } else {
+            g[hands::kRight].target = rh.grip;
+        }
+    }
+    if (lh.valid) {
+        if (W.slide.Held()) {
+            g[hands::kLeft].kind = hands::GrabKind::kSlideGrab;
+            g[hands::kLeft].object = gun.Object();
+            g[hands::kLeft].target = lh.grip;
+        } else if (W.held_mag) {
+            g[hands::kLeft].kind = hands::GrabKind::kMagHeld;
+            g[hands::kLeft].object = W.held_mag;
+            g[hands::kLeft].target = lh.grip;
+        }
+    }
+    std::lock_guard<std::mutex> lock(g_hands_mutex);
+    g_grab[0] = g[0];
+    g_grab[1] = g[1];
+}
+
 void OnTick(UObject player, float dt) {
     g_clock += dt;
     input::Snapshot s = input::Consume();
@@ -349,12 +387,17 @@ void OnTick(UObject player, float dt) {
         W = WeaponState();
         W.gun = gun.Object();
     }
-    if (!gun.Valid()) return;
+    if (!gun.Valid()) {
+        hands::HandState none;
+        PublishGrabs(gun, none, none);
+        return;
+    }
     hands::HandState rh = hands::Get(hands::kRight), lh = hands::Get(hands::kLeft);
     if (rh.valid) HoldGun(gun, rh);
     Trigger(player, s.hand[input::kRight]);
     SlideHandling(gun, lh, s.hand[input::kLeft], dt);
     MagazineHandling(gun, lh, s.hand[input::kLeft], s.hand[input::kRight]);
+    PublishGrabs(gun, rh, lh);
 }
 
 }  // namespace
@@ -372,6 +415,14 @@ namespace holevr::vr::hands {
 HandState Get(Hand hand) {
     std::lock_guard<std::mutex> lock(controls::g_hands_mutex);
     return controls::g_hands[hand];
+}
+HandGrab GetGrab(Hand hand) {
+    std::lock_guard<std::mutex> lock(controls::g_hands_mutex);
+    return controls::g_grab[hand];
+}
+FingerInput GetFingers(Hand hand) {
+    std::lock_guard<std::mutex> lock(controls::g_hands_mutex);
+    return controls::g_fingers[hand];
 }
 bool Head(Pose* out) {
     std::lock_guard<std::mutex> lock(controls::g_hands_mutex);

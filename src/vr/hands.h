@@ -2,6 +2,8 @@
 // World-space hand poses for other systems (wrist HUD, body IK, weapons).
 // Updated on the game thread every game frame by vr/controls.
 
+#include <cstdint>
+
 #include "vr/math.h"
 
 namespace holevr::vr::hands {
@@ -23,6 +25,25 @@ struct HandState {
 };
 
 HandState Get(Hand hand);
+
+// What each hand is holding, so body IK can snap the hand to the object
+// instead of the raw controller.
+enum class GrabKind { kNone, kGunGrip, kSlideGrab, kMagHeld, kMagInsert, kHolster };
+struct HandGrab {
+    GrabKind kind = GrabKind::kNone;
+    uintptr_t object = 0;   // gun or magazine UObject
+    Pose target;            // world transform the hand should take while attached
+};
+HandGrab GetGrab(Hand hand);
+
+// Raw finger inputs for hand poses.
+struct FingerInput {
+    float trigger = 0.f;      // 0..1
+    bool trigger_touch = false;
+    float grip = 0.f;         // 0..1
+    bool thumb_touch = false; // thumb resting on a button/stick (when the controller reports it)
+};
+FingerInput GetFingers(Hand hand);
 
 // Head (centre eye) in world space; valid once the headset is rendering.
 bool Head(Pose* out);
