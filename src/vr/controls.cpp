@@ -995,7 +995,9 @@ void SupportGrip(const hands::HandState& lh, const input::HandInput& lin) {
 
 // Right stick click: fire selector (safe / semi / auto, as the gun allows).
 void FireSelector(game::Gun& gun, const input::HandInput& rin) {
-    if (!rin.stick_click.pressed) return;
+    // Rifles only: a Glock has no selector, and a stray click on the turn
+    // stick must never put the pistol on safe.
+    if (W.is_pistol || !rin.stick_click.pressed) return;
     ue::Call c(gun.Object(), "Gun_SwitchFireMode");
     c.Invoke();
     uint8_t mode = 0;
