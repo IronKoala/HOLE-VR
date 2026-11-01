@@ -43,6 +43,16 @@ T ReadOr(uintptr_t p, T fallback = T{}) {
     return Read(p, v) ? v : fallback;
 }
 
+// True if [p, p+len) is committed read/write memory (heap objects, not code).
+bool IsWritable(uintptr_t p, size_t len);
+
+template <typename T>
+bool Write(uintptr_t p, const T& value) {
+    if (!IsWritable(p, sizeof(T))) return false;
+    std::memcpy(reinterpret_cast<void*>(p), &value, sizeof(T));
+    return true;
+}
+
 // Plausible user-mode heap/module pointer on x64 Windows.
 inline bool LooksLikePointer(uintptr_t p) {
     return p >= 0x10000 && p < 0x00007FFFFFFFFFFFull && (p & 0x7) == 0;

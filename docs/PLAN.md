@@ -24,7 +24,7 @@ Agreed with the project owner (Mtthew), who directs features and playtests.
    turning, movement relative to head or controller. Then physical weapon
    handling and full-body IK (see below).
 4. **Polish**: menus and HUD on world-space panels, fixes for effects that break
-   in stereo, performance, installer.
+   in stereo, performance, installer. Details and progress: [STEP4.md](STEP4.md).
 
 ## Weapon interaction (must-haves)
 
