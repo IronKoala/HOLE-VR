@@ -441,9 +441,13 @@ void RunFrame() {
     if (long long last = g_last_frame_qpc.load()) {
         double gap = MsSince(last);
         if (gap > g_max_gap_ms) g_max_gap_ms = gap;
-        if (gap > config::GetFloat("hitch_log_ms", 50.0f)) {
+        if (gap > config::GetFloat("hitch_log_ms", 100.0f)) {
             ++g_hitches;
-            log::Info("OpenXR: game frame gap %.0f ms (session state %d)", gap, static_cast<int>(g_state));
+            static DWORD last_log = 0;
+            if (GetTickCount() - last_log > 1000) {
+                last_log = GetTickCount();
+                log::Info("OpenXR: game frame gap %.0f ms (session state %d)", gap, static_cast<int>(g_state));
+            }
         }
     }
     XrFrameState fs{XR_TYPE_FRAME_STATE};
@@ -543,7 +547,9 @@ void RunFrame() {
 
 // Re-sends the last frame while the game is stalled (shader compiles, level
 // streaming, loading), so SteamVR keeps showing the game instead of timing
-// it out and going black.
+// it out and going black. Only for real stalls: each keep-alive frame waits
+// for a display slot, and the game's next frame then waits for another, so
+// a short threshold (40 ms) fed on itself and dragged the game to ~20 fps.
 void KeepAliveFrame() {
     XrFrameState fs{XR_TYPE_FRAME_STATE};
     XrFrameWaitInfo wi{XR_TYPE_FRAME_WAIT_INFO};
@@ -572,10 +578,10 @@ void KeepAliveLoop() {
         Sleep(5);
         long long last = g_last_frame_qpc.load();
         if (!g_running || !last) continue;
-        if (MsSince(last) < config::GetFloat("keep_alive_after_ms", 40.0f)) continue;
+        if (MsSince(last) < config::GetFloat("keep_alive_after_ms", 250.0f)) continue;
         std::lock_guard<std::mutex> lock(g_frame_mutex);
         // Re-check under the lock: the game may have submitted meanwhile.
-        if (!g_running || MsSince(g_last_frame_qpc.load()) < config::GetFloat("keep_alive_after_ms", 40.0f))
+        if (!g_running || MsSince(g_last_frame_qpc.load()) < config::GetFloat("keep_alive_after_ms", 250.0f))
             continue;
         KeepAliveFrame();
     }
