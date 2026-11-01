@@ -230,6 +230,9 @@ struct WeaponState {
     double check_chamber_at = -1;
     double pending_release_at = -1;
     bool retried_rack = false;
+    bool dead_trigger = false;  // Glock: after a dry fire the trigger is dead until the slide moves
+    bool trigger_sent = false;  // the game saw the current trigger press
+    bool lock_on_release = false; // B pressed while holding the slide back: lock it open
 } W;
 
 double Len(const FVector& v) { return std::sqrt(v.X * v.X + v.Y * v.Y + v.Z * v.Z); }
@@ -350,14 +353,31 @@ void HoldGun(game::Gun& gun, const hands::HandState& rh) {
     SetActorTransform(g, loc, rot);
 }
 
-void Trigger(UObject player, const input::HandInput& rin) {
-    if (rin.trigger_button.pressed || rin.trigger_button.released) {
-        bool pressed = rin.trigger_button.down;
-        // The parameter means "trigger released": false on press, true on release.
+void Trigger(UObject player, game::Gun& gun, const input::HandInput& rin) {
+    // The game's parameter means "trigger released": false on press, true on release.
+    auto send = [&](bool released) {
         ue::Call c(player, "PlayerInput_UseWeapon");
-        c.Set("Press Released", !pressed);
+        c.Set("Press Released", released);
         c.Invoke();
-        if (pressed) input::Haptic(input::kRight, 0.8f, 0.05f);
+    };
+    if (rin.trigger_button.pressed) {
+        if (W.dead_trigger) {
+            log::Info("controls: dead trigger (dry fired, slide not moved since)");
+            return;
+        }
+        game::GunState st = gun.State();
+        const bool dry = st.chamber == 0 && !st.slide_locked;
+        send(false);
+        W.trigger_sent = true;
+        if (dry) {
+            W.dead_trigger = true;
+            input::Haptic(input::kRight, 0.25f, 0.02f);
+        } else {
+            input::Haptic(input::kRight, 0.8f, 0.05f);
+        }
+    } else if (rin.trigger_button.released && W.trigger_sent) {
+        send(true);
+        W.trigger_sent = false;
     }
 }
 
@@ -397,8 +417,19 @@ void SlideHandling(game::Gun& gun, const hands::HandState& lh, const input::Hand
             gun.ChargeBoltPull();
             input::Haptic(input::kLeft, 0.7f, 0.05f);
             break;
-        case SlideEvent::kRacked:
-            log::Info("controls: rack, before: %s", gun.State().Describe().c_str());
+        case SlideEvent::kRacked: {
+            game::GunState st = gun.State();
+            log::Info("controls: rack, before: %s", st.Describe().c_str());
+            // Glock: the slide stays open if the thumb pushed the slide stop up
+            // (B while holding it back) or an empty magazine's follower lifts it.
+            if (W.lock_on_release || (st.has_magazine && st.magazine == 0)) {
+                W.lock_on_release = false;
+                gun.EndBoltCharging();
+                ue::SetProp<bool>(gun.Object(), "IsBolt(Slide)Stopped", true);
+                input::Haptic(input::kLeft, 0.6f, 0.04f);
+                log::Info("controls: slide locked open: %s", gun.State().Describe().c_str());
+                break;
+            }
             gun.ChargeBoltRelease();
             W.end_charging_at = g_clock + 0.4;
             W.check_chamber_at = g_clock + 0.6;
@@ -406,11 +437,18 @@ void SlideHandling(game::Gun& gun, const hands::HandState& lh, const input::Hand
             input::Haptic(input::kRight, 0.5f, 0.05f);
             log::Info("controls: full rack");
             break;
+        }
         case SlideEvent::kPartialRelease:
         case SlideEvent::kSlipped:
+            W.lock_on_release = false;
             log::Info("controls: slide let go at %.0f%%", W.slide.Peak() * 100);
             break;
         default: break;
+    }
+    // Moving the slide a few mm resets a Glock's trigger after a dry fire.
+    if (W.dead_trigger && W.slide.Travel() > rest + 0.12) {
+        W.dead_trigger = false;
+        log::Info("controls: trigger reset by the slide");
     }
     if (W.slide.Travel() > 0.001 && (W.slide.Held() || !locked || W.slide.Travel() > rest + 0.001)) {
         gun.SetSlideTravel(W.slide.Travel(), ue::Vec3d{cfg.axis.X, cfg.axis.Y, cfg.axis.Z});
@@ -508,12 +546,25 @@ void RefillPouch(game::Gun& gun, UObject player, const FVector& loc, const FQuat
 void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState& lh, const input::HandInput& lin,
                       const input::HandInput& rin) {
     // Right A / primary: magazine release.
+    // Right B: the slide stop lever. Pressed down on a locked slide it
+    // releases it; with the slide held back by the left hand it pushes the
+    // lever up so the slide stays open; otherwise it does nothing.
     if (rin.secondary.pressed) {
-        log::Info("controls: slide release (B), before: %s", gun.State().Describe().c_str());
-        gun.ReleaseSlideCatch();
-        W.end_charging_at = g_clock + 0.4;
-        W.check_chamber_at = g_clock + 0.6;
-        input::Haptic(input::kRight, 0.5f, 0.04f);
+        game::GunState st = gun.State();
+        double len = gun.SlideBackLength() > 0.5 ? gun.SlideBackLength() : 4.7;
+        double stop = gun.SlideStopLength() > 0 ? gun.SlideStopLength() / len : 0.75;
+        if (W.slide.Held() && W.slide.Travel() >= stop - 0.05) {
+            W.lock_on_release = true;
+            input::Haptic(input::kRight, 0.3f, 0.03f);
+            log::Info("controls: slide stop pushed up, slide will stay open");
+        } else if (st.slide_locked && !W.slide.Held()) {
+            log::Info("controls: slide release (B), before: %s", st.Describe().c_str());
+            gun.ReleaseSlideCatch();
+            W.dead_trigger = false;
+            W.end_charging_at = g_clock + 0.4;
+            W.check_chamber_at = g_clock + 0.6;
+            input::Haptic(input::kRight, 0.5f, 0.04f);
+        }
     }
     if (rin.primary.pressed && gun.State().has_magazine) {
         log::Info("controls: mag release, before: %s", gun.State().Describe().c_str());
@@ -662,7 +713,7 @@ void OnTick(UObject player, float dt) {
     HookChargeTimeline();
     hands::HandState rh = hands::Get(hands::kRight), lh = hands::Get(hands::kLeft);
     if (rh.valid) HoldGun(gun, rh);
-    Trigger(player, s.hand[input::kRight]);
+    Trigger(player, gun, s.hand[input::kRight]);
     SlideHandling(gun, lh, s.hand[input::kLeft], dt);
     MagazineHandling(gun, player, lh, s.hand[input::kLeft], s.hand[input::kRight]);
     PublishGrabs(gun, rh, lh);
