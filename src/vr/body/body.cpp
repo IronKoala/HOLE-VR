@@ -545,6 +545,42 @@ FVector g_catch_rel;  // magazine catch in the gun frame, from MainHandPosition
 // MainHandPosition. From the magazine catch: back to the middle of the grip,
 // then down the slanted grip. The game's MainHandPosition is where its wrist
 // goes, ~8 cm from the grip itself, which is why the hand used to float.
+// Local-space bounding box of a mesh part. The parts' GetLocalBounds
+// returned all zeros in the game (seventh grip test), so read the mesh
+// asset's own box first.
+struct BoxMinMax {
+    FVector Min, Max;
+};
+bool LocalBox(UObject comp, FVector* mn, FVector* mx) {
+    UObject mesh = 0;
+    {
+        ue::Call g(comp, "GetStaticMesh");
+        if (g.Valid() && g.Invoke()) mesh = g.Result<UObject>();
+    }
+    if (!mesh) ue::GetProp(comp, "StaticMesh", mesh);
+    if (mesh) {
+        ue::Call b(mesh, "GetBoundingBox");
+        if (b.Valid() && b.Invoke()) {
+            BoxMinMax r = b.Result<BoxMinMax>();
+            if (Length(r.Max - r.Min) > 0.1 && Length(r.Max - r.Min) < 500.0) {
+                *mn = r.Min;
+                *mx = r.Max;
+                return true;
+            }
+        }
+    }
+    ue::Call lb(comp, "GetLocalBounds");
+    if (lb.Valid() && lb.Invoke()) {
+        FVector a = lb.Get<FVector>("Min"), b = lb.Get<FVector>("Max");
+        if (Length(b - a) > 0.1 && Length(b - a) < 500.0) {
+            *mn = a;
+            *mx = b;
+            return true;
+        }
+    }
+    return false;
+}
+
 bool g_guard_known = false;
 double g_guard_bottom = 0;  // lowest point of the trigger guard, gun frame Z from MainHandPosition
 
@@ -573,10 +609,14 @@ void FindTriggerGuard(UObject gun, const hands::Pose& main) {
             if (p.type != "ObjectProperty" || Lower(p.name).find("triggerguard") == std::string::npos) continue;
             UObject comp = 0;
             if (!mem::Read(gun + p.offset, comp) || !comp) continue;
-            ue::Call lb(comp, "GetLocalBounds");
+            FVector mn, mx;
             ue::Call tw(comp, "K2_GetComponentToWorld");
-            if (!lb.Invoke() || !tw.Invoke()) continue;
-            FVector mn = lb.Get<FVector>("Min"), mx = lb.Get<FVector>("Max");
+            if (!LocalBox(comp, &mn, &mx)) {
+                log::Info("body: trigger guard %s has no readable size, grip height from the magazine catch",
+                          p.name.c_str());
+                break;
+            }
+            if (!tw.Invoke()) continue;
             Xf t = tw.Result<Xf>();
             double low = 1e9;
             for (int i = 0; i < 8; ++i) {
@@ -584,7 +624,9 @@ void FindTriggerGuard(UObject gun, const hands::Pose& main) {
                 FVector w = t.translation + t.rotation.Rotate(FVector{c.X * t.scale.X, c.Y * t.scale.Y, c.Z * t.scale.Z});
                 low = std::min(low, main.rotation.Inverse().Rotate(w - main.location).Z);
             }
-            if (low > -20.0 && low < 30.0) {
+            // The guard hangs below the magazine catch; anything else is a
+            // bad reading.
+            if (low > -20.0 && low < 30.0 && (!g_catch_known || low < g_catch_rel.Z - 1.0)) {
                 g_guard_bottom = low;
                 g_guard_known = true;
                 log::Info("body: trigger guard %s bottom at %.1f cm (gun frame)", p.name.c_str(), low);
@@ -728,10 +770,10 @@ void CollectPrimitives(UObject actor, bool make_traceable) {
             // Size of the part (local bounds x scale), to compare the gun
             // with a real one and with the avatar's hand.
             FVector size{0, 0, 0};
-            ue::Call lb(comp, "GetLocalBounds");
+            FVector bmn, bmx;
             ue::Call tw(comp, "K2_GetComponentToWorld");
-            if (lb.Invoke() && tw.Invoke()) {
-                FVector d = lb.Get<FVector>("Max") - lb.Get<FVector>("Min");
+            if (LocalBox(comp, &bmn, &bmx) && tw.Invoke()) {
+                FVector d = bmx - bmn;
                 FVector sc = tw.Result<Xf>().scale;
                 size = FVector{d.X * sc.X, d.Y * sc.Y, d.Z * sc.Z};
             }
@@ -750,10 +792,9 @@ void RefreshBoxes() {
     g_c->boxes.clear();
     if (!g_c->boxes_mode) return;
     for (UObject comp : g_c->comps) {
-        ue::Call lb(comp, "GetLocalBounds");
+        FVector mn, mx;
         ue::Call tw(comp, "K2_GetComponentToWorld");
-        if (!lb.Invoke() || !tw.Invoke()) continue;
-        FVector mn = lb.Get<FVector>("Min"), mx = lb.Get<FVector>("Max");
+        if (!LocalBox(comp, &mn, &mx) || !tw.Invoke()) continue;
         Xf t = tw.Result<Xf>();
         FVector c = (mn + mx) * 0.5, h = (mx - mn) * 0.5;
         if (Length(h) < 0.5 || Length(h) > 40.0) continue;
@@ -829,9 +870,8 @@ bool MagHold(FVector* fist, FVector* up, FVector* front) {
     double best_size = 0;
     FVector bmin, bmax;
     for (UObject comp : g_c->comps) {
-        ue::Call b(comp, "GetLocalBounds");
-        if (!b.Invoke()) continue;
-        FVector mn = b.Get<FVector>("Min"), mx = b.Get<FVector>("Max");
+        FVector mn, mx;
+        if (!LocalBox(comp, &mn, &mx)) continue;
         double size = Length(mx - mn);
         if (size > best_size && size < 80.0) {
             best = comp;
