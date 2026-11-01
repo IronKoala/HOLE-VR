@@ -176,9 +176,13 @@ void HookCalcOffset(void* self, int32_t view_index, FRotator* rotation, float wo
     if (view_index == 1) xr::SetRenderedViews(views);
 
     if (g_recenter.exchange(false)) {
+        // Put the game camera exactly at the dominant eye, so weapon sights
+        // the game centres on its camera line up with that eye.
         const XrVector3f& a = views[0].pose.position;
         const XrVector3f& b = views[1].pose.position;
-        g_origin_m = XrToUePosition((a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f, (a.z + b.z) * 0.5f, 1.0);
+        std::string eye = config::GetString("dominant_eye", "right");
+        float t = eye == "left" ? 0.0f : eye == "center" ? 0.5f : 1.0f;
+        g_origin_m = XrToUePosition(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t, 1.0);
         const XrQuaternionf& q = views[0].pose.orientation;
         g_origin_yaw = YawOf(XrToUeQuat(q.x, q.y, q.z, q.w));
         log::Info("stereo: recentered (yaw %.1f)", g_origin_yaw);
@@ -195,6 +199,9 @@ void HookCalcOffset(void* self, int32_t view_index, FRotator* rotation, float wo
     // pitch and roll so the horizon never moves on its own.
     FQuat base = config::GetBool("use_game_pitch", false) ? ToQuat(*rotation) : YawOnly(rotation->Yaw);
     *rotation = ToRotator(base * local_q);
+    // The game's camera sits at the character's face, close to the weapon;
+    // pull the view back a little (positive = further back).
+    local_p.X -= config::GetFloat("camera_back_cm", 4.0f) * world_to_meters / 100.0;
     *location = *location + base.Rotate(local_p);
 }
 

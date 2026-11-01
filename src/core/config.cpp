@@ -124,6 +124,11 @@ int GetInt(const char* key, int fallback) {
     return (v && !v->empty()) ? std::atoi(v->c_str()) : fallback;
 }
 
+std::string GetString(const char* key, const std::string& fallback) {
+    const std::string* v = Find(key);
+    return (v && !v->empty()) ? *v : fallback;
+}
+
 float GetFloat(const char* key, float fallback) {
     const std::string* v = Find(key);
     return (v && !v->empty()) ? static_cast<float>(std::atof(v->c_str())) : fallback;
