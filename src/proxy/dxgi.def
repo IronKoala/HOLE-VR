@@ -1,0 +1,22 @@
+LIBRARY dxgi
+EXPORTS
+    ApplyCompatResolutionQuirking=holevr_ApplyCompatResolutionQuirking
+    CompatString=holevr_CompatString
+    CompatValue=holevr_CompatValue
+    CreateDXGIFactory=holevr_CreateDXGIFactory
+    CreateDXGIFactory1=holevr_CreateDXGIFactory1
+    CreateDXGIFactory2=holevr_CreateDXGIFactory2
+    DXGID3D10CreateDevice=holevr_DXGID3D10CreateDevice
+    DXGID3D10CreateLayeredDevice=holevr_DXGID3D10CreateLayeredDevice
+    DXGID3D10GetLayeredDeviceSize=holevr_DXGID3D10GetLayeredDeviceSize
+    DXGID3D10RegisterLayers=holevr_DXGID3D10RegisterLayers
+    DXGIDeclareAdapterRemovalSupport=holevr_DXGIDeclareAdapterRemovalSupport
+    DXGIDisableVBlankVirtualization=holevr_DXGIDisableVBlankVirtualization
+    DXGIDumpJournal=holevr_DXGIDumpJournal
+    DXGIGetDebugInterface1=holevr_DXGIGetDebugInterface1
+    DXGIReportAdapterConfiguration=holevr_DXGIReportAdapterConfiguration
+    PIXBeginCapture=holevr_PIXBeginCapture
+    PIXEndCapture=holevr_PIXEndCapture
+    PIXGetCaptureState=holevr_PIXGetCaptureState
+    SetAppCompatStringPointer=holevr_SetAppCompatStringPointer
+    UpdateHMDEmulationStatus=holevr_UpdateHMDEmulationStatus
