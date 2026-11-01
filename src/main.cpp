@@ -17,6 +17,7 @@
 #include "ue/process_event.h"
 #include "ue/reflection.h"
 #include "vr/dxgi_hooks.h"
+#include "vr/input.h"
 #include "vr/openxr.h"
 #include "vr/render_fixes.h"
 #include "vr/stereo.h"
@@ -67,6 +68,7 @@ std::wstring g_mod_dir;
 // SteamVR/the headset if they are not running yet.
 void StartVr() {
     using namespace holevr;
+    vr::input::Init();  // controller actions must exist before the session starts
     bool told = false;
     while (!vr::xr::InitInstance()) {
         if (!told) log::Info("Waiting for SteamVR and the headset...");
