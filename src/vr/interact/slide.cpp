@@ -19,7 +19,8 @@ SlideEvent Slide::Update(const FVector& hand, bool grab_down, double dt) {
 
     if (!held_) {
         // Spring forward when not held.
-        travel_ = std::max(0.0, travel_ - cfg_.return_speed * dt);
+        if (travel_ > rest_) travel_ = std::max(rest_, travel_ - cfg_.return_speed * dt);
+        else travel_ = rest_;
         if (pressed && InZone(hand)) {
             held_ = true;
             reached_back_ = false;
@@ -46,7 +47,8 @@ SlideEvent Slide::Update(const FVector& hand, bool grab_down, double dt) {
     if (!grab_down) return let_go(SlideEvent::kPartialRelease);
     if (off_axis > cfg_.max_off_axis) return let_go(SlideEvent::kSlipped);
 
-    travel_ = std::clamp((along - start_) / cfg_.length, 0.0, 1.0);
+    // A locked-open slide cannot go further forward than the catch.
+    travel_ = std::clamp((along - start_) / cfg_.length, rest_, 1.0);
     peak_ = std::max(peak_, travel_);
     if (!reached_back_ && travel_ >= cfg_.full_threshold) {
         reached_back_ = true;

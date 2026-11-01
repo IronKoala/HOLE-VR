@@ -32,6 +32,9 @@ class Slide {
 public:
     explicit Slide(const SlideConfig& c = SlideConfig()) : cfg_(c) {}
     void Configure(const SlideConfig& c) { cfg_ = c; }
+    // Where the slide rests when not held: 0 normally, or the slide-catch
+    // position while the gun is locked open.
+    void SetRest(double rest) { rest_ = rest; }
 
     // hand: off-hand grip position in the slide's parent space (cm).
     // grab_down: grab button held this frame. dt: seconds.
@@ -49,6 +52,7 @@ private:
     bool reached_back_ = false;
     double start_ = 0.0;   // hand position along the axis when grabbed, minus travel then
     double travel_ = 0.0;
+    double rest_ = 0.0;
     double peak_ = 0.0;
 };
 

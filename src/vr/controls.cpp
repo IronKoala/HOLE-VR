@@ -315,7 +315,12 @@ void HoldGun(game::Gun& gun, const hands::HandState& rh) {
     FVector rel = actor_rot.Inverse().Rotate(main_world.translation - actor_loc);
 
     if (!W.have_frame) LearnGunFrame(g, actor_loc, actor_rot, main_world.translation);
-    FQuat hand = rh.aim.rotation * ToQuat(FRotator{g_set.gun_pitch, g_set.gun_yaw, g_set.gun_roll});
+    // The controller's pointing ray sits about 30 degrees above a pistol's
+    // bore in a natural grip (second headset test: barrel at 10 o'clock
+    // instead of 9 seen from the side), so pitch down by that first.
+    constexpr double kBasePitch = -30.0;
+    FQuat hand = rh.aim.rotation *
+                 ToQuat(FRotator{kBasePitch + g_set.gun_pitch, g_set.gun_yaw, g_set.gun_roll});
     FQuat rot = W.have_frame ? hand * W.gun_frame.Inverse() : hand;
     FVector loc = rh.grip.location - rot.Rotate(rel);
     SetActorTransform(g, loc, rot);
@@ -346,7 +351,14 @@ void SlideHandling(game::Gun& gun, const hands::HandState& lh, const input::Hand
     ue::Vec3d o = gun.SlideOrigin();
     cfg.grab_center = FVector{o.x, o.y, o.z} + cfg.axis * 4.0;
     cfg.grab_radius = 8.0;
+    // Locked open (empty gun): the slide rests on the catch, and pulling it a
+    // little further back and letting go releases it, like a real pistol.
+    const bool locked = gun.State().slide_locked;
+    const double stop = gun.SlideStopLength();
+    const double rest = locked && stop > 0 ? std::fmin(0.95, stop / cfg.length) : 0.0;
+    if (locked) cfg.full_threshold = std::fmin(1.0, rest + 0.08);
     W.slide.Configure(cfg);
+    W.slide.SetRest(rest);
 
     if (lin.grip_button.pressed && W.held_mag == 0)
         log::Info("controls: left grab at slide-space (%.1f %.1f %.1f), %s the slide zone", hand.X, hand.Y,
@@ -375,11 +387,13 @@ void SlideHandling(game::Gun& gun, const hands::HandState& lh, const input::Hand
             break;
         default: break;
     }
-    if (W.slide.Travel() > 0.001) {
+    if (W.slide.Travel() > 0.001 && (W.slide.Held() || !locked || W.slide.Travel() > rest + 0.001)) {
         gun.SetSlideTravel(W.slide.Travel(), ue::Vec3d{cfg.axis.X, cfg.axis.Y, cfg.axis.Z});
         W.slide_was_moved = true;
     } else if (W.slide_was_moved) {
-        gun.RestoreSlide();
+        // Back to rest: closed, or sitting on the slide catch if locked open.
+        if (locked) gun.SetSlideTravel(rest, ue::Vec3d{cfg.axis.X, cfg.axis.Y, cfg.axis.Z});
+        else gun.RestoreSlide();
         W.slide_was_moved = false;
     }
     if (W.end_charging_at > 0 && g_clock >= W.end_charging_at) {

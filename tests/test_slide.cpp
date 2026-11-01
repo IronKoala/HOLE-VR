@@ -93,6 +93,33 @@ int main() {
         s.Update(FVector{-6, 0, 2}, true, 0.011);
         EXPECT(s.Update(FVector{-6, 0, 2}, false, 0.011) == SlideEvent::kRacked);
     }
+    {   // locked open: a short pull past the catch counts as a rack
+        SlideConfig c = Pistol();
+        double rest = 3.6 / 4.7;
+        c.full_threshold = rest + 0.08;
+        Slide s(c);
+        s.SetRest(rest);
+        s.Update(FVector{-6, 0, 2}, false, 0.011);
+        EXPECT(s.Travel() == rest);
+        EXPECT(s.Update(FVector{-6, 0, 2}, true, 0.011) == SlideEvent::kGrabbed);
+        EXPECT(s.Travel() == rest);
+        EXPECT(s.Update(FVector{-6.6, 0, 2}, true, 0.011) == SlideEvent::kReachedBack);
+        EXPECT(s.Update(FVector{-6.6, 0, 2}, false, 0.011) == SlideEvent::kRacked);
+    }
+    {   // locked open and let go without pulling: stays on the catch
+        SlideConfig c = Pistol();
+        double rest = 3.6 / 4.7;
+        c.full_threshold = rest + 0.08;
+        Slide s(c);
+        s.SetRest(rest);
+        s.Update(FVector{-6, 0, 2}, false, 0.011);
+        s.Update(FVector{-6, 0, 2}, true, 0.011);
+        s.Update(FVector{-3, 0, 2}, true, 0.011);  // pushing forward does nothing
+        EXPECT(s.Travel() == rest);
+        EXPECT(s.Update(FVector{-3, 0, 2}, false, 0.011) == SlideEvent::kPartialRelease);
+        for (int i = 0; i < 10; ++i) s.Update(FVector{0, 0, 0}, false, 0.011);
+        EXPECT(s.Travel() == rest);
+    }
     std::printf(failures ? "%d failure(s)\n" : "all slide tests passed\n", failures);
     return failures ? EXIT_FAILURE : EXIT_SUCCESS;
 }
