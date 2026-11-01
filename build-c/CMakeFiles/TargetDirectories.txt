@@ -1,4 +1,0 @@
-/home/claude/hole-vr/build-c/CMakeFiles/hole_vr.dir
-/home/claude/hole-vr/build-c/CMakeFiles/hole_vr_setup.dir
-/home/claude/hole-vr/build-c/CMakeFiles/edit_cache.dir
-/home/claude/hole-vr/build-c/CMakeFiles/rebuild_cache.dir

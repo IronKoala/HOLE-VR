@@ -1,3 +1,0 @@
-/usr/bin/cmake -E rm -f CMakeFiles/hole_vr.dir/objects.a
-/usr/bin/x86_64-w64-mingw32-ar qc CMakeFiles/hole_vr.dir/objects.a @CMakeFiles/hole_vr.dir/objects1.rsp
-/usr/bin/x86_64-w64-mingw32-g++-posix -O3 -DNDEBUG -static -static-libgcc -static-libstdc++ -Wl,--kill-at /home/claude/hole-vr/src/proxy/dxgi.def -shared -o dxgi.dll -Wl,--out-implib,libdxgi.dll.a -Wl,--major-image-version,0,--minor-image-version,0 -Wl,--whole-archive CMakeFiles/hole_vr.dir/objects.a -Wl,--no-whole-archive @CMakeFiles/hole_vr.dir/linkLibs.rsp
