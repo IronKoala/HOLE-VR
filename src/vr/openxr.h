@@ -49,6 +49,10 @@ void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* back_buffer);
 // The texture the engine rendered both eyes into (left half / right half).
 void SetEyeTexture(ID3D12Resource* texture);
 void SetFallbackTexture(ID3D12Resource* texture);
+// The game window's back buffer for the frame being presented (state
+// PRESENT), with the desktop mirror and the game's menus/HUD on it. Only
+// valid during AddLayers/OnFrame on the present thread.
+ID3D12Resource* WindowTexture();
 
 struct EyeView {
     XrPosef pose;  // in tracking space

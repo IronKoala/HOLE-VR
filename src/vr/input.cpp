@@ -318,6 +318,11 @@ Snapshot Consume() {
     return s;
 }
 
+Snapshot Peek() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return g_latest;
+}
+
 void Haptic(Hand hand, float amplitude, float seconds, float frequency_hz) {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_haptics.size() < 16) g_haptics.push_back({hand, amplitude, seconds, frequency_hz});

@@ -23,6 +23,7 @@
 #include "vr/openxr.h"
 #include "vr/cvars.h"
 #include "vr/render_fixes.h"
+#include "vr/ui_panel.h"
 #include "vr/stereo.h"
 
 namespace {
@@ -72,6 +73,7 @@ std::wstring g_mod_dir;
 void StartVr() {
     using namespace holevr;
     vr::input::Init();  // controller actions must exist before the session starts
+    vr::ui_panel::Init();
     bool told = false;
     while (!vr::xr::InitInstance()) {
         if (!told) log::Info("Waiting for SteamVR and the headset...");
@@ -133,6 +135,7 @@ DWORD WINAPI InitThread(LPVOID) {
         // New cameras, volumes and captures appear on every level load, so
         // the render fixes are re-applied once a second.
         if (render_fixes && frame % 60 == 0) vr::render_fixes::Apply();
+        if (frame % 60 == 15) vr::ui_panel::Maintain();
         bool ctrl = GetAsyncKeyState(VK_CONTROL) & 0x8000;
         bool dump = ctrl && (GetAsyncKeyState(VK_F9) & 0x8000);
         bool recenter = ctrl && (GetAsyncKeyState(VK_F8) & 0x8000);

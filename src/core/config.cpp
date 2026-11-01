@@ -77,6 +77,20 @@ const Block kBlocks[] = {
      ";\n"
      "; Any engine console variable can be set here with a cvar. prefix, e.g.\n"
      "; cvar.r.Tonemapper.Sharpen=0.5\n"},
+    {"menu_panel",
+     "\n"
+     "; --- Menus in the headset ---\n"
+     "; While a game menu is open, the game screen floats in front of you and\n"
+     "; either controller is a laser pointer: trigger clicks, thumbstick scrolls,\n"
+     "; B/Y goes back. The controller menu button opens/closes the pause menu.\n"
+     "menu_panel=1\n"
+     "menu_panel_width_m=1.6\n"
+     "menu_panel_distance_m=1.6\n"
+     "; How far below eye height the middle of the screen sits.\n"
+     "menu_panel_drop_m=0.1\n"
+     "; Turn further away than this and the screen comes back in front of you.\n"
+     "menu_panel_follow_deg=60\n"
+     "menu_button_pauses=1\n"},
     {"vr_controls",
      "\n"
      "; --- Motion controls ---\n"

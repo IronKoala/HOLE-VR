@@ -34,6 +34,7 @@ add_library(hole_vr SHARED
     src/game/weapon_lab.cpp
     src/vr/render_fixes.cpp
     src/vr/cvars.cpp
+    src/vr/ui_panel.cpp
     src/main.cpp
 )
 
