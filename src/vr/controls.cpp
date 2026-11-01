@@ -233,7 +233,6 @@ struct WeaponState {
     bool retried_rack = false;
     bool dead_trigger = false;  // Glock: after a dry fire the trigger is dead until the slide moves
     bool trigger_sent = false;  // the game saw the current trigger press
-    bool lock_on_release = false; // B pressed while holding the slide back: lock it open
     bool timeline_fast = false;   // game's charge timeline sped up for this gun
     // Gun pose this frame (from HoldGun).
     bool have_pose = false;
@@ -408,7 +407,8 @@ void Trigger(UObject player, game::Gun& gun, const input::HandInput& rin) {
     }
 }
 
-void SlideHandling(game::Gun& gun, const hands::HandState& lh, const input::HandInput& lin, double dt) {
+void SlideHandling(game::Gun& gun, const hands::HandState& lh, const input::HandInput& lin,
+                   const input::HandInput& rin, double dt) {
     UObject slide_comp = gun.SlideComponent();
     if (!slide_comp || !lh.valid) return;
     UObject parent = 0;
@@ -450,10 +450,9 @@ void SlideHandling(game::Gun& gun, const hands::HandState& lh, const input::Hand
         case SlideEvent::kRacked: {
             game::GunState st = gun.State();
             log::Info("controls: rack, before: %s", st.Describe().c_str());
-            // Glock: the slide stays open if the thumb pushed the slide stop up
-            // (B while holding it back) or an empty magazine's follower lifts it.
-            if (W.lock_on_release || (st.has_magazine && st.magazine == 0)) {
-                W.lock_on_release = false;
+            // The slide stop lever sits up unless B holds it down (owner's
+            // choice): a full rack locks the slide open unless B is held.
+            if (!rin.secondary.down) {
                 gun.EndBoltCharging();
                 ue::SetProp<bool>(gun.Object(), "IsBolt(Slide)Stopped", true);
                 input::Haptic(input::kLeft, 0.6f, 0.04f);
@@ -471,7 +470,6 @@ void SlideHandling(game::Gun& gun, const hands::HandState& lh, const input::Hand
         }
         case SlideEvent::kPartialRelease:
         case SlideEvent::kSlipped:
-            W.lock_on_release = false;
             W.trace_until = g_clock + 1.5;
             log::Info("controls: slide let go at %.0f%%", W.slide.Peak() * 100);
             break;
@@ -582,18 +580,11 @@ void RefillPouch(game::Gun& gun, UObject player, const FVector& loc, const FQuat
 void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState& lh, const input::HandInput& lin,
                       const input::HandInput& rin) {
     // Right A / primary: magazine release.
-    // Right B: the slide stop lever. Pressed down on a locked slide it
-    // releases it; with the slide held back by the left hand it pushes the
-    // lever up so the slide stays open; otherwise it does nothing.
+    // Right B: pushes the slide stop lever down. On a locked slide that
+    // drops it; held while racking, the slide runs forward instead of locking.
     if (rin.secondary.pressed) {
         game::GunState st = gun.State();
-        double len = gun.SlideBackLength() > 0.5 ? gun.SlideBackLength() : 4.7;
-        double stop = gun.SlideStopLength() > 0 ? gun.SlideStopLength() / len : 0.75;
-        if (W.slide.Held() && W.slide.Travel() >= stop - 0.05) {
-            W.lock_on_release = true;
-            input::Haptic(input::kRight, 0.3f, 0.03f);
-            log::Info("controls: slide stop pushed up, slide will stay open");
-        } else if (st.slide_locked && !W.slide.Held()) {
+        if (st.slide_locked && !W.slide.Held()) {
             log::Info("controls: slide release (B), before: %s", st.Describe().c_str());
             gun.ReleaseSlideCatch();
             W.dead_trigger = false;
@@ -863,7 +854,7 @@ void OnTick(UObject player, float dt) {
     hands::HandState rh = hands::Get(hands::kRight), lh = hands::Get(hands::kLeft);
     if (rh.valid) HoldGun(gun, rh);
     Trigger(player, gun, s.hand[input::kRight]);
-    SlideHandling(gun, lh, s.hand[input::kLeft], dt);
+    SlideHandling(gun, lh, s.hand[input::kLeft], s.hand[input::kRight], dt);
     MagazineHandling(gun, player, lh, s.hand[input::kLeft], s.hand[input::kRight]);
     PublishGrabs(gun, rh, lh);
     RackTrace(gun, dt);
