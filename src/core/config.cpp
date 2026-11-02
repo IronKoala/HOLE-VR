@@ -143,6 +143,13 @@ const Block kBlocks[] = {
      "; 1 = hide the see-through grey box some menus draw behind their buttons\n"
      "; (Options has one); it shows as a shadowy box on the arm\n"
      "menu_hide_backdrops=1\n"},
+    {"menu_fit_content",
+     "\n"
+     "; 1 = zoom each forearm menu so the part holding its buttons fills the\n"
+     "; menu's space on the arm (bigger text; text and boxes grow together)\n"
+     "menu_fit_content=1\n"
+     "; Most a menu is zoomed (1 = never)\n"
+     "menu_fit_max_zoom=3\n"},
     {"wrist_hud",
      "\n"
      "; --- Wrist display ---\n"
