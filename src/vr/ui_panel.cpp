@@ -161,6 +161,8 @@ void Maintain() {
     }
 }
 
-bool MenuOpen() { return g_menu_open.load(); }
+// The cursor never shows for the VR pause menu, so a menu on the forearm
+// counts as open too (stops the controls firing while you press buttons).
+bool MenuOpen() { return g_menu_open.load() || world_menu::MenuUp(); }
 
 }  // namespace holevr::vr::ui_panel

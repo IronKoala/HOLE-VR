@@ -279,4 +279,58 @@ void OnAny(PostFn post) {
     }
 }
 
+namespace {
+// UFunction::Func: the native thunk pointer a few fields after FunctionFlags.
+// Native functions each have their own thunk in .text; Blueprint events
+// declared in C++ all share UObject::ProcessInternal.
+uintptr_t g_func_off = 0;
+
+bool FindFuncOffset() {
+    if (g_func_off) return true;
+    const char* natives[] = {"Function /Script/Engine.Actor:K2_GetActorLocation",
+                             "Function /Script/Engine.Actor:K2_DestroyActor",
+                             "Function /Script/UMG.Widget:RemoveFromParent",
+                             "Function /Script/Engine.KismetSystemLibrary:IsValid"};
+    const char* events[] = {"Function /Script/Engine.Actor:ReceiveBeginPlay",
+                            "Function /Script/Engine.Actor:ReceiveTick"};
+    UObject n[4], e[2];
+    for (int i = 0; i < 4; ++i)
+        if (!(n[i] = FindObject(natives[i]))) return false;
+    for (int i = 0; i < 2; ++i)
+        if (!(e[i] = FindObject(events[i]))) return false;
+    for (uintptr_t o = g_flags_off + 8; o <= g_flags_off + 0x48; o += 8) {
+        uintptr_t ev0 = mem::ReadOr<uintptr_t>(e[0] + o), ev1 = mem::ReadOr<uintptr_t>(e[1] + o);
+        if (!InText(ev0) || ev0 != ev1) continue;
+        bool ok = true;
+        uintptr_t seen[4];
+        for (int i = 0; i < 4 && ok; ++i) {
+            seen[i] = mem::ReadOr<uintptr_t>(n[i] + o);
+            ok = InText(seen[i]) && seen[i] != ev0;
+            for (int j = 0; j < i && ok; ++j) ok = seen[j] != seen[i];
+        }
+        if (ok) {
+            g_func_off = o;
+            log::Info("process_event: UFunction::Func at 0x%llx", static_cast<unsigned long long>(o));
+            return true;
+        }
+    }
+    log::Error("process_event: UFunction::Func not found");
+    return false;
+}
+}  // namespace
+
+bool HookNative(UObject function, NativeFn hook, NativeFn* original) {
+    if (!g_ready || !function || !hook || !original || !FindFuncOffset()) return false;
+    uint32_t flags = mem::ReadOr<uint32_t>(function + g_flags_off);
+    if (!(flags & FUNC_Native)) return false;
+    uintptr_t slot = function + g_func_off;
+    uintptr_t cur = mem::ReadOr<uintptr_t>(slot);
+    if (cur == reinterpret_cast<uintptr_t>(hook)) return true;
+    if (!InText(cur)) return false;
+    *original = reinterpret_cast<NativeFn>(cur);
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(slot), static_cast<LONG64>(reinterpret_cast<uintptr_t>(hook)));
+    log::Info("process_event: following %s", GetName(function).c_str());
+    return true;
+}
+
 }  // namespace holevr::ue::process_event

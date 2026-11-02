@@ -9,6 +9,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -101,13 +102,23 @@ struct Candidate {
     int index = -1;
     UObject cls = 0;
 };
-std::mutex g_scan_mutex;
-std::vector<Candidate> g_candidates;
-std::atomic<bool> g_want_scan{false};
 std::atomic<bool> g_active{false};
 
 UObject g_wbgc_class = 0;  // WidgetBlueprintGeneratedClass
 std::unordered_set<UObject> g_menu_classes;
+
+// What the game does with its menus, seen on the game thread:
+//  - a UIM_ menu's Construct event fires when the game puts it on the screen
+//    (verified in the 2026-11-02 study runs: Pause and Option both do this);
+//  - Widget.RemoveFromParent is how its Blueprints take a menu away again.
+// Construct alone can't tell us a hosted menu closed: the panel keeps its
+// Slate widget alive, so we also follow RemoveFromParent itself.
+std::mutex g_events_mutex;
+std::vector<Candidate> g_new_menus;
+std::vector<UObject> g_removed;
+thread_local bool t_our_call = false;  // our own RemoveFromParent
+ue::process_event::NativeFn g_orig_remove = nullptr;
+std::atomic<bool> g_menu_up{false};
 std::unordered_set<UObject> g_not_menu_classes;
 
 bool IsMenuClass(UObject cls) {
@@ -117,7 +128,9 @@ bool IsMenuClass(UObject cls) {
     if (ue::GetClass(cls) == g_wbgc_class) {
         std::string n = ue::GetName(cls);
         // Top-level screens are UIM_*; the in-game HUD stays where it is.
-        menu = n.rfind("UIM_", 0) == 0 && n != "UIM_HUD_C";
+        // The title screen and loading screen are left alone (hosting the
+        // title froze the game once); UIM_HUD is the in-game HUD.
+        menu = n.rfind("UIM_", 0) == 0 && n != "UIM_HUD_C" && n != "UIM_Title_C" && n != "UIM_Loading_C";
     }
     (menu ? g_menu_classes : g_not_menu_classes).insert(cls);
     return menu;
@@ -167,10 +180,10 @@ struct State {
 
 double Now() { return GetTickCount64() / 1000.0; }
 
-// UIM widgets that were showing on screen during play (before any menu
-// opened): in-game panels, not menus, so they stay on the flat HUD.
-std::unordered_set<UObject> g_play_widgets;
-double g_play_check = 0;
+// A picture of the headset view a second after a menu goes on the arm, so
+// placement can be checked from the log folder without asking the player.
+double g_capture_at = -1;
+std::string g_capture_name;
 
 // Laser shared with the OpenXR thread.
 struct Laser {
@@ -213,13 +226,6 @@ bool CallBool(UObject obj, const char* fn) {
 void CallVoid(UObject obj, const char* fn) {
     ue::Call c(obj, fn);
     c.Invoke();
-}
-
-// BPI_UIControl::IsOpened(out IsOpen). -1 when the widget doesn't have it.
-int IsOpened(UObject widget) {
-    ue::Call c(widget, "IsOpened");
-    if (!c.Valid() || !c.Invoke()) return -1;
-    return c.Get<bool>("IsOpen") ? 1 : 0;
 }
 
 uint8_t Visibility(UObject widget) {
@@ -484,7 +490,9 @@ bool Host(const Candidate& c) {
     ue::Call set(comp, "SetWidget");
     set.Set("Widget", c.obj);
     set.Invoke();
+    t_our_call = true;
     CallVoid(c.obj, "RemoveFromParent");
+    t_our_call = false;
 
     Panel p;
     p.widget = c.obj;
@@ -495,7 +503,9 @@ bool Host(const Candidate& c) {
     p.hosted_at = Now();
     p.layer = G.panels.empty() ? 0 : G.panels.back().layer + 1;
     G.panels.push_back(p);
-    log::Info("world menu: %s is now a panel in the world (layer %d)", p.name.c_str(), p.layer);
+    log::Info("world menu: %s is now a panel on the forearm (layer %d), off the flat screen", p.name.c_str(), p.layer);
+    g_capture_at = Now() + 1.0;
+    g_capture_name = p.name;
 
     FVector head;
     double yaw;
@@ -512,6 +522,29 @@ bool Host(const Candidate& c) {
             v.Set("InVisibility", kCollapsed);
             v.Invoke();
         }
+    }
+    // Full-screen backdrops inside the menu (a background blur or image the
+    // size of the screen) would read as a box on the arm. List what the menu
+    // is built from, and hide any background blur.
+    std::string prefix = ue::GetPathName(c.obj) + ".";
+    std::unordered_map<std::string, int> kinds;
+    std::vector<UObject> blurs;
+    ue::objects::ForEach([&](int, UObject o) {
+        if (ue::IsDefaultObject(o)) return;
+        std::string path = ue::GetPathName(o);
+        if (path.compare(0, prefix.size(), prefix) != 0) return;
+        std::string cn = ue::GetName(ue::GetClass(o));
+        ++kinds[cn];
+        if (cn == "BackgroundBlur") blurs.push_back(o);
+    });
+    std::string list;
+    for (const auto& k : kinds) list += " " + k.first + " x" + std::to_string(k.second) + ";";
+    log::Info("world menu: %s is built from:%s", p.name.c_str(), list.c_str());
+    for (UObject b : blurs) {
+        ue::Call v(b, "SetVisibility");
+        v.Set("InVisibility", kCollapsed);
+        v.Invoke();
+        log::Info("world menu: hid %s (a background blur)", ue::GetName(b).c_str());
     }
     return true;
 }
@@ -532,44 +565,40 @@ void Unhost(size_t i, const char* why) {
     DestroyComponent(p.comp, p.comp_index);
 }
 
-void UnhostAll(const char* why) {
-    ReleaseKey();
-    while (!G.panels.empty()) Unhost(G.panels.size() - 1, why);
-    G.placed = false;
-}
 
-// Takes newly opened menus from the flat screen.
+// Takes menus the game just put on the flat screen onto the forearm.
 void TakeNewMenus() {
     std::vector<Candidate> list;
     {
-        std::lock_guard<std::mutex> lock(g_scan_mutex);
-        list = g_candidates;
+        std::lock_guard<std::mutex> lock(g_events_mutex);
+        list.swap(g_new_menus);
     }
     for (const auto& c : list) {
-        if (g_play_widgets.count(c.obj)) continue;
-        // The title widget stays on the screen (the game keeps it there,
-        // invisible, all through play); every other menu goes on the forearm.
-        if (ue::GetName(c.cls) == "UIM_Title_C") continue;
         bool hosted = false;
         for (auto& p : G.panels) hosted = hosted || p.widget == c.obj;
-        if (!Alive(c.obj, c.index)) continue;
-        if (!CallBool(c.obj, "IsInViewport")) continue;
-        if (hosted) {
-            // The game put a menu we hold back on the screen (reopened it).
-            CallVoid(c.obj, "RemoveFromParent");
-            log::Info("world menu: %s reopened", ue::GetName(ue::GetClass(c.obj)).c_str());
-            G.placed = false;
+        if (hosted || !Alive(c.obj, c.index)) continue;
+        if (!CallBool(c.obj, "IsInViewport")) {
+            log::Info("world menu: %s came up but isn't on the screen, left alone",
+                      ue::GetName(c.cls).c_str());
             continue;
         }
         Host(c);
     }
 }
 
-// Lets go of menus the game has closed.
+// Lets go of menus the game took away (RemoveFromParent) or destroyed.
 void DropClosedMenus() {
-    double now = Now();
+    std::vector<UObject> removed;
+    {
+        std::lock_guard<std::mutex> lock(g_events_mutex);
+        removed.swap(g_removed);
+    }
     for (size_t i = G.panels.size(); i-- > 0;) {
         Panel& p = G.panels[i];
+        if (std::find(removed.begin(), removed.end(), p.widget) != removed.end()) {
+            Unhost(i, "closed by the game");
+            continue;
+        }
         if (!Alive(p.widget, p.widget_index)) {
             Unhost(i, "was destroyed");
             continue;
@@ -583,21 +612,8 @@ void DropClosedMenus() {
             if (p.last_vis != 255) log::Info("world menu: %s visibility %d", p.name.c_str(), vis);
             p.last_vis = vis;
         }
-        if (p.open_unreliable) continue;
-        int open = IsOpened(p.widget);
-        if (open < 0) {
-            p.open_unreliable = true;
-            continue;
-        }
-        if (open == 1) p.saw_open = true;
-        else if (!p.saw_open && now - p.hosted_at > 1.0) {
-            // Never said it was open: this menu doesn't report it.
-            p.open_unreliable = true;
-            log::Info("world menu: %s doesn't report open/closed, following the cursor only", p.name.c_str());
-        } else if (p.saw_open) {
-            Unhost(i, "closed");
-        }
     }
+    if (G.panels.empty()) G.placed = false;
 }
 
 // ------------------------------------------------------------ pointer --
@@ -727,58 +743,22 @@ void UpdatePointer() {
 
 void OnGameFrame() {
     if (!S.enabled || !ue::reflection::Ready() || !ue::process_event::Ready()) return;
-    bool open = ui_panel::MenuOpen();
+    // Once per frame: the controller's tick and the player's tick can both call.
+    static uint64_t s_last_ms = 0;
+    uint64_t ms = GetTickCount64();
+    if (ms - s_last_ms < 4) return;
+    s_last_ms = ms;
     double now = Now();
-    g_want_scan = open;
-    // Only in a level with the player (the title screen has none).
-    if (!open && G.panels.empty() && game::Player() && now - g_play_check > 1.0) {
-        g_play_check = now;
-        std::vector<Candidate> list;
-        {
-            std::lock_guard<std::mutex> lock(g_scan_mutex);
-            list = g_candidates;
-        }
-        std::unordered_set<UObject> showing;
-        for (const auto& c : list) {
-            if (!Alive(c.obj, c.index) || !CallBool(c.obj, "IsInViewport")) continue;
-            uint8_t vis = Visibility(c.obj);
-            if (vis == kCollapsed || vis == kHidden) continue;
-            showing.insert(c.obj);
-        }
-        // Seen in two checks a second apart, so a menu that is just opening
-        // isn't mistaken for one.
-        static std::unordered_set<UObject> s_prev;
-        std::unordered_set<UObject> play;
-        for (UObject o : showing) {
-            if (!s_prev.count(o)) continue;
-            play.insert(o);
-            if (!g_play_widgets.count(o))
-                log::Info("world menu: %s is on screen during play; it stays on the flat HUD",
-                          ue::GetName(ue::GetClass(o)).c_str());
-        }
-        s_prev.swap(showing);
-        g_play_widgets.swap(play);
-    }
-    if (!open) {
-        if (G.panels.empty()) {
-            G.closed_since = -1;
-            g_active = false;
-            std::lock_guard<std::mutex> lock(g_laser_mutex);
-            g_laser = Laser{};
-            return;
-        }
-        // A short grace: the cursor can blink off while one menu replaces another.
-        if (G.closed_since < 0) G.closed_since = now;
-        if (now - G.closed_since > 0.3) {
-            UnhostAll("closed (menu mode ended)");
-            g_active = false;
-            std::lock_guard<std::mutex> lock(g_laser_mutex);
-            g_laser = Laser{};
-        }
+    TakeNewMenus();
+    DropClosedMenus();
+    g_menu_up = !G.panels.empty();
+    if (G.panels.empty()) {
+        g_active = false;
+        std::lock_guard<std::mutex> lock(g_laser_mutex);
+        g_laser = Laser{};
         return;
     }
-    G.closed_since = -1;
-    // How often the panels are updated while a menu is open, once a second.
+    // How often the panels are updated while a menu is up, once a second.
     static int s_frames = 0;
     static double s_rate_at = 0;
     ++s_frames;
@@ -788,10 +768,9 @@ void OnGameFrame() {
         s_frames = 0;
         s_rate_at = now;
     }
-    if (now - G.last_take > 0.1) {
-        G.last_take = now;
-        TakeNewMenus();
-        DropClosedMenus();
+    if (g_capture_at > 0 && now >= g_capture_at) {
+        g_capture_at = -1;
+        xr::RequestCapture(("forearm-" + g_capture_name).c_str());
     }
     g_active = !G.panels.empty();
     if (G.panels.empty()) return;
@@ -1108,62 +1087,98 @@ void Init() {
         log::Info("world menu: floating in front, %.2f m wide at %.2f m", S.width_m, S.distance_m);
 }
 
-void Scan() {
-    if (!S.enabled || !ue::objects::Ready()) return;
-    // Quickly while a menu is open, slowly during play.
-    static int s_calls = 0;
-    if (!g_want_scan.load() && (s_calls++ % 8) != 0) return;
-    if (!g_wbgc_class) {
-        g_wbgc_class = ue::FindObject("Class /Script/UMG.WidgetBlueprintGeneratedClass");
-        if (!g_wbgc_class) return;
+// The pump runs on the game thread from the player controller's tick, which
+// keeps running while the game is paused (the 2026-11-02 study counted it at
+// the frame rate during the pause menu), and from the player's tick until the
+// controller is found. Nothing runs from inside the stereo view setup.
+void OnPlayerTick(UObject, float) { OnGameFrame(); }
+void AfterControllerTick(UObject, UObject, void*) { OnGameFrame(); }
+
+// The game's Blueprints took a widget away (or we did, which is skipped).
+void ExecRemoveFromParent(UObject context, void* stack, void* result) {
+    if (!t_our_call && context) {
+        std::lock_guard<std::mutex> lock(g_events_mutex);
+        g_removed.push_back(context);
     }
-    std::vector<Candidate> found;
-    ue::objects::ForEach([&](int index, UObject o) {
-        UObject cls = ue::GetClass(o);
-        if (!cls || !IsMenuClass(cls)) return;
-        uint32_t flags = mem::ReadOr<uint32_t>(o + ue::off::kObjFlags, RF_ClassDefaultObject);
-        if (flags & (RF_ClassDefaultObject | RF_BeginDestroyed | RF_FinishDestroyed)) return;
-        found.push_back({o, index, cls});
-    });
-    std::lock_guard<std::mutex> lock(g_scan_mutex);
-    g_candidates.swap(found);
+    g_orig_remove(context, stack, result);
 }
 
-// The pump runs from the player's tick while the player ticks (play and the
-// title level), and from the HUD's draw event otherwise (paused game), at most
-// once per frame. Nothing runs from inside the stereo view setup.
-std::atomic<uint64_t> g_last_tick_ms{0};
-
-void OnPlayerTick(UObject, float) {
-    g_last_tick_ms = GetTickCount64();
-    OnGameFrame();
-}
-
-void AfterDrawHud(UObject, UObject, void*) {
-    if (GetTickCount64() - g_last_tick_ms.load() < 100) return;  // the player tick is pumping
-    static uint64_t s_last = 0;
-    uint64_t now = GetTickCount64();
-    if (now - s_last < 5) return;  // a second HUD in the same frame
-    s_last = now;
-    static bool s_logged = false;
-    if (!s_logged) {
-        s_logged = true;
-        log::Info("world menu: driven by the HUD's draw (game paused)");
+// A menu's Construct: the game just put it up.
+void OnAnyEvent(UObject self, UObject function, void*) {
+    if (!S.enabled || !self || !function) return;
+    // Each widget class has its own Construct function object: remember
+    // which function objects are a Construct.
+    static std::mutex s_mutex;
+    static std::unordered_map<UObject, bool> s_is_construct;
+    {
+        std::lock_guard<std::mutex> lock(s_mutex);
+        auto it = s_is_construct.find(function);
+        if (it == s_is_construct.end())
+            it = s_is_construct.emplace(function, ue::GetName(function) == "Construct").first;
+        if (!it->second) return;
     }
-    OnGameFrame();
+    UObject cls = ue::GetClass(self);
+    if (!cls || !IsMenuClass(cls)) return;
+    // Only menus that stand on their own; one built into another menu's
+    // panels (UIM_YesNo inside Options) travels with that menu.
+    UObject slot = 0;
+    if (ue::GetProp(self, "Slot", slot) && slot) return;
+    int index = IndexOf(self);
+    log::Info("world menu: the game put up %s", ue::GetName(cls).c_str());
+    std::lock_guard<std::mutex> lock(g_events_mutex);
+    g_new_menus.push_back({self, index, cls});
 }
 
 void InitGame() {
     if (!S.enabled) return;
     game::AddTickListener(&OnPlayerTick);
-    UObject hud_cdo = ue::FindObject("HUD /Script/Engine.Default__HUD");
-    UObject draw = ue::FindObject("Function /Script/Engine.HUD:ReceiveDrawHUD");
-    if (hud_cdo && draw && ue::process_event::HookVtableOf(hud_cdo) && ue::process_event::On(draw, nullptr, &AfterDrawHud))
-        log::Info("world menu: following the HUD's draw while paused");
+    g_wbgc_class = ue::FindObject("Class /Script/UMG.WidgetBlueprintGeneratedClass");
+    UObject uw = ue::FindObject("UserWidget /Script/UMG.Default__UserWidget");
+    bool widgets = uw && ue::process_event::HookVtableOf(uw);
+    ue::process_event::OnAny(&OnAnyEvent);
+    UObject remove = ue::FindObject("Function /Script/UMG.Widget:RemoveFromParent");
+    bool removal = remove && ue::process_event::HookNative(remove, &ExecRemoveFromParent, &g_orig_remove);
+    if (widgets && removal)
+        log::Info("world menu: following the game's menus (Construct and RemoveFromParent)");
     else
-        log::Warn("world menu: HUD draw not found; menus only move while the game isn't paused");
+        log::Error("world menu: could not follow the game's menus (widgets %d, removal %d); menus stay as the game draws them",
+                   widgets ? 1 : 0, removal ? 1 : 0);
 }
 
+// Background thread: finds the player controller and its camera manager and
+// follows their per-frame Blueprint events. Both kept firing at the frame rate
+// during the pause menu in the 2026-11-02 study (ReceiveTick and
+// BlueprintUpdateCamera). Only a class's own override is followed, so we
+// never take over a function object other code shares.
+void FollowFrameEvent(const char* base_class, const char* fn_name, UObject* hooked_cls) {
+    UObject base = ue::FindObject(base_class);
+    if (!base) return;
+    UObject obj = ue::FindFirstInstance(base);
+    if (!obj) return;
+    UObject cls = ue::GetClass(obj);
+    if (cls == *hooked_cls) return;
+    *hooked_cls = cls;
+    UObject fn = ue::FindFunction(cls, fn_name);
+    if (!fn || ue::GetOuter(fn) != cls) {
+        log::Info("world menu: %s has no %s of its own", ue::GetName(cls).c_str(), fn_name);
+        return;
+    }
+    if (ue::process_event::HookVtableOf(obj) && ue::process_event::On(fn, nullptr, &AfterControllerTick))
+        log::Info("world menu: driven by %s.%s (runs while paused)", ue::GetName(cls).c_str(), fn_name);
+    else
+        log::Warn("world menu: could not follow %s.%s", ue::GetName(cls).c_str(), fn_name);
+}
+
+void Scan() {
+    if (!S.enabled || !ue::objects::Ready() || !ue::process_event::Ready()) return;
+    static int s_calls = 0;
+    if ((s_calls++ % 4) != 0) return;
+    static UObject s_pc = 0, s_cam = 0;
+    FollowFrameEvent("Class /Script/Engine.PlayerController", "ReceiveTick", &s_pc);
+    FollowFrameEvent("Class /Script/Engine.PlayerCameraManager", "BlueprintUpdateCamera", &s_cam);
+}
+
+bool MenuUp() { return g_menu_up.load(); }
 bool Active() { return g_active.load(); }
 bool Enabled() { return S.enabled; }
 

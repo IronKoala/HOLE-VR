@@ -20,8 +20,11 @@ namespace holevr::vr::world_menu {
 void Init();
 // After game::Init(): hooks the game-thread events that drive the panels.
 void InitGame();
-// Background thread, a few times a second: finds the game's menu widgets.
+// Background thread, a few times a second: finds the player controller
+// whose tick drives the menus (it keeps ticking while the game is paused).
 void Scan();
+// True while a game menu is on the forearm (the game is in a menu).
+bool MenuUp();
 // True while at least one menu is on a world panel.
 bool Active();
 // True when world panels are switched on in the settings.

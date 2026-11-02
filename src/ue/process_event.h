@@ -37,4 +37,11 @@ bool On(UObject function, PreFn pre, PostFn post);
 // Keep it cheap. Up to 4 listeners; each is added once.
 void OnAny(PostFn post);
 
+// A native UFunction's exec thunk, which Blueprint code calls directly (not
+// through ProcessEvent): Func(Context, FFrame& Stack, RESULT_DECL).
+using NativeFn = void (*)(UObject context, void* stack, void* result);
+// Replaces `function`'s exec thunk with `hook`; `*original` gets the old one,
+// which the hook must call. Finds UFunction::Func by layout on first use.
+bool HookNative(UObject function, NativeFn hook, NativeFn* original);
+
 }  // namespace holevr::ue::process_event
