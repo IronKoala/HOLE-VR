@@ -51,6 +51,13 @@ bool GetSlot(Slot slot, hands::Pose* out);
 enum class Anchor : int { kBelt, kChest, kThighL, kThighR, kCount };
 bool GetAnchor(Anchor anchor, hands::Pose* out);
 
+// The held pistol's slide, measured with line traces against the slide's
+// own parts (once per gun, while the right hand holds it): the rear sight
+// (highest point of the slide's rear 3.5 cm, on its centre line) and the top
+// of the slide's rear and front ends, in world space for where the slide is
+// now. False until measured (or if the gun has no traceable slide).
+bool SlideMarks(uintptr_t gun, FVector* rear_sight, FVector* rear_end, FVector* front_end);
+
 // Registers the game tick listener. Call after controls::Init() so hand
 // poses for this frame are already published.
 void Init();
