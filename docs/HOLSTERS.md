@@ -24,13 +24,19 @@ magazines) come once the rifle is unlocked.
   the rounds facing forward, as it sits in a level gun facing the body's front.
 - A light haptic tick when a free hand reaches a holster that has something in
   it.
-- **Moving the holsters in the headset.** Hold the pistol (right hand) and/or
-  a magazine (left hand) where you want the holster and hold the right stick
-  click for 2 s. Each held item's holster moves there, saved in
-  `hole-vr/holsters.ini` (that file wins over the ini values; delete it to go
-  back). A short tap on the right stick click is still objective markers (it
-  now fires on release). Needs the VR body on; rifles keep the click for the
-  fire selector.
+- **Moving the holsters anywhere (owner, 2026-11-02: "if i want to put them
+  on my chest let me, my arm pit let me").** Hold the pistol (right hand)
+  and/or a magazine (left hand) wherever you want its holster, at the angle you
+  want it to hang, and hold the right stick click for 2 s (strong buzz in that
+  hand). The holster then sits exactly there and the item hangs exactly as it
+  was held. Each holster rides on the nearest body part: belt (pelvis, turns
+  with the body only), chest (top of the spine, tilts with the torso, for chest
+  rigs, armpits, shoulders, back) or a thigh (middle of the thigh, swings with
+  the leg, for drop-leg holsters). Saved in `hole-vr/holsters.ini` (that file
+  wins over the ini values; delete it to go back). Only the items in your hands
+  move, so holster the pistol first to move just the pouch. A short tap on the
+  right stick click is still objective markers (it fires on release). Needs the
+  VR body on; rifles keep the click for the fire selector.
 - Grip editor: while it borrows a controller (`hands::EditorHand() >= 0`) or a
   menu is open, the holster never changes, so the gun stays in the hand.
 
@@ -39,20 +45,37 @@ magazines) come once the rifle is unlocked.
 | Part | File |
 | --- | --- |
 | Pure logic: spots, holster frames, draw / put away / fly back, hover zone | `src/vr/interact/holster.*`, tests `tests/test_holster.cpp` |
-| Belt and chest anchors on the posed VR body | `body::GetAnchor` in `src/vr/body/body.*` |
+| Belt, chest and thigh anchors on the posed VR body | `body::GetAnchor` in `src/vr/body/body.*` |
 | Game side: placing the gun and pouch magazine, grips, calibration | `src/vr/controls.cpp` (`UpdatePistolHolster`, `PlaceGunInHolster`, `PlacePouchMag`, `HolsterCalibration`, `OnLateTick`) |
 
-Spots are offsets from the belt (pelvis bone) in the body's yaw frame (X
-forward, Y right, Z up), so they turn, crouch and move with the VR body but do
-not tip when you lean. The controls tick runs before the body, so holstered
-items are placed by a second, late tick registered after `body::Init()`
+A spot is where the hand grabs, as an offset in its anchor's frame, plus
+(once placed in the headset) the item's rotation in that frame. Anchors
+(`interact::HolsterAnchor`, same order as `body::Anchor`):
+
+| Anchor | Bone | Frame |
+| --- | --- | --- |
+| belt | pelvis | body yaw only (X forward, Y right, Z up): leaning does not tip it |
+| chest | top spine bone | Z from the pelvis up to it, X toward the body's front: tilts with the torso |
+| left_thigh, right_thigh | middle of hip and knee | Z up along the thigh, X toward the front: swings with the leg |
+
+Placing picks the nearest anchor to the hand (`interact::NearestAnchor`, belt
+wins ties). The controls tick runs before the body, so holstered items are
+placed by a second, late tick registered after `body::Init()`
 (`controls::InitLate`); otherwise they would trail the body by a frame while
 walking. With the VR body off (F9) the belt is taken
-`holster_belt_below_head_cm` (60) below and 8 cm behind the headset.
+`holster_belt_below_head_cm` (60) below and 8 cm behind the headset, the chest
+40 cm above it and the thighs 22 cm below it, all turned with the head's yaw.
+
+`holsters.ini` lines: `pistol=chest 4.9 12.0 -3.0 rot qx qy qz qw` (anchor,
+offset in cm, item rotation in the anchor frame as a quaternion). The older
+`pistol=4.9 32.3 18.2` (belt, built-in hanging) still loads.
 
 The pistol in the holster is placed exactly as `HoldGun` would place it for a
-hand at the spot (same `GunGripOffset`), so the spot is where the controller
-grip is when holding the holstered gun, and drawing only turns the gun.
+hand at the spot (same `GunGripOffset`), with the gun frame it had when the
+holster was placed (or `PistolHolsterFrame` before that), so the spot is where
+the controller grip is when holding the holstered gun. The pouch magazine sits
+at the spot with the rotation the held magazine had when the pouch was placed
+(or upright, `MagPouchRotation`, before that).
 
 Settings (hole-vr.ini): `holster_pistol`, `holster_pistol_grip_toggle`,
 `holster_pistol_cant_deg`, `holster_<pistol|mag>_<forward|right|up|radius>_cm`,
@@ -60,8 +83,9 @@ Settings (hole-vr.ini): `holster_pistol`, `holster_pistol_grip_toggle`,
 
 ## Log lines to check after a playtest
 
-- `holster: belt from the VR body's pelvis, N cm below the headset; pistol spot ...`
-  (N should be roughly 65-75 cm standing).
+- `holster: body parts from the VR body: belt N cm below the headset, chest N, thighs N and N`
+  (belt roughly 65-75 cm standing), then `holster: pistol spot on your ...`
+  and `holster: magazine spot on your ...`.
 - `holster: pistol drawn (hand X cm from the holster spot)`,
   `holster: pistol holstered ...`, `holster: pistol let go N cm from the holster ...`.
 - `controls: took the pouch magazine (hand X cm from the pouch)`,
@@ -69,7 +93,8 @@ Settings (hole-vr.ini): `holster_pistol`, `holster_pistol_grip_toggle`,
 - `holster: pouch magazine turned ...` and
   `controls: learned magazine seat (...), turned N deg from the magwell point`:
   if N is large, the pouch magazine looks turned until the first insert.
-- `holster: moved; pistol spot (...)` after calibrating.
+- `holster: moved the pistol holster to your chest, (...) cm, N cm from its centre, at the angle you held it`
+  after placing one, then `holster: saved to holsters.ini`.
 
 ## Later: rifle slots
 

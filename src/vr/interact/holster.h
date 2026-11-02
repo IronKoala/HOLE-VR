@@ -3,42 +3,78 @@
 // put-away logic for them. Pure logic (no game calls), unit tested in
 // tests/test_holster.cpp; vr/controls places the items and reads the hands.
 //
-// A spot is an offset in the body's frame (X forward, Y right, Z up, turned
-// with the body's yaw only, so leaning does not tip it) from an anchor on the
-// VR body: the belt (pelvis bone) or the chest (top spine bone). Offsets come
-// from hole-vr.ini and can be moved in the headset, which saves them to
-// hole-vr/holsters.ini.
+// A spot is where the hand grabs the item, as an offset in an anchor's frame.
+// Anchors are parts of the VR body: the belt (pelvis bone, turned with the
+// body's yaw only, so leaning does not tip it), the chest (top spine bone,
+// tilting with the torso) and each thigh (mid-thigh, swinging with the leg).
+// A spot placed in the headset also keeps the item's rotation in that frame,
+// so it hangs at whatever angle it was held. Defaults come from hole-vr.ini;
+// spots placed in the headset are saved to hole-vr/holsters.ini.
 //
 // Slots now: right hip = pistol, left hip = pistol magazines (the magazine
-// pouch). Planned for when the rifle is unlocked: a rifle slot (chest/back)
-// and a rifle magazine slot; HolsterId and DefaultSpot already have room.
+// pouch), both movable anywhere on the body. Planned for when the rifle is
+// unlocked: a rifle slot (chest/back) and a rifle magazine slot; HolsterId
+// and DefaultSpot already have room.
+
+#include <string>
 
 #include "vr/math.h"
 
 namespace holevr::vr::interact {
 
 enum class HolsterId : int { kPistol, kMag, kRifle, kRifleMag, kCount };
-enum class HolsterAnchor : int { kBelt, kChest };
+// Body parts a holster can ride on. Belt and chest frames: X forward, Y
+// right, Z up (the chest's up runs up the spine). Thigh frames: Z up along the
+// thigh, X forward, Y right.
+enum class HolsterAnchor : int { kBelt, kChest, kThighL, kThighR, kCount };
 
 struct HolsterSpot {
     bool enabled = true;
     HolsterAnchor anchor = HolsterAnchor::kBelt;
-    FVector offset;        // cm from the anchor, body frame (X forward, Y right, Z up)
+    FVector offset;        // where the hand grabs, cm in the anchor's frame
     double radius = 12.0;  // grab / put-away zone around the spot, cm
     int hand = 1;          // 0 left, 1 right: the hand that takes from it
+    // Placed in the headset: the item's rotation in the anchor's frame (for a
+    // gun its gun frame, for a magazine the magazine actor's rotation).
+    // Otherwise the built-in hanging (PistolHolsterFrame / MagPouchGunFrame).
+    bool turned = false;
+    FQuat rot;
 };
 
 // Built-in spots, before hole-vr.ini and calibration.
 HolsterSpot DefaultSpot(HolsterId id);
 // "pistol", "mag", "rifle", "rifle_mag": ini keys are holster_<name>_*.
 const char* HolsterName(HolsterId id);
+// "belt", "chest", "left_thigh", "right_thigh" (holsters.ini).
+const char* AnchorName(HolsterAnchor a);
+// For the log: "your belt", "your chest", "your left thigh" ...
+const char* AnchorPlace(HolsterAnchor a);
 
-// World position of a spot from its anchor's world location and the body's
-// rotation (yaw only).
-FVector SpotWorld(const HolsterSpot& s, const FVector& anchor, const FQuat& body_rot);
+// A frame with Z along `up` and X as close to `forward` as it can be (Y =
+// right). For anchors that tilt (chest up the spine, thigh along the leg).
+FQuat FrameFromUp(const FVector& up, const FVector& forward);
+
+// The anchor a holster placed at `hand` rides on: the nearest of the valid
+// anchors (locations indexed by HolsterAnchor). The belt wins ties.
+HolsterAnchor NearestAnchor(const FVector& hand, const FVector* anchor_locs, const bool* anchor_valid);
+
+// Placing a spot from the hand: `hand` is where the hand grabs, `item_rot`
+// the item's world rotation (turned = false when not known).
+HolsterSpot PlaceSpot(const HolsterSpot& base, HolsterAnchor anchor, const FVector& anchor_loc,
+                      const FQuat& anchor_rot, const FVector& hand, const FQuat* item_rot);
+
+// One line of hole-vr/holsters.ini, without the newline:
+//   pistol=chest 4.9 12.0 -3.0 rot 0.1 0.2 0.3 0.9
+// The old form "pistol=4.9 32.3 18.2" (belt, built-in hanging) still loads.
+std::string FormatSpotLine(HolsterId id, const HolsterSpot& s);
+// Applies a holsters.ini line to `s` if it names `id`. False if it doesn't.
+bool ParseSpotLine(const char* line, HolsterId id, HolsterSpot* s);
+
+// World position of a spot from its anchor's world location and rotation.
+FVector SpotWorld(const HolsterSpot& s, const FVector& anchor, const FQuat& anchor_rot);
 // The offset that puts a spot at `world` (calibration: "the holster goes
 // where the hand is now").
-FVector SpotOffset(const FVector& world, const FVector& anchor, const FQuat& body_rot);
+FVector SpotOffset(const FVector& world, const FVector& anchor, const FQuat& anchor_rot);
 
 // Gun frame (X barrel, Y right, Z up) of a pistol sitting in a strong-side
 // hip holster: muzzle down, top of the slide toward the front, the gun's

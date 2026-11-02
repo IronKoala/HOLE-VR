@@ -39,11 +39,16 @@ enum class Slot : int {
 // False while the VR body is off or not yet posed.
 bool GetSlot(Slot slot, hands::Pose* out);
 
-// The bones gear hangs from, for holsters that keep their own offsets
-// (vr/interact/holster.h): kBelt = pelvis, kChest = top spine bone. Rotation
-// is the body's yaw only (X forward, Y right, Z up), as for the slots. Same
-// frame timing and validity as GetSlot.
-enum class Anchor : int { kBelt, kChest };
+// The body parts gear hangs from, for holsters that keep their own offsets
+// (vr/interact/holster.h; same order as interact::HolsterAnchor):
+//   kBelt  = pelvis bone, the body's yaw only (X forward, Y right, Z up).
+//   kChest = top spine bone, tilting with the torso (Z from the pelvis up to
+//            it, X toward the body's front).
+//   kThighL/kThighR = middle of the thigh, swinging with the leg (Z up along
+//            the thigh, X toward the body's front). With the legs off they
+//            hang from the belt.
+// Same frame timing and validity as GetSlot.
+enum class Anchor : int { kBelt, kChest, kThighL, kThighR, kCount };
 bool GetAnchor(Anchor anchor, hands::Pose* out);
 
 // Registers the game tick listener. Call after controls::Init() so hand
