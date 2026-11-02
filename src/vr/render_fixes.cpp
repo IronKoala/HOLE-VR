@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -72,14 +73,29 @@ struct PauseSetting {
     int32_t flag_offset = -1;
     uint8_t flag_mask = 0;
 };
-// The focal distance comes last, so the blur only starts once the others are in.
+// The aperture (f-stop) is never touched: in UE5 it also sets the exposure of
+// a physical camera, and setting f/1.2 made the whole picture several stops
+// brighter while paused (owner's 2026-11-02 run; capture mean 92 -> 208 in
+// the same room). The blur amount comes from the sensor width instead, which
+// only the depth of field uses. The focal distance comes last, so the blur
+// only starts once the sensor width is in.
 std::vector<PauseSetting> g_pause = {
-    {"bOverride_DepthOfFieldFstop", "DepthOfFieldFstop", 1.2f},
-    {"bOverride_DepthOfFieldMinFstop", "DepthOfFieldMinFstop", 1.2f},
     // A wide "sensor" makes the lens model blur more for the same headset view.
-    {"bOverride_DepthOfFieldSensorWidth", "DepthOfFieldSensorWidth", 300.f},
+    {"bOverride_DepthOfFieldSensorWidth", "DepthOfFieldSensorWidth", 1000.f},
     {"bOverride_DepthOfFieldFocalDistance", "DepthOfFieldFocalDistance", 100.f},  // cm
 };
+constexpr size_t kPauseSensor = 0, kPauseFocus = 1;
+
+// Read only, for the log: the game's own aperture and exposure mode.
+struct Probe {
+    const char* override;
+    const char* value;
+    int32_t value_offset = -1;
+    int32_t flag_offset = -1;
+    uint8_t flag_mask = 0;
+};
+Probe g_probe_fstop{"bOverride_DepthOfFieldFstop", "DepthOfFieldFstop"};
+Probe g_probe_exposure{"bOverride_AutoExposureMethod", "AutoExposureMethod"};
 bool g_pause_ready = false;
 std::atomic<bool> g_pause_on{false};
 int32_t g_dof_focal_offset = -1;  // the "no depth of field" fix's value
@@ -216,10 +232,16 @@ bool Init() {
     } else if (g_dof_focal_offset < 0) {
         log::Info("render fixes: pause blur off (needs vr_disable_depth_of_field=1)");
     } else {
-        g_pause[0].target = config::GetFloat("pause_blur_fstop", 1.2f);
-        g_pause[1].target = g_pause[0].target;
-        g_pause[2].target = config::GetFloat("pause_blur_sensor_mm", 300.f);
-        g_pause[3].target = config::GetFloat("pause_blur_focus_m", 1.0f) * 100.f;
+        g_pause[kPauseSensor].target = config::GetFloat("pause_blur_sensor_mm", 1000.f);
+        g_pause[kPauseFocus].target = config::GetFloat("pause_blur_focus_m", 1.0f) * 100.f;
+        for (Probe* pr : {&g_probe_fstop, &g_probe_exposure}) {
+            refl::PropertyInfo flag = refl::FindProperty(pp_struct, pr->override);
+            refl::PropertyInfo val = refl::FindProperty(pp_struct, pr->value);
+            if (!flag.valid() || !flag.bool_mask || !val.valid()) continue;
+            pr->flag_offset = flag.offset;
+            pr->flag_mask = flag.bool_mask;
+            pr->value_offset = val.offset;
+        }
         bool ok = true;
         for (PauseSetting& p : g_pause) {
             refl::PropertyInfo flag = refl::FindProperty(pp_struct, p.override);
@@ -238,8 +260,9 @@ bool Init() {
             // Nothing nearer than the focus gets blurred: hands, arms, body, menu.
             vr::cvars::Want("r.DOF.Kernel.MaxForegroundRadius", "0.0");
             g_pause_ready = true;
-            log::Info("render fixes: pause blur ready (focus %.2f m, f/%.1f, sensor %.0f mm)",
-                      g_pause[3].target / 100.f, g_pause[0].target, g_pause[2].target);
+            log::Info("render fixes: pause blur ready (focus %.2f m, sensor %.0f mm; the game's aperture and "
+                      "exposure are left alone)",
+                      g_pause[kPauseFocus].target / 100.f, g_pause[kPauseSensor].target);
         }
     }
     log::Info("render fixes: %d post-process overrides active; camera settings at 0x%x, "
@@ -294,6 +317,25 @@ void Apply() {
     }
 }
 
+// "f/4.0*" = aperture 4.0, set by this object (* = override on); "exp 2*" = exposure method.
+std::string Describe(uintptr_t settings) {
+    std::string out;
+    char buf[64];
+    if (g_probe_fstop.value_offset >= 0) {
+        float f = mem::ReadOr<float>(settings + g_probe_fstop.value_offset, -1.f);
+        bool set = mem::ReadOr<uint8_t>(settings + g_probe_fstop.flag_offset) & g_probe_fstop.flag_mask;
+        std::snprintf(buf, sizeof(buf), "f/%.1f%s", f, set ? "*" : "");
+        out += buf;
+    }
+    if (g_probe_exposure.value_offset >= 0) {
+        int m = mem::ReadOr<uint8_t>(settings + g_probe_exposure.value_offset, 255);
+        bool set = mem::ReadOr<uint8_t>(settings + g_probe_exposure.flag_offset) & g_probe_exposure.flag_mask;
+        std::snprintf(buf, sizeof(buf), " exp %d%s", m, set ? "*" : "");
+        out += buf;
+    }
+    return out;
+}
+
 int SetPauseBlur(bool on) {
     if (!g_pause_ready) return -1;
     {
@@ -306,14 +348,19 @@ int SetPauseBlur(bool on) {
         targets = g_targets;
     }
     int n = 0;
+    std::string seen;
     for (const Target& t : targets) {
         if (t.index < 0 || ue::objects::Get(t.index) != t.obj) continue;
         uint32_t flags = mem::ReadOr<uint32_t>(t.obj + ue::off::kObjFlags, kSkipFlags);
         if (flags & kSkipFlags) continue;
-        std::lock_guard<std::mutex> lock(g_write_mutex);
-        ForceNeutral(t.obj + t.offset);
+        {
+            std::lock_guard<std::mutex> lock(g_write_mutex);
+            ForceNeutral(t.obj + t.offset);
+        }
+        if (on && n < 8) seen += " | " + ue::GetName(ue::GetClass(t.obj)) + " " + Describe(t.obj + t.offset);
         ++n;
     }
+    if (on) log::Info("render fixes: pause blur on %d settings (aperture/exposure untouched:%s)", n, seen.c_str());
     return n;
 }
 

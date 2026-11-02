@@ -874,13 +874,19 @@ void OnGameFrame() {
     static bool s_blur = false;
     if (s_blur != !G.panels.empty()) {
         s_blur = !G.panels.empty();
+        // Nothing nearer than the focus may blur (hands, arms, body, menu).
+        // Set right here, before the blur starts: the background cvars pass
+        // only runs while the player ticks and had not run yet on the
+        // owner's 2026-11-02 12:13 run, so the hands came out blurred.
+        if (s_blur) cvars::RunNow("r.DOF.Kernel.MaxForegroundRadius 0", G.actor);
         int n = render_fixes::SetPauseBlur(s_blur);
         if (n >= 0 && s_blur)
-            log::Info("world menu: pause blur on (%d cameras/post-process components; r.DepthOfFieldQuality %d, "
-                      "r.DOF.Kernel.MaxForegroundRadius set to 0 at level start)",
-                      n, cvars::ReadIntNow("r.DepthOfFieldQuality", -1));
+            log::Info("world menu: pause blur on (%d settings; r.DepthOfFieldQuality %d, "
+                      "r.DOF.Kernel.MaxForegroundRadius %.3f)",
+                      n, cvars::ReadIntNow("r.DepthOfFieldQuality", -1),
+                      cvars::ReadFloatNow("r.DOF.Kernel.MaxForegroundRadius", -1.f));
         else if (n >= 0)
-            log::Info("world menu: pause blur off (%d cameras/post-process components)", n);
+            log::Info("world menu: pause blur off (%d settings)", n);
     }
     if (G.panels.empty()) {
         g_active = false;
@@ -1234,8 +1240,10 @@ void PrepareHolder(UObject player) {
     s_checked = now;
     if (G.actor && Alive(G.actor, G.actor_index) && G.wic && Alive(G.wic, G.wic_index)) return;
     double t0 = perf::NowMs();
-    if (EnsureActor(player))
+    if (EnsureActor(player)) {
+        cvars::RunNow("r.DOF.Kernel.MaxForegroundRadius 0", player);  // for the pause blur
         log::Info("world menu: forearm menu holder ready for this level (%.1f ms)", perf::NowMs() - t0);
+    }
 }
 
 void AfterControllerTick(UObject, UObject, void*) { OnGameFrame(); }

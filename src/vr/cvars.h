@@ -16,4 +16,8 @@ void CycleAntiAliasing();
 void Want(const std::string& name, const std::string& value);
 // Game thread: current integer value of a console variable, or fallback.
 int ReadIntNow(const std::string& name, int fallback);
+float ReadFloatNow(const std::string& name, float fallback);
+// Game thread: run a console command right away (e.g. "r.Foo 0"). context is
+// any object in the world (the player), or 0.
+void RunNow(const std::string& command, uintptr_t context);
 }  // namespace holevr::vr::cvars

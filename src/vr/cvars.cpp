@@ -40,15 +40,13 @@ struct AaMode {
 constexpr AaMode kAaModes[] = {{"fxaa", 1}, {"taa", 2}, {"tsr", 4}, {"off", 0}};
 int g_aa_index = -1;  // -1: leave the game's setting
 
-UObject Library() {
-    static UObject ksl = 0;
-    static int lookups = 0;
-    if (!ksl && lookups < 5) {
-        ++lookups;
-        ksl = ue::FindObject("KismetSystemLibrary /Script/Engine.Default__KismetSystemLibrary");
-    }
-    return ksl;
-}
+// Found once in Init(), on the start-up thread. A lookup by name walks every
+// object in the game (about half a second with a level loaded), so it must
+// never happen on the game thread: the first one used to land on the frame
+// the pause menu opened (2026-11-02 log: 545 ms).
+std::atomic<UObject> g_ksl{0};
+
+UObject Library() { return g_ksl.load(); }
 
 // Game thread only.
 bool ReadInt(UObject ksl, const std::string& name, int* out) {
@@ -112,6 +110,16 @@ void Want(const std::string& name, const std::string& value) {
     g_wanted[name] = value;
 }
 
+float ReadFloatNow(const std::string& name, float fallback) {
+    UObject ksl = Library();
+    if (!ksl) return fallback;
+    std::wstring w = Widen(name);
+    FStringView str{w.c_str(), static_cast<int32_t>(w.size() + 1), static_cast<int32_t>(w.size() + 1)};
+    ue::Call c(ksl, "GetConsoleVariableFloatValue");
+    c.Set("VariableName", str);
+    return c.Invoke() ? c.Result<float>() : fallback;
+}
+
 int ReadIntNow(const std::string& name, int fallback) {
     UObject ksl = Library();
     int v = fallback;
@@ -119,7 +127,15 @@ int ReadIntNow(const std::string& name, int fallback) {
     return v;
 }
 
+void RunNow(const std::string& command, UObject context) {
+    UObject ksl = Library();
+    if (!ksl) return;
+    Execute(ksl, context, command);
+}
+
 void Init() {
+    g_ksl = ue::FindObject("KismetSystemLibrary /Script/Engine.Default__KismetSystemLibrary");
+    if (!g_ksl.load()) log::Warn("cvars: KismetSystemLibrary not found, console variables can't be set");
     std::string aa = config::GetString("vr_anti_aliasing", "fxaa");
     for (int i = 0; i < static_cast<int>(sizeof(kAaModes) / sizeof(kAaModes[0])); ++i)
         if (aa == kAaModes[i].name) g_aa_index = i;
