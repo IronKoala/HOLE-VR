@@ -91,6 +91,10 @@ hand (its buttons stop reaching the game, and the gun won't fire).
   the controller: the magazine moves and turns in the hand (the hand stays
   where it is on its controller while editing).
 - **Pistol**: the palm ball moves and turns the whole hand on the gun.
+- The editing hand's grab point is a small ball just ahead of the
+  controller; when that hand holds a gun it sits in front of the barrel
+  (`hand_editor_gun_hand_reach_cm`, default 22). Joint balls are 2.6 cm
+  across (`hand_editor_joint_ball_cm`) so they show through the fingers.
 - The ball a squeeze would take grows and the controller ticks when it
   changes (`hand_editor_show_grab_points`). Pull the real trigger to edit
   the "resting" and "pulled" index poses.

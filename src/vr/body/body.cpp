@@ -71,6 +71,8 @@ struct Settings {
     bool grip_records = true;
     double finger_radius = 0.5;
     bool editor_markers = true;
+    double joint_ball = 2.6;       // joint grab ball diameter, cm
+    double reach_gun = 22.0;       // pointer ahead of a gun-holding editing hand, cm
     bool gun_wrist_straight = true;
     bool fit_log = true;
     bool fixed_height = true;
@@ -109,6 +111,8 @@ void LoadSettings() {
     S.grip_records = config::GetBool("hand_grip_records", true);
     S.finger_radius = config::GetFloat("hand_finger_radius_cm", 0.5f);
     S.editor_markers = config::GetBool("hand_editor_show_grab_points", true);
+    S.joint_ball = std::clamp<double>(config::GetFloat("hand_editor_joint_ball_cm", 2.6f), 0.5, 6.0);
+    S.reach_gun = std::clamp<double>(config::GetFloat("hand_editor_gun_hand_reach_cm", 22.f), 3.0, 60.0);
     S.gun_wrist_straight = config::GetBool("body_gun_wrist_straight", true);
     S.fit_log = config::GetBool("body_fit_log", true);
     S.fixed_height = config::GetBool("fixed_height", true);
@@ -1562,7 +1566,7 @@ void ShowMarkers(UObject player, int side, int hover, const FVector& pointer, co
     }
     for (int m = 0; m < grip_editor::kJointItems; ++m) {
         bool hot = m == hover;
-        PlaceMarker(m, g_joint_world[side][m / 3][m % 3].translation, hot ? 2.0 : 0.9);
+        PlaceMarker(m, g_joint_world[side][m / 3][m % 3].translation, hot ? S.joint_ball * 1.4 : S.joint_ball);
     }
     // The palm ball (move the hand) or, holding a magazine, the magazine ball.
     if (object) PlaceMarker(kMkObject, *object, hover == grip_editor::kObjectItem ? 4.5 : 2.5);
@@ -1572,7 +1576,7 @@ void ShowMarkers(UObject player, int side, int hover, const FVector& pointer, co
         SetVisible(g_mk.comp[kMkObject], g_mk.object_shown);
         SetVisible(g_mk.comp[kMkPalm], !g_mk.object_shown);
     }
-    PlaceMarker(kMkPointer, pointer, 0.8);
+    PlaceMarker(kMkPointer, pointer, 1.5);
 }
 
 // The grip-record entry a finger's joints belong to (the index: the trigger
@@ -1624,7 +1628,11 @@ void UpdateEditor(const hands::HandGrab grab[2], const hands::HandState hs[2], d
     in.y_down = b.y_down;
     in.stick_click_pressed = b.left_stick_pressed;
     in.grab_down = b.grip_down[ctrl];
-    const FVector pointer_w = hs[ctrl].grip.location + hs[ctrl].aim.rotation.Rotate(FVector{3, 0, 0});
+    // The grab point sits just ahead of the controller; when that hand holds a
+    // gun it sits in front of the barrel, so the gun doesn't hide it or get in
+    // the way.
+    const double reach = grab[ctrl].kind == hands::GrabKind::kGunGrip ? S.reach_gun : 3.0;
+    const FVector pointer_w = hs[ctrl].grip.location + hs[ctrl].aim.rotation.Rotate(FVector{reach, 0, 0});
     in.pointer = local(pointer_w);
     in.pointer_rot = Normalized(inv * hs[ctrl].grip.rotation);
     grip_editor::Scene sc;

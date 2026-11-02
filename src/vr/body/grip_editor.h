@@ -78,7 +78,7 @@ private:
 };
 
 // Grab reach: items further than this from the pointer are not picked, cm.
-constexpr double kGrabRadius = 4.0;
+constexpr double kGrabRadius = 5.0;
 
 // The item a squeeze at `pointer` would take: nearest joint, or the palm /
 // object (bigger targets), kNoItem when nothing is in reach.
