@@ -1098,7 +1098,27 @@ void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState& lh
             if (t < 1.0) return;
             W.mag_seating = false;
             W.mag_engaged = false;
-            ue::SetProp<UObject>(gun.Object(), "MagazineObj_Temp", W.held_mag);
+            // Bullet holes stopped after the first reload with a pouch magazine
+            // spawned by the mod: those are not set up the way the game's own
+            // magazines are. With the magwell empty, ask the game for a proper
+            // magazine (its own reload step), seat that, and remove ours.
+            UObject game_mag = 0;
+            if (!gun.State().has_magazine) {
+                ue::SetProp<UObject>(gun.Object(), "MagazineObj_Temp", UObject(0));
+                gun.TakeNewMagazine();
+                ue::GetProp(gun.Object(), "MagazineObj_Temp", game_mag);
+                if (game_mag == W.held_mag) game_mag = 0;
+            }
+            if (game_mag) {
+                SetActorTransform(game_mag, show_loc, show_rot);
+                ue::Call destroy(W.held_mag, "K2_DestroyActor");
+                destroy.Invoke();
+                log::Info("controls: seating the game's own magazine %s (pouch magazine removed)",
+                          ue::GetName(game_mag).c_str());
+            } else {
+                ue::SetProp<UObject>(gun.Object(), "MagazineObj_Temp", W.held_mag);
+                log::Info("controls: seating the pouch magazine itself (game gave none)");
+            }
             gun.InsertMagazine();
             UObject mag = 0;
             if (ue::GetProp(gun.Object(), "MagazineObj", mag) && mag) {
@@ -1513,6 +1533,11 @@ void LogShot(UObject player, game::Gun& gun) {
     log::Info("shot %d: muzzle (%.0f %.0f %.0f) muzzle X (%.2f %.2f %.2f) barrel (%.2f %.2f %.2f) "
               "control rot (p %.1f y %.1f)", n, mloc.X, mloc.Y, mloc.Z, mfwd.X, mfwd.Y, mfwd.Z, gfwd.X, gfwd.Y,
               gfwd.Z, ctrl.Pitch, ctrl.Yaw);
+    UObject mag = 0, round = 0;
+    ue::GetProp(gun.Object(), "MagazineObj", mag);
+    ue::GetProp(gun.Object(), "AmmoObj_InChamber", round);
+    log::Info("shot %d: magazine %s, chambered round %s", n, mag ? ue::GetName(mag).c_str() : "none",
+              round ? ue::GetName(round).c_str() : "none");
 }
 
 void OnTick(UObject player, float dt) {
