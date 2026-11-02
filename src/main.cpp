@@ -27,8 +27,6 @@
 #include "vr/wrist_hud.h"
 #include "vr/world_menu.h"
 #include "vr/menu_study.h"
-#include "vr/launch.h"
-#include "vr/steamvr.h"
 #include "vr/stereo.h"
 
 namespace {
@@ -81,23 +79,12 @@ void StartVr() {
     vr::ui_panel::Init();
     vr::world_menu::Init();
     vr::wrist_hud::Init();
-    vr::launch::Init();
-    // Start SteamVR ourselves if it is closed, before the first OpenXR call
-    // (that call alone would start a SteamVR that refuses wireless headsets).
-    vr::steamvr::EnsureRunning();
-    const DWORD wait_start = GetTickCount();
-    DWORD last_note = 0;
+    bool told = false;
     while (!vr::xr::InitInstance()) {
-        DWORD waited = GetTickCount() - wait_start;
-        if (last_note == 0 || waited - last_note >= 30000) {
-            log::Info("Waiting for SteamVR and the headset (%lu s so far; SteamVR %s)...",
-                      static_cast<unsigned long>(waited / 1000),
-                      vr::steamvr::Running() ? "running, headset not connected yet" : "not running");
-            last_note = waited ? waited : 1;
-        }
+        if (!told) log::Info("Waiting for SteamVR and the headset...");
+        told = true;
         Sleep(2000);
     }
-    log::Info("Headset found %.1f s after the mod started looking", (GetTickCount() - wait_start) / 1000.0);
     for (int tries = 0; !vr::stereo::Install(); ++tries) {
         if (tries == 120) {
             log::Error("Gave up hooking the stereo device");
@@ -173,7 +160,6 @@ DWORD WINAPI InitThread(LPVOID) {
         if (frame % 60 == 15) vr::ui_panel::Maintain();
         if (frame % 15 == 7) vr::world_menu::Scan();
         if (hooks) vr::menu_study::Poll();
-        if (hooks) vr::launch::Poll();
         bool ctrl = GetAsyncKeyState(VK_CONTROL) & 0x8000;
         bool dump = ctrl && (GetAsyncKeyState(VK_F9) & 0x8000);
         bool recenter = ctrl && (GetAsyncKeyState(VK_F8) & 0x8000);
