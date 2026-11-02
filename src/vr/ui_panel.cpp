@@ -18,6 +18,7 @@
 #include "vr/dxgi_hooks.h"
 #include "vr/input.h"
 #include "vr/openxr.h"
+#include "vr/world_menu.h"
 
 namespace holevr::vr::ui_panel {
 namespace {
@@ -50,6 +51,7 @@ int32_t g_cursor_offset = -1;
 uint8_t g_cursor_mask = 0;
 UObject g_pc_base_class = 0;
 std::atomic<bool> g_menu_open{false};
+DWORD g_opened_at = 0;
 
 bool ReadMenuOpen() {
     uintptr_t pc = g_pc.load();
@@ -350,7 +352,10 @@ struct UiListener : xr::Listener {
         if (open != g_menu_open.load()) {
             g_menu_open = open;
             log::Info("menu panel: menu %s", open ? "opened" : "closed");
-            if (open) P.placed = false;
+            if (open) {
+                P.placed = false;
+                g_opened_at = GetTickCount();
+            }
             if (!open && PT.mouse_down) {
                 if (HWND w = GameWindow()) PostMessageW(w, WM_LBUTTONUP, 0, 0);
                 PT.mouse_down = false;
@@ -371,6 +376,31 @@ struct UiListener : xr::Listener {
             PT.menu_down[hnd] = m;
         }
         if (!open || !S.enabled) return;
+
+        // B/Y goes back (Escape).
+        if (in.valid) {
+            for (int hnd = 0; hnd < 2; ++hnd) {
+                bool back = in.hand[hnd].secondary.down;
+                if (back && !PT.back_down[hnd] && w) PostKey(w, VK_ESCAPE);
+                PT.back_down[hnd] = back;
+            }
+        }
+
+        // Menus on their own panels in the world (vr/world_menu) replace this
+        // flat copy of the screen. It only comes back if no menu could be
+        // moved there.
+        if (world_menu::Enabled()) {
+            if (world_menu::Active() || GetTickCount() - g_opened_at < 1500) {
+                if (PT.mouse_down && w) PostMessageW(w, WM_LBUTTONUP, 0, 0);
+                PT.mouse_down = false;
+                return;
+            }
+            static bool s_said = false;
+            if (!s_said) {
+                s_said = true;
+                log::Warn("menu panel: no menu could be moved into the world; showing the flat screen instead");
+            }
+        }
 
         ID3D12Resource* source = xr::WindowTexture();
         if (!source || !InitGpu()) return;
@@ -402,9 +432,6 @@ struct UiListener : xr::Listener {
                 bool t = h.trigger > (PT.trigger_down[hnd] ? 0.35f : 0.6f);
                 if (t && !PT.trigger_down[hnd]) PT.active_hand = hnd;
                 PT.trigger_down[hnd] = t;
-                bool back = h.secondary.down;
-                if (back && !PT.back_down[hnd] && w) PostKey(w, VK_ESCAPE);
-                PT.back_down[hnd] = back;
             }
             const auto& h = in.hand[PT.active_hand];
             if (HitPanel(h, &u, &v)) {

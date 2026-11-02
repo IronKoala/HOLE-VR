@@ -7,9 +7,10 @@
 // thumbstick up/down to scroll, B/Y to go back. The menu button on either
 // controller opens and closes the pause menu.
 //
-// The panel shows the whole window, so the game is visible behind the menu,
-// like a cinema screen. HUD elements during play are handled separately
-// (wrist HUD).
+// By default menus are moved onto their own panels in the world instead
+// (vr/world_menu); this module then only detects menus and handles the
+// menu/back buttons. The flat copy of the whole window is the fallback
+// (menu_mode=window, or when no menu could be moved).
 namespace holevr::vr::ui_panel {
 // Before the VR session starts (registers with OpenXR).
 void Init();

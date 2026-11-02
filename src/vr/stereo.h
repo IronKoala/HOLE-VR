@@ -26,4 +26,9 @@ void Recenter();
 // false until the first headset frame has been rendered.
 bool TrackingToWorld(const XrPosef& tracking_pose, FVector* world_location, FQuat* world_rotation);
 
+// Runs `fn` on the game thread once per rendered frame, right after both eye
+// views are set up. Unlike the player's tick it keeps running while the game
+// is paused and on the title screen, so menus can use it. One callback.
+void SetGameFrameCallback(void (*fn)());
+
 }  // namespace holevr::vr::stereo

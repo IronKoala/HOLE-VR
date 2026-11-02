@@ -181,8 +181,32 @@ struct WorldMapping {
 std::mutex g_world_mutex;
 WorldMapping g_world;
 
+std::atomic<void (*)()> g_frame_callback{nullptr};
+std::atomic<DWORD> g_view_thread{0};
+
+// After the right eye: the frame's head pose and world mapping are final.
+void RunFrameCallback() {
+    auto fn = g_frame_callback.load();
+    if (!fn) return;
+    // Only the thread that set up the views (the game thread) runs it.
+    DWORD me = GetCurrentThreadId();
+    DWORD expected = 0;
+    if (!g_view_thread.compare_exchange_strong(expected, me) && expected != me) return;
+    static bool running = false;
+    if (running) return;
+    running = true;
+    fn();
+    running = false;
+}
+
 void HookCalcOffset(void* self, int32_t view_index, FRotator* rotation, float world_to_meters, FVector* location) {
     HOLEVR_FIRST_CALL("CalculateStereoViewOffset");
+    struct AfterRightEye {
+        int32_t i;
+        ~AfterRightEye() {
+            if (i == 1) RunFrameCallback();
+        }
+    } after{view_index};
     xr::EyeView views[2];
     // A left-eye request starts a new frame: take a fresh tracking sample.
     if (view_index < 0 || view_index > 1 || !FrameViews(view_index == 0, views)) {
@@ -465,6 +489,8 @@ bool Install() {
 }
 
 void Recenter() { g_recenter = true; }
+
+void SetGameFrameCallback(void (*fn)()) { g_frame_callback.store(fn); }
 
 bool TrackingToWorld(const XrPosef& pose, FVector* world_location, FQuat* world_rotation) {
     WorldMapping m;

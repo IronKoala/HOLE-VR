@@ -38,6 +38,7 @@ add_library(hole_vr SHARED
     src/vr/render_fixes.cpp
     src/vr/cvars.cpp
     src/vr/ui_panel.cpp
+    src/vr/world_menu.cpp
     src/vr/wrist_hud.cpp
     src/main.cpp
 )

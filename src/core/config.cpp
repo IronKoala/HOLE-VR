@@ -91,6 +91,20 @@ const Block kBlocks[] = {
      "; Turn further away than this and the screen comes back in front of you.\n"
      "menu_panel_follow_deg=60\n"
      "menu_button_pauses=1\n"},
+    {"menu_world",
+     "\n"
+     "; --- Menus as panels in the world ---\n"
+     "; world  = each game menu is taken off the flat screen and shown on its own\n"
+     ";          panel floating in front of you (like other VR games)\n"
+     "; window = the old way: the whole game screen on a flat panel\n"
+     "menu_mode=world\n"
+     "menu_world_width_m=1.8\n"
+     "menu_world_distance_m=1.6\n"
+     "menu_world_drop_m=0.15\n"
+     "; Darkness behind the menu, 0 (none, just the game's own art) to 1 (solid)\n"
+     "menu_world_backdrop=0.55\n"
+     "; Laser from the controller to the menu\n"
+     "menu_world_laser=1\n"},
     {"wrist_hud",
      "\n"
      "; --- Wrist display ---\n"

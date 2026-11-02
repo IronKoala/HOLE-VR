@@ -25,6 +25,7 @@
 #include "vr/render_fixes.h"
 #include "vr/ui_panel.h"
 #include "vr/wrist_hud.h"
+#include "vr/world_menu.h"
 #include "vr/stereo.h"
 
 namespace {
@@ -75,6 +76,7 @@ void StartVr() {
     using namespace holevr;
     vr::input::Init();  // controller actions must exist before the session starts
     vr::ui_panel::Init();
+    vr::world_menu::Init();
     vr::wrist_hud::Init();
     bool told = false;
     while (!vr::xr::InitInstance()) {
@@ -139,6 +141,7 @@ DWORD WINAPI InitThread(LPVOID) {
         // the render fixes are re-applied once a second.
         if (render_fixes && frame % 60 == 0) vr::render_fixes::Apply();
         if (frame % 60 == 15) vr::ui_panel::Maintain();
+        if (frame % 15 == 7) vr::world_menu::Scan();
         bool ctrl = GetAsyncKeyState(VK_CONTROL) & 0x8000;
         bool dump = ctrl && (GetAsyncKeyState(VK_F9) & 0x8000);
         bool recenter = ctrl && (GetAsyncKeyState(VK_F8) & 0x8000);
