@@ -153,6 +153,13 @@ const Block kBlocks[] = {
      "menu_laser_own_hit=1\n"
      "; 1 = the menu hand buzzes when the game puts a menu on your arm\n"
      "menu_arrive_buzz=1\n"},
+    {"menu_fit_content",
+     "\n"
+     "; 1 = zoom each forearm menu so the part holding its buttons fills the\n"
+     "; menu's space on the arm (bigger text; text and boxes grow together)\n"
+     "menu_fit_content=1\n"
+     "; Most a menu is zoomed (1 = never)\n"
+     "menu_fit_max_zoom=3\n"},
     {"wrist_hud",
      "\n"
      "; --- Wrist display ---\n"

@@ -66,6 +66,8 @@ struct Settings {
     bool hide_backdrops = true;   // see-through grey boxes inside the menus (HideBackdrops)
     bool own_hit = true;          // the laser tells the menu where it hits (no game collision check)
     bool arrive_buzz = true;      // buzz the menu hand when the game puts a menu on the arm
+    bool fit = true;              // zoom each menu so its buttons fill the space on the arm
+    float fit_max_zoom = 3.f;
 } S;
 
 // The game's menus are laid out for a 1920x1080 screen.
@@ -163,6 +165,12 @@ struct Panel {
     uint8_t last_vis = 255;
     int layer = 0;             // 0 = the first menu, sub-menus come forward
     bool shown = true;         // false while a sub-menu covers it
+    // FitContent: how much the menu is zoomed on the arm, and the part of the
+    // 1920x1080 layout that holds its buttons (centre and half size), which
+    // sits at the panel's spot on the arm and is where the laser can hit.
+    double zoom = 1.0;
+    double cx = kDrawW * 0.5, cy = kDrawH * 0.5;
+    double half_w = kDrawW * 0.5, half_h = kDrawH * 0.5;
 };
 
 struct Pointer {
@@ -231,6 +239,11 @@ struct Lookups {
     int32_t image_brush = -1, image_color = -1, border_brush = -1, border_color = -1;
     int32_t brush_tint = -1, brush_resource = -1, brush_draw_as = -1, slate_color = -1;
     int32_t render_opacity = -1;
+    // FitContent: CanvasPanel children's layout (CanvasPanelSlot.LayoutData).
+    UObject canvas_class = 0, canvas_slot_class = 0;
+    int32_t slot_offsets = -1, slot_anchor_min = -1, slot_anchor_max = -1, slot_alignment = -1;
+    int32_t slot_autosize = -1;
+    uint8_t slot_autosize_mask = 0;
     FName ui_profile;           // collision profile "UI"
     bool have_ui_profile = false;
     FName left_mouse;           // key name "LeftMouseButton", for the laser
@@ -304,6 +317,39 @@ void ResolveCustomSource() {
     log::Warn("world menu: EWidgetInteractionSource not readable; using Custom = %d", kSourceCustom);
 }
 
+// CanvasPanelSlot.LayoutData (FAnchorData): Offsets (FMargin: Left, Top,
+// Right, Bottom floats), Anchors (Minimum, Maximum: FVector2D, doubles in
+// UE5) and Alignment (FVector2D), plus bAutoSize.
+void ResolveFitOffsets() {
+    namespace rf = ue::reflection;
+    L.canvas_class = Lookup("Class /Script/UMG.CanvasPanel");
+    L.canvas_slot_class = Lookup("Class /Script/UMG.CanvasPanelSlot");
+    if (!L.canvas_class || !L.canvas_slot_class) return;
+    rf::PropertyInfo layout = rf::FindProperty(L.canvas_slot_class, "LayoutData");
+    rf::PropertyInfo autosize = rf::FindProperty(L.canvas_slot_class, "bAutoSize");
+    if (!layout.valid() || !layout.inner || !autosize.valid()) {
+        log::Warn("world menu: CanvasPanelSlot layout not found; menus are not zoomed to fit");
+        return;
+    }
+    rf::PropertyInfo offsets = rf::FindProperty(layout.inner, "Offsets");
+    rf::PropertyInfo anchors = rf::FindProperty(layout.inner, "Anchors");
+    rf::PropertyInfo align = rf::FindProperty(layout.inner, "Alignment");
+    rf::PropertyInfo amin = anchors.valid() && anchors.inner ? rf::FindProperty(anchors.inner, "Minimum") : rf::PropertyInfo{};
+    rf::PropertyInfo amax = anchors.valid() && anchors.inner ? rf::FindProperty(anchors.inner, "Maximum") : rf::PropertyInfo{};
+    // Only the layout this code reads: four floats, and doubles for the vectors.
+    if (!offsets.valid() || offsets.element_size != 16 || !align.valid() || align.element_size != 16 ||
+        !amin.valid() || amin.element_size != 16 || !amax.valid() || amax.element_size != 16) {
+        log::Warn("world menu: AnchorData layout is not the one expected; menus are not zoomed to fit");
+        return;
+    }
+    L.slot_offsets = layout.offset + offsets.offset;
+    L.slot_anchor_min = layout.offset + anchors.offset + amin.offset;
+    L.slot_anchor_max = layout.offset + anchors.offset + amax.offset;
+    L.slot_alignment = layout.offset + align.offset;
+    L.slot_autosize = autosize.offset;
+    L.slot_autosize_mask = autosize.bool_mask ? autosize.bool_mask : 0xFF;
+}
+
 void ResolveLookups() {
     ResolveCustomSource();
     L.ksl = Lookup("KismetSystemLibrary /Script/Engine.Default__KismetSystemLibrary");
@@ -317,6 +363,7 @@ void ResolveLookups() {
     L.image_class = Lookup("Class /Script/UMG.Image");
     L.border_class = Lookup("Class /Script/UMG.Border");
     ResolveBackdropOffsets();
+    ResolveFitOffsets();
     L.have_ui_profile = ue::names::Find("UI", &L.ui_profile);
     if (!ue::names::Find("LeftMouseButton", &L.left_mouse))
         log::Warn("world menu: name \"LeftMouseButton\" not found");
@@ -575,7 +622,7 @@ bool PlaceOnForearm() {
 
 void PosePanel(const Panel& p) {
     if (!Alive(p.comp, p.comp_index)) return;
-    double s = Scale();
+    double s = Scale() * p.zoom;
     SetWorldPose(p.comp, PanelCentre(p), PanelRotation());
     ue::Call sc(p.comp, "SetWorldScale3D");
     sc.Set("NewScale", FVector{s, s, s});
@@ -738,6 +785,138 @@ int HideBackdrops(UObject menu, const std::string& menu_name) {
     return hidden;
 }
 
+// ------------------------------------------------------------ fitting --
+// The game lays its menus out for a 1920x1080 screen, mostly empty: the pause
+// menu is a narrow column in the middle. Shrinking the whole screen onto the
+// arm left the text tiny (owner 2026-11-02: "the menu is big enough but its
+// still hard to read the text ... larger text but they dont overlap, and they
+// still fit the individual boxes"). So each menu is measured from its own
+// layout (where the game's CanvasPanel puts each part) and zoomed until the
+// part holding its buttons fills the space the whole screen used to take on
+// the arm. Text and boxes grow together, so nothing overlaps or spills out.
+
+struct Rect {
+    double x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    double W() const { return x1 - x0; }
+    double H() const { return y1 - y0; }
+};
+
+Vector2D DesiredSize(UObject w) {
+    ue::Call c(w, "GetDesiredSize");
+    return c.Invoke() ? c.Result<Vector2D>() : Vector2D{0, 0};
+}
+
+// Where a CanvasPanel child sits inside the canvas's own rectangle.
+bool SlotRect(UObject child, UObject slot, const Rect& parent, Rect* out) {
+    uintptr_t b = static_cast<uintptr_t>(slot);
+    struct Margin {
+        float l, t, r, b;
+    };
+    Margin m = mem::ReadOr<Margin>(b + L.slot_offsets, Margin{0, 0, 0, 0});
+    Vector2D amin = mem::ReadOr<Vector2D>(b + L.slot_anchor_min, Vector2D{0, 0});
+    Vector2D amax = mem::ReadOr<Vector2D>(b + L.slot_anchor_max, Vector2D{0, 0});
+    Vector2D al = mem::ReadOr<Vector2D>(b + L.slot_alignment, Vector2D{0, 0});
+    bool autosize = (mem::ReadOr<uint8_t>(b + L.slot_autosize, 0) & L.slot_autosize_mask) != 0;
+    auto sane = [](double v) { return std::isfinite(v) && v > -10.0 && v < 10.0; };
+    if (!sane(amin.x) || !sane(amin.y) || !sane(amax.x) || !sane(amax.y) || !sane(al.x) || !sane(al.y)) return false;
+    Vector2D want = autosize ? DesiredSize(child) : Vector2D{m.r, m.b};
+    auto axis = [&](double lo, double size, double a0, double a1, float o0, float o1, double align, double desired,
+                    double* r0, double* r1) {
+        if (std::fabs(a1 - a0) < 1e-6) {  // anchored at a point: the offsets are position and size
+            double start = lo + a0 * size + o0 - align * desired;
+            *r0 = start;
+            *r1 = start + desired;
+        } else {  // stretched between two anchors: the offsets are margins
+            *r0 = lo + a0 * size + o0;
+            *r1 = lo + a1 * size - o1;
+        }
+    };
+    axis(parent.x0, parent.W(), amin.x, amax.x, m.l, m.r, al.x, want.x, &out->x0, &out->x1);
+    axis(parent.y0, parent.H(), amin.y, amax.y, m.t, m.b, al.y, want.y, &out->y0, &out->y1);
+    return std::isfinite(out->x0) && std::isfinite(out->x1) && std::isfinite(out->y0) && std::isfinite(out->y1);
+}
+
+bool Covers(const Rect& r, const Rect& screen) {
+    return r.W() >= screen.W() * 0.9 && r.H() >= screen.H() * 0.9;
+}
+
+// Adds the parts of `w` (laid out in `r`) that show something to `box`.
+void Measure(UObject w, const Rect& r, const Rect& screen, int depth, Rect* box, bool* any, int* seen) {
+    if (!w || ++*seen > 600 || depth > 12) return;
+    uint8_t vis = Visibility(w);
+    if (vis == kCollapsed || vis == kHidden) return;
+    if (IsA(w, L.user_widget_class)) {
+        // A user widget that fills its spot with its own canvas: look inside.
+        UObject tree = 0, root = 0;
+        if (ue::GetProp(w, "WidgetTree", tree) && tree && ue::GetProp(tree, "RootWidget", root) && root &&
+            IsA(root, L.canvas_class)) {
+            Measure(root, r, screen, depth + 1, box, any, seen);
+            return;
+        }
+    } else if (IsA(w, L.canvas_class)) {
+        ue::Call count(w, "GetChildrenCount");
+        int n = count.Invoke() ? count.Result<int32_t>() : 0;
+        for (int i = 0; i < n && i < 128; ++i) {
+            ue::Call at(w, "GetChildAt");
+            at.Set("Index", static_cast<int32_t>(i));
+            UObject child = at.Invoke() ? at.Result<UObject>() : 0;
+            UObject slot = 0;
+            if (!child || !ue::GetProp(child, "Slot", slot) || !slot || !IsA(slot, L.canvas_slot_class)) continue;
+            Rect cr;
+            if (SlotRect(child, slot, r, &cr)) Measure(child, cr, screen, depth + 1, box, any, seen);
+        }
+        return;
+    }
+    Rect use = r;
+    if (Covers(r, screen)) {
+        // Something stretched over the whole screen (an overlay holding the
+        // real content in its middle): count its content's size, centred.
+        Vector2D d = DesiredSize(w);
+        if (d.x <= 1 || d.y <= 1 || d.x >= screen.W() * 0.9) return;
+        double mx = (r.x0 + r.x1) * 0.5, my = (r.y0 + r.y1) * 0.5;
+        use = {mx - d.x * 0.5, my - d.y * 0.5, mx + d.x * 0.5, my + d.y * 0.5};
+    }
+    if (use.W() <= 1 || use.H() <= 1) return;
+    if (!*any) *box = use;
+    else *box = {std::min(box->x0, use.x0), std::min(box->y0, use.y0), std::max(box->x1, use.x1),
+                 std::max(box->y1, use.y1)};
+    *any = true;
+}
+
+void FitContent(Panel& p) {
+    if (!S.fit || L.slot_offsets < 0 || !L.canvas_class || !L.user_widget_class) return;
+    CallVoid(p.widget, "ForceLayoutPrepass");  // so the desired sizes are known
+    Rect screen{0, 0, static_cast<double>(kDrawW), static_cast<double>(kDrawH)};
+    Rect box;
+    bool any = false;
+    int seen = 0;
+    Measure(p.widget, screen, screen, 0, &box, &any, &seen);
+    if (!any) {
+        log::Info("world menu: %s: couldn't measure its layout, shown whole (%d widgets looked at)", p.name.c_str(), seen);
+        return;
+    }
+    // Clamp to the screen and keep a small border so nothing touches the edge.
+    box = {std::max(0.0, box.x0 - 24), std::max(0.0, box.y0 - 24), std::min(screen.x1, box.x1 + 24),
+           std::min(screen.y1, box.y1 + 24)};
+    if (box.W() < 80 || box.H() < 40) {
+        log::Info("world menu: %s: measured %.0fx%.0f, too small to trust; shown whole", p.name.c_str(), box.W(), box.H());
+        return;
+    }
+    double zoom = std::min(screen.W() / box.W(), screen.H() / box.H());
+    zoom = std::clamp(zoom, 1.0, static_cast<double>(S.fit_max_zoom));
+    p.zoom = zoom;
+    p.cx = (box.x0 + box.x1) * 0.5;
+    p.cy = (box.y0 + box.y1) * 0.5;
+    p.half_w = box.W() * 0.5;
+    p.half_h = box.H() * 0.5;
+    // The panel turns and sits around this point instead of the screen centre.
+    ue::Call pivot(p.comp, "SetPivot");
+    pivot.Set("InPivot", Vector2D{p.cx / kDrawW, p.cy / kDrawH});
+    pivot.Invoke();
+    log::Info("world menu: %s: buttons fill %.0f,%.0f to %.0f,%.0f of the screen; zoomed %.2fx on the arm",
+              p.name.c_str(), box.x0, box.y0, box.x1, box.y1, zoom);
+}
+
 // ------------------------------------------------------------ hosting --
 
 bool Host(const Candidate& c) {
@@ -820,6 +999,8 @@ bool Host(const Candidate& c) {
     }
     int boxes = HideBackdrops(c.obj, p.name);
     if (boxes > 0) log::Info("world menu: hid %d see-through backdrop box(es) in %s", boxes, p.name.c_str());
+    FitContent(G.panels.back());
+    if (G.placed) PosePanel(G.panels.back());  // zoomed, before this frame is drawn
     log::Info("world menu: %s on the arm in %.1f ms (%d widgets looked at; holder %s)", p.name.c_str(),
               perf::NowMs() - t0, widgets, holder_ready ? "made at level start" : "made just now");
     // A menu the game put up by itself (the area select after the microwave
@@ -1095,8 +1276,10 @@ Hit RayPanel(const FVector& o, const FVector& d, const Panel& p) {
     if (t <= 0) return h;
     FVector at = o + d * t;
     FVector local = rot.Inverse().Rotate(at - c);
-    double s = Scale();
-    if (std::fabs(local.Y) > kDrawW * 0.5 * s || std::fabs(local.Z) > kDrawH * 0.5 * s) return h;
+    // Only the part of the layout that holds the menu (FitContent), a little
+    // wider so the edges of buttons still count.
+    double s = Scale() * p.zoom;
+    if (std::fabs(local.Y) > (p.half_w + 30) * s || std::fabs(local.Z) > (p.half_h + 30) * s) return h;
     h.ok = true;
     h.t = t;
     h.point = at;
@@ -1277,6 +1460,13 @@ void OnGameFrame() {
         }
     }
     UpdatePointer();
+    // A laser click can put up the next menu right now (Options, Task...).
+    // Take it onto the arm before this frame is drawn: left for the next
+    // frame, it was drawn once on the flat screen, which the headset shows in
+    // front of your face (owner 2026-11-02 13:57: "the menu starts on my face
+    // and then move to my wrist").
+    TakeNewMenus();
+    UpdateStack();
 }
 
 // -------------------------------------------------------- laser layer --
@@ -1570,6 +1760,8 @@ void Init() {
     S.hide_backdrops = config::GetBool("menu_hide_backdrops", true);
     S.own_hit = config::GetBool("menu_laser_own_hit", true);
     S.arrive_buzz = config::GetBool("menu_arrive_buzz", true);
+    S.fit = config::GetBool("menu_fit_content", true);
+    S.fit_max_zoom = std::clamp(config::GetFloat("menu_fit_max_zoom", 3.f), 1.f, 6.f);
     if (!S.enabled) {
         log::Info("world menu: off (menu_mode=%s)", mode.c_str());
         return;
