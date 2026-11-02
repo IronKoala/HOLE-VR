@@ -21,6 +21,8 @@ Manual install, if you prefer:
 
 1. Copy `dxgi.dll` into `HOLE\HOLE\Binaries\Win64\` (next to `HOLE-Win64-Shipping.exe`).
 2. Start SteamVR, put the headset on, then start the game normally from Steam.
+   The first time the title screen comes up, the mod presses START for you
+   before it shows (`title_auto_start=0` in `hole-vr.ini` turns this off).
 3. A `hole-vr` folder appears next to the DLL with `hole-vr.log`, `hole-vr.ini`
    and a `dump` folder. `hole-vr.log` is the latest run; the three runs before
    it are kept as `hole-vr.1.log` (newest) to `hole-vr.3.log`.

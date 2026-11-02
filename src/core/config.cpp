@@ -46,6 +46,11 @@ const Block kBlocks[] = {
      "\n"
      "; 1 = seated tracking space instead of standing/room scale.\n"
      "seated_space=0\n"},
+    {"title_auto_start",
+     "\n"
+     "; 1 = the first time the title screen comes up, press START for you before\n"
+     "; it shows, so the game starts with it closed. 0 = leave the title alone.\n"
+     "title_auto_start=1\n"},
     {"vr_render_fixes",
      "\n"
      "; --- Effects that break in VR (1 = turn the effect off, 0 = leave it) ---\n"
