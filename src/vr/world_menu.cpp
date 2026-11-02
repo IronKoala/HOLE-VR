@@ -547,6 +547,9 @@ void TakeNewMenus() {
     }
     for (const auto& c : list) {
         if (g_play_widgets.count(c.obj)) continue;
+        // The title widget stays on the screen (the game keeps it there,
+        // invisible, all through play); every other menu goes on the forearm.
+        if (ue::GetName(c.cls) == "UIM_Title_C") continue;
         bool hosted = false;
         for (auto& p : G.panels) hosted = hosted || p.widget == c.obj;
         if (!Alive(c.obj, c.index)) continue;
@@ -775,6 +778,16 @@ void OnGameFrame() {
         return;
     }
     G.closed_since = -1;
+    // How often the panels are updated while a menu is open, once a second.
+    static int s_frames = 0;
+    static double s_rate_at = 0;
+    ++s_frames;
+    if (now - s_rate_at >= 1.0) {
+        if (s_rate_at > 0 && s_frames > 0)
+            log::Info("world menu: %d updates/s, %zu panel(s) on the forearm", s_frames, G.panels.size());
+        s_frames = 0;
+        s_rate_at = now;
+    }
     if (now - G.last_take > 0.1) {
         G.last_take = now;
         TakeNewMenus();
@@ -1088,7 +1101,6 @@ void Init() {
         return;
     }
     xr::RegisterListener(&g_laser_listener);
-    stereo::SetGameFrameCallback(&OnGameFrame);
     if (S.forearm)
         log::Info("world menu: on the back of the %s forearm, %.2f m wide", S.arm == input::kLeft ? "left" : "right",
                   S.arm_width_m);
@@ -1115,6 +1127,41 @@ void Scan() {
     });
     std::lock_guard<std::mutex> lock(g_scan_mutex);
     g_candidates.swap(found);
+}
+
+// The pump runs from the player's tick while the player ticks (play and the
+// title level), and from the HUD's draw event otherwise (paused game), at most
+// once per frame. Nothing runs from inside the stereo view setup.
+std::atomic<uint64_t> g_last_tick_ms{0};
+
+void OnPlayerTick(UObject, float) {
+    g_last_tick_ms = GetTickCount64();
+    OnGameFrame();
+}
+
+void AfterDrawHud(UObject, UObject, void*) {
+    if (GetTickCount64() - g_last_tick_ms.load() < 100) return;  // the player tick is pumping
+    static uint64_t s_last = 0;
+    uint64_t now = GetTickCount64();
+    if (now - s_last < 5) return;  // a second HUD in the same frame
+    s_last = now;
+    static bool s_logged = false;
+    if (!s_logged) {
+        s_logged = true;
+        log::Info("world menu: driven by the HUD's draw (game paused)");
+    }
+    OnGameFrame();
+}
+
+void InitGame() {
+    if (!S.enabled) return;
+    game::AddTickListener(&OnPlayerTick);
+    UObject hud_cdo = ue::FindObject("HUD /Script/Engine.Default__HUD");
+    UObject draw = ue::FindObject("Function /Script/Engine.HUD:ReceiveDrawHUD");
+    if (hud_cdo && draw && ue::process_event::HookVtableOf(hud_cdo) && ue::process_event::On(draw, nullptr, &AfterDrawHud))
+        log::Info("world menu: following the HUD's draw while paused");
+    else
+        log::Warn("world menu: HUD draw not found; menus only move while the game isn't paused");
 }
 
 bool Active() { return g_active.load(); }

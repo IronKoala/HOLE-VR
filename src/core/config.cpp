@@ -91,7 +91,7 @@ const Block kBlocks[] = {
      "; Turn further away than this and the screen comes back in front of you.\n"
      "menu_panel_follow_deg=60\n"
      "menu_button_pauses=1\n"},
-    {"menu_world",
+    {"menu_mode",
      "\n"
      "; --- Menus as panels in the world ---\n"
      "; world  = each game menu is taken off the flat screen and shown on its own\n"
@@ -105,7 +105,7 @@ const Block kBlocks[] = {
      "menu_world_backdrop=0.55\n"
      "; Laser from the controller to the menu\n"
      "menu_world_laser=1\n"},
-    {"menu_forearm",
+    {"menu_world_place",
      "\n"
      "; --- Menu on your forearm, status on your hand ---\n"
      "; forearm = game menus lie on the back of the wrist_hud_hand forearm, like a\n"
