@@ -1026,8 +1026,10 @@ UObject FindMarkerMesh(double* size) {
         mesh = sphere ? sphere : cube;
     }
     if (!mesh) return 0;
-    struct Box {
+    struct Box {  // FBox: Min, Max, IsValid (+ padding) = 56 bytes
         FVector min, max;
+        uint8_t valid;
+        uint8_t pad[7];
     };
     ue::Call bb(mesh, "GetBoundingBox");
     if (bb.Invoke()) {
@@ -1694,15 +1696,27 @@ void OnTick(UObject player, float dt_f) {
     const FVector sc_target = head.location - head_fwd * behind - FVector{0, 0, below};
     const FVector sc_anim_r = pelvis.translation + yaw_q.Rotate(sc_anim - pelvis.translation);
     FVector delta = sc_target - sc_anim_r;
-    if (Length(delta) > 150.0) delta = FVector{};  // teleport / recenter in progress
+    if (Length(delta) > 500.0) delta = FVector{};  // teleport in progress
     if (delta.Z > G.stand_dz) G.stand_dz = delta.Z;
     const double down = delta.Z - G.stand_dz;
     const double crouch = S.fixed_height ? 0.0 : std::clamp(down, -S.max_crouch, 0.0);
     FVector offset{delta.X, delta.Y, 0};
-    FVector pelvis_shift = offset * 0.7;
-    if (Length(pelvis_shift) > 60.0) pelvis_shift = Normalize(pelvis_shift) * 60.0;
-    FVector lean = offset - pelvis_shift;
+    // The body always goes under the head: a little of the offset is lean,
+    // the rest moves the whole body. (It used to stop at 60 cm, so walking
+    // around the room left the body behind and the camera ended up inside
+    // it or far from it.)
+    FVector lean = offset * 0.3;
     if (Length(lean) > S.max_lean) lean = Normalize(lean) * S.max_lean;
+    FVector pelvis_shift = offset - lean;
+    {
+        static double last_far_log = -1e9;
+        double off = Length(offset);
+        if (off > 60.0 && perf::NowMs() - last_far_log > 10000.0) {
+            last_far_log = perf::NowMs();
+            log::Info("body: your head is %.0f cm from the game character (walked in the room?); the body follows it",
+                      off);
+        }
+    }
     if (k.pelvis >= 0) {
         Xf p = pelvis;
         p.rotation = Normalized(yaw_q * p.rotation);
