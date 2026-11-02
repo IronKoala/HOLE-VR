@@ -46,6 +46,11 @@ const Block kBlocks[] = {
      "\n"
      "; 1 = seated tracking space instead of standing/room scale.\n"
      "seated_space=0\n"},
+    {"title_auto_start",
+     "\n"
+     "; 1 = the first time the title screen comes up, press START for you before\n"
+     "; it shows, so the game starts with it closed. 0 = leave the title alone.\n"
+     "title_auto_start=1\n"},
     {"vr_render_fixes",
      "\n"
      "; --- Effects that break in VR (1 = turn the effect off, 0 = leave it) ---\n"
@@ -130,6 +135,14 @@ const Block kBlocks[] = {
      ";     that menu comes back when you leave the sub-menu\n"
      "; 0 = both stay on the arm, the sub-menu just in front\n"
      "menu_submenu_replaces=1\n"},
+    {"menu_forearm_size",
+     "\n"
+     "; How big the forearm menus are, times menu_forearm_width_m (1.25 = 25%\n"
+     "; bigger than 0.30 m, what the owner asked for on 2026-11-02)\n"
+     "menu_forearm_size=1.25\n"
+     "; 1 = hide the see-through grey box some menus draw behind their buttons\n"
+     "; (Options has one); it shows as a shadowy box on the arm\n"
+     "menu_hide_backdrops=1\n"},
     {"wrist_hud",
      "\n"
      "; --- Wrist display ---\n"
@@ -197,9 +210,7 @@ const Block kBlocks[] = {
      "; Aiming eye: 1 = right, 0 = left.\n"
      "dominant_eye_right=1\n"
      "; Pistol slide can be grabbed this far forward of its rear (front serrations, press checks)\n"
-     "slide_grab_forward_cm=16\n"
-     "; ...and pinched from this far behind its rear, on the bore line\n"
-     "slide_grab_back_cm=15\n"},
+     "slide_grab_forward_cm=16\n"},
     {"holster_pistol",
      "\n"
      "; --- Holsters on your VR body ---\n"

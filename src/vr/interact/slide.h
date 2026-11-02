@@ -40,6 +40,9 @@ struct SlideConfig {
     // along the pull axis, radius grab_radius_back. 0 = none.
     double grab_back = 0.0;           // cm
     double grab_radius_back = 5.0;    // cm
+    // Pistol: pinch at the rear sight. Extra sphere, radius 0 = none.
+    FVector sight_center;             // parent space, cm
+    double sight_radius = 0.0;        // cm
 };
 
 enum class SlideEvent { kNone, kGrabbed, kReachedBack, kRacked, kPartialRelease, kSlipped };

@@ -68,11 +68,17 @@ states from trigger touch and the analog trigger.
   sits on the controller with a simple curl until a grip is made in the
   editor.
 - Slide: three holds, like Half-Life: Alyx, each posed and saved on its
-  own (`<Class>.slide-over|rear|front.ini`). The hold is picked once, when
+  own (`<Class>.slide-rear-flat|rear-pinch|front-flat.ini`). The hold is picked once, when
   the hand closes on the slide: fist over the FRONT half of the slide
-  (measured from the slide part's mesh) = **front**; more than 7 cm behind
-  the slide's grab point, i.e. behind the slide (`hand_slide_pinch_behind_cm`)
-  = **rear pinch**; else **rear overhand**. A hold not posed yet keeps the
+  (measured from the slide part's mesh) = **front**; fist within 6 cm of
+  the rear sight (the gun's `DefaultADSPoint`, `hand_slide_pinch_sight_cm`)
+  = **rear pinch**; else **rear overhand**.
+  Until a hold is saved it uses a built-in pose (`hand_slide_builtin_holds`):
+  front and rear overhand = flat hand with the thumb's pad on the slide;
+  pinch = fist with the thumb straight out and the side of the index
+  finger's middle knuckle on the slide. The hand keeps the controller's angle
+  at the grab and is moved so that contact point touches the slide (a line
+  trace against the slide part, which is made query-only traceable). A hold not posed yet keeps the
   hand where the controller grabbed, carried along with the slide. To pose one, grab
   the slide that way, then open the editor (hold left Y 1 s). A hold not
   posed yet uses an old `<Class>.slide.ini` if there is one. The log line
@@ -90,6 +96,10 @@ and how deep anything sits inside the object's outline
 Hold **left Y for 1 s** while holding the pistol (or a magazine in the
 left hand): the editor is on and the OTHER controller becomes the editing
 hand (its buttons stop reaching the game, and the gun won't fire).
+While the editor runs, both hands and the held gun/magazine/slide stay
+frozen where they were when it started; only the editing controller's grab
+point follows the real controller (controls freezes the game's gun, slide
+and grabs on its side while `hands::EditorHand() >= 0`).
 
 - **Finger joints**: a small ball sits on every finger joint (15: base,
   middle and tip joint of each finger). Squeeze grip on one and turn the
@@ -110,7 +120,7 @@ hand (its buttons stop reaching the game, and the gun won't fire).
   the "resting" and "pulled" index poses.
 - **Tap Y** to save, **click the left stick** to undo to the saved grip,
   **hold Y 1 s** to save and finish. Grips are saved per object class in
-  `hole-vr/grips/<Class>.<grip|mag|slide-over|slide-rear|slide-front|support>.ini`.
+  `hole-vr/grips/<Class>.<grip|mag|slide-rear-flat|slide-rear-pinch|slide-front-flat|support>.ini`.
 
 ## Body
 

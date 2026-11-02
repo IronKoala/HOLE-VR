@@ -97,7 +97,6 @@ struct Settings {
     bool holster_toggle = false;    // squeeze to draw, squeeze at the holster to put away
     double holster_cant = 10.0;     // grip tilted forward, degrees
     double belt_below_head = 60.0;  // belt height when the VR body is off, cm below the headset
-    double slide_grab_back = 15.0;      // pinch zone behind the slide (5 cm radius, on the bore line)
     double slide_grab_forward = 16.0;   // pistol slide grab zone reaches this far forward of the rear grab point
     bool wall_collision = true;    // keep the gun out of walls
     double recoil_kick = 1.0;      // scale of the in-hand recoil kick, 0 = off
@@ -139,7 +138,6 @@ void LoadSettings() {
     g_set.holster_cant = config::GetFloat("holster_pistol_cant_deg", 10.f);
     g_set.belt_below_head = config::GetFloat("holster_belt_below_head_cm", 60.f);
     g_set.slide_grab_forward = config::GetFloat("slide_grab_forward_cm", 16.f);
-    g_set.slide_grab_back = config::GetFloat("slide_grab_back_cm", 15.f);
     g_set.virtual_stock = config::GetBool("rifle_virtual_stock", true);
     g_set.stock_snap = config::GetFloat("rifle_stock_snap_cm", 12.f);
     g_set.stock_release = config::GetFloat("rifle_stock_release_cm", 20.f);
@@ -420,6 +418,9 @@ struct WeaponState {
     // Virtual stock (rifles): gun-frame points, from the grip.
     FVector stock_local;          // middle of the butt pad
     FVector ads_local;            // the game's aiming eye point (DefaultADSPoint)
+    bool edit_frozen = false;     // grip editor running: gun held still
+    FVector edit_gun_loc;
+    FQuat edit_gun_rot;
     bool have_stock = false;
     bool shouldered = false;
     double shoulder_blend = 0;    // 0 hands only .. 1 pivoting from the shoulder
@@ -883,10 +884,24 @@ void SlideHandling(game::Gun& gun, const hands::HandState& lh, const input::Hand
     cfg.grab_center = FVector{o.x, o.y, o.z} + cfg.axis * 4.0;
     cfg.grab_radius = 8.0;
     cfg.grab_forward = g_set.slide_grab_forward;   // whole slide, front serrations included
-    cfg.grab_back = g_set.slide_grab_back;         // pinch from behind the slide
+    // No zone behind the slide: the pinch is grabbed at the rear sight only.
+    if (W.is_pistol) {
+        // Pinch at the rear sight (the body picks its pinch pose there too).
+        UObject sight = 0;
+        ue::GetProp(gun.Object(), "DefaultADSPoint", sight);
+        if (sight) {
+            cfg.sight_center = ToLocal(pt, ComponentToWorld(sight).translation);
+            cfg.sight_radius = 7.0;
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                log::Info("controls: rear sight pinch zone at slide-space (%.1f %.1f %.1f), 7 cm", cfg.sight_center.X,
+                          cfg.sight_center.Y, cfg.sight_center.Z);
+            }
+        }
+    }
     if (!W.is_pistol) {
         cfg.grab_forward = 0.0;
-        cfg.grab_back = 0.0;
         // AR-15: the left hand works the T-shaped charging handle at the
         // back of the upper receiver. It always sits forward (it does not
         // stay back with a locked bolt), so it is grabbed at its rest point.
@@ -1925,7 +1940,7 @@ void OnLateTick(UObject player, float) {
     g_late_ok = false;
     if (!g_hw.valid || !W.gun || !player) return;
     game::Gun gun(W.gun);
-    if (W.uses_holster && !W.in_hand) PlaceGunInHolster(gun);
+    if (W.uses_holster && !W.in_hand && !W.edit_frozen) PlaceGunInHolster(gun);
     PlacePouchMag(W.gun);
 }
 
@@ -2034,10 +2049,31 @@ void OnTick(UObject player, float dt) {
         }
     }
     hands::HandState rh = hands::Get(hands::kRight), lh = hands::Get(hands::kLeft);
-    UpdatePistolHolster(player, rh, s.hand[input::kRight]);
-    if (rh.valid && W.in_hand) HoldGun(gun, rh);
+    // Grip editor: everything holds still while the owner poses the hands.
+    // The gun stays where it was when editing started, and the slide, the
+    // held magazine and the grabs keep their state (no drop, no release).
+    const bool editing = hands::EditorHand() >= 0;
+    if (editing && !W.edit_frozen) {
+        W.edit_frozen = true;
+        W.edit_gun_loc = ActorLocation(gun.Object());
+        W.edit_gun_rot = ActorRotation(gun.Object());
+        log::Info("controls: grip editor on, gun, slide and magazine frozen");
+    } else if (!editing && W.edit_frozen) {
+        W.edit_frozen = false;
+        log::Info("controls: grip editor off, gun handling back on");
+    }
+    if (!editing) UpdatePistolHolster(player, rh, s.hand[input::kRight]);
+    if (editing) SetActorTransform(gun.Object(), W.edit_gun_loc, W.edit_gun_rot);
+    else if (rh.valid && W.in_hand) HoldGun(gun, rh);
     g_late_ok = true;
-    if (ui_panel::MenuOpen()) {
+    if (editing) {
+        if (W.trigger_sent) {
+            ue::Call c(player, "PlayerInput_UseWeapon");
+            c.Set("Press Released", true);
+            c.Invoke();
+            W.trigger_sent = false;
+        }
+    } else if (ui_panel::MenuOpen()) {
         // A game menu is up: the trigger is a laser-pointer click, so no
         // firing, grabbing or gun buttons. Let go of anything held.
         if (W.trigger_sent) {

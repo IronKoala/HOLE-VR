@@ -27,6 +27,7 @@
 #include "vr/wrist_hud.h"
 #include "vr/world_menu.h"
 #include "vr/menu_study.h"
+#include "vr/launch.h"
 #include "vr/stereo.h"
 
 namespace {
@@ -106,6 +107,8 @@ DWORD WINAPI InitThread(LPVOID) {
     if (!WaitFor("GUObjectArray", ue::objects::Init, timeout)) return 0;
     if (!WaitFor("reflection offsets", ue::reflection::Init, timeout)) return 0;
     log::Info("Engine discovery complete");
+    // Before the slow start-up work: the title screen is up within seconds.
+    vr::launch::Init();
 
     if (config::GetBool("dump_on_start", true)) ue::dumper::DumpAll(mod_dir);
     const bool render_fixes = config::GetBool("vr_render_fixes", true) && vr::render_fixes::Init();

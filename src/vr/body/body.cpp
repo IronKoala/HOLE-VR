@@ -1014,6 +1014,16 @@ bool IsGrab(hands::GrabKind k) {
 // While a magazine grip is edited, the hand stays where it was on the
 // controller and the magazine is placed from the hand (so moving the
 // magazine in the editor moves the magazine, not the hand).
+// While the grip editor runs, both hands and the held objects stay where
+// they were when it started (owner: "when i initiate the pose editor i want
+// my vr hands to freeze in place"); only the editing controller's grab point
+// follows the real controller.
+struct EditFreeze {
+    bool on = false;
+    hands::HandState hs[2];
+    hands::HandGrab grab[2];
+} g_freeze;
+
 struct MagPin {
     bool on = false;
     int side = -1;
@@ -1030,7 +1040,7 @@ Xf PoseXf(const hands::Pose& p) {
 
 bool PinnedObject(const hands::HandGrab& grab, hands::Pose* out) {
     if (!g_pin.on || grab.object != g_pin.object || G.grip[g_pin.side].object != grab.object) return false;
-    hands::HandState h = hands::Get(g_pin.side == kL ? hands::kLeft : hands::kRight);
+    hands::HandState h = g_freeze.on ? g_freeze.hs[g_pin.side] : hands::Get(g_pin.side == kL ? hands::kLeft : hands::kRight);
     if (!h.valid) return false;
     const Xf hand = skel::Compose(g_pin.hand_in_ctrl, PoseXf(h.grip));
     const ActiveGrip& g = G.grip[g_pin.side];
@@ -1089,7 +1099,8 @@ struct FreeSlideHand {
 // overhand, palm facing the muzzle (hand behind the slide) = rear pinch.
 // Each is its own record.
 enum SlideHold { kSlideOver, kSlideRear, kSlideFront, kSlideHoldCount };
-const char* kSlideHoldKey[] = {"over", "rear", "front"};
+// (New names on 2026-11-02 so the owner's earlier test saves, slide-over/front, do not hide the built-in holds.)
+const char* kSlideHoldKey[] = {"rear-flat", "rear-pinch", "front-flat"};
 const char* kSlideHoldName[] = {"rear overhand", "rear pinch", "front"};
 int g_slide_hold[2] = {kSlideOver, kSlideOver};
 
@@ -1123,15 +1134,25 @@ int PickSlideHold(const hands::HandState& h, const hands::Pose& gun, UObject gun
     // Front half of the slide (unknown length: well ahead of the grab point).
     const double split = span ? (back + front) * 0.5 : 5.0;
     int best;
-    // Behind the slide (owner: "the pinch zone needs to be behind the
-    // slide"): the rear pinch, whatever the palm does.
+    // The pinch is taken at the rear sight (owner: "the pinch grab zone
+    // should be the rear iron sights"): fist within reach of the gun's sight
+    // point. Without a sight point: behind the slide.
+    static const double pinch_sight = config::GetFloat("hand_slide_pinch_sight_cm", 6.f);
     static const double pinch_behind = config::GetFloat("hand_slide_pinch_behind_cm", 7.f);
-    if (at.X > split) best = kSlideFront;
-    else if (at.X < -pinch_behind) best = kSlideRear;
+    UObject sight = 0;
+    FVector sight_at{};
+    double to_sight = -1;
+    if (gun_actor && ue::GetProp(gun_actor, "DefaultADSPoint", sight) && sight) {
+        sight_at = inv.Rotate(ComponentToWorld(sight).translation - gun.location);
+        to_sight = Length(at - sight_at);
+    }
+    const bool pinch = to_sight >= 0 ? to_sight < pinch_sight : at.X < -pinch_behind;
+    if (pinch) best = kSlideRear;
+    else if (at.X > split) best = kSlideFront;
     else best = kSlideOver;
-    log::Info("body: slide grab: %s hold (fist %.1f cm along the slide from the grab point; slide %s; "
-              "front half from %.1f; palm in gun frame %.2f %.2f %.2f)",
-              kSlideHoldName[best], at.X,
+    log::Info("body: slide grab: %s hold (fist (%.1f %.1f %.1f) from the grab point, rear sight at (%.1f %.1f %.1f), "
+              "%.1f cm from it, pinch within %.1f; slide %s; front half from %.1f; palm in gun frame %.2f %.2f %.2f)",
+              kSlideHoldName[best], at.X, at.Y, at.Z, sight_at.X, sight_at.Y, sight_at.Z, to_sight, pinch_sight,
               span ? (std::to_string(int(back * 10) / 10.0) + ".." + std::to_string(int(front * 10) / 10.0)).c_str()
                    : "size unknown",
               split, n.X, n.Y, n.Z);
@@ -1501,6 +1522,7 @@ void StopEditor() {
     if (g_editor.Active()) log::Info("body: grip editor off");
     g_editor.Stop();
     g_pin.on = false;
+    g_freeze.on = false;
     HideMarkers();
     g_edit_side = g_edit_ctrl = -1;
     hands::SetEditorHand(-1);
@@ -1674,7 +1696,10 @@ struct JointDrag {
     Xf obj_in_hand0, ctrl_in_hand0;
 } g_drag;
 
-void UpdateEditor(const hands::HandGrab grab[2], const hands::HandState hs[2], double dt) {
+// grab/hs: frozen while editing; live: the real controllers (the editing
+// controller's grab point follows them).
+void UpdateEditor(const hands::HandGrab grab[2], const hands::HandState hs[2], const hands::HandState live[2],
+                  double dt) {
     const hands::EditButtons b = hands::GetEditButtons();
     // Which grip: a magazine or the slide in the left hand first (the right
     // controller edits), else the gun in the right hand (the left edits).
@@ -1692,7 +1717,7 @@ void UpdateEditor(const hands::HandGrab grab[2], const hands::HandState hs[2], d
     const int ctrl = 1 - side;
     const bool is_mag = grab[side].kind == hands::GrabKind::kMagHeld || grab[side].kind == hands::GrabKind::kMagInsert;
     hands::Pose obj;
-    if (!ObjectFrame(grab[side], grab[kR], &obj) || !hs[ctrl].valid) return;
+    if (!ObjectFrame(grab[side], grab[kR], &obj) || !live[ctrl].valid) return;
     const FQuat inv = obj.rotation.Inverse();
     auto local = [&](const FVector& w) { return inv.Rotate(w - obj.location); };
 
@@ -1705,9 +1730,9 @@ void UpdateEditor(const hands::HandGrab grab[2], const hands::HandState hs[2], d
     // gun it sits in front of the barrel, so the gun doesn't hide it or get in
     // the way.
     const double reach = grab[ctrl].kind == hands::GrabKind::kGunGrip ? S.reach_gun : 3.0;
-    const FVector pointer_w = hs[ctrl].grip.location + hs[ctrl].aim.rotation.Rotate(FVector{reach, 0, 0});
+    const FVector pointer_w = live[ctrl].grip.location + live[ctrl].aim.rotation.Rotate(FVector{reach, 0, 0});
     in.pointer = local(pointer_w);
-    in.pointer_rot = Normalized(inv * hs[ctrl].grip.rotation);
+    in.pointer_rot = Normalized(inv * live[ctrl].grip.rotation);
     grip_editor::Scene sc;
     for (int m = 0; m < grip_editor::kJointItems; ++m) sc.joint[m] = local(g_joint_world[side][m / 3][m % 3].translation);
     sc.palm = local(g_palm_world[side]);
@@ -1724,6 +1749,10 @@ void UpdateEditor(const hands::HandGrab grab[2], const hands::HandState hs[2], d
     grip_editor::Output out = g_editor.Update(in, sc, &g.rec, &hand_rot, &hand_pos);
     const Xf hand_w = g_hand_world[side];  // last frame's posed hand
     if (out.entered) {
+        g_freeze.on = true;
+        for (int i = 0; i < 2; ++i) g_freeze.hs[i] = hs[i], g_freeze.grab[i] = grab[i];
+        log::Info("body: grip editor: hands and %s frozen in place; the %s controller's grab point is live",
+                  is_mag ? "magazine" : "gun", ctrl == kR ? "right" : "left");
         g_edit_side = side;
         g_edit_ctrl = ctrl;
         hands::SetEditorHand(ctrl);
@@ -1767,7 +1796,7 @@ void UpdateEditor(const hands::HandGrab grab[2], const hands::HandState hs[2], d
         g_drag.joint = out.grabbed % 3;
         g_drag.tip = FingerTip(g_drag.finger, sc.index_state);
         g_drag.joint_world0 = g_joint_world[side][g_drag.finger][g_drag.joint].rotation;
-        g_drag.ctrl_rot0 = hs[ctrl].grip.rotation;
+        g_drag.ctrl_rot0 = live[ctrl].grip.rotation;
         // From now on this finger is posed joint by joint: start from what it shows.
         const int t = g_drag.tip;
         if (!g.rec.posed[t]) {
@@ -1782,13 +1811,13 @@ void UpdateEditor(const hands::HandGrab grab[2], const hands::HandState hs[2], d
         objx.translation = obj.location;
         objx.rotation = obj.rotation;
         g_drag.obj_in_hand0 = skel::Relative(objx, hand_w);
-        g_drag.ctrl_in_hand0 = skel::Relative(PoseXf(hs[ctrl].grip), hand_w);
+        g_drag.ctrl_in_hand0 = skel::Relative(PoseXf(live[ctrl].grip), hand_w);
     }
     if (out.grabbed >= 0 && g_drag.tip >= 0) {
         // The joint turns with the controller (all three axes).
         const int f = g_drag.finger, n = g_drag.joint, t = g_drag.tip;
         const fingers::Chain& c = rig.chain[f];
-        FQuat d = Normalized(hs[ctrl].grip.rotation * g_drag.ctrl_rot0.Inverse());
+        FQuat d = Normalized(live[ctrl].grip.rotation * g_drag.ctrl_rot0.Inverse());
         FQuat want_h = Normalized(hand_w.rotation.Inverse() * d * g_drag.joint_world0);
         fingers::Angles a;
         for (int j = 0; j < 3; ++j) a.extra[j] = g.rec.joint[t][j];
@@ -1800,7 +1829,7 @@ void UpdateEditor(const hands::HandGrab grab[2], const hands::HandState hs[2], d
         SolveGrip(side, t, true);
     } else if (out.grabbed == grip_editor::kObjectItem) {
         // The magazine moves and turns with the controller, relative to the hand.
-        Xf ctrl_h = skel::Relative(PoseXf(hs[ctrl].grip), hand_w);
+        Xf ctrl_h = skel::Relative(PoseXf(live[ctrl].grip), hand_w);
         FQuat d = Normalized(ctrl_h.rotation * g_drag.ctrl_in_hand0.rotation.Inverse());
         Xf o;
         o.rotation = Normalized(d * g_drag.obj_in_hand0.rotation);
@@ -1975,6 +2004,123 @@ void PoseFingers(int side, const fingers::Angles a[hand_pose::kFingerCount]) {
         }
 }
 
+// An empty hand on its controller (fist_at: where the fist goes).
+void FreeHand(int side, const hands::HandState& h, const FVector& fist_at, FQuat* rot, FVector* pos) {
+    const HandRig& rig = G.rig[side];
+    const FVector fist = fist_at + h.grip.rotation.Rotate(FVector{S.hand_offset[0], S.hand_offset[1], S.hand_offset[2]});
+    const FVector fwd = h.grip.rotation.Rotate(FVector{1, 0, 0});
+    FQuat hand_rot = rig.frame.valid ? HandRotation(rig.frame, fwd, h.palm_normal) : h.grip.rotation;
+    if (S.hand_rot[0] || S.hand_rot[1] || S.hand_rot[2]) {
+        double mirror = side == kL ? -1.0 : 1.0;
+        hand_rot = Normalized(h.grip.rotation *
+                              ToQuat(FRotator{S.hand_rot[0], S.hand_rot[1] * mirror, S.hand_rot[2] * mirror}) *
+                              h.grip.rotation.Inverse() * hand_rot);
+    }
+    *rot = hand_rot;
+    *pos = rig.frame.valid ? fist - hand_rot.Rotate(rig.frame.fist) : fist;
+}
+
+// ---- built-in slide holds (owner's description, 2026-11-02) ----
+// Front and rear overhand: hand flat, the thumb's pad against the slide.
+// Rear pinch: a fist with the thumb straight out, the side of the index
+// finger's first knuckle against the slide. The hand keeps the angle the
+// controller had when it grabbed; it is only moved so the contact point
+// touches the slide's surface, found with a line trace against the slide part.
+// Unsaved: the grip editor fine-tunes it and Y saves it as usual.
+bool TraceSlide(UObject slide, const FVector& a, const FVector& b, FVector* hit) {
+    // The game's gun parts have no collision; a line trace against one
+    // component needs query collision. Query-only and ignoring every channel:
+    // nothing in the game can hit it.
+    static UObject made = 0;
+    if (made != slide) {
+        made = slide;
+        uint8_t coll = 0;
+        ue::Call ce(slide, "GetCollisionEnabled");
+        if (ce.Invoke()) coll = ce.Result<uint8_t>();
+        if (coll == 0) {
+            ue::Call r(slide, "SetCollisionResponseToAllChannels");
+            r.Set("NewResponse", static_cast<uint8_t>(0));  // ECR_Ignore
+            ue::Call e(slide, "SetCollisionEnabled");
+            e.Set("NewType", static_cast<uint8_t>(1));  // QueryOnly
+            const bool ok = r.Invoke() && e.Invoke();
+            log::Info("body: slide part made traceable (query only, ignores every channel): %s", ok ? "ok" : "FAILED");
+        }
+    }
+    ue::Call c(slide, "K2_LineTraceComponent");
+    if (!c.Valid()) return false;
+    c.Set("TraceStart", a).Set("TraceEnd", b).Set("bTraceComplex", true);
+    if (!c.Invoke() || !c.Result<bool>()) return false;
+    *hit = c.Get<FVector>("HitLocation");
+    return true;
+}
+
+bool BuildSlidePreset(int side, const hands::HandState& h, const hands::Pose& obj, const hands::HandGrab& grab) {
+    static const bool enabled = config::GetBool("hand_slide_builtin_holds", true);
+    const HandRig& rig = G.rig[side];
+    if (!enabled || !rig.ok || !grab.object) return false;
+    UObject slide = 0;
+    if (!ue::GetProp(grab.object, "GunParts_Bolt(Slide)", slide) || !slide) return false;
+    const int hold = g_slide_hold[side];
+    const bool pinch = hold == kSlideRear;
+    // Hand where the controller grabbed, in the object frame.
+    FQuat hand_rot;
+    FVector hand_pos;
+    FreeHand(side, h, h.grip.location, &hand_rot, &hand_pos);
+    const FQuat inv = obj.rotation.Inverse();
+    FQuat rot_o = Normalized(inv * hand_rot);
+    FVector pos_o = inv.Rotate(hand_pos - obj.location);
+    // Fingers: flat, or a fist; the thumb straight either way.
+    gr::Record rec;
+    rec.name = RecordKey(side, grab);
+    rec.right_hand = side == kR;
+    FVector contact_h{};  // hand space
+    for (int t = 0; t < gr::kTipCount; ++t) {
+        const int f = TipFinger(t);
+        const fingers::Chain& c = rig.chain[f];
+        const bool thumb = f == hand_pose::kThumb;
+        fingers::Angles a = fingers::Curl(c, pinch && !thumb ? 1.0 : 0.0, fingers::DefaultLimits(thumb));
+        for (int j = 0; j < 3; ++j) rec.joint[t][j] = Normalized(c.ref[j].rotation.Inverse() * fingers::LocalRotation(c, j, a));
+        rec.posed[t] = true;
+        Xf js[3];
+        FVector tip;
+        fingers::Fk(c, a, js, &tip);
+        rec.tip[t] = tip;  // hand space for now
+        if (!pinch && thumb) contact_h = (js[2].translation + tip) * 0.5;  // thumb pad
+        if (pinch && t == gr::kIndexRest) contact_h = js[1].translation + rig.across_h * 0.9;  // side of the index knuckle
+    }
+    // Move the hand so the contact point sits on the slide: trace toward the
+    // slide's centre line (gun X through the slide part's origin).
+    const Xf sw = ComponentToWorld(slide);
+    FVector cw = obj.location + obj.rotation.Rotate(pos_o + rot_o.Rotate(contact_h));
+    const FVector axis = obj.rotation.Rotate(FVector{1, 0, 0});
+    FVector on_line = sw.translation + axis * Dot(cw - sw.translation, axis);
+    FVector d = on_line - cw;
+    const double dist = Length(d);
+    bool snapped = false;
+    FVector hit{};
+    if (dist > 0.1) {
+        d = d * (1.0 / dist);
+        snapped = TraceSlide(slide, cw - d * 8.0, on_line, &hit);
+        if (snapped) {
+            static const double pad = config::GetFloat("hand_slide_contact_skin_cm", 0.6f);
+            pos_o = pos_o + inv.Rotate(hit - d * pad - cw);
+        }
+    }
+    gr::StoreHand(&rec, rig.geo, rot_o, pos_o);
+    for (int t = 0; t < gr::kTipCount; ++t) rec.tip[t] = pos_o + rot_o.Rotate(rec.tip[t]);
+    ActiveGrip& g = G.grip[side];
+    g.key = rec.name;
+    g.rec = rec;
+    g.have = true;
+    g.from_file = false;
+    SolveGrip(side, -1, false);
+    log::Info("body: slide %s hold: built-in pose (%s), contact %s on the slide%s", kSlideHoldName[hold],
+              pinch ? "fist, thumb out, index knuckle on the slide" : "flat hand, thumb pad on the slide",
+              snapped ? "placed" : "NOT placed (the trace missed the slide; hand left where it grabbed)",
+              snapped ? "" : "");
+    return true;
+}
+
 void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, const hands::HandGrab& right_grab,
               const FVector& body_fwd, const FVector& body_right, double dt) {
     const Skeleton& k = G.skel;
@@ -1992,7 +2138,8 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
             g_slide_hold[side] = PickSlideHold(h, gun, grab.object);
         LoadGrip(side, grab);
         g_free_slide[side].on = false;
-        if (grab.kind == hands::GrabKind::kSlideGrab && !g.have && ObjectFrame(grab, right_grab, &gun)) {
+        if (grab.kind == hands::GrabKind::kSlideGrab && !g.have && ObjectFrame(grab, right_grab, &gun) &&
+            !BuildSlidePreset(side, h, gun, grab)) {
             const FQuat inv = gun.rotation.Inverse();
             g_free_slide[side] = {true, Normalized(inv * h.grip.rotation), inv.Rotate(h.grip.location - gun.location)};
         }
@@ -2016,19 +2163,9 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
             hv.grip.location = sobj.location + sobj.rotation.Rotate(g_free_slide[side].pos);
             hv.palm_normal = turn.Rotate(h.palm_normal);
         }
-        const hands::HandState& h = hv;
         const bool free_slide = grab.kind == hands::GrabKind::kSlideGrab && g_free_slide[side].on;
-        FVector fist = IsGrab(grab.kind) && !free_slide ? grab.target.location : h.grip.location;
-        fist = fist + h.grip.rotation.Rotate(FVector{S.hand_offset[0], S.hand_offset[1], S.hand_offset[2]});
-        FVector fwd = h.grip.rotation.Rotate(FVector{1, 0, 0});
-        hand_rot = rig.frame.valid ? HandRotation(rig.frame, fwd, h.palm_normal) : h.grip.rotation;
-        if (S.hand_rot[0] || S.hand_rot[1] || S.hand_rot[2]) {
-            double mirror = side == kL ? -1.0 : 1.0;
-            hand_rot = Normalized(h.grip.rotation *
-                                  ToQuat(FRotator{S.hand_rot[0], S.hand_rot[1] * mirror, S.hand_rot[2] * mirror}) *
-                                  h.grip.rotation.Inverse() * hand_rot);
-        }
-        hand_pos = rig.frame.valid ? fist - hand_rot.Rotate(rig.frame.fist) : fist;
+        FreeHand(side, hv, IsGrab(grab.kind) && !free_slide ? grab.target.location : hv.grip.location, &hand_rot,
+                 &hand_pos);
     }
 
     FVector shoulder = WP(k.upperarm[side]);
@@ -2287,8 +2424,11 @@ void OnTick(UObject player, float dt_f) {
     G.pose.ClearChanged();
     ++G.frames;
 
-    hands::HandState hs[2] = {hands::Get(hands::kLeft), hands::Get(hands::kRight)};
+    const hands::HandState live[2] = {hands::Get(hands::kLeft), hands::Get(hands::kRight)};
+    hands::HandState hs[2] = {live[0], live[1]};
     hands::HandGrab grab[2] = {hands::GetGrab(hands::kLeft), hands::GetGrab(hands::kRight)};
+    if (g_freeze.on)
+        for (int i = 0; i < 2; ++i) hs[i] = g_freeze.hs[i], grab[i] = g_freeze.grab[i];
 
     // The upper body belongs to the player, not the flat-screen animation:
     // no recoil kick, aim pitch or idle sway in the spine and shoulders.
@@ -2414,7 +2554,7 @@ void OnTick(UObject player, float dt_f) {
         G.pose.SetL(k.head, l);
     }
 
-    UpdateEditor(grab, hs, dt);
+    UpdateEditor(grab, hs, live, dt);
     StepMeasure(hs, sc_target, body_right, dt);
     for (int side = 0; side < 2; ++side)
         if (hs[side].valid) SolveArm(side, hs[side], grab[side], grab[kR], body_fwd, body_right, dt);
