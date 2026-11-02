@@ -10,13 +10,20 @@ double Length(const FVector& a) { return std::sqrt(Dot(a, a)); }
 
 bool Slide::InZone(const FVector& hand) const {
     if (Length(hand - cfg_.grab_center) <= cfg_.grab_radius) return true;
-    if (cfg_.grab_forward <= 0.0) return false;
-    // Forward along the slide: distance to the segment from grab_center to
-    // grab_center - axis * grab_forward.
-    const double fwd = -Dot(hand - cfg_.grab_center, cfg_.axis);
-    const double t = std::clamp(fwd, 0.0, cfg_.grab_forward);
-    const FVector on_seg = cfg_.grab_center - cfg_.axis * t;
-    return Length(hand - on_seg) <= cfg_.grab_radius_forward;
+    const double back = Dot(hand - cfg_.grab_center, cfg_.axis);   // + behind, - forward
+    if (cfg_.grab_forward > 0.0 && back < 0.0) {
+        // Forward along the slide: distance to the segment from grab_center
+        // to grab_center - axis * grab_forward.
+        const double t = std::min(-back, cfg_.grab_forward);
+        if (Length(hand - (cfg_.grab_center - cfg_.axis * t)) <= cfg_.grab_radius_forward) return true;
+    }
+    if (cfg_.grab_back > 0.0 && back > 0.0) {
+        // Behind the slide (pinch): segment from grab_center to
+        // grab_center + axis * grab_back.
+        const double t = std::min(back, cfg_.grab_back);
+        if (Length(hand - (cfg_.grab_center + cfg_.axis * t)) <= cfg_.grab_radius_back) return true;
+    }
+    return false;
 }
 
 SlideEvent Slide::Update(const FVector& hand, bool grab_down, double dt) {

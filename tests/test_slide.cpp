@@ -58,6 +58,24 @@ int main() {
         EXPECT(back);
         EXPECT(s.Update(FVector{3, 0, 2}, false, 0.011) == SlideEvent::kRacked);
         SlideConfig r = Pistol();   // rear sphere only (default)
+        EXPECT(!Slide(r).InZone(FVector{-20, 0, 2}));
+        {   // pinch from behind (owner's log: hands 10-15 cm behind the rear point)
+            SlideConfig b = c;
+            b.grab_back = 15.0;
+            Slide p(b);
+            EXPECT(p.InZone(FVector{-17.6, -0.8, 0.5}));
+            EXPECT(p.InZone(FVector{-21.0, 1.0, 2.0}));
+            EXPECT(!p.InZone(FVector{-14, 0, -8}));   // support hand under the grip: not the slide
+            EXPECT(!p.InZone(FVector{-28, 0, 2}));
+            FVector h{-18, 0, 2};
+            p.Update(h, false, 0.011);
+            EXPECT(p.Update(h, true, 0.011) == SlideEvent::kGrabbed);
+            bool back = false;
+            for (int i = 1; i <= 20; ++i)
+                if (p.Update(FVector{-18 - 5.0 * i / 20, 0, 2}, true, 0.011) == SlideEvent::kReachedBack) back = true;
+            EXPECT(back);
+            EXPECT(p.Update(FVector{-23, 0, 2}, false, 0.011) == SlideEvent::kRacked);
+        }
         EXPECT(!Slide(r).InZone(FVector{8, 0, 2}));
     }
     {   // full rack
