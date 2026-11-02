@@ -176,6 +176,7 @@ struct WorldMapping {
     FQuat recenter;
     FVector origin_m;
     double world_to_meters = 100.0;
+    double height_drop_m = 0.0;  // fixed_height: real head height above the recentre point, removed from everything
     FVector head_offset_cm;  // midpoint of the eyes from the game camera, world axes, horizontal
 };
 std::mutex g_world_mutex;
@@ -217,6 +218,17 @@ void HookCalcOffset(void* self, int32_t view_index, FRotator* rotation, float wo
     FQuat local_q = recenter * eye_q;
     FVector local_p = recenter.Rotate(eye_p - g_origin_m) * world_to_meters;
 
+    // Fixed height: the eyes stay at the game camera's height whether the
+    // player sits, stands or crouches. The same vertical shift is applied to
+    // the hands (TrackingToWorld) so they stay put relative to the head.
+    double height_drop_m = 0.0;
+    if (config::GetBool("fixed_height", true)) {
+        const XrVector3f& a = views[0].pose.position;
+        const XrVector3f& b = views[1].pose.position;
+        height_drop_m = XrToUePosition(0, (a.y + b.y) * 0.5f, 0, 1.0).Z - g_origin_m.Z;
+        local_p.Z -= height_drop_m * world_to_meters;
+    }
+
     // The game keeps steering yaw (mouse/stick turning); the headset owns
     // pitch and roll so the horizon never moves on its own.
     FQuat base = config::GetBool("use_game_pitch", false) ? ToQuat(*rotation) : YawOnly(rotation->Yaw);
@@ -228,7 +240,7 @@ void HookCalcOffset(void* self, int32_t view_index, FRotator* rotation, float wo
         FVector head_offset = base.Rotate(recenter.Rotate(head_p - g_origin_m) * world_to_meters);
         head_offset.Z = 0;
         g_world = {true, *location, base, FQuat{recenter.X, recenter.Y, recenter.Z, recenter.W}, g_origin_m,
-                   world_to_meters, head_offset};
+                   world_to_meters, height_drop_m, head_offset};
     }
     *rotation = ToRotator(base * local_q);
     *location = *location + base.Rotate(local_p);
@@ -480,6 +492,7 @@ bool TrackingToWorld(const XrPosef& pose, FVector* world_location, FQuat* world_
     FQuat q = XrToUeQuat(pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w);
     FVector p = XrToUePosition(pose.position.x, pose.position.y, pose.position.z, 1.0);
     FVector local_p = m.recenter.Rotate(p - m.origin_m) * m.world_to_meters;
+    local_p.Z -= m.height_drop_m * m.world_to_meters;
     if (world_location) *world_location = m.camera_location + m.base.Rotate(local_p);
     if (world_rotation) *world_rotation = m.base * (m.recenter * q);
     return true;
