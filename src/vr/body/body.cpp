@@ -1116,6 +1116,133 @@ void ReportGrip(int side, const char* why) {
 std::map<std::string, ActiveGrip> g_grip_cache;
 std::string CacheKey(int side, const std::string& key) { return key + (side == kL ? "#L" : "#R"); }
 
+// ---- built-in magazine hold ----
+// The magazine's outline in its own actor frame: the union of its static
+// meshes' bounding boxes (game parts report zero local bounds, so read the
+// mesh asset's box and place it with the component's transform).
+void AddMeshBoxes(UObject comp, const Xf& actor, int depth, UObject sm_class, FVector* lo, FVector* hi, int* n) {
+    if (!comp || depth > 4) return;
+    if (sm_class && ue::reflection::IsA(comp, sm_class)) {
+        ue::Call gm(comp, "GetStaticMesh");
+        UObject mesh = gm.Invoke() ? gm.Result<UObject>() : 0;
+        struct Box {  // FBox: Min, Max, IsValid (+ padding) = 56 bytes
+            FVector min, max;
+            uint8_t valid;
+            uint8_t pad[7];
+        };
+        ue::Call bb(mesh, "GetBoundingBox");
+        if (mesh && bb.Invoke()) {
+            Box b = bb.Result<Box>();
+            const Xf cw = ComponentToWorld(comp);
+            for (int i = 0; i < 8; ++i) {
+                FVector c{i & 1 ? b.max.X : b.min.X, i & 2 ? b.max.Y : b.min.Y, i & 4 ? b.max.Z : b.min.Z};
+                Xf pt;
+                pt.translation = skel::Apply(cw, c);
+                FVector l = skel::Relative(pt, actor).translation;
+                if (!std::isfinite(l.X) || !std::isfinite(l.Y) || !std::isfinite(l.Z)) continue;
+                if (*n == 0) *lo = *hi = l;
+                lo->X = std::min(lo->X, l.X), lo->Y = std::min(lo->Y, l.Y), lo->Z = std::min(lo->Z, l.Z);
+                hi->X = std::max(hi->X, l.X), hi->Y = std::max(hi->Y, l.Y), hi->Z = std::max(hi->Z, l.Z);
+                ++*n;
+            }
+        }
+    }
+    int32_t off = ue::PropertyOffset(comp, "AttachChildren");
+    TArrayRaw arr{};
+    if (off < 0 || !mem::Read(comp + off, arr) || arr.num <= 0 || arr.num > 64) return;
+    for (int i = 0; i < arr.num; ++i)
+        AddMeshBoxes(mem::ReadOr<UObject>(arr.data + i * sizeof(UObject), 0), actor, depth + 1, sm_class, lo, hi, n);
+}
+
+// Nearest actor axis (signed) to a direction.
+FVector SnapAxis(const FVector& d, const FVector& not_this = FVector{}) {
+    FVector best{1, 0, 0};
+    double best_dot = -2;
+    const FVector axes[3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+    for (const FVector& a : axes) {
+        if (std::fabs(Dot(a, not_this)) > 0.5) continue;
+        double dd = Dot(a, d);
+        if (std::fabs(dd) > best_dot) best_dot = std::fabs(dd), best = dd < 0 ? a * -1.0 : a;
+    }
+    return best;
+}
+
+// The owner's magazine hold (reference photos 2026-11-01 and 2026-11-02):
+// the magazine lies diagonally across the palm, base low in the heel of the
+// hand, middle/ring/pinky wrapped round the lower body, index straight up the
+// FRONT of the magazine to the top round, thumb up the side. Built in the
+// magazine's frame from its measured outline and the way it is carried (its
+// top points where the controller points, its front away from the back of
+// the hand), then tuned in the grip editor.
+bool DefaultMagRecord(int side, UObject mag, gr::Record* rec) {
+    ue::Call t(mag, "GetTransform");
+    if (!t.Invoke()) return false;
+    const Xf actor = t.Result<Xf>();
+    hands::HandState h = hands::Get(side == kL ? hands::kLeft : hands::kRight);
+    if (!h.valid) return false;
+    static UObject sm_class = ue::FindObject("Class /Script/Engine.StaticMeshComponent");
+    UObject root = 0;
+    ue::GetProp(mag, "RootComponent", root);
+    FVector lo{}, hi{};
+    int n = 0;
+    AddMeshBoxes(root, actor, 0, sm_class, &lo, &hi, &n);
+    // Mag axes in its own frame: up = controller pointing direction, front =
+    // away from the back of the hand (controls carries it that way).
+    const FQuat inv = actor.rotation.Inverse();
+    FVector up_w = h.aim.rotation.Rotate(FVector{1, 0, 0});
+    FVector fr_w = h.aim.rotation.Rotate(FVector{0, 0, -1});
+    FVector U = SnapAxis(inv.Rotate(up_w));
+    FVector F = SnapAxis(inv.Rotate(fr_w), U);
+    FVector Sx = Cross(U, F);  // right
+    auto along = [&](const FVector& a, double* mn, double* mx) {
+        double p = Dot(lo, a), q = Dot(hi, a);
+        *mn = std::min(p, q), *mx = std::max(p, q);
+    };
+    double u0, u1, f0, f1, s0, s1;
+    along(U, &u0, &u1), along(F, &f0, &f1), along(Sx, &s0, &s1);
+    double L = u1 - u0, d = f1 - f0, w = s1 - s0;
+    FVector centre = (lo + hi) * 0.5;
+    const bool measured = n >= 8 && L > 6 && L < 40 && d > 1 && d < 8 && w > 0.8 && w < 6;
+    if (!measured) {
+        // Glock 19 magazine, centred on the actor.
+        L = 12.5, d = 3.2, w = 2.8;
+        centre = U * (L * 0.5 - 1.0);
+        lo = centre - (U * L + F * d + Sx * w) * 0.5;
+        hi = centre + (U * L + F * d + Sx * w) * 0.5;
+    }
+    const double mirror = side == kL ? 1.0 : -1.0;  // the palm is on the mag's left side for the left hand
+    // Canonical (side, front, up-from-base) -> magazine frame.
+    auto P = [&](double sv, double fv, double uv) {
+        return centre + Sx * (sv * mirror) + F * fv + U * (uv - L * 0.5);
+    };
+    auto D = [&](double sv, double fv, double uv) { return Normalize(Sx * (sv * mirror) + F * fv + U * uv); };
+    gr::Record r;
+    r.name = "magazine";
+    r.right_hand = side == kR;
+    // Palm against the left side, knuckles a third of the way up, the
+    // knuckle row running up the magazine diagonally (pinky at the base).
+    r.knuckle = P(-w * 0.5 - 1.2, -0.3, 0.36 * L);
+    r.across = D(0, 0.3, 1.0);
+    r.fingers = D(0, 1.0, -0.3);
+    r.tip[gr::kThumb] = P(w * 0.5 + 0.7, -0.4, 0.62 * L);       // up the right side
+    r.tip[gr::kIndexOff] = P(-w * 0.15, d * 0.5 + 0.8, L - 0.8);  // straight up the front to the top round
+    r.tip[gr::kIndexRest] = r.tip[gr::kIndexOff];
+    r.tip[gr::kIndexPull] = r.tip[gr::kIndexOff];
+    r.tip[gr::kMiddle] = P(w * 0.25, d * 0.5 + 0.8, 0.40 * L);  // wrapped round the front
+    r.tip[gr::kRing] = P(w * 0.3, d * 0.5 + 0.7, 0.26 * L);
+    r.tip[gr::kPinky] = P(w * 0.25, d * 0.5 + 0.6, 0.13 * L);
+    // Outline for the clip check, in the magazine's frame.
+    FVector half = (hi - lo) * 0.5;
+    half = {std::fabs(half.X), std::fabs(half.Y), std::fabs(half.Z)};
+    r.outline = {{"magazine", (lo + hi) * 0.5, half, 0.0}};
+    *rec = r;
+    log::Info("body: magazine %s: %s %.1f x %.1f x %.1f cm (long x deep x wide), top along (%.0f %.0f %.0f), front "
+              "along (%.0f %.0f %.0f) of the magazine; built-in hold from the owner's photos",
+              ue::GetName(ue::GetClass(mag)).c_str(), measured ? "measured" : "not measurable, assumed", L, d, w,
+              U.X, U.Y, U.Z, F.X, F.Y, F.Z);
+    return true;
+}
+
 void LoadGrip(int side, const hands::HandGrab& grab, bool from_disk = false) {
     ActiveGrip& g = G.grip[side];
     g = ActiveGrip{};
@@ -1138,8 +1265,13 @@ void LoadGrip(int side, const hands::HandGrab& grab, bool from_disk = false) {
         rec.name = g.key;
         have = true;
     }
+    const bool is_mag = grab.kind == hands::GrabKind::kMagHeld || grab.kind == hands::GrabKind::kMagInsert;
+    if (is_mag && DefaultMagRecord(side, grab.object, &rec)) {
+        rec.name = g.key;
+        have = true;
+    }
     if (ReadText(RecordPath(g.key), &text)) {
-        if (!have) rec.right_hand = side == kR;
+        if (!have || is_mag) rec.right_hand = side == kR;
         if (gr::Parse(text, &rec)) {
             have = true;
             g.from_file = true;
