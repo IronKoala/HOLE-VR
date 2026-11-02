@@ -1487,6 +1487,34 @@ void HookChargeTimeline() {
     log::Info("controls: charge timeline %s", update ? "overridden by the hand" : "not found");
 }
 
+// Bullet-hole bug (2026-11-02): every shot lands on the first hole. Log
+// where the muzzle points against where the gun frame points, the player's
+// control rotation and the game camera, so the log shows which one the
+// game aims its bullets with. First 12 shots per launch.
+void LogShot(UObject player, game::Gun& gun) {
+    static int n = 0;
+    if (++n > 12) return;
+    UObject muzzle = 0;
+    ue::GetProp(gun.Object(), "MuzzleFirePoint", muzzle);
+    if (!muzzle) ue::GetProp(gun.Object(), "DefaultMuzzlePoint", muzzle);
+    FVector mloc, mfwd;
+    if (muzzle) {
+        UETransform t = ComponentToWorld(muzzle);
+        mloc = t.translation;
+        mfwd = t.rotation.Rotate(FVector{1, 0, 0});
+    }
+    FVector gfwd = W.frame_rot.Rotate(FVector{1, 0, 0});
+    FRotator ctrl{};
+    ue::Call gc(player, "GetController");
+    if (UObject c = gc.Invoke() ? gc.Result<UObject>() : 0) {
+        ue::Call r(c, "GetControlRotation");
+        if (r.Invoke()) ctrl = r.Result<FRotator>();
+    }
+    log::Info("shot %d: muzzle (%.0f %.0f %.0f) muzzle X (%.2f %.2f %.2f) barrel (%.2f %.2f %.2f) "
+              "control rot (p %.1f y %.1f)", n, mloc.X, mloc.Y, mloc.Z, mfwd.X, mfwd.Y, mfwd.Z, gfwd.X, gfwd.Y,
+              gfwd.Z, ctrl.Pitch, ctrl.Yaw);
+}
+
 void OnTick(UObject player, float dt) {
     g_clock += dt;
     g_dt = dt;
@@ -1533,6 +1561,7 @@ void OnTick(UObject player, float dt) {
         {
             W.kick_t0 = g_clock;
             W.kick_side = (std::rand() % 2001) / 1000.0 - 1.0;
+            LogShot(player, gun);
         }
         W.last_rounds = rounds;
         W.last_has_mag = st.has_magazine;
