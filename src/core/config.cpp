@@ -143,6 +143,16 @@ const Block kBlocks[] = {
      "; 1 = hide the see-through grey box some menus draw behind their buttons\n"
      "; (Options has one); it shows as a shadowy box on the arm\n"
      "menu_hide_backdrops=1\n"},
+    {"menu_laser_own_hit",
+     "\n"
+     "; --- Laser on forearm menus ---\n"
+     "; 1 = the laser tells the menu where it hits, so nothing in the level can\n"
+     ";     block it (the area select menu in the pit after the microwave fall\n"
+     ";     could not be clicked with 0)\n"
+     "; 0 = the old way: the game's collision is checked along the beam\n"
+     "menu_laser_own_hit=1\n"
+     "; 1 = the menu hand buzzes when the game puts a menu on your arm\n"
+     "menu_arrive_buzz=1\n"},
     {"wrist_hud",
      "\n"
      "; --- Wrist display ---\n"

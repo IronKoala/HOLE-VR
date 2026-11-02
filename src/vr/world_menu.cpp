@@ -64,6 +64,8 @@ struct Settings {
     bool laser = true;
     bool stack = true;            // a sub-menu takes the place of the menu under it
     bool hide_backdrops = true;   // see-through grey boxes inside the menus (HideBackdrops)
+    bool own_hit = true;          // the laser tells the menu where it hits (no game collision check)
+    bool arrive_buzz = true;      // buzz the menu hand when the game puts a menu on the arm
 } S;
 
 // The game's menus are laid out for a 1920x1080 screen.
@@ -78,6 +80,7 @@ constexpr uint32_t RF_FinishDestroyed = 0x10000;
 constexpr uint8_t kSpaceWorld = 0;          // EWidgetSpace::World
 constexpr uint8_t kBlendTransparent = 2;    // EWidgetBlendMode::Transparent
 constexpr uint8_t kSourceWorld = 0;         // EWidgetInteractionSource::World
+constexpr uint8_t kSourceCustom = 3;        // EWidgetInteractionSource::Custom
 constexpr uint8_t kVisible = 0, kCollapsed = 1, kHidden = 2;  // ESlateVisibility
 
 // FTransform (double precision).
@@ -274,7 +277,35 @@ void ResolveBackdropOffsets() {
     L.render_opacity = ro.offset;
 }
 
+// EWidgetInteractionSource::Custom, read from the engine's enum: UEnum keeps
+// its TArray<TPair<FName, int64>> Names right after UField (0x30) and the
+// CppType string, at 0x40 in UE 5.5. Checked by name; 3 (its value in every
+// UE5 release) if the layout doesn't match.
+uint8_t g_source_custom = kSourceCustom;
+void ResolveCustomSource() {
+    UObject e = ue::FindObject("Enum /Script/UMG.EWidgetInteractionSource");
+    struct Arr {
+        uintptr_t data;
+        int32_t num, max;
+    };
+    Arr a = e ? mem::ReadOr<Arr>(e + 0x40, Arr{}) : Arr{};
+    if (a.data && a.num > 0 && a.num <= 16 && a.max >= a.num) {
+        for (int i = 0; i < a.num; ++i) {
+            FName n = mem::ReadOr<FName>(a.data + i * 16, FName{});
+            int64_t v = mem::ReadOr<int64_t>(a.data + i * 16 + 8, -1);
+            std::string s = ue::names::ToString(n);
+            if (s == "EWidgetInteractionSource::Custom" && v >= 0 && v < 256) {
+                g_source_custom = static_cast<uint8_t>(v);
+                log::Info("world menu: pointer source Custom = %d (from the engine)", static_cast<int>(v));
+                return;
+            }
+        }
+    }
+    log::Warn("world menu: EWidgetInteractionSource not readable; using Custom = %d", kSourceCustom);
+}
+
 void ResolveLookups() {
+    ResolveCustomSource();
     L.ksl = Lookup("KismetSystemLibrary /Script/Engine.Default__KismetSystemLibrary");
     L.statics = Lookup("GameplayStatics /Script/Engine.Default__GameplayStatics");
     L.actor_class = Lookup("Class /Script/Engine.Actor");
@@ -400,7 +431,12 @@ bool EnsureActor(UObject world_context) {
         log::Error("world menu: could not create the pointer");
         return false;
     }
-    ue::SetProp<uint8_t>(wic, "InteractionSource", kSourceWorld);
+    // Custom: the laser hands the pointer its hit itself (SendHit), so the
+    // game's collision along the beam never comes into it. With World the
+    // pointer traced the game's Visibility channel and stopped at the first
+    // thing in the way: in the pit under the microwave (area select menu,
+    // owner's 2026-11-02 13:52 run) it never once reached the menu.
+    ue::SetProp<uint8_t>(wic, "InteractionSource", S.own_hit ? g_source_custom : kSourceWorld);
     ue::SetProp<float>(wic, "InteractionDistance", 0.f);
     FinishComponent(G.actor, wic);
     TickWhenPaused(wic);
@@ -786,6 +822,13 @@ bool Host(const Candidate& c) {
     if (boxes > 0) log::Info("world menu: hid %d see-through backdrop box(es) in %s", boxes, p.name.c_str());
     log::Info("world menu: %s on the arm in %.1f ms (%d widgets looked at; holder %s)", p.name.c_str(),
               perf::NowMs() - t0, widgets, holder_ready ? "made at level start" : "made just now");
+    // A menu the game put up by itself (the area select after the microwave
+    // fall comes up in a dark pit) is easy to miss on the arm: buzz that hand
+    // so you look. Only for the first menu; sub-menus come from your clicks.
+    if (S.arrive_buzz && S.forearm && p.layer == 0) {
+        input::Haptic(static_cast<input::Hand>(S.arm), 0.7f, 0.25f, 160.f);
+        log::Info("world menu: buzzed the %s hand: a menu is on the arm", S.arm == input::kLeft ? "left" : "right");
+    }
     return true;
 }
 
@@ -915,7 +958,130 @@ struct Hit {
     bool ok = false;
     double t = 0;
     FVector point;
+    const Panel* panel = nullptr;
 };
+
+// --------------------------------------------- the pointer's own hit --
+// With the pointer's source set to Custom, each frame the laser's hit on a
+// panel is handed to it as a hit result made by the engine itself
+// (GameplayStatics.MakeHitResult, so the component reference is a proper
+// one) and passed to WidgetInteractionComponent.SetCustomHitResult. When
+// the laser is off every panel, an empty hit (not blocking) is handed over
+// once, which lets go of the hovered button.
+bool g_sent_hit = false;  // the pointer holds a hit on a panel
+bool g_own_hit_broken = false;
+
+void SendHit(const Hit* hit, const FVector& origin, const FVector& dir) {
+    if (!S.own_hit || g_own_hit_broken || !Alive(G.wic, G.wic_index)) return;
+    if (!hit && !g_sent_hit) return;
+    ue::Call set(G.wic, "SetCustomHitResult");
+    int32_t want = 0;
+    uint8_t* dst = set.Raw("HitResult", &want);
+    auto give_up = [](const char* why) {
+        g_own_hit_broken = true;
+        log::Error("world menu: %s; the laser goes back to the game's collision check", why);
+        if (Alive(G.wic, G.wic_index)) ue::SetProp<uint8_t>(G.wic, "InteractionSource", kSourceWorld);
+    };
+    if (!set.Valid() || !dst || want <= 0) return give_up("the pointer has no SetCustomHitResult");
+    if (hit && hit->panel && L.statics) {
+        ue::Call make(L.statics, "MakeHitResult");
+        FVector n = G.rot.Rotate(FVector{1, 0, 0});  // the panel's face
+        FVector end = origin + dir * (hit->t + 0.05 * G.cm_per_m);
+        make.Set("bBlockingHit", true).Set("bInitialOverlap", false)
+            .Set("Time", static_cast<float>(hit->t / (hit->t + 0.05 * G.cm_per_m)))
+            .Set("Distance", static_cast<float>(hit->t))
+            .Set("Location", hit->point).Set("ImpactPoint", hit->point)
+            .Set("Normal", n).Set("ImpactNormal", n)
+            .Set("HitActor", G.actor).Set("HitComponent", hit->panel->comp)
+            .Set("TraceStart", origin).Set("TraceEnd", end);
+        int32_t size = 0;
+        const uint8_t* made = make.Invoke() ? make.Raw("ReturnValue", &size) : nullptr;
+        if (!made || size != want) {
+            log::Error("world menu: MakeHitResult gave %d bytes, SetCustomHitResult wants %d", size, want);
+            return give_up("could not make a hit for the pointer");
+        }
+        std::memcpy(dst, made, static_cast<size_t>(size));
+    }
+    // else: the zeroed buffer is "no hit" (bBlockingHit false, no component)
+    {
+        ue::process_event::GameCodeScope game_code;  // hover may make the game react
+        set.Invoke();
+    }
+    g_sent_hit = hit != nullptr;
+}
+
+// ------------------------------------------------- laser diagnostics --
+// What the laser is doing, logged when it changes (never per frame): which
+// menu it is on, and once a second while it is on one, what the game's own
+// collision finds along the beam where the pointer used to look (3 cm either
+// side of the menu). That second line names whatever stopped the old
+// pointer, e.g. a wall or a box the player stands inside.
+struct LaserLog {
+    std::string on;          // menu the laser is on, "" for none
+    int lines = 0;
+    double probe_at = 0;
+    std::string probe_said;
+    int probe_lines = 0;
+} LL;
+
+void ProbeBeam(const Hit& hit, const FVector& dir) {
+    double now = Now();
+    if (now - LL.probe_at < 1.0 || LL.probe_lines >= 30 || !L.ksl || !L.statics || !hit.panel) return;
+    LL.probe_at = now;
+    double back = 0.03 * G.cm_per_m;
+    FVector from = hit.point - dir * back, to = hit.point + dir * back;
+    ue::Call t(L.ksl, "LineTraceSingle");
+    t.Set("WorldContextObject", G.actor).Set("Start", from).Set("End", to)
+        .Set("TraceChannel", uint8_t{0}).Set("bTraceComplex", false).Set("bIgnoreSelf", false);
+    std::string said;
+    if (!t.Invoke()) return;
+    if (!t.Result<bool>()) {
+        said = "nothing blocks the beam at the menu (the menu itself isn't hit either)";
+    } else {
+        int32_t hit_size = 0, in_size = 0;
+        uint8_t* raw = t.Raw("OutHit", &hit_size);
+        ue::Call b(L.statics, "BreakHitResult");
+        uint8_t* in = b.Raw("Hit", &in_size);
+        if (!raw || !in || in_size != hit_size) return;
+        std::memcpy(in, raw, static_cast<size_t>(hit_size));
+        if (!b.Invoke()) return;
+        UObject comp = b.Get<UObject>("HitComponent");
+        UObject actor = b.Get<UObject>("HitActor");
+        bool inside = b.Get<bool>("bInitialOverlap");
+        float dist = b.Get<float>("Distance");
+        char buf[400];
+        if (comp && comp == hit.panel->comp) {
+            std::snprintf(buf, sizeof(buf), "the game's collision reaches the menu (%.1f cm along)", dist);
+        } else {
+            std::string a = actor ? ue::GetName(actor) : "?";
+            std::string c = comp ? ue::GetName(comp) : "?";
+            std::string k = comp ? ue::GetName(ue::GetClass(comp)) : "?";
+            if (inside)
+                std::snprintf(buf, sizeof(buf), "the game's collision stops at %s.%s (%s): the beam starts inside it",
+                              a.c_str(), c.c_str(), k.c_str());
+            else
+                std::snprintf(buf, sizeof(buf), "the game's collision stops at %s.%s (%s), %.1f cm along, before the menu",
+                              a.c_str(), c.c_str(), k.c_str(), dist);
+        }
+        said = buf;
+    }
+    if (said == LL.probe_said) return;
+    LL.probe_said = said;
+    ++LL.probe_lines;
+    log::Info("world menu: laser on %s: %s", hit.panel->name.c_str(), said.c_str());
+}
+
+void LogLaser(const Hit& best, const FVector& dir) {
+    std::string on = best.ok && best.panel ? best.panel->name : std::string();
+    if (on != LL.on && LL.lines < 60) {
+        ++LL.lines;
+        if (on.empty()) log::Info("world menu: laser left the menus");
+        else log::Info("world menu: laser now on %s (pointer gets its hit %s)", on.c_str(),
+                       S.own_hit && !g_own_hit_broken ? "from the laser" : "from the game's collision");
+    }
+    LL.on = on;
+    if (best.ok) ProbeBeam(best, dir);
+}
 
 Hit RayPanel(const FVector& o, const FVector& d, const Panel& p) {
     Hit h;
@@ -966,11 +1132,12 @@ void UpdatePointer() {
         for (const auto& p : G.panels) {
             if (!p.shown || !WidgetShows(p)) continue;
             Hit hit = RayPanel(o, d, p);
+            hit.panel = &p;
             if (hit.ok && (!best.ok || hit.t < best.t)) best = hit;
         }
         if (best.ok) {
-            // The interaction component traces a few centimetres through the
-            // panel we hit, so nothing else in the world gets in the way.
+            // For the old collision-check pointer (menu_laser_own_hit=0): it
+            // traces a few centimetres through the panel we hit.
             double back = 0.03 * G.cm_per_m;
             FVector from = best.point - d * back;
             FRotator r{std::asin(std::clamp(d.Z, -1.0, 1.0)) * kRadToDeg, std::atan2(d.Y, d.X) * kRadToDeg, 0};
@@ -978,6 +1145,10 @@ void UpdatePointer() {
             laser.hit = true;
             laser.length_m = static_cast<float>(best.t / G.cm_per_m);
         }
+        SendHit(best.ok ? &best : nullptr, o, d);
+        LogLaser(best, d);
+    } else {
+        SendHit(nullptr, o, FVector{1, 0, 0});
     }
     float want = best.ok ? static_cast<float>(0.06 * G.cm_per_m) : 0.f;
     if (want != G.last_distance) {
@@ -1067,6 +1238,11 @@ void OnGameFrame() {
     }
     if (G.panels.empty()) {
         g_active = false;
+        SendHit(nullptr, FVector{}, FVector{1, 0, 0});  // let go of the last menu's button
+        if (!LL.on.empty()) {
+            LL.on.clear();
+            LL.probe_said.clear();
+        }
         std::lock_guard<std::mutex> lock(g_laser_mutex);
         g_laser = Laser{};
         return;
@@ -1392,6 +1568,8 @@ void Init() {
     S.stack = config::GetBool("menu_submenu_replaces", true);
     S.arm_size = std::clamp(config::GetFloat("menu_forearm_size", 1.25f), 0.5f, 3.f);
     S.hide_backdrops = config::GetBool("menu_hide_backdrops", true);
+    S.own_hit = config::GetBool("menu_laser_own_hit", true);
+    S.arrive_buzz = config::GetBool("menu_arrive_buzz", true);
     if (!S.enabled) {
         log::Info("world menu: off (menu_mode=%s)", mode.c_str());
         return;
