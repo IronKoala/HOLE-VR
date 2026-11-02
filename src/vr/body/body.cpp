@@ -7,6 +7,8 @@
 #include <cmath>
 #include <cstdio>
 #include <map>
+#include <mutex>
+#include <unordered_map>
 #include <string>
 #include <vector>
 
@@ -17,6 +19,7 @@
 #include "game/game.h"
 #include "ue/call.h"
 #include "ue/names.h"
+#include "ue/process_event.h"
 #include "ue/reflection.h"
 #include "vr/body/finger_solve.h"
 #include "vr/body/grip_editor.h"
@@ -754,6 +757,12 @@ bool Setup(UObject player) {
             leader == mem::ReadOr<int32_t>(mesh + ue::off::kObjIndex, -2)) {
             G.anim_src = mesh;
             ue::SetProp<uint8_t>(mesh, "VisibilityBasedAnimTickOption", 0);  // AlwaysTickPoseAndRefreshBones
+            // Hidden and (now) casting no shadow, the engine would drop it
+            // to its lowest detail, which can filter out animation notifies
+            // such as footsteps. Keep it at full detail.
+            ue::Call lod(mesh, "SetForcedLOD");
+            lod.Set("InNewForcedLOD", static_cast<int32_t>(1));
+            lod.Invoke();
             log::Info("body: BodyMesh follows %s's animation, so the VR body copies from %s",
                       ue::GetName(mesh).c_str(), ue::GetName(mesh).c_str());
         } else {
@@ -844,6 +853,71 @@ void WalkCheckTick(UObject player, double speed, double dt) {
     for (bool& h : g_walk.have) h = false;
 }
 
+
+
+// ---- footstep study: which animation notifies fire (owner: no footstep sounds) ----
+struct NotifyStudy {
+    std::mutex m;
+    std::unordered_map<UObject, int> fn_kind;  // 0 ignore, 1 log
+    std::map<std::string, int> counts;
+    int lines = 0;
+} g_ns;
+
+void OnAnyNotify(UObject self, UObject function, void* params) {
+    if (!self || !function) return;
+    std::lock_guard<std::mutex> lock(g_ns.m);
+    auto it = g_ns.fn_kind.find(function);
+    if (it == g_ns.fn_kind.end()) {
+        std::string fn = ue::GetName(function);
+        std::string lo = Lower(fn);
+        bool want = fn.rfind("AnimNotify_", 0) == 0 || fn == "Received_Notify" || fn == "Received_NotifyBegin" ||
+                    lo.find("foot") != std::string::npos || lo.find("step") != std::string::npos ||
+                    lo.find("sound") != std::string::npos;
+        it = g_ns.fn_kind.emplace(function, want ? 1 : 0).first;
+    }
+    if (!it->second) return;
+    std::string key = ue::GetName(ue::GetClass(self)) + "." + ue::GetName(function);
+    int& n = ++g_ns.counts[key];
+    if (n <= 2 && g_ns.lines < 120) {
+        ++g_ns.lines;
+        std::string mesh;
+        if (ue::GetName(function).rfind("Received_Notify", 0) == 0 && params)
+            mesh = " on " + ue::GetName(mem::ReadOr<UObject>(reinterpret_cast<uintptr_t>(params), 0));
+        log::Info("body footstep study: %s%s", key.c_str(), mesh.c_str());
+    }
+}
+
+void NotifyStudyInit() {
+    if (!config::GetBool("body_footstep_study", true)) return;
+    const char* cdos[] = {"AnimNotify /Script/Engine.Default__AnimNotify",
+                          "AnimNotifyState /Script/Engine.Default__AnimNotifyState",
+                          "AnimInstance /Script/Engine.Default__AnimInstance"};
+    for (const char* name : cdos) {
+        UObject cdo = ue::FindObject(name);
+        bool ok = cdo && ue::process_event::HookVtableOf(cdo);
+        log::Info("body footstep study: %s %s", name, ok ? "followed" : "not found");
+    }
+    ue::process_event::OnAny(&OnAnyNotify);
+}
+
+void NotifyStudyReport(double dt) {
+    static double t = 0;
+    static int reports = 0;
+    t += dt;
+    if (t < 15.0 || reports >= 8) return;
+    t = 0;
+    std::lock_guard<std::mutex> lock(g_ns.m);
+    if (g_ns.counts.empty()) {
+        log::Info("body footstep study: no animation notifies in the last 15 s");
+        ++reports;
+        return;
+    }
+    std::string line;
+    for (auto& [k, n] : g_ns.counts) line += " | " + k + " x" + std::to_string(n);
+    log::Info("body footstep study (15 s):%s", line.c_str());
+    g_ns.counts.clear();
+    ++reports;
+}
 
 // ---- world <-> component space (this frame) ----
 Xf g_w;  // the pose component's transform
@@ -1915,6 +1989,7 @@ void OnTick(UObject player, float dt_f) {
     // Legs keep the animated feet where they were (turned with the body).
     const double speed = std::sqrt(v.X * v.X + v.Y * v.Y);
     WalkCheckTick(player, speed, dt);
+    NotifyStudyReport(dt);
     if (S.legs && k.pelvis >= 0)
         for (int s = 0; s < 2; ++s) {
             if (!k.legs_ok[s]) continue;
@@ -2011,6 +2086,7 @@ bool GetSlot(Slot slot, hands::Pose* out) {
 void Init() {
     LoadSettings();
     game::AddTickListener(&OnTick);
+    NotifyStudyInit();
     log::Info("body: ready (%s; F9 toggles; grip editor: hold left Y 1 s while holding the gun)",
               S.enabled ? "on" : "off");
 }
