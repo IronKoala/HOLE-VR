@@ -57,6 +57,13 @@ int main() {
             if (s.Update(FVector{8 - 5.0 * i / 20, 0, 2}, true, 0.011) == SlideEvent::kReachedBack) back = true;
         EXPECT(back);
         EXPECT(s.Update(FVector{3, 0, 2}, false, 0.011) == SlideEvent::kRacked);
+        {   // rear sight pinch sphere
+            SlideConfig q = c;
+            q.sight_center = FVector{-9, 0, 5};
+            q.sight_radius = 7.0;
+            EXPECT(Slide(q).InZone(FVector{-12, 0, 10}));
+            EXPECT(!Slide(c).InZone(FVector{-12, 0, 10}));
+        }
         SlideConfig r = Pistol();   // rear sphere only (default)
         EXPECT(!Slide(r).InZone(FVector{-20, 0, 2}));
         {   // pinch from behind (owner's log: hands 10-15 cm behind the rear point)

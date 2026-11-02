@@ -10,6 +10,7 @@ double Length(const FVector& a) { return std::sqrt(Dot(a, a)); }
 
 bool Slide::InZone(const FVector& hand) const {
     if (Length(hand - cfg_.grab_center) <= cfg_.grab_radius) return true;
+    if (cfg_.sight_radius > 0.0 && Length(hand - cfg_.sight_center) <= cfg_.sight_radius) return true;
     const double back = Dot(hand - cfg_.grab_center, cfg_.axis);   // + behind, - forward
     if (cfg_.grab_forward > 0.0 && back < 0.0) {
         // Forward along the slide: distance to the segment from grab_center
