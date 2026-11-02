@@ -107,6 +107,8 @@ DWORD WINAPI InitThread(LPVOID) {
     if (!WaitFor("GUObjectArray", ue::objects::Init, timeout)) return 0;
     if (!WaitFor("reflection offsets", ue::reflection::Init, timeout)) return 0;
     log::Info("Engine discovery complete");
+    // Before the slow start-up work: the title screen is up within seconds.
+    vr::launch::Init();
 
     if (config::GetBool("dump_on_start", true)) ue::dumper::DumpAll(mod_dir);
     const bool render_fixes = config::GetBool("vr_render_fixes", true) && vr::render_fixes::Init();
@@ -131,7 +133,6 @@ DWORD WINAPI InitThread(LPVOID) {
         vr::wrist_hud::InitGame();
         vr::world_menu::InitGame();
         vr::menu_study::InitGame();
-        vr::launch::Init();
     }
 
     // Development hotkeys. Polled rather than hooked so nothing here can
@@ -162,7 +163,6 @@ DWORD WINAPI InitThread(LPVOID) {
         if (frame % 60 == 15) vr::ui_panel::Maintain();
         if (frame % 15 == 7) vr::world_menu::Scan();
         if (hooks) vr::menu_study::Poll();
-        if (hooks) vr::launch::Poll();
         bool ctrl = GetAsyncKeyState(VK_CONTROL) & 0x8000;
         bool dump = ctrl && (GetAsyncKeyState(VK_F9) & 0x8000);
         bool recenter = ctrl && (GetAsyncKeyState(VK_F8) & 0x8000);
