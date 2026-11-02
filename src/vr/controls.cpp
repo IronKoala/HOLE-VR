@@ -107,6 +107,7 @@ struct Settings {
     double stock_right = 0.0;
     double stock_up = 0.0;
     bool right_eye = true;         // aiming eye (the stock sits on that side)
+    bool room_scale = true;        // the character follows you around the room
 };
 Settings g_set;
 
@@ -137,6 +138,7 @@ void LoadSettings() {
     g_set.stock_right = config::GetFloat("rifle_stock_right_cm", 0.f);
     g_set.stock_up = config::GetFloat("rifle_stock_up_cm", 0.f);
     g_set.right_eye = config::GetInt("dominant_eye_right", 1) != 0;
+    g_set.room_scale = config::GetBool("room_scale_follow", true);
 }
 
 // ---- shared hand state for other systems ----
@@ -248,6 +250,27 @@ void Locomotion(UObject player, const input::Snapshot& s, double dt) {
             set.Invoke();
         }
     }
+}
+
+// Room-scale walking: when you step around the room, move the character
+// (its collision capsule) with you instead of leaving it where the stick put
+// it. The move is swept, so walls stop the character; whatever it actually
+// moved is taken off the headset's offset, so the view never jumps.
+void RoomScaleFollow(UObject player) {
+    if (!g_set.room_scale || !player) return;
+    FVector off;
+    if (!stereo::HeadOffsetWorld(&off)) return;
+    off.Z = 0;
+    double len = std::sqrt(off.X * off.X + off.Y * off.Y);
+    if (len < 2.0) return;                       // ignore small head sway
+    if (len > 50.0) off = off * (50.0 / len);    // at most 50 cm per frame
+    FVector before = ActorLocation(player);
+    ue::Call c(player, "K2_SetActorLocation");
+    c.Set("NewLocation", before + off).Set("bSweep", true).Set("bTeleport", false);
+    if (!c.Invoke()) return;
+    FVector moved = ActorLocation(player) - before;
+    moved.Z = 0;
+    if (moved.X * moved.X + moved.Y * moved.Y > 1e-4) stereo::ShiftOriginWorld(moved);
 }
 
 // ---- weapon handling ----
@@ -1311,6 +1334,7 @@ void OnTick(UObject player, float dt) {
         s.hand[input::kRight].trigger_button = input::Button{};
     }
     Locomotion(player, s, dt);
+    RoomScaleFollow(player);
     ApplyCameraShakeSetting(player);
 
     game::Gun gun = game::Gun::Current(player);
