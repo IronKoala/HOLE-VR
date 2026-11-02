@@ -46,7 +46,13 @@ struct Settings {
     float distance_m = 1.6f;
     float drop_m = 0.15f;
     float follow_deg = 60.f;
-    float backdrop = 0.55f;
+    float backdrop = 0.f;
+    bool forearm = true;          // on the back of the off-hand forearm, else floating in front
+    int arm = input::kLeft;
+    float arm_width_m = 0.30f;
+    float arm_along_m = 0.20f;    // from the controller grip toward the elbow
+    float arm_back_m = 0.05f;     // out from the back of the forearm
+    bool hide_covers = true;      // the menus' full-screen click-catcher
     bool laser = true;
 } S;
 
@@ -150,6 +156,8 @@ struct State {
     bool placed = false;
     FVector centre;
     double yaw = 0;
+    FQuat rot;           // panel rotation; its +X is the face
+    double up_sign = 1;  // forearm: which edge is the top
     double cm_per_m = 100;
     double closed_since = -1;  // cursor gone at this time
     double last_take = 0;
@@ -351,17 +359,77 @@ bool HeadInWorld(FVector* loc, double* yaw) {
     return true;
 }
 
-double Scale() { return S.width_m * G.cm_per_m / kDrawW; }
+double PanelWidthM() { return S.forearm ? S.arm_width_m : S.width_m; }
+double Scale() { return PanelWidthM() * G.cm_per_m / kDrawW; }
 
 // Sub-menus sit a little in front of the menu they came from.
 FVector PanelCentre(const Panel& p) {
-    double fwd_x = std::cos(G.yaw * kDegToRad), fwd_y = std::sin(G.yaw * kDegToRad);
-    double toward = p.layer * 0.04 * G.cm_per_m;
-    return {G.centre.X - fwd_x * toward, G.centre.Y - fwd_y * toward, G.centre.Z};
+    FVector n = G.rot.Rotate(FVector{1, 0, 0});
+    double toward = p.layer * (S.forearm ? 0.006 : 0.04) * G.cm_per_m;
+    return G.centre + n * toward;
 }
 
 // Facing back at the head: the widget's front is its +X side.
-FRotator PanelRotation() { return FRotator{0, NormalizeAxis(G.yaw + 180.0), 0}; }
+FRotator PanelRotation() { return ToRotator(G.rot); }
+
+
+// Rotation whose columns are the given orthonormal axes.
+FQuat FromAxes(const FVector& x, const FVector& y, const FVector& z) {
+    double tr = x.X + y.Y + z.Z;
+    if (tr > 0) {
+        double s = std::sqrt(tr + 1.0) * 2.0;
+        return {(y.Z - z.Y) / s, (z.X - x.Z) / s, (x.Y - y.X) / s, 0.25 * s};
+    }
+    if (x.X > y.Y && x.X > z.Z) {
+        double s = std::sqrt(1.0 + x.X - y.Y - z.Z) * 2.0;
+        return {0.25 * s, (y.X + x.Y) / s, (z.X + x.Z) / s, (y.Z - z.Y) / s};
+    }
+    if (y.Y > z.Z) {
+        double s = std::sqrt(1.0 + y.Y - x.X - z.Z) * 2.0;
+        return {(y.X + x.Y) / s, 0.25 * s, (z.Y + y.Z) / s, (z.X - x.Z) / s};
+    }
+    double s = std::sqrt(1.0 + z.Z - x.X - y.Y) * 2.0;
+    return {(z.X + x.Z) / s, (z.Y + y.Z) / s, 0.25 * s, (x.Y - y.X) / s};
+}
+
+FVector Cross(const FVector& a, const FVector& b) {
+    return {a.Y * b.Z - a.Z * b.Y, a.Z * b.X - a.X * b.Z, a.X * b.Y - a.Y * b.X};
+}
+double DotV(const FVector& a, const FVector& b) { return a.X * b.X + a.Y * b.Y + a.Z * b.Z; }
+
+// The menu lies on the back of the forearm like a big watch face: its long
+// side along the arm, its face out of the back of the arm, and its top on
+// whichever side of the arm is higher in your view, so it reads upright.
+// Uses the controller, not the body, so it works whatever the body does.
+bool PlaceOnForearm() {
+    input::Snapshot in = input::Peek();
+    if (!in.valid || !in.hand[S.arm].grip_valid) return G.placed;
+    FVector loc;
+    FQuat q;
+    if (!stereo::TrackingToWorld(in.hand[S.arm].grip, &loc, &q)) return G.placed;
+    FVector head;
+    double yaw;
+    HeadInWorld(&head, &yaw);  // refreshes cm_per_m
+    // Grip axes in UE: +X through the fist, +Z along the thumb, +Y out of the
+    // back of the left hand.
+    double side = S.arm == input::kLeft ? 1.0 : -1.0;
+    FVector back = q.Rotate(FVector{0, side, 0});
+    FVector thumb = q.Rotate(FVector{0, 0, 1});
+    G.centre = loc + q.Rotate(FVector{-S.arm_along_m * G.cm_per_m, side * S.arm_back_m * G.cm_per_m, 0});
+    xr::EyeView eyes[2];
+    if (xr::LatestViews(eyes)) {
+        FQuat hq;
+        if (stereo::TrackingToWorld(eyes[0].pose, nullptr, &hq)) {
+            FVector head_up = hq.Rotate(FVector{0, 0, 1});
+            if (DotV(thumb, head_up) * G.up_sign < -0.25) G.up_sign = -G.up_sign;
+        }
+    }
+    FVector up = thumb * G.up_sign;
+    FVector y = Cross(up, back);  // widget's left edge
+    G.rot = FromAxes(back, y, up);
+    G.placed = true;
+    return true;
+}
 
 void PosePanel(const Panel& p) {
     if (!Alive(p.comp, p.comp_index)) return;
@@ -375,6 +443,7 @@ void PosePanel(const Panel& p) {
 void PlacePanels(const FVector& head, double yaw) {
     double d = S.distance_m * G.cm_per_m;
     G.yaw = yaw;
+    G.rot = YawOnly(yaw + 180.0);
     G.centre = {head.X + std::cos(yaw * kDegToRad) * d, head.Y + std::sin(yaw * kDegToRad) * d,
                 head.Z - S.drop_m * G.cm_per_m};
     G.placed = true;
@@ -430,8 +499,20 @@ bool Host(const Candidate& c) {
 
     FVector head;
     double yaw;
-    if (G.placed) PosePanel(G.panels.back());
+    if (S.forearm) {
+        if (PlaceOnForearm()) PosePanel(G.panels.back());
+    } else if (G.placed) PosePanel(G.panels.back());
     else if (HeadInWorld(&head, &yaw)) PlacePanels(head, yaw);
+    if (S.hide_covers) {
+        // The full-screen "click here to get focus back" cover: a box over the
+        // whole panel that a VR player never needs.
+        UObject cover = 0;
+        if (ue::GetProp(c.obj, "UIP_FocusLostCover", cover) && cover) {
+            ue::Call v(cover, "SetVisibility");
+            v.Set("InVisibility", kCollapsed);
+            v.Invoke();
+        }
+    }
     return true;
 }
 
@@ -556,12 +637,13 @@ void UpdatePointer() {
     // The hand whose trigger was pulled last points.
     for (int hnd = 0; hnd < 2; ++hnd) {
         bool t = in.hand[hnd].trigger > (G.pt.trigger_down[hnd] ? 0.35f : 0.6f);
-        if (t && !G.pt.trigger_down[hnd] && hnd != G.pt.hand) {
+        if (t && !G.pt.trigger_down[hnd] && hnd != G.pt.hand && !(S.forearm && hnd == S.arm)) {
             ReleaseKey();
             G.pt.hand = hnd;
         }
         G.pt.trigger_down[hnd] = t;
     }
+    if (S.forearm) G.pt.hand = 1 - S.arm;  // the hand holding the menu can't point at it
     const input::HandInput& h = in.hand[G.pt.hand];
     laser.hand = G.pt.hand;
     FVector o;
@@ -703,7 +785,10 @@ void OnGameFrame() {
 
     FVector head;
     double yaw;
-    if (HeadInWorld(&head, &yaw)) {
+    if (S.forearm) {
+        if (PlaceOnForearm())
+            for (auto& p : G.panels) PosePanel(p);
+    } else if (HeadInWorld(&head, &yaw)) {
         if (!G.placed) PlacePanels(head, yaw);
         else {
             double diff = std::fabs(NormalizeAxis(yaw - G.yaw));
@@ -990,7 +1075,13 @@ void Init() {
     S.distance_m = config::GetFloat("menu_world_distance_m", 1.6f);
     S.drop_m = config::GetFloat("menu_world_drop_m", 0.15f);
     S.follow_deg = config::GetFloat("menu_panel_follow_deg", 60.f);
-    S.backdrop = std::clamp(config::GetFloat("menu_world_backdrop", 0.55f), 0.f, 1.f);
+    S.backdrop = std::clamp(config::GetFloat("menu_world_backdrop_v2", 0.f), 0.f, 1.f);
+    S.forearm = config::GetString("menu_world_place", "forearm") != "front";
+    S.arm = config::GetString("wrist_hud_hand", "left") == "right" ? input::kRight : input::kLeft;
+    S.arm_width_m = config::GetFloat("menu_forearm_width_m", 0.30f);
+    S.arm_along_m = config::GetFloat("menu_forearm_along_m", 0.20f);
+    S.arm_back_m = config::GetFloat("menu_forearm_back_m", 0.05f);
+    S.hide_covers = config::GetBool("menu_hide_focus_cover", true);
     S.laser = config::GetBool("menu_world_laser", true);
     if (!S.enabled) {
         log::Info("world menu: off (menu_mode=%s)", mode.c_str());
@@ -998,7 +1089,11 @@ void Init() {
     }
     xr::RegisterListener(&g_laser_listener);
     stereo::SetGameFrameCallback(&OnGameFrame);
-    log::Info("world menu: on, %.2f m wide at %.2f m", S.width_m, S.distance_m);
+    if (S.forearm)
+        log::Info("world menu: on the back of the %s forearm, %.2f m wide", S.arm == input::kLeft ? "left" : "right",
+                  S.arm_width_m);
+    else
+        log::Info("world menu: floating in front, %.2f m wide at %.2f m", S.width_m, S.distance_m);
 }
 
 void Scan() {

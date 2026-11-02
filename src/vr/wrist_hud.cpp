@@ -253,15 +253,34 @@ void Draw(const Status& st, std::vector<uint32_t>& out) {
     }
     GdiFlush();
     out.resize(kTexW * kTexH);
-    const float back_a = 0.55f;  // dark backing so it reads over anything
+    // No box behind it: each pixel's brightest channel is its coverage, and a
+    // soft dark outline around the text and bar keeps it readable over
+    // anything.
+    std::vector<float> cov(kTexW * kTexH), tmp(kTexW * kTexH), halo(kTexW * kTexH);
     for (int i = 0; i < kTexW * kTexH; ++i) {
         uint32_t p = C.pixels[i];
-        float b = (p & 0xFF) / 255.f, g = ((p >> 8) & 0xFF) / 255.f, r = ((p >> 16) & 0xFF) / 255.f;
-        float cov = std::max({r, g, b});
-        float a = back_a + (1.f - back_a) * cov;
-        // Premultiplied: colour already carries its coverage; the backing is black.
+        cov[i] = std::max({(p & 0xFF), (p >> 8) & 0xFF, (p >> 16) & 0xFF}) / 255.f;
+    }
+    const int r = 5;
+    for (int y = 0; y < kTexH; ++y)
+        for (int x = 0; x < kTexW; ++x) {
+            float m = 0;
+            for (int k = std::max(0, x - r); k <= std::min(kTexW - 1, x + r); ++k) m = std::max(m, cov[y * kTexW + k]);
+            tmp[y * kTexW + x] = m;
+        }
+    for (int y = 0; y < kTexH; ++y)
+        for (int x = 0; x < kTexW; ++x) {
+            float m = 0;
+            for (int k = std::max(0, y - r); k <= std::min(kTexH - 1, y + r); ++k) m = std::max(m, tmp[k * kTexW + x]);
+            halo[y * kTexW + x] = m;
+        }
+    for (int i = 0; i < kTexW * kTexH; ++i) {
+        uint32_t p = C.pixels[i];
+        float b = (p & 0xFF) / 255.f, g = ((p >> 8) & 0xFF) / 255.f, rr = ((p >> 16) & 0xFF) / 255.f;
+        float a = std::max(cov[i], 0.6f * halo[i]);
+        // Premultiplied: colour already carries its coverage; the outline is black.
         auto ch = [](float v) { return static_cast<uint32_t>(std::clamp(v, 0.f, 1.f) * 255.f + 0.5f); };
-        out[i] = ch(b) | (ch(g) << 8) | (ch(r) << 16) | (ch(a) << 24);
+        out[i] = ch(b) | (ch(g) << 8) | (ch(rr) << 16) | (ch(a) << 24);
     }
 }
 
@@ -441,24 +460,50 @@ V3 Rotate(XrQuaternionf q, V3 v) {
     V3 t = Mul(V3{u.y * v.z - u.z * v.y, u.z * v.x - u.x * v.z, u.x * v.y - u.y * v.x}, 2.f);
     return Add(Add(v, Mul(t, q.w)), V3{u.y * t.z - u.z * t.y, u.z * t.x - u.x * t.z, u.x * t.y - u.y * t.x});
 }
-XrQuaternionf QMul(XrQuaternionf a, XrQuaternionf b) {
-    return {a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y, a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
-            a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w, a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z};
+
+V3 Cross(V3 a, V3 b) { return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x}; }
+
+// Rotation whose columns are the given orthonormal axes.
+XrQuaternionf FromAxes(V3 x, V3 y, V3 z) {
+    float tr = x.x + y.y + z.z;
+    if (tr > 0) {
+        float s = std::sqrt(tr + 1.f) * 2.f;
+        return {(y.z - z.y) / s, (z.x - x.z) / s, (x.y - y.x) / s, 0.25f * s};
+    }
+    if (x.x > y.y && x.x > z.z) {
+        float s = std::sqrt(1.f + x.x - y.y - z.z) * 2.f;
+        return {0.25f * s, (y.x + x.y) / s, (z.x + x.z) / s, (y.z - z.y) / s};
+    }
+    if (y.y > z.z) {
+        float s = std::sqrt(1.f + y.y - x.x - z.z) * 2.f;
+        return {(y.x + x.y) / s, 0.25f * s, (z.y + y.z) / s, (z.x - x.z) / s};
+    }
+    float s = std::sqrt(1.f + z.z - x.x - y.y) * 2.f;
+    return {(z.x + x.z) / s, (z.y + y.z) / s, 0.25f * s, (x.y - y.x) / s};
 }
 
 // OpenXR grip space: -Z through the fist, +Y along the thumb, +X out of the
-// back of the left hand (into the palm of the right). The display lies on
-// the back of the wrist, reading like a watch: its right edge toward the
-// fingers, its top toward the thumb.
+// back of the left hand (into the palm of the right). The display lies flat
+// on the back of the hand. Its long side runs along the hand, and its top is
+// whichever edge (thumb or little finger side) is higher in your view, so it
+// always reads the right way up like a watch.
 bool WristPose(const input::HandInput& h, XrPosef* pose) {
     if (!h.grip_valid) return false;
     float side = S.hand == input::kLeft ? 1.f : -1.f;  // which way +X is "back of the hand"
     V3 local{side * S.offset_back_m, 0.f, S.offset_elbow_m};
     V3 p = Add(V3{h.grip.position.x, h.grip.position.y, h.grip.position.z}, Rotate(h.grip.orientation, local));
-    // Quad +Z (its face) -> grip +X*side; quad +X -> grip -Z; quad +Y -> grip +Y.
-    const float s = 0.70710678f;
-    XrQuaternionf turn = S.hand == input::kLeft ? XrQuaternionf{0, s, 0, s} : XrQuaternionf{0, -s, 0, s};
-    pose->orientation = QMul(h.grip.orientation, turn);
+    V3 face = Rotate(h.grip.orientation, V3{side, 0, 0});
+    V3 thumb = Rotate(h.grip.orientation, V3{0, 1, 0});
+    xr::EyeView eyes[2];
+    static float s_up_sign = 1.f;
+    if (xr::LatestViews(eyes)) {
+        V3 head_up = Rotate(eyes[0].pose.orientation, V3{0, 1, 0});
+        float d = Dot(thumb, head_up) * s_up_sign;
+        if (d < -0.25f) s_up_sign = -s_up_sign;  // a little hysteresis so it doesn't flip back and forth
+    }
+    V3 up = Mul(thumb, s_up_sign);
+    V3 right = Cross(up, face);
+    pose->orientation = FromAxes(right, up, face);
     pose->position = {p.x, p.y, p.z};
     return true;
 }
@@ -514,7 +559,7 @@ struct WristListener : xr::Listener {
             st = g_status;
         }
         Heartbeat(st);
-        if (!st.valid || ui_panel::MenuOpen()) return;
+        if (!st.valid) return;
         input::Snapshot in = input::Peek();
         XrPosef pose;
         if (!in.valid || !WristPose(in.hand[S.hand], &pose)) return;
@@ -567,8 +612,9 @@ void Init() {
     S.show_distance_m = config::GetFloat("wrist_hud_show_distance_m", 0.5f);
     S.show_angle_deg = config::GetFloat("wrist_hud_show_angle_deg", 40.f);
     S.width_m = config::GetFloat("wrist_hud_width_m", 0.10f);
-    S.offset_back_m = config::GetFloat("wrist_hud_offset_back_m", 0.035f);
-    S.offset_elbow_m = config::GetFloat("wrist_hud_offset_elbow_m", 0.10f);
+    // Over the back of the hand (new keys; the old wrist_hud_offset_* put it on the wrist).
+    S.offset_back_m = config::GetFloat("hand_hud_offset_back_m", 0.045f);
+    S.offset_elbow_m = config::GetFloat("hand_hud_offset_along_m", 0.0f);
     S.ammo = config::GetBool("wrist_hud_ammo", true);
     S.hide_flat_hud = config::GetBool("hud_hide_flat_parts", true);
     S.heartbeat = config::GetBool("low_health_heartbeat", true);

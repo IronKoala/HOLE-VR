@@ -105,6 +105,24 @@ const Block kBlocks[] = {
      "menu_world_backdrop=0.55\n"
      "; Laser from the controller to the menu\n"
      "menu_world_laser=1\n"},
+    {"menu_forearm",
+     "\n"
+     "; --- Menu on your forearm, status on your hand ---\n"
+     "; forearm = game menus lie on the back of the wrist_hud_hand forearm, like a\n"
+     ";           big watch face; point with the other hand's laser\n"
+     "; front   = game menus float in front of you\n"
+     "menu_world_place=forearm\n"
+     "menu_forearm_width_m=0.30\n"
+     "; From the controller grip toward the elbow, and out from the arm\n"
+     "menu_forearm_along_m=0.20\n"
+     "menu_forearm_back_m=0.05\n"
+     "; Darkness behind the menu, 0 = none (just the menu itself)\n"
+     "menu_world_backdrop_v2=0\n"
+     "; Hide the menus' full-screen focus cover (an invisible box over everything)\n"
+     "menu_hide_focus_cover=1\n"
+     "; Ammo and health over the back of the hand (from the grip, out and along)\n"
+     "hand_hud_offset_back_m=0.045\n"
+     "hand_hud_offset_along_m=0.0\n"},
     {"wrist_hud",
      "\n"
      "; --- Wrist display ---\n"
