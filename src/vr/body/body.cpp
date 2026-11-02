@@ -1117,41 +1117,99 @@ std::map<std::string, ActiveGrip> g_grip_cache;
 std::string CacheKey(int side, const std::string& key) { return key + (side == kL ? "#L" : "#R"); }
 
 // ---- built-in magazine hold ----
-// The magazine's outline in its own actor frame: the union of its static
-// meshes' bounding boxes (game parts report zero local bounds, so read the
-// mesh asset's box and place it with the component's transform).
-void AddMeshBoxes(UObject comp, const Xf& actor, int depth, UObject sm_class, FVector* lo, FVector* hi, int* n) {
-    if (!comp || depth > 4) return;
-    if (sm_class && ue::reflection::IsA(comp, sm_class)) {
-        ue::Call gm(comp, "GetStaticMesh");
-        UObject mesh = gm.Invoke() ? gm.Result<UObject>() : 0;
-        struct Box {  // FBox: Min, Max, IsValid (+ padding) = 56 bytes
-            FVector min, max;
-            uint8_t valid;
-            uint8_t pad[7];
-        };
+// The magazine's outline in its own actor frame: the union of its parts'
+// boxes. Game parts report zero local bounds, so read the mesh asset's box
+// (static mesh bounding box, or skeletal mesh bounds) and place it with the
+// component's transform.
+struct MeshBox {  // FBox: Min, Max, IsValid (+ padding) = 56 bytes
+    FVector min, max;
+    uint8_t valid;
+    uint8_t pad[7];
+};
+struct MeshBounds {  // FBoxSphereBounds: Origin, BoxExtent, SphereRadius
+    FVector origin, extent;
+    double radius;
+};
+
+bool PartBox(UObject comp, FVector* mn, FVector* mx, const char** how) {
+    auto ok = [](const FVector& a, const FVector& b) {
+        double s = std::max({b.X - a.X, b.Y - a.Y, b.Z - a.Z});
+        return std::isfinite(s) && s > 0.3 && s < 200.0;
+    };
+    ue::Call gm(comp, "GetStaticMesh");
+    UObject mesh = gm.Invoke() ? gm.Result<UObject>() : 0;
+    if (mesh) {
         ue::Call bb(mesh, "GetBoundingBox");
-        if (mesh && bb.Invoke()) {
-            Box b = bb.Result<Box>();
-            const Xf cw = ComponentToWorld(comp);
-            for (int i = 0; i < 8; ++i) {
-                FVector c{i & 1 ? b.max.X : b.min.X, i & 2 ? b.max.Y : b.min.Y, i & 4 ? b.max.Z : b.min.Z};
-                Xf pt;
-                pt.translation = skel::Apply(cw, c);
-                FVector l = skel::Relative(pt, actor).translation;
-                if (!std::isfinite(l.X) || !std::isfinite(l.Y) || !std::isfinite(l.Z)) continue;
-                if (*n == 0) *lo = *hi = l;
-                lo->X = std::min(lo->X, l.X), lo->Y = std::min(lo->Y, l.Y), lo->Z = std::min(lo->Z, l.Z);
-                hi->X = std::max(hi->X, l.X), hi->Y = std::max(hi->Y, l.Y), hi->Z = std::max(hi->Z, l.Z);
-                ++*n;
-            }
+        if (bb.Invoke()) {
+            MeshBox b = bb.Result<MeshBox>();
+            if (ok(b.min, b.max)) return *mn = b.min, *mx = b.max, *how = "static mesh", true;
         }
     }
-    int32_t off = ue::PropertyOffset(comp, "AttachChildren");
-    TArrayRaw arr{};
-    if (off < 0 || !mem::Read(comp + off, arr) || arr.num <= 0 || arr.num > 64) return;
-    for (int i = 0; i < arr.num; ++i)
-        AddMeshBoxes(mem::ReadOr<UObject>(arr.data + i * sizeof(UObject), 0), actor, depth + 1, sm_class, lo, hi, n);
+    ue::Call ga(comp, "GetSkinnedAsset");
+    UObject skin = ga.Invoke() ? ga.Result<UObject>() : 0;
+    if (skin) {
+        ue::Call bb(skin, "GetBounds");
+        if (bb.Invoke()) {
+            MeshBounds b = bb.Result<MeshBounds>();
+            if (ok(b.origin - b.extent, b.origin + b.extent))
+                return *mn = b.origin - b.extent, *mx = b.origin + b.extent, *how = "skeletal mesh", true;
+        }
+    }
+    ue::Call lb(comp, "GetLocalBounds");
+    if (lb.Invoke()) {
+        ue::Vec3d a = lb.Get<ue::Vec3d>("Min"), c = lb.Get<ue::Vec3d>("Max");
+        FVector a2{a.x, a.y, a.z}, c2{c.x, c.y, c.z};
+        if (ok(a2, c2)) return *mn = a2, *mx = c2, *how = "local bounds", true;
+    }
+    return false;
+}
+
+int ActorLocalBox(UObject actor, const Xf& actor_xf, FVector* lo, FVector* hi) {
+    static UObject prim_class = ue::FindObject("Class /Script/Engine.PrimitiveComponent");
+    if (!prim_class) return 0;
+    ue::Call list(actor, "K2_GetComponentsByClass");
+    list.Set("ComponentClass", prim_class);
+    int32_t size = 0;
+    const uint8_t* raw = list.Invoke() ? list.Raw("ReturnValue", &size) : nullptr;
+    struct Arr {
+        uintptr_t data;
+        int32_t num, max;
+    } arr{};
+    if (raw && size >= (int32_t)sizeof(Arr)) std::memcpy(&arr, raw, sizeof(Arr));
+    int parts = 0;
+    for (int i = 0; i < arr.num && i < 64; ++i) {
+        UObject c = mem::ReadOr<uintptr_t>(arr.data + i * sizeof(uintptr_t), 0);
+        if (!c) continue;
+        FVector mn, mx;
+        const char* how = "";
+        bool got = PartBox(c, &mn, &mx, &how);
+        const Xf cw = ComponentToWorld(c);
+        FVector a{}, b{};
+        if (got) {
+            for (int k = 0; k < 8; ++k) {
+                FVector corner{k & 1 ? mx.X : mn.X, k & 2 ? mx.Y : mn.Y, k & 4 ? mx.Z : mn.Z};
+                Xf pt;
+                pt.translation = skel::Apply(cw, corner);
+                FVector l = skel::Relative(pt, actor_xf).translation;
+                if (k == 0) a = b = l;
+                a = {std::min(a.X, l.X), std::min(a.Y, l.Y), std::min(a.Z, l.Z)};
+                b = {std::max(b.X, l.X), std::max(b.Y, l.Y), std::max(b.Z, l.Z)};
+            }
+            if (parts == 0) *lo = a, *hi = b;
+            *lo = {std::min(lo->X, a.X), std::min(lo->Y, a.Y), std::min(lo->Z, a.Z)};
+            *hi = {std::max(hi->X, b.X), std::max(hi->Y, b.Y), std::max(hi->Z, b.Z)};
+            ++parts;
+        }
+        log::Info("body: magazine part %s (%s): %s%s", ue::GetName(c).c_str(), ue::GetName(ue::GetClass(c)).c_str(),
+                  got ? how : "no size",
+                  got ? (" " + std::to_string(int(a.X * 10) / 10.0) + ".." + std::to_string(int(b.X * 10) / 10.0) +
+                         " x, " + std::to_string(int(a.Y * 10) / 10.0) + ".." + std::to_string(int(b.Y * 10) / 10.0) +
+                         " y, " + std::to_string(int(a.Z * 10) / 10.0) + ".." + std::to_string(int(b.Z * 10) / 10.0) +
+                         " z cm in the magazine's frame")
+                            .c_str()
+                      : "");
+    }
+    return parts;
 }
 
 // Nearest actor axis (signed) to a direction.
@@ -1180,12 +1238,8 @@ bool DefaultMagRecord(int side, UObject mag, gr::Record* rec) {
     const Xf actor = t.Result<Xf>();
     hands::HandState h = hands::Get(side == kL ? hands::kLeft : hands::kRight);
     if (!h.valid) return false;
-    static UObject sm_class = ue::FindObject("Class /Script/Engine.StaticMeshComponent");
-    UObject root = 0;
-    ue::GetProp(mag, "RootComponent", root);
     FVector lo{}, hi{};
-    int n = 0;
-    AddMeshBoxes(root, actor, 0, sm_class, &lo, &hi, &n);
+    const int n = ActorLocalBox(mag, actor, &lo, &hi);
     // Mag axes in its own frame: up = controller pointing direction, front =
     // away from the back of the hand (controls carries it that way).
     const FQuat inv = actor.rotation.Inverse();
@@ -1202,7 +1256,7 @@ bool DefaultMagRecord(int side, UObject mag, gr::Record* rec) {
     along(U, &u0, &u1), along(F, &f0, &f1), along(Sx, &s0, &s1);
     double L = u1 - u0, d = f1 - f0, w = s1 - s0;
     FVector centre = (lo + hi) * 0.5;
-    const bool measured = n >= 8 && L > 6 && L < 40 && d > 1 && d < 8 && w > 0.8 && w < 6;
+    const bool measured = n >= 1 && L > 6 && L < 40 && d > 1 && d < 8 && w > 0.8 && w < 6;
     if (!measured) {
         // Glock 19 magazine, centred on the actor.
         L = 12.5, d = 3.2, w = 2.8;
@@ -1219,18 +1273,22 @@ bool DefaultMagRecord(int side, UObject mag, gr::Record* rec) {
     gr::Record r;
     r.name = "magazine";
     r.right_hand = side == kR;
-    // Palm against the left side, knuckles a third of the way up, the
-    // knuckle row running up the magazine diagonally (pinky at the base).
-    r.knuckle = P(-w * 0.5 - 1.2, -0.3, 0.36 * L);
-    r.across = D(0, 0.3, 1.0);
-    r.fingers = D(0, 1.0, -0.3);
-    r.tip[gr::kThumb] = P(w * 0.5 + 0.7, -0.4, 0.62 * L);       // up the right side
-    r.tip[gr::kIndexOff] = P(-w * 0.15, d * 0.5 + 0.8, L - 0.8);  // straight up the front to the top round
+    // From the photos: the magazine stands up out of the hand like an
+    // extension of the index finger. Its base sits in the palm at the roots
+    // of the fingers, the palm against its left side; the index runs
+    // straight up the front edge to the top round; middle, ring and pinky
+    // curl round the lower body onto the right side; the thumb lies flat up
+    // the right side.
+    r.knuckle = P(-w * 0.5 - 1.2, -0.4, 1.0);
+    r.fingers = D(0, 0, 1.0);    // wrist -> knuckles: up along the magazine
+    r.across = D(0, 1.0, 0);     // pinky -> index: towards the front
+    r.tip[gr::kIndexOff] = P(-w * 0.5 + 0.4, d * 0.5 + 0.6, L - 0.8);  // up the front edge to the top round
     r.tip[gr::kIndexRest] = r.tip[gr::kIndexOff];
     r.tip[gr::kIndexPull] = r.tip[gr::kIndexOff];
-    r.tip[gr::kMiddle] = P(w * 0.25, d * 0.5 + 0.8, 0.40 * L);  // wrapped round the front
-    r.tip[gr::kRing] = P(w * 0.3, d * 0.5 + 0.7, 0.26 * L);
-    r.tip[gr::kPinky] = P(w * 0.25, d * 0.5 + 0.6, 0.13 * L);
+    r.tip[gr::kMiddle] = P(w * 0.5 + 0.7, 0.2, 4.0);  // curled round onto the right side
+    r.tip[gr::kRing] = P(w * 0.5 + 0.7, -0.7, 3.0);
+    r.tip[gr::kPinky] = P(w * 0.5 + 0.6, -1.3, 2.0);
+    r.tip[gr::kThumb] = P(w * 0.5 + 0.7, 0.4, 0.55 * L);  // flat up the right side
     // Outline for the clip check, in the magazine's frame.
     FVector half = (hi - lo) * 0.5;
     half = {std::fabs(half.X), std::fabs(half.Y), std::fabs(half.Z)};
