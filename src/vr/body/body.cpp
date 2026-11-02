@@ -1072,27 +1072,60 @@ bool ObjectFrame(const hands::HandGrab& grab, const hands::HandGrab& right, hand
     }
 }
 
-// Slide grabs have three poses, picked once when the hand closes on the slide
-// from how the palm faces the gun and where the hand is (like Half-Life:
-// Alyx): overhand (palm down on top), rear pinch (from behind the slide, palm
-// facing forward) and side (palm against the side). Each is its own record.
-enum SlideHold { kSlideOver, kSlideRear, kSlideSide, kSlideHoldCount };
-const char* kSlideHoldKey[] = {"over", "rear", "side"};
-const char* kSlideHoldName[] = {"overhand", "rear pinch", "side"};
+// Slide grabs have three poses, picked once when the hand closes on the
+// slide (like Half-Life: Alyx). Hand on the FRONT half of the slide = front
+// hold. On the rear half the angle decides: palm facing down onto it =
+// overhand, palm facing the muzzle (hand behind the slide) = rear pinch.
+// Each is its own record.
+enum SlideHold { kSlideOver, kSlideRear, kSlideFront, kSlideHoldCount };
+const char* kSlideHoldKey[] = {"over", "rear", "front"};
+const char* kSlideHoldName[] = {"rear overhand", "rear pinch", "front"};
 int g_slide_hold[2] = {kSlideOver, kSlideOver};
 
-int PickSlideHold(const hands::HandState& h, const hands::Pose& gun) {
+bool PartBox(UObject comp, FVector* mn, FVector* mx, const char** how);
+
+// The slide's length along the barrel, in the frame of `gun` (x only).
+bool SlideSpan(UObject gun_actor, const hands::Pose& gun, double* back, double* front) {
+    UObject slide = 0;
+    if (!gun_actor || !ue::GetProp(gun_actor, "GunParts_Bolt(Slide)", slide) || !slide) return false;
+    FVector mn, mx;
+    const char* how = "";
+    if (!PartBox(slide, &mn, &mx, &how)) return false;
+    const Xf cw = ComponentToWorld(slide);
+    const FQuat inv = gun.rotation.Inverse();
+    for (int k = 0; k < 8; ++k) {
+        FVector corner{k & 1 ? mx.X : mn.X, k & 2 ? mx.Y : mn.Y, k & 4 ? mx.Z : mn.Z};
+        double x = inv.Rotate(skel::Apply(cw, corner) - gun.location).X;
+        if (k == 0) *back = *front = x;
+        *back = std::min(*back, x);
+        *front = std::max(*front, x);
+    }
+    return *front - *back > 3.0 && *front - *back < 60.0;
+}
+
+int PickSlideHold(const hands::HandState& h, const hands::Pose& gun, UObject gun_actor) {
     const FQuat inv = gun.rotation.Inverse();
     const FVector n = inv.Rotate(h.palm_normal);                    // palm direction, gun frame
     const FVector at = inv.Rotate(h.grip.location - gun.location);  // fist from the grab point, gun frame
-    // Behind the grab point (toward the shooter) favours the rear pinch.
-    const double behind = std::clamp((-at.X - 2.0) / 6.0, 0.0, 1.0) * 0.35;
-    const double score[kSlideHoldCount] = {-n.Z, n.X + behind, std::fabs(n.Y)};
-    int best = kSlideOver;
-    for (int i = 1; i < kSlideHoldCount; ++i)
-        if (score[i] > score[best]) best = i;
-    log::Info("body: slide grab: %s hold (palm in gun frame %.2f %.2f %.2f, fist %.1f cm %s the grab point)",
-              kSlideHoldName[best], n.X, n.Y, n.Z, std::fabs(at.X), at.X < 0 ? "behind" : "ahead of");
+    double back = 0, front = 0;
+    const bool span = SlideSpan(gun_actor, gun, &back, &front);
+    // Front half of the slide (unknown length: well ahead of the grab point).
+    const double split = span ? (back + front) * 0.5 : 5.0;
+    int best;
+    if (at.X > split) {
+        best = kSlideFront;
+    } else {
+        // Rear: palm down on top vs palm toward the muzzle; being behind the
+        // grab point favours the pinch.
+        const double behind = std::clamp((-at.X - 2.0) / 6.0, 0.0, 1.0) * 0.35;
+        best = n.X + behind > -n.Z ? kSlideRear : kSlideOver;
+    }
+    log::Info("body: slide grab: %s hold (fist %.1f cm along the slide from the grab point; slide %s; "
+              "front half from %.1f; palm in gun frame %.2f %.2f %.2f)",
+              kSlideHoldName[best], at.X,
+              span ? (std::to_string(int(back * 10) / 10.0) + ".." + std::to_string(int(front * 10) / 10.0)).c_str()
+                   : "size unknown",
+              split, n.X, n.Y, n.Z);
     return best;
 }
 
@@ -1947,7 +1980,7 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
         if (g_editor.Active() && g_edit_side == side) StopEditor();
         hands::Pose gun;
         if (grab.kind == hands::GrabKind::kSlideGrab && ObjectFrame(grab, right_grab, &gun))
-            g_slide_hold[side] = PickSlideHold(h, gun);
+            g_slide_hold[side] = PickSlideHold(h, gun, grab.object);
         LoadGrip(side, grab);
     }
     hands::Pose obj;

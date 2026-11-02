@@ -68,13 +68,14 @@ states from trigger touch and the analog trigger.
   sits on the controller with a simple curl until a grip is made in the
   editor.
 - Slide: three holds, like Half-Life: Alyx, each posed and saved on its
-  own (`<Class>.slide-over|rear|side.ini`). The hold is picked once, when
-  the hand closes on the slide: palm facing down onto it = **overhand**,
-  palm facing the muzzle (hand behind the slide; being behind counts
-  extra) = **rear pinch**, palm against the side = **side**. To pose one,
-  grab the slide that way, then open the editor (hold left Y 1 s). A hold
-  not posed yet uses an old `<Class>.slide.ini` if there is one. The log
-  line `slide grab: <hold> hold` shows which was picked.
+  own (`<Class>.slide-over|rear|front.ini`). The hold is picked once, when
+  the hand closes on the slide: fist over the FRONT half of the slide
+  (measured from the slide part's mesh) = **front**; on the rear half,
+  palm facing down onto it = **rear overhand**, palm facing the muzzle
+  (being behind the slide counts extra) = **rear pinch**. To pose one, grab
+  the slide that way, then open the editor (hold left Y 1 s). A hold not
+  posed yet uses an old `<Class>.slide.ini` if there is one. The log line
+  `slide grab: <hold> hold` shows which was picked and the slide's span.
 - Object frames: gun = X barrel, Y right, Z up at `MainHandPosition`;
   slide/handguard = gun frame at the point held; magazine = the magazine
   actor.
@@ -108,7 +109,7 @@ hand (its buttons stop reaching the game, and the gun won't fire).
   the "resting" and "pulled" index poses.
 - **Tap Y** to save, **click the left stick** to undo to the saved grip,
   **hold Y 1 s** to save and finish. Grips are saved per object class in
-  `hole-vr/grips/<Class>.<grip|mag|slide-over|slide-rear|slide-side|support>.ini`.
+  `hole-vr/grips/<Class>.<grip|mag|slide-over|slide-rear|slide-front|support>.ini`.
 
 ## Body
 
