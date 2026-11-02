@@ -60,9 +60,15 @@ states from trigger touch and the analog trigger.
   under the trigger guard, thumb forward along the LEFT side of the frame,
   index straight along the right side above the guard. The thumb's side is a
   stored choice, so it can't flip.
-- Magazine, slide, charging handle, rifle handguard: no built-in grip yet;
-  the hand sits on the controller with a simple curl until a grip is made in
-  the editor.
+- Magazine: built in (`DefaultMagRecord` in body.cpp), from the owner's
+  photos: the magazine lies diagonally across the palm, base low in the heel
+  of the hand, middle/ring/pinky wrapped round the lower body, index straight
+  up the front to the top round, thumb up the side. It is placed from the
+  magazine's measured outline (log line `body: magazine ...`) and tuned in
+  the editor like any grip (saved as `<MagazineClass>.mag.ini`).
+- Slide, charging handle, rifle handguard: no built-in grip yet; the hand
+  sits on the controller with a simple curl until a grip is made in the
+  editor.
 - Object frames: gun = X barrel, Y right, Z up at `MainHandPosition`;
   slide/handguard = gun frame at the point held; magazine = the magazine
   actor.
