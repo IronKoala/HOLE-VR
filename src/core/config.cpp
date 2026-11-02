@@ -210,9 +210,7 @@ const Block kBlocks[] = {
      "; Aiming eye: 1 = right, 0 = left.\n"
      "dominant_eye_right=1\n"
      "; Pistol slide can be grabbed this far forward of its rear (front serrations, press checks)\n"
-     "slide_grab_forward_cm=16\n"
-     "; ...and pinched from this far behind its rear, on the bore line\n"
-     "slide_grab_back_cm=15\n"},
+     "slide_grab_forward_cm=16\n"},
     {"holster_pistol",
      "\n"
      "; --- Holsters on your VR body ---\n"

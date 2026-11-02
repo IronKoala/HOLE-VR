@@ -97,7 +97,6 @@ struct Settings {
     bool holster_toggle = false;    // squeeze to draw, squeeze at the holster to put away
     double holster_cant = 10.0;     // grip tilted forward, degrees
     double belt_below_head = 60.0;  // belt height when the VR body is off, cm below the headset
-    double slide_grab_back = 15.0;      // pinch zone behind the slide (5 cm radius, on the bore line)
     double slide_grab_forward = 16.0;   // pistol slide grab zone reaches this far forward of the rear grab point
     bool wall_collision = true;    // keep the gun out of walls
     double recoil_kick = 1.0;      // scale of the in-hand recoil kick, 0 = off
@@ -139,7 +138,6 @@ void LoadSettings() {
     g_set.holster_cant = config::GetFloat("holster_pistol_cant_deg", 10.f);
     g_set.belt_below_head = config::GetFloat("holster_belt_below_head_cm", 60.f);
     g_set.slide_grab_forward = config::GetFloat("slide_grab_forward_cm", 16.f);
-    g_set.slide_grab_back = config::GetFloat("slide_grab_back_cm", 15.f);
     g_set.virtual_stock = config::GetBool("rifle_virtual_stock", true);
     g_set.stock_snap = config::GetFloat("rifle_stock_snap_cm", 12.f);
     g_set.stock_release = config::GetFloat("rifle_stock_release_cm", 20.f);
@@ -877,7 +875,7 @@ void SlideHandling(game::Gun& gun, const hands::HandState& lh, const input::Hand
     cfg.grab_center = FVector{o.x, o.y, o.z} + cfg.axis * 4.0;
     cfg.grab_radius = 8.0;
     cfg.grab_forward = g_set.slide_grab_forward;   // whole slide, front serrations included
-    cfg.grab_back = g_set.slide_grab_back;         // pinch from behind the slide
+    // No zone behind the slide: the pinch is grabbed at the rear sight only.
     if (W.is_pistol) {
         // Pinch at the rear sight (the body picks its pinch pose there too).
         UObject sight = 0;
@@ -895,7 +893,6 @@ void SlideHandling(game::Gun& gun, const hands::HandState& lh, const input::Hand
     }
     if (!W.is_pistol) {
         cfg.grab_forward = 0.0;
-        cfg.grab_back = 0.0;
         // AR-15: the left hand works the T-shaped charging handle at the
         // back of the upper receiver. It always sits forward (it does not
         // stay back with a locked bolt), so it is grabbed at its rest point.
