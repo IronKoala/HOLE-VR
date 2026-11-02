@@ -43,6 +43,7 @@ struct Output {
     bool save = false, revert = false;
     bool changed = false;      // record or hand moved this frame
     int grabbed = kNoItem;     // item being dragged
+    int hover = kNoItem;       // item a squeeze would take now (or the one held)
     float haptic = 0.f;        // pulse strength for the editing hand, 0 = none
 };
 
@@ -68,5 +69,9 @@ private:
 
 // Grab reach: items further than this from the pointer are not picked, cm.
 constexpr double kGrabRadius = 6.0;
+
+// The item a squeeze at `pointer` would take: nearest fingertip (the index
+// in its showing state) or the palm, kNoItem when nothing is in reach.
+int Pick(const FVector& pointer, const Scene& scene);
 
 }  // namespace holevr::vr::grip_editor

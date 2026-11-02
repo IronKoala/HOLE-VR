@@ -5,6 +5,25 @@ namespace holevr::vr::grip_editor {
 using namespace ik;
 using grip_record::kTipCount;
 
+int Pick(const FVector& pointer, const Scene& scene) {
+    double best = kGrabRadius;
+    int item = kNoItem;
+    auto consider = [&](int i, const FVector& p) {
+        double d = Length(p - pointer);
+        if (d < best) {
+            best = d;
+            item = i;
+        }
+    };
+    consider(grip_record::kThumb, scene.tip[grip_record::kThumb]);
+    consider(scene.index_state, scene.tip[scene.index_state]);
+    for (int t = grip_record::kMiddle; t < grip_record::kTipCount; ++t) consider(t, scene.tip[t]);
+    // The palm is a bigger target: pick it unless a fingertip is clearly nearer.
+    double palm_d = Length(scene.palm - pointer) - 1.5;
+    if (palm_d < best) item = kHandItem;
+    return item;
+}
+
 Output Editor::Update(const Input& in, const Scene& scene, grip_record::Record* rec, FQuat* hand_rot,
                       FVector* hand_pos) {
     Output out;
@@ -44,21 +63,7 @@ Output Editor::Update(const Input& in, const Scene& scene, grip_record::Record* 
 
     // Grab the nearest item.
     if (in.grab_down && !grab_was_down_ && !out.revert) {
-        double best = kGrabRadius;
-        grabbed_ = kNoItem;
-        auto consider = [&](int item, const FVector& p) {
-            double d = Length(p - in.pointer);
-            if (d < best) {
-                best = d;
-                grabbed_ = item;
-            }
-        };
-        consider(grip_record::kThumb, scene.tip[grip_record::kThumb]);
-        consider(scene.index_state, scene.tip[scene.index_state]);
-        for (int t = grip_record::kMiddle; t < kTipCount; ++t) consider(t, scene.tip[t]);
-        // The palm is a bigger target: pick it unless a fingertip is clearly nearer.
-        double palm_d = Length(scene.palm - in.pointer) - 1.5;
-        if (palm_d < best) grabbed_ = kHandItem;
+        grabbed_ = Pick(in.pointer, scene);
         if (grabbed_ != kNoItem) {
             pointer0_ = in.pointer;
             pointer_rot0_ = in.pointer_rot;
@@ -84,6 +89,7 @@ Output Editor::Update(const Input& in, const Scene& scene, grip_record::Record* 
         out.changed = true;
     }
     out.grabbed = grabbed_;
+    out.hover = grabbed_ != kNoItem ? grabbed_ : Pick(in.pointer, scene);
     return out;
 }
 

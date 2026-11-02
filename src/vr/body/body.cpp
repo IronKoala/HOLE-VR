@@ -67,6 +67,8 @@ struct Settings {
     bool elbow_relieves_wrist = true;
     bool grip_records = true;
     double finger_radius = 0.5;
+    bool editor_markers = true;
+    bool gun_wrist_straight = true;
     bool fit_log = true;
     bool fixed_height = true;
 } S;
@@ -103,6 +105,8 @@ void LoadSettings() {
     S.elbow_relieves_wrist = config::GetBool("body_elbow_relieves_wrist", true);
     S.grip_records = config::GetBool("hand_grip_records", true);
     S.finger_radius = config::GetFloat("hand_finger_radius_cm", 0.5f);
+    S.editor_markers = config::GetBool("hand_editor_show_grab_points", true);
+    S.gun_wrist_straight = config::GetBool("body_gun_wrist_straight", true);
     S.fit_log = config::GetBool("body_fit_log", true);
     S.fixed_height = config::GetBool("fixed_height", true);
 }
@@ -453,6 +457,7 @@ struct ActiveGrip {
     double err[gr::kTipCount] = {};
     double clip[gr::kTipCount] = {};
     double palm_clip = 0;
+    double web_clip = 0;  // web between thumb and index (meets the tang)
 };
 
 struct State {
@@ -481,6 +486,7 @@ struct State {
     bool knee_known[2] = {false, false};
     double clav_amount[2] = {0, 0};
     double stand_dz = -1e9;
+    double body_dz = 0;  // whole body moved up/down so the shoulders sit under the eyes
     int frames = 0;
     // fit log
     double fit_time = 0;
@@ -858,6 +864,10 @@ void SolveGrip(int side, int only_tip, bool quick) {
             FVector p = r.geo.knuckle * along + r.palm_h * 1.5 + r.geo.across * (sidew * 5.0);
             g.palm_clip = std::max(g.palm_clip, fn(p));
         }
+    // The web: from the thumb's base joint to the index knuckle.
+    g.web_clip = 0;
+    const FVector tb = r.chain[hand_pose::kThumb].ref[0].translation, ib = r.chain[hand_pose::kIndex].ref[0].translation;
+    for (double a : {0.0, 0.25, 0.5, 0.75}) g.web_clip = std::max(g.web_clip, fn(tb + (ib - tb) * a));
 }
 
 void ReportGrip(int side, const char* why) {
@@ -881,6 +891,18 @@ void ReportGrip(int side, const char* why) {
     log::Info("body: grip %s clip check: deepest %.1f cm inside the %s outline (%s); fingers:%s palm %.1f%s",
               g.key.c_str(), worst, g.rec.outline.empty() ? "(no outline)" : "object's", worst_name, clips.c_str(),
               g.palm_clip, worst < 0.3 ? " - clean" : "");
+    // How the hand lines up with the object (gun: X = barrel): with a
+    // straight wrist, the forearm runs along this direction.
+    const HandRig& r = G.rig[side];
+    if (r.ok) {
+        FVector fa = Normalize(g.hand_rot.Rotate(r.forearm_dir));
+        log::Info("body: grip %s hand: wrist at (%.1f %.1f %.1f) cm; a straight wrist puts the forearm %.0f deg %s and "
+                  "%.0f deg %s of the barrel; web of the hand %.1f cm inside",
+                  g.key.c_str(), g.hand_pos.X, g.hand_pos.Y, g.hand_pos.Z,
+                  std::fabs(std::atan2(fa.Y, fa.X)) * kRadToDeg, fa.Y >= 0 ? "right" : "left",
+                  std::fabs(std::atan2(fa.Z, std::hypot(fa.X, fa.Y))) * kRadToDeg, fa.Z >= 0 ? "above" : "below",
+                  g.web_clip);
+    }
 }
 
 // Solved grips by record key and hand, so picking the same kind of object
@@ -915,6 +937,15 @@ void LoadGrip(int side, const hands::HandGrab& grab, bool from_disk = false) {
         if (gr::Parse(text, &rec)) {
             have = true;
             g.from_file = true;
+            if (grab.kind == hands::GrabKind::kGunGrip && gr::HasOldPistolHand(rec)) {
+                // Saved before the hand was lined up with the barrel: keep the
+                // fingertips, take the new hand and outline.
+                gr::PistolHand(&rec);
+                rec.outline = gr::DefaultPistol().outline;
+                log::Info("body: grip %s had the old hand placement; moved the hand in line with the barrel "
+                          "(your fingertip positions are kept; tap Y in the editor to save it)",
+                          g.key.c_str());
+            }
         } else {
             log::Error("body: grip file %s.ini could not be read, using the built-in grip", g.key.c_str());
         }
@@ -940,9 +971,11 @@ FVector g_palm_world[2];
 Xf g_hand_world[2];
 bool g_tips_valid[2] = {false, false};
 
+void HideMarkers();
 void StopEditor() {
     if (g_editor.Active()) log::Info("body: grip editor off");
     g_editor.Stop();
+    HideMarkers();
     g_edit_side = g_edit_ctrl = -1;
     hands::SetEditorHand(-1);
 }
@@ -959,6 +992,139 @@ bool SaveGrip(int side) {
     ReportGrip(side, "saved");
     g_grip_cache[CacheKey(side, g.key)] = g;
     return true;
+}
+
+// ---- editor grab points: small balls on the fingertips, palm and pointer ----
+// Uses a sphere mesh the game already has loaded (engine basic shape), on
+// plain StaticMeshComponents with no collision, shown only while editing.
+enum Marker : int { kMkThumb, kMkIndex, kMkMiddle, kMkRing, kMkPinky, kMkPalm, kMkPointer, kMkCount };
+struct EditorMarkers {
+    bool tried = false;
+    UObject mesh = 0;
+    double mesh_size = 100;  // cm across at scale 1
+    UObject owner = 0;
+    UObject comp[kMkCount] = {};
+    bool shown = false;
+} g_mk;
+
+UObject FindMarkerMesh(double* size) {
+    UObject sm_class = ue::FindObject("Class /Script/Engine.StaticMesh");
+    if (!sm_class) return 0;
+    // Best first: engine basic shapes, then any loaded sphere, then a cube.
+    const char* exact[] = {"StaticMesh /Engine/BasicShapes/Sphere.Sphere", "StaticMesh /Engine/EngineMeshes/Sphere.Sphere",
+                           "StaticMesh /Engine/BasicShapes/Cube.Cube"};
+    UObject mesh = 0;
+    for (const char* n : exact)
+        if ((mesh = ue::FindObject(n))) break;
+    if (!mesh) {
+        UObject sphere = 0, cube = 0;
+        ue::objects::ForEach([&](int, UObject o) {
+            if (sphere || ue::GetClass(o) != sm_class) return;
+            std::string n = Lower(ue::GetName(o));
+            if (n == "sphere" || n == "sm_sphere" || n == "shape_sphere") sphere = o;
+            else if (!cube && (n == "cube" || n == "sm_cube" || n == "shape_cube")) cube = o;
+        });
+        mesh = sphere ? sphere : cube;
+    }
+    if (!mesh) return 0;
+    struct Box {  // FBox: Min, Max, IsValid (+ padding) = 56 bytes
+        FVector min, max;
+        uint8_t valid;
+        uint8_t pad[7];
+    };
+    ue::Call bb(mesh, "GetBoundingBox");
+    if (bb.Invoke()) {
+        Box b = bb.Result<Box>();
+        double s = std::fmax(b.max.X - b.min.X, std::fmax(b.max.Y - b.min.Y, b.max.Z - b.min.Z));
+        if (s > 0.1 && s < 10000) *size = s;
+    }
+    log::Info("body: editor grab points use %s (%.0f cm)", ue::GetFullName(mesh).c_str(), *size);
+    return mesh;
+}
+
+bool MakeMarkers(UObject player) {
+    if (g_mk.owner == player && g_mk.comp[0]) return true;
+    for (UObject& c : g_mk.comp) c = 0;  // a new player (level): make them again
+    if (g_mk.tried && !g_mk.mesh) return false;
+    if (!g_mk.tried) {
+        g_mk.tried = true;
+        g_mk.mesh = FindMarkerMesh(&g_mk.mesh_size);
+        if (!g_mk.mesh) {
+            log::Info("body: no sphere or cube mesh loaded, so the editor can't show grab points");
+            return false;
+        }
+    }
+    UObject cls = ue::FindObject("Class /Script/Engine.StaticMeshComponent");
+    if (!cls || !player) return false;
+    for (int i = 0; i < kMkCount; ++i) {
+        ue::Call add(player, "AddComponentByClass");
+        add.Set("Class", cls).Set("bManualAttachment", true).Set("RelativeTransform", Xf{}).Set("bDeferredFinish", false);
+        UObject c = add.Invoke() ? add.Result<UObject>() : 0;
+        if (!c) {
+            log::Error("body: could not add the editor grab points");
+            return false;
+        }
+        ue::Call col(c, "SetCollisionEnabled");
+        col.Set("NewType", static_cast<uint8_t>(0));  // NoCollision
+        col.Invoke();
+        CallBool(c, "SetGenerateOverlapEvents", "bInGenerateOverlapEvents", false);
+        CallBool(c, "SetCastShadow", "NewCastShadow", false);
+        ue::Call sm(c, "SetStaticMesh");
+        sm.Set("NewMesh", g_mk.mesh);
+        sm.Invoke();
+        SetVisible(c, false);
+        g_mk.comp[i] = c;
+    }
+    g_mk.owner = player;
+    g_mk.shown = false;
+    return true;
+}
+
+void PlaceMarker(int i, const FVector& at, double diameter_cm) {
+    Xf t;
+    t.translation = at;
+    double s = diameter_cm / g_mk.mesh_size;
+    t.scale = FVector{s, s, s};
+    ue::Call c(g_mk.comp[i], "K2_SetWorldTransform");
+    c.Set("NewTransform", t).Set("bSweep", false).Set("bTeleport", true);
+    c.Invoke();
+}
+
+void HideMarkers() {
+    if (!g_mk.shown) return;
+    if (g_mk.owner != G.player) {  // the level changed: those components are gone
+        g_mk.shown = false;
+        return;
+    }
+    for (UObject c : g_mk.comp)
+        if (c) SetVisible(c, false);
+    g_mk.shown = false;
+}
+
+// hover: the editor item a squeeze would take (or is holding).
+void ShowMarkers(UObject player, int side, int index_tip, int hover, const FVector& pointer) {
+    if (!S.editor_markers || !MakeMarkers(player)) return;
+    if (!g_mk.shown) {
+        for (UObject c : g_mk.comp) SetVisible(c, true);
+        g_mk.shown = true;
+    }
+    auto item_of = [](int m, int index_tip) {
+        switch (m) {
+        case kMkThumb: return static_cast<int>(gr::kThumb);
+        case kMkIndex: return index_tip;
+        case kMkMiddle: return static_cast<int>(gr::kMiddle);
+        case kMkRing: return static_cast<int>(gr::kRing);
+        case kMkPinky: return static_cast<int>(gr::kPinky);
+        default: return grip_editor::kHandItem;
+        }
+    };
+    for (int m = 0; m < kMkPointer; ++m) {
+        FVector at = m == kMkPalm ? g_palm_world[side] : g_tip_world[side][item_of(m, index_tip)];
+        bool hot = item_of(m, index_tip) == hover;
+        double d = m == kMkPalm ? (hot ? 4.0 : 2.0) : (hot ? 2.6 : 1.1);
+        PlaceMarker(m, at, d);
+    }
+    PlaceMarker(kMkPointer, pointer, 0.8);
 }
 
 void UpdateEditor(const hands::HandGrab grab[2], const hands::HandState hs[2], double dt) {
@@ -1051,6 +1217,19 @@ void UpdateEditor(const hands::HandGrab grab[2], const hands::HandState hs[2], d
     }
     if (out.save) SaveGrip(side);
     if (out.exited) StopEditor();
+    // Grab points: a ball on each fingertip and the palm; the one a squeeze
+    // would take grows, with a light tick in the editing hand when it changes.
+    static int last_hover = grip_editor::kNoItem;
+    if (g_editor.Active()) {
+        FVector pointer_w = hs[ctrl].grip.location + hs[ctrl].aim.rotation.Rotate(FVector{3, 0, 0});
+        ShowMarkers(G.player, side, sc.index_state, out.hover, pointer_w);
+        if (out.hover != last_hover && out.hover != grip_editor::kNoItem && out.grabbed == grip_editor::kNoItem &&
+            out.haptic <= 0.f)
+            out.haptic = 0.1f;
+        last_hover = out.hover;
+    } else {
+        last_hover = grip_editor::kNoItem;
+    }
     if (out.haptic > 0.f && ctrl >= 0)
         input::Haptic(ctrl == kL ? input::kLeft : input::kRight, out.haptic, 0.03f);
 }
@@ -1250,15 +1429,22 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
     const FVector axis = Normalize(hand_pos - shoulder);
     double best_cost = 1e18, best_ang = 0, flex = 0, dev = 0;
     TwoBoneResult sol{};
-    for (int step = -6; step <= 6; ++step) {
-        if (step != 0 && (!S.elbow_relieves_wrist || !rig.ok)) continue;
-        double ang = step * 10.0 * kDegToRad;
+    // Holding the gun, the wrist stays as straight as the arm allows (the
+    // owner's photos: forearm right behind the gun), so the elbow searches
+    // wider and minimises the whole bend, not just what is past the limits.
+    const bool straight = S.gun_wrist_straight && recorded && rig.ok && grab.kind == hands::GrabKind::kGunGrip;
+    const int steps = straight ? 9 : 6;  // +-45 deg (+-90 flung the elbow up, 120 deg forearm twist)
+    const double step_deg = straight ? 5.0 : 10.0;
+    for (int step = -steps; step <= steps; ++step) {
+        if (step != 0 && (!S.elbow_relieves_wrist || !rig.ok) && !straight) continue;
+        double ang = step * step_deg * kDegToRad;
         TwoBoneResult s = SolveTwoBone(shoulder, hand_pos, upper, lower, AxisAngle(axis, ang).Rotate(pole), stretch);
         double fl = 0, dv = 0;
         if (rig.ok) WristBend(rig, hand_rot, s.end - s.mid, &fl, &dv);
         double over_f = std::max(0.0, std::fabs(fl) - 55.0 * kDegToRad);
         double over_d = std::max(0.0, std::fabs(dv) - 25.0 * kDegToRad);
-        double cost = over_f * over_f + 2.0 * over_d * over_d + 0.15 * ang * ang;
+        double cost = straight ? fl * fl + 2.0 * dv * dv + 0.4 * ang * ang
+                               : over_f * over_f + 2.0 * over_d * over_d + 0.15 * ang * ang;
         if (cost < best_cost) {
             best_cost = cost;
             best_ang = ang;
@@ -1376,9 +1562,10 @@ void FitLog(double dt, double yaw_lag) {
                           G.fit_flex[s] / n, G.fit_dev[s] / n, G.fit_twist[s] / n, G.fit_swivel[s] / n);
             arms += buf;
         }
-        log::Info("body fit: arm scale %.3f (%s), body %.0f deg behind head yaw%s", ArmScale(),
+        log::Info("body fit: arm scale %.3f (%s), body %.0f deg behind head yaw, body moved %+.0f cm to put the "
+                  "shoulders under the eyes%s", ArmScale(),
                   S.arm_scale_override > 0 ? "ini" : M.have ? "measured" : "not measured",
-                  G.fit_yaw_n ? G.fit_yaw_lag / G.fit_yaw_n : 0.0, arms.c_str());
+                  G.fit_yaw_n ? G.fit_yaw_lag / G.fit_yaw_n : 0.0, G.body_dz, arms.c_str());
     }
     G.fit_time = G.fit_yaw_lag = 0;
     G.fit_yaw_n = 0;
@@ -1511,15 +1698,36 @@ void OnTick(UObject player, float dt_f) {
     const FVector sc_target = head.location - head_fwd * behind - FVector{0, 0, below};
     const FVector sc_anim_r = pelvis.translation + yaw_q.Rotate(sc_anim - pelvis.translation);
     FVector delta = sc_target - sc_anim_r;
-    if (Length(delta) > 150.0) delta = FVector{};  // teleport / recenter in progress
+    if (Length(delta) > 500.0) delta = FVector{};  // teleport in progress
     if (delta.Z > G.stand_dz) G.stand_dz = delta.Z;
-    const double down = delta.Z - G.stand_dz;
-    const double crouch = S.fixed_height ? 0.0 : std::clamp(down, -S.max_crouch, 0.0);
+    // Height: the avatar is taller than the game's camera (its shoulders
+    // came out level with the eyes, camera "in the collarbone"), so the whole
+    // body moves down (knees bend) until the shoulders are one head unit
+    // below the eyes. With fixed_height this is a constant; otherwise real
+    // crouching adds to it.
+    {
+        double lo = S.fixed_height ? -45.0 : -(S.max_crouch + 45.0);
+        double want_dz = std::clamp(delta.Z, lo, 10.0);
+        G.body_dz += (want_dz - G.body_dz) * (1.0 - std::exp(-8.0 * dt));
+    }
+    const double crouch = G.body_dz;
     FVector offset{delta.X, delta.Y, 0};
-    FVector pelvis_shift = offset * 0.7;
-    if (Length(pelvis_shift) > 60.0) pelvis_shift = Normalize(pelvis_shift) * 60.0;
-    FVector lean = offset - pelvis_shift;
+    // The body always goes under the head: a little of the offset is lean,
+    // the rest moves the whole body. (It used to stop at 60 cm, so walking
+    // around the room left the body behind and the camera ended up inside
+    // it or far from it.)
+    FVector lean = offset * 0.3;
     if (Length(lean) > S.max_lean) lean = Normalize(lean) * S.max_lean;
+    FVector pelvis_shift = offset - lean;
+    {
+        static double last_far_log = -1e9;
+        double off = Length(offset);
+        if (off > 60.0 && perf::NowMs() - last_far_log > 10000.0) {
+            last_far_log = perf::NowMs();
+            log::Info("body: your head is %.0f cm from the game character (walked in the room?); the body follows it",
+                      off);
+        }
+    }
     if (k.pelvis >= 0) {
         Xf p = pelvis;
         p.rotation = Normalized(yaw_q * p.rotation);
@@ -1527,7 +1735,7 @@ void OnTick(UObject player, float dt_f) {
         SetWX(k.pelvis, p);
     }
     if (have_shoulders && !k.spine.empty() && k.pelvis >= 0) {
-        FVector want = sc_anim_r + pelvis_shift + FVector{0, 0, std::max(down, -S.max_crouch - 30.0)} + lean;
+        FVector want = sc_anim_r + pelvis_shift + FVector{0, 0, crouch} + lean;
         FVector base = WP(k.spine[0]);
         FVector now = (WP(k.upperarm[kL]) + WP(k.upperarm[kR])) * 0.5;
         FQuat bend = ClampAngle(Arc(now - base, want - base), S.max_spine_bend * kDegToRad);
