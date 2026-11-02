@@ -47,6 +47,21 @@ struct FingerInput {
 };
 FingerInput GetFingers(Hand hand);
 
+// Buttons for the grip editor (vr/body/grip_editor.h), from this frame's
+// controller state before anything is filtered for the game.
+struct EditButtons {
+    bool y_down = false;              // left Y / secondary
+    bool left_stick_pressed = false;  // left stick click, went down this frame
+    bool left_stick_down = false;
+    bool grip_down[2] = {false, false};
+};
+EditButtons GetEditButtons();
+// The controller the grip editor is using (kLeft/kRight), or -1. While set,
+// controls ignores that controller's buttons for game actions and the gun
+// does not fire.
+void SetEditorHand(int hand);
+int EditorHand();
+
 // Head (centre eye) in world space; valid once the headset is rendering.
 bool Head(Pose* out);
 

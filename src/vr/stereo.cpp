@@ -440,12 +440,12 @@ bool Install() {
     g_device = dev;
     log::Info("stereo: hooked (render target %ux%u, near plane %.1f)", g_eye_w * 2, g_eye_h,
               g_near_plane ? *g_near_plane : 10.0f);
-    if (g_eye_w && config::GetBool("headset_resolution", true)) {
+    if (g_eye_w && config::GetBool("headset_resolution", false)) {
         // Switch the viewport to a separate eye texture. It asks for its
         // render target again when NeedReAllocate says so (g_realloc); if it
         // still has none after a few seconds, a window resize forces it.
         g_separate_rt = true;
-        log::Info("stereo: asking the engine for a %ux%u eye texture (headset_resolution=0 turns this off)",
+        log::Info("stereo: asking the engine for a %ux%u eye texture (headset_resolution=1 in the ini; experimental)",
                   g_eye_w * 2, g_eye_h);
         if (HANDLE t = CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
                 Sleep(4000);
