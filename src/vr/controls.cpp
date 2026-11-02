@@ -401,6 +401,14 @@ bool LearnGunFrame(UObject g, const FVector& actor_loc, const FQuat& actor_rot, 
     FVector grip = inv.Rotate(grip_world - actor_loc);
     FVector m = inv.Rotate(ComponentToWorld(muzzle).translation - actor_loc);
     FVector fwd = Norm(m - grip);
+    // The grip sits well below the bore, so grip->muzzle tilts up (37 deg on
+    // the pistol: its slide was then rejected below and the whole gun, and
+    // the hand around it, came out pitched). The sight sits just above the
+    // bore at the back, so sight->muzzle runs nearly parallel to it.
+    if (sight) {
+        FVector s = inv.Rotate(ComponentToWorld(sight).translation - actor_loc);
+        if (DotV(m - s, fwd) > 5.0) fwd = Norm(m - s);
+    }
     // The slide runs exactly along the bore, so prefer it when there is one:
     // it moves along -X of its parent component (measured in the weapon lab).
     game::Gun gun(g);
@@ -446,8 +454,9 @@ bool LearnGunFrame(UObject g, const FVector& actor_loc, const FQuat& actor_rot, 
         log::Info("controls: slide/bolt pulls along (%.2f %.2f %.2f) in its parent's space", W.slide_axis.X,
                   W.slide_axis.Y, W.slide_axis.Z);
     }
-    log::Info("controls: %s barrel along (%.2f %.2f %.2f), top along (%.2f %.2f %.2f) in actor space",
-              ue::GetName(ue::GetClass(g)).c_str(), fwd.X, fwd.Y, fwd.Z, up.X, up.Y, up.Z);
+    log::Info("controls: %s barrel along (%.2f %.2f %.2f), top along (%.2f %.2f %.2f) in actor space; muzzle %.1f cm "
+              "ahead of and %.1f cm above the grip point",
+              ue::GetName(ue::GetClass(g)).c_str(), fwd.X, fwd.Y, fwd.Z, up.X, up.Y, up.Z, W.muzzle_dist, W.bore_height);
     return true;
 }
 
