@@ -54,6 +54,12 @@ std::atomic<bool> g_counting{false};
 std::unordered_map<std::string, int> g_counts;
 std::atomic<int> g_player_ticks{0};
 
+// Menus the game has put up: a UIM_ widget's Construct (added to the screen
+// or a panel) until its Destruct (removed). UIM_HUD is the in-game HUD.
+std::unordered_set<UObject> g_open_menus;
+std::atomic<int> g_open_count{0};
+std::atomic<int> g_menu_seq{0};
+
 bool TracedClassName(const std::string& n) {
     if (StartsWith(n, "HUDP_")) return false;  // in-game HUD parts: noisy, not menus
     return StartsWith(n, "UIM_") || StartsWith(n, "UIP_") || StartsWith(n, "UIS_") ||
@@ -66,7 +72,7 @@ bool NoisyFunction(const std::string& n) {
     return n.find("Tick") != std::string::npos || n.find("Paint") != std::string::npos ||
            n.find("__UpdateFunc") != std::string::npos || n.find("FinishedFunc") != std::string::npos ||
            StartsWith(n, "Get") || StartsWith(n, "InpAxisEvt") || n.find("Hovered") != std::string::npos ||
-           n.find("Unhovered") != std::string::npos || n == "ReceiveDrawHUD";
+           n.find("Unhovered") != std::string::npos || n == "ReceiveDrawHUD" || n == "OnMouseMove";
 }
 
 const std::string& FnName(UObject fn) {
@@ -87,6 +93,18 @@ void OnAnyEvent(UObject self, UObject function, void*) {
     if (g_counting.load(std::memory_order_relaxed)) {
         std::string key = ue::GetName(cls) + "." + fn;
         if (g_counts.size() < 4000 || g_counts.count(key)) ++g_counts[key];
+    }
+    if (it->second && (fn == "Construct" || fn == "Destruct")) {
+        std::string cn = ue::GetName(cls);
+        if (StartsWith(cn, "UIM_") && cn != "UIM_HUD_C") {
+            bool changed = fn == "Construct" ? g_open_menus.insert(self).second : g_open_menus.erase(self) > 0;
+            if (changed) {
+                g_open_count = static_cast<int>(g_open_menus.size());
+                ++g_menu_seq;
+                log::Info("menu study: MENU %s %s (%d menu(s) up)", fn == "Construct" ? "UP" : "DOWN",
+                          ue::GetName(self).c_str(), g_open_count.load());
+            }
+        }
     }
     if (!it->second || NoisyFunction(fn)) return;
     if (g_trace_lines.load(std::memory_order_relaxed) >= kMaxTraceLines) return;
@@ -135,7 +153,7 @@ void Snapshot(const char* why) {
         if (!cls) return;
         auto it = class_ok.find(cls);
         if (it == class_ok.end()) it = class_ok.emplace(cls, IsStudiedWidgetClass(cls)).first;
-        if (!it->second) return;
+        if (!it->second || StartsWith(ue::GetName(cls), "HUDP_")) return;
         uint32_t flags = mem::ReadOr<uint32_t>(o + ue::off::kObjFlags, RF_ClassDefaultObject);
         if (flags & (RF_ClassDefaultObject | RF_BeginDestroyed | RF_FinishDestroyed)) return;
         Row r;
@@ -238,12 +256,23 @@ void Poll() {
         HookFirstInstanceNamed("BP_GameInstance_C");
         HookFirstInstanceNamed("UIM_Pause_C");
         HookFirstInstanceNamed("UIM_Title_C");
+        HookFirstInstanceNamed("ALS_CustomPlayerController_C");
+        HookFirstInstanceNamed("ALS_PlayerCameraManager_C");
     }
 
-    bool open = ui_panel::MenuOpen();
+    // A menu is up while the game has a UIM_ menu constructed (the mouse
+    // cursor doesn't show in VR, so it can't be used for this).
+    bool open = g_open_count.load() > 0;
+    static int s_seq = 0;
+    if (open && s_open && g_menu_seq.load() != s_seq) {
+        // Another menu came up on top (e.g. Options from Pause): study it too.
+        s_open_at = now;
+        s_step = 0;
+    }
+    s_seq = g_menu_seq.load();
     if (open != s_open) {
         s_open = open;
-        log::Info("menu study: menu %s (mouse cursor %s)", open ? "OPENED" : "CLOSED", open ? "on" : "off");
+        log::Info("menu study: menu %s (cursor %s)", open ? "OPENED" : "CLOSED", ui_panel::MenuOpen() ? "on" : "off");
         if (open) {
             s_open_at = now;
             s_step = 0;
@@ -259,20 +288,20 @@ void Poll() {
             g_counting = false;
         }
     }
-    if (open && s_snaps < 16) {
+    if (open && s_snaps < 24) {
         double t = now - s_open_at;
         if (s_step == 0 && t > 0.05) { ++s_step; ++s_snaps; Snapshot("menu just opened"); }
         if (s_step == 1 && t > 0.7) { ++s_step; ++s_snaps; Snapshot("menu open 0.7 s"); }
         if (s_step == 2 && t > 1.2) {
             ++s_step;
             static int s_caps = 0;
-            if (++s_caps <= 4) xr::RequestCapture(("menu" + std::to_string(s_caps)).c_str());
+            if (++s_caps <= 6) xr::RequestCapture(("menu" + std::to_string(s_caps)).c_str());
         }
         if (s_step == 3 && t > 3.0) { ++s_step; ++s_snaps; Snapshot("menu open 3 s"); }
     }
     if (open && g_counting && now - s_last_count >= 1.0) {
         s_last_count = now;
-        if (++s_count_dumps <= 20) DumpCounts("menu open");
+        if (++s_count_dumps <= 40) DumpCounts("menu open");
         g_player_ticks = 0;
     }
     if (!open && s_closed_at > 0 && s_close_step == 0 && now - s_closed_at > 0.7 && s_snaps < 16) {
