@@ -5,8 +5,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cmath>
 #include <cstring>
+#include <initializer_list>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -54,12 +56,14 @@ struct Settings {
     bool forearm = true;          // on the back of the off-hand forearm, else floating in front
     int arm = input::kLeft;
     float arm_width_m = 0.30f;
+    float arm_size = 1.25f;       // owner 2026-11-02: menus 25% bigger than 0.30 m
     float arm_along_m = 0.20f;    // from the controller grip toward the elbow
     float arm_back_m = 0.05f;     // out from the back of the forearm
     float arm_roll_deg = 0.f;     // extra turn of the menu on the arm
     bool hide_covers = true;      // the menus' full-screen click-catcher
     bool laser = true;
     bool stack = true;            // a sub-menu takes the place of the menu under it
+    bool hide_backdrops = true;   // see-through grey boxes inside the menus (HideBackdrops)
 } S;
 
 // The game's menus are laid out for a 1920x1080 screen.
@@ -218,6 +222,12 @@ struct Lookups {
     UObject panel_class = 0;    // PanelWidget: has child widgets
     UObject user_widget_class = 0;
     UObject blur_class = 0;     // BackgroundBlur
+    UObject image_class = 0;    // Image and Border: where a menu's see-through
+    UObject border_class = 0;   // grey backdrop box lives (HideBackdrops)
+    // Byte offsets inside them, from the engine's own property data.
+    int32_t image_brush = -1, image_color = -1, border_brush = -1, border_color = -1;
+    int32_t brush_tint = -1, brush_resource = -1, brush_draw_as = -1, slate_color = -1;
+    int32_t render_opacity = -1;
     FName ui_profile;           // collision profile "UI"
     bool have_ui_profile = false;
     FName left_mouse;           // key name "LeftMouseButton", for the laser
@@ -229,6 +239,41 @@ UObject Lookup(const char* full_name) {
     return o;
 }
 
+// Offsets for HideBackdrops: Image.Brush / Image.ColorAndOpacity,
+// Border.Background / Border.BrushColor, and inside FSlateBrush its
+// TintColor (an FSlateColor: SpecifiedColor), ResourceObject and DrawAs.
+void ResolveBackdropOffsets() {
+    namespace rf = ue::reflection;
+    UObject widget = ue::FindObject("Class /Script/UMG.Widget");
+    if (!L.image_class || !L.border_class || !widget) return;
+    rf::PropertyInfo ib = rf::FindProperty(L.image_class, "Brush");
+    rf::PropertyInfo ic = rf::FindProperty(L.image_class, "ColorAndOpacity");
+    rf::PropertyInfo bb = rf::FindProperty(L.border_class, "Background");
+    rf::PropertyInfo bc = rf::FindProperty(L.border_class, "BrushColor");
+    rf::PropertyInfo ro = rf::FindProperty(widget, "RenderOpacity");
+    if (!ib.valid() || !ib.inner || !ic.valid() || !bb.valid() || !bc.valid() || !ro.valid()) {
+        log::Warn("world menu: Image/Border layout not found; menu backdrops stay");
+        return;
+    }
+    rf::PropertyInfo tint = rf::FindProperty(ib.inner, "TintColor");
+    rf::PropertyInfo res = rf::FindProperty(ib.inner, "ResourceObject");
+    rf::PropertyInfo draw = rf::FindProperty(ib.inner, "DrawAs");
+    rf::PropertyInfo spec = tint.valid() && tint.inner ? rf::FindProperty(tint.inner, "SpecifiedColor") : rf::PropertyInfo{};
+    if (!tint.valid() || !res.valid() || !draw.valid() || !spec.valid()) {
+        log::Warn("world menu: SlateBrush layout not found; menu backdrops stay");
+        return;
+    }
+    L.image_brush = ib.offset;
+    L.image_color = ic.offset;
+    L.border_brush = bb.offset;
+    L.border_color = bc.offset;
+    L.brush_tint = tint.offset;
+    L.brush_resource = res.offset;
+    L.brush_draw_as = draw.offset;
+    L.slate_color = spec.offset;
+    L.render_opacity = ro.offset;
+}
+
 void ResolveLookups() {
     L.ksl = Lookup("KismetSystemLibrary /Script/Engine.Default__KismetSystemLibrary");
     L.statics = Lookup("GameplayStatics /Script/Engine.Default__GameplayStatics");
@@ -238,6 +283,9 @@ void ResolveLookups() {
     L.panel_class = Lookup("Class /Script/UMG.PanelWidget");
     L.user_widget_class = Lookup("Class /Script/UMG.UserWidget");
     L.blur_class = Lookup("Class /Script/UMG.BackgroundBlur");
+    L.image_class = Lookup("Class /Script/UMG.Image");
+    L.border_class = Lookup("Class /Script/UMG.Border");
+    ResolveBackdropOffsets();
     L.have_ui_profile = ue::names::Find("UI", &L.ui_profile);
     if (!ue::names::Find("LeftMouseButton", &L.left_mouse))
         log::Warn("world menu: name \"LeftMouseButton\" not found");
@@ -386,7 +434,7 @@ bool HeadInWorld(FVector* loc, double* yaw) {
     return true;
 }
 
-double PanelWidthM() { return S.forearm ? S.arm_width_m : S.width_m; }
+double PanelWidthM() { return S.forearm ? S.arm_width_m * S.arm_size : S.width_m; }
 double Scale() { return PanelWidthM() * G.cm_per_m / kDrawW; }
 
 // Sub-menus sit a little in front of the menu they came from.
@@ -550,6 +598,110 @@ int FindBlurs(UObject menu, std::vector<UObject>* blurs) {
     return seen;
 }
 
+// ------------------------------------------------------------ backdrops --
+// Some menus draw a see-through grey box behind their buttons (Options does:
+// owner 2026-11-02 "i can see a grey shadowy box around them"). On a flat
+// screen that dims the game behind the menu; on the arm it reads as a box,
+// which the owner never wants. Such a box is an Image (or a Border's
+// background) that is see-through and has no picture, just a colour. Only
+// the menu's own layout and its frame parts are looked at: never the insides
+// of buttons, sliders, tick boxes or the option tabs and task cards, whose
+// own dark bars keep their text readable.
+
+std::string Lower(std::string s) {
+    for (auto& ch : s) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    return s;
+}
+
+bool HasAny(const std::string& lower, std::initializer_list<const char*> words) {
+    for (const char* w : words)
+        if (lower.find(w) != std::string::npos) return true;
+    return false;
+}
+
+struct BrushLook {
+    float alpha = 1.f;       // how see-through it is drawn (1 = solid)
+    bool picture = false;    // has a texture or material
+    bool drawn = true;       // DrawAs isn't NoDrawType
+};
+
+BrushLook ReadBrush(UObject w, int32_t brush, int32_t color) {
+    BrushLook b;
+    uintptr_t base = static_cast<uintptr_t>(w);
+    LinearColor tint = mem::ReadOr<LinearColor>(base + brush + L.brush_tint + L.slate_color, LinearColor{1, 1, 1, 1});
+    LinearColor col = mem::ReadOr<LinearColor>(base + color, LinearColor{1, 1, 1, 1});
+    float opacity = mem::ReadOr<float>(base + L.render_opacity, 1.f);
+    b.alpha = tint.a * col.a * opacity;
+    b.picture = mem::ReadOr<UObject>(base + brush + L.brush_resource, 0) != 0;
+    b.drawn = mem::ReadOr<uint8_t>(base + brush + L.brush_draw_as, 1) != 0;
+    return b;
+}
+
+// Returns how many boxes it hid.
+int HideBackdrops(UObject menu, const std::string& menu_name) {
+    if (!S.hide_backdrops || L.image_brush < 0 || !L.panel_class || !L.user_widget_class) return 0;
+    int hidden = 0, logged = 0, seen = 0;
+    std::vector<std::pair<UObject, int>> todo;  // widget, user-widget depth
+    auto push_tree = [&](UObject user_widget, int depth) {
+        UObject tree = 0, root = 0;
+        if (ue::GetProp(user_widget, "WidgetTree", tree) && tree && ue::GetProp(tree, "RootWidget", root) && root)
+            todo.push_back({root, depth});
+    };
+    push_tree(menu, 0);
+    while (!todo.empty() && seen < 1000) {
+        auto [w, depth] = todo.back();
+        todo.pop_back();
+        ++seen;
+        uint8_t vis = Visibility(w);
+        if (vis == kCollapsed || vis == kHidden) continue;
+        std::string name = ue::GetName(w);
+        bool image = IsA(w, L.image_class), border = !image && IsA(w, L.border_class);
+        if (image || border) {
+            BrushLook b = image ? ReadBrush(w, L.image_brush, L.image_color) : ReadBrush(w, L.border_brush, L.border_color);
+            std::string lo = Lower(name);
+            bool named = HasAny(lo, {"shadow", "backdrop", "background", "bg", "dim", "fade"});
+            bool see_through = b.alpha > 0.02f && b.alpha < 0.9f;
+            bool backdrop = b.drawn && ((see_through && !b.picture) || (named && b.alpha > 0.02f));
+            if (backdrop && image) {
+                ue::Call v(w, "SetVisibility");
+                v.Set("InVisibility", kHidden);
+                v.Invoke();
+                ++hidden;
+            } else if (backdrop && border) {
+                // A border holds the menu's content: only its own fill goes.
+                ue::Call c(w, "SetBrushColor");
+                c.Set("InBrushColor", LinearColor{0, 0, 0, 0});
+                c.Invoke();
+                ++hidden;
+            }
+            if (logged < 40) {
+                ++logged;
+                log::Info("world menu: %s: %s %s, %s, drawn %.2f opaque -> %s", menu_name.c_str(),
+                          image ? "image" : "border", name.c_str(), b.picture ? "picture" : "plain colour",
+                          b.alpha, backdrop ? "backdrop hidden" : "kept");
+            }
+        }
+        if (IsA(w, L.user_widget_class)) {
+            if (depth >= 2) continue;
+            // The menu's frame parts only; skip controls, tab pages and cards.
+            std::string cls = Lower(ue::GetName(ue::GetClass(w)));
+            if (cls.rfind("uis_", 0) == 0 ||
+                HasAny(cls, {"btn", "button", "che", "chb", "cmb", "sld", "key", "yesno", "card", "tab"}))
+                continue;
+            push_tree(w, depth + 1);
+        } else if (IsA(w, L.panel_class)) {  // Border is a panel too (one child)
+            ue::Call count(w, "GetChildrenCount");
+            int n = count.Invoke() ? count.Result<int32_t>() : 0;
+            for (int i = 0; i < n && i < 256; ++i) {
+                ue::Call child(w, "GetChildAt");
+                child.Set("Index", static_cast<int32_t>(i));
+                if (child.Invoke() && child.Result<UObject>()) todo.push_back({child.Result<UObject>(), depth});
+            }
+        }
+    }
+    return hidden;
+}
+
 // ------------------------------------------------------------ hosting --
 
 bool Host(const Candidate& c) {
@@ -630,6 +782,8 @@ bool Host(const Candidate& c) {
         v.Invoke();
         log::Info("world menu: hid %s (a background blur)", ue::GetName(b).c_str());
     }
+    int boxes = HideBackdrops(c.obj, p.name);
+    if (boxes > 0) log::Info("world menu: hid %d see-through backdrop box(es) in %s", boxes, p.name.c_str());
     log::Info("world menu: %s on the arm in %.1f ms (%d widgets looked at; holder %s)", p.name.c_str(),
               perf::NowMs() - t0, widgets, holder_ready ? "made at level start" : "made just now");
     return true;
@@ -1236,14 +1390,16 @@ void Init() {
     S.hide_covers = config::GetBool("menu_hide_focus_cover", true);
     S.laser = config::GetBool("menu_world_laser", true);
     S.stack = config::GetBool("menu_submenu_replaces", true);
+    S.arm_size = std::clamp(config::GetFloat("menu_forearm_size", 1.25f), 0.5f, 3.f);
+    S.hide_backdrops = config::GetBool("menu_hide_backdrops", true);
     if (!S.enabled) {
         log::Info("world menu: off (menu_mode=%s)", mode.c_str());
         return;
     }
     xr::RegisterListener(&g_laser_listener);
     if (S.forearm)
-        log::Info("world menu: on the back of the %s forearm, %.2f m wide", S.arm == input::kLeft ? "left" : "right",
-                  S.arm_width_m);
+        log::Info("world menu: on the back of the %s forearm, %.2f m wide (%.2f m x size %.2f)",
+                  S.arm == input::kLeft ? "left" : "right", S.arm_width_m * S.arm_size, S.arm_width_m, S.arm_size);
     else
         log::Info("world menu: floating in front, %.2f m wide at %.2f m", S.width_m, S.distance_m);
 }
