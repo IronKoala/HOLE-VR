@@ -8,5 +8,8 @@ namespace holevr::vr::controls {
 
 // Registers the game tick listener. Call after game::Init().
 void Init();
+// Registers the late tick that puts holstered items on the VR body. Call
+// after body::Init(), so it runs after the body is posed for the frame.
+void InitLate();
 
 }  // namespace holevr::vr::controls

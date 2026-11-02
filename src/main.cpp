@@ -125,6 +125,7 @@ DWORD WINAPI InitThread(LPVOID) {
         game::weapon_lab::Init();
         vr::controls::Init();
         vr::body::Init();  // after controls: reads this frame's hand poses
+        vr::controls::InitLate();  // after the body: holsters ride this frame's body pose
         vr::cvars::Init();
         vr::wrist_hud::InitGame();
         vr::world_menu::InitGame();

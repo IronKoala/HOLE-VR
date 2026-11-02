@@ -61,6 +61,8 @@ once step 2 lands) and never opens its own session.
   gripping spawns a magazine in that hand (`ReloadMag_TakeNewMag`); bringing its
   top within a few cm of `MagazinePoint`, roughly aligned, seats it
   (`ReloadMag_InsertMag_Begin/End`).
+- **Holsters** (2026-11-02): the pistol lives on the right hip and the right grip
+  draws and holds it; the pouch is on the left hip. See [HOLSTERS.md](HOLSTERS.md).
 - **Firing**: trigger value drives `PlayerInput_UseWeapon`; the game's own recoil
   feeds a hand kick instead of camera movement.
 - **Hand poses**: per weapon and grip point, blended with finger curl from the

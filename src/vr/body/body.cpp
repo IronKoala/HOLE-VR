@@ -565,6 +565,7 @@ const SlotDef kSlots[static_cast<int>(Slot::kCount)] = {
     {true, {-16, 0, 4}},     // back
 };
 hands::Pose g_slots[static_cast<int>(Slot::kCount)];
+hands::Pose g_anchors[2];  // belt, chest (holsters)
 bool g_slots_valid = false;
 
 UObject g_poseable_class = 0;
@@ -2490,6 +2491,8 @@ void OnTick(UObject player, float dt_f) {
             g_slots[i].location = (kSlots[i].chest ? chest : belt) + body_q.Rotate(kSlots[i].offset);
             g_slots[i].rotation = body_q;
         }
+        g_anchors[static_cast<int>(Anchor::kBelt)] = {belt, body_q};
+        g_anchors[static_cast<int>(Anchor::kChest)] = {chest, body_q};
         g_slots_valid = true;
     }
     g_perf_solve.Add(perf::NowMs() - t_solve);
@@ -2511,6 +2514,13 @@ bool GetSlot(Slot slot, hands::Pose* out) {
     int i = static_cast<int>(slot);
     if (!g_slots_valid || i < 0 || i >= static_cast<int>(Slot::kCount)) return false;
     *out = g_slots[i];
+    return true;
+}
+
+bool GetAnchor(Anchor anchor, hands::Pose* out) {
+    int i = static_cast<int>(anchor);
+    if (!g_slots_valid || i < 0 || i > 1) return false;
+    *out = g_anchors[i];
     return true;
 }
 
