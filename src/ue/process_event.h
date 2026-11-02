@@ -34,7 +34,7 @@ bool HookVtableOf(UObject sample);
 // Register callbacks for one UFunction (by object address). Up to 64 entries.
 bool On(UObject function, PreFn pre, PostFn post);
 // Called for every hooked ProcessEvent before the per-function callbacks.
-// Keep it cheap. Only one; later calls replace it.
+// Keep it cheap. Up to 4 listeners; each is added once.
 void OnAny(PostFn post);
 
 }  // namespace holevr::ue::process_event

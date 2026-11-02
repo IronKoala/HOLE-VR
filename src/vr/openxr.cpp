@@ -286,6 +286,148 @@ D3D12_RESOURCE_BARRIER Transition(ID3D12Resource* r, D3D12_RESOURCE_STATES befor
     return b;
 }
 
+// ------------------------------------------------------------- capture --
+// A one-off readback of the picture the headset gets, written as a BMP.
+
+std::mutex g_capture_mutex;
+std::string g_capture_tag;  // non-empty: capture the next frame
+ID3D12Resource* g_readback = nullptr;
+UINT64 g_readback_size = 0;
+D3D12_PLACED_SUBRESOURCE_FOOTPRINT g_readback_fp{};
+std::string g_readback_tag;  // set while a readback is in this frame's commands
+
+float Channel(uint32_t px, DXGI_FORMAT f, int c) {
+    switch (f) {
+        case DXGI_FORMAT_R10G10B10A2_UNORM:
+        case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+            return ((px >> (10 * c)) & 0x3ff) / 1023.f;
+        case DXGI_FORMAT_B8G8R8A8_UNORM:
+        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+        case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+            return ((px >> (8 * (2 - c))) & 0xff) / 255.f;
+        default:  // R8G8B8A8
+            return ((px >> (8 * c)) & 0xff) / 255.f;
+    }
+}
+
+void WriteBmp(std::string tag, std::vector<uint8_t> data, D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp, DXGI_FORMAT f) {
+    const uint32_t w = fp.Footprint.Width / 2, h = fp.Footprint.Height / 2;
+    const uint32_t row = (w * 3 + 3) & ~3u;
+    std::vector<uint8_t> out(54 + static_cast<size_t>(row) * h);
+    auto put32 = [&](size_t at, uint32_t v) { std::memcpy(&out[at], &v, 4); };
+    out[0] = 'B';
+    out[1] = 'M';
+    put32(2, static_cast<uint32_t>(out.size()));
+    put32(10, 54);
+    put32(14, 40);
+    put32(18, w);
+    put32(22, h);
+    out[26] = 1;
+    out[28] = 24;
+    for (uint32_t y = 0; y < h; ++y) {
+        const uint8_t* src = data.data() + static_cast<size_t>(y * 2) * fp.Footprint.RowPitch;
+        uint8_t* dst = &out[54 + static_cast<size_t>(h - 1 - y) * row];
+        for (uint32_t x = 0; x < w; ++x) {
+            uint32_t px;
+            std::memcpy(&px, src + x * 2 * 4, 4);
+            for (int c = 0; c < 3; ++c) {
+                float v = std::clamp(Channel(px, f, c), 0.f, 1.f);
+                dst[x * 3 + (2 - c)] = static_cast<uint8_t>(v * 255.f + 0.5f);
+            }
+        }
+    }
+    std::wstring path = config::Dir() + L"\\capture-" + std::wstring(tag.begin(), tag.end()) + L".bmp";
+    FILE* file = _wfopen(path.c_str(), L"wb");
+    if (!file) {
+        log::Warn("capture: could not write capture-%s.bmp", tag.c_str());
+        return;
+    }
+    fwrite(out.data(), 1, out.size(), file);
+    fclose(file);
+    log::Info("capture: saved capture-%s.bmp (%ux%u, both eyes side by side)", tag.c_str(), w, h);
+}
+
+// Records a copy of `source` into the readback buffer when a capture is due.
+void RecordCapture(ID3D12Resource* source) {
+    g_readback_tag.clear();
+    std::string tag;
+    {
+        std::lock_guard<std::mutex> lock(g_capture_mutex);
+        if (g_capture_tag.empty()) return;
+        tag.swap(g_capture_tag);
+    }
+    D3D12_RESOURCE_DESC sd = source->GetDesc();
+    if (sd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || sd.SampleDesc.Count != 1) {
+        log::Warn("capture: source isn't a plain 2D texture, skipped");
+        return;
+    }
+    switch (sd.Format) {
+        case DXGI_FORMAT_R10G10B10A2_UNORM: case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+        case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+        case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+            break;
+        default:
+            log::Warn("capture: format %d not supported, skipped", static_cast<int>(sd.Format));
+            return;
+    }
+    UINT64 total = 0;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+    g_device->GetCopyableFootprints(&sd, 0, 1, 0, &fp, nullptr, nullptr, &total);
+    if (!g_readback || g_readback_size < total) {
+        if (g_readback) g_readback->Release();
+        g_readback = nullptr;
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC bd{};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width = total;
+        bd.Height = 1;
+        bd.DepthOrArraySize = 1;
+        bd.MipLevels = 1;
+        bd.SampleDesc.Count = 1;
+        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                     nullptr, IID_PPV_ARGS(&g_readback)))) {
+            log::Warn("capture: could not create the readback buffer");
+            return;
+        }
+        g_readback_size = total;
+    }
+    D3D12_TEXTURE_COPY_LOCATION dst{};
+    dst.pResource = g_readback;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint = fp;
+    D3D12_TEXTURE_COPY_LOCATION src{};
+    src.pResource = source;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src.SubresourceIndex = 0;
+    g_cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    g_readback_fp = fp;
+    g_readback_tag = tag;
+}
+
+// After the frame's commands are submitted: waits for them and saves the picture.
+void FinishCapture(DXGI_FORMAT format) {
+    if (g_readback_tag.empty()) return;
+    std::string tag;
+    tag.swap(g_readback_tag);
+    if (g_fence->GetCompletedValue() < g_fence_value) {
+        g_fence->SetEventOnCompletion(g_fence_value, g_fence_event);
+        WaitForSingleObject(g_fence_event, 500);
+    }
+    void* mapped = nullptr;
+    D3D12_RANGE range{0, static_cast<SIZE_T>(g_readback_size)};
+    if (FAILED(g_readback->Map(0, &range, &mapped)) || !mapped) {
+        log::Warn("capture: could not read the picture back");
+        return;
+    }
+    std::vector<uint8_t> data(static_cast<const uint8_t*>(mapped),
+                              static_cast<const uint8_t*>(mapped) + g_readback_size);
+    D3D12_RANGE none{0, 0};
+    g_readback->Unmap(0, &none);
+    std::thread(WriteBmp, tag, std::move(data), g_readback_fp, format).detach();
+}
+
 // Copies both halves of the eye texture into the acquired swapchain images.
 bool CopyEyes(ID3D12Resource* source, D3D12_RESOURCE_STATES src_state, const uint32_t image_index[2]) {
     int slot = g_frame_slot;
@@ -305,6 +447,7 @@ bool CopyEyes(ID3D12Resource* source, D3D12_RESOURCE_STATES src_state, const uin
                    D3D12_RESOURCE_STATE_COPY_DEST),
     };
     g_cmd->ResourceBarrier(3, before);
+    RecordCapture(source);
     for (int eye = 0; eye < 2; ++eye) {
         const Swapchain& sc = g_swapchains[eye];
         D3D12_TEXTURE_COPY_LOCATION dst{};
@@ -329,6 +472,7 @@ bool CopyEyes(ID3D12Resource* source, D3D12_RESOURCE_STATES src_state, const uin
     g_queue->ExecuteCommandLists(1, lists);
     g_queue->Signal(g_fence, ++g_fence_value);
     g_allocator_fence_value[slot] = g_fence_value;
+    FinishCapture(source->GetDesc().Format);
     return true;
 }
 
@@ -723,5 +867,11 @@ XrInstance Instance() { return g_instance; }
 XrSession Session() { return g_session; }
 XrSpace TrackingSpace() { return g_space; }
 ID3D12Device* Device() { return g_device; }
+
+void RequestCapture(const char* tag) {
+    std::lock_guard<std::mutex> lock(g_capture_mutex);
+    g_capture_tag = tag ? tag : "frame";
+    log::Info("capture: next headset picture will be saved as capture-%s.bmp", g_capture_tag.c_str());
+}
 
 }  // namespace holevr::vr::xr

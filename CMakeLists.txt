@@ -18,6 +18,7 @@ add_library(hole_vr SHARED
     src/ue/dumper.cpp
     src/hooks/hooks.cpp
     src/vr/openxr.cpp
+    src/vr/menu_study.cpp
     src/vr/dxgi_hooks.cpp
     src/vr/stereo.cpp
     src/vr/input.cpp
