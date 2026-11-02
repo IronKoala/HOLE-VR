@@ -105,7 +105,6 @@ std::mutex g_scan_mutex;
 std::vector<Candidate> g_candidates;
 std::atomic<bool> g_want_scan{false};
 std::atomic<bool> g_active{false};
-std::atomic<bool> g_title_up{false};
 
 UObject g_wbgc_class = 0;  // WidgetBlueprintGeneratedClass
 std::unordered_set<UObject> g_menu_classes;
@@ -546,32 +545,11 @@ void TakeNewMenus() {
         std::lock_guard<std::mutex> lock(g_scan_mutex);
         list = g_candidates;
     }
-    // The title screen and anything opened from it stay as the game made
-    // them: the forearm menu only starts once the title is gone.
-    bool title_up = false;
-    for (const auto& c : list) {
-        if (ue::GetName(c.cls) != "UIM_Title_C" || !Alive(c.obj, c.index)) continue;
-        // The game keeps the title widget around during play, hidden.
-        uint8_t vis = Visibility(c.obj);
-        if (vis != kCollapsed && vis != kHidden && CallBool(c.obj, "IsInViewport")) {
-            title_up = true;
-            static uint8_t s_logged_vis = 255;
-            if (vis != s_logged_vis) {
-                s_logged_vis = vis;
-                log::Info("world menu: title widget on screen, visibility %d", vis);
-            }
-        }
-    }
-    static bool s_said_title = false;
-    if (title_up != s_said_title) {
-        s_said_title = title_up;
-        log::Info("world menu: title screen %s", title_up ? "is up, menus stay on the flat screen until it's gone"
-                                                          : "is gone, menus go on the forearm");
-    }
-    g_title_up = title_up;
-    if (title_up) return;
     for (const auto& c : list) {
         if (g_play_widgets.count(c.obj)) continue;
+        // The title widget stays on the screen (the game keeps it there,
+        // invisible, all through play); every other menu goes on the forearm.
+        if (ue::GetName(c.cls) == "UIM_Title_C") continue;
         bool hosted = false;
         for (auto& p : G.panels) hosted = hosted || p.widget == c.obj;
         if (!Alive(c.obj, c.index)) continue;
@@ -800,6 +778,16 @@ void OnGameFrame() {
         return;
     }
     G.closed_since = -1;
+    // How often the panels are updated while a menu is open, once a second.
+    static int s_frames = 0;
+    static double s_rate_at = 0;
+    ++s_frames;
+    if (now - s_rate_at >= 1.0) {
+        if (s_rate_at > 0 && s_frames > 0)
+            log::Info("world menu: %d updates/s, %zu panel(s) on the forearm", s_frames, G.panels.size());
+        s_frames = 0;
+        s_rate_at = now;
+    }
     if (now - G.last_take > 0.1) {
         G.last_take = now;
         TakeNewMenus();
@@ -1157,6 +1145,11 @@ void AfterDrawHud(UObject, UObject, void*) {
     uint64_t now = GetTickCount64();
     if (now - s_last < 5) return;  // a second HUD in the same frame
     s_last = now;
+    static bool s_logged = false;
+    if (!s_logged) {
+        s_logged = true;
+        log::Info("world menu: driven by the HUD's draw (game paused)");
+    }
     OnGameFrame();
 }
 
@@ -1172,7 +1165,6 @@ void InitGame() {
 }
 
 bool Active() { return g_active.load(); }
-bool TitleUp() { return g_title_up.load(); }
 bool Enabled() { return S.enabled; }
 
 }  // namespace holevr::vr::world_menu

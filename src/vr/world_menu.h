@@ -12,8 +12,8 @@
 // from.
 //
 // When the game closes a menu we let go of it; when the menu disappears from
-// view entirely (cursor gone) every panel is removed. If no menu could be
-// moved, the old flat-screen panel (vr/ui_panel) takes over.
+// view entirely (cursor gone) every panel is removed. There is no flat-screen
+// fallback: a menu is on the forearm or nowhere.
 namespace holevr::vr::world_menu {
 
 // Before the VR session starts (registers the laser layer with OpenXR).
@@ -24,8 +24,6 @@ void InitGame();
 void Scan();
 // True while at least one menu is on a world panel.
 bool Active();
-// True while the title screen is showing (its menus stay on the flat screen).
-bool TitleUp();
 // True when world panels are switched on in the settings.
 bool Enabled();
 
