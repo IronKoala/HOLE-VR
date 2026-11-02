@@ -29,6 +29,7 @@
 #include "vr/body/skeleton.h"
 #include "vr/hands.h"
 #include "vr/input.h"
+#include "vr/interact/holster.h"
 
 namespace holevr::vr::body {
 namespace {
@@ -565,7 +566,7 @@ const SlotDef kSlots[static_cast<int>(Slot::kCount)] = {
     {true, {-16, 0, 4}},     // back
 };
 hands::Pose g_slots[static_cast<int>(Slot::kCount)];
-hands::Pose g_anchors[2];  // belt, chest (holsters)
+hands::Pose g_anchors[static_cast<int>(Anchor::kCount)];  // holsters (body.h Anchor)
 bool g_slots_valid = false;
 
 UObject g_poseable_class = 0;
@@ -2631,8 +2632,19 @@ void OnTick(UObject player, float dt_f) {
             g_slots[i].location = (kSlots[i].chest ? chest : belt) + body_q.Rotate(kSlots[i].offset);
             g_slots[i].rotation = body_q;
         }
+        const FVector fwd = body_q.Rotate(FVector{1, 0, 0});
         g_anchors[static_cast<int>(Anchor::kBelt)] = {belt, body_q};
-        g_anchors[static_cast<int>(Anchor::kChest)] = {chest, body_q};
+        g_anchors[static_cast<int>(Anchor::kChest)] = {
+            chest, k.spine.empty() ? body_q : interact::FrameFromUp(chest - belt, fwd)};
+        for (int s = 0; s < 2; ++s) {
+            hands::Pose& a = g_anchors[static_cast<int>(s == kL ? Anchor::kThighL : Anchor::kThighR)];
+            if (S.legs && k.legs_ok[s]) {
+                const FVector hip = WP(k.thigh[s]), knee = WP(k.calf[s]);
+                a = {(hip + knee) * 0.5, interact::FrameFromUp(hip - knee, fwd)};
+            } else {
+                a = {belt + body_q.Rotate(FVector{0, s == kL ? -10.0 : 10.0, -22.0}), body_q};
+            }
+        }
         g_slots_valid = true;
     }
     g_perf_solve.Add(perf::NowMs() - t_solve);
@@ -2659,7 +2671,7 @@ bool GetSlot(Slot slot, hands::Pose* out) {
 
 bool GetAnchor(Anchor anchor, hands::Pose* out) {
     int i = static_cast<int>(anchor);
-    if (!g_slots_valid || i < 0 || i > 1) return false;
+    if (!g_slots_valid || i < 0 || i >= static_cast<int>(Anchor::kCount)) return false;
     *out = g_anchors[i];
     return true;
 }

@@ -2,11 +2,22 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstring>
 
 namespace holevr::vr::interact {
 namespace {
 
 double Len(const FVector& v) { return std::sqrt(v.X * v.X + v.Y * v.Y + v.Z * v.Z); }
+double Dot(const FVector& a, const FVector& b) { return a.X * b.X + a.Y * b.Y + a.Z * b.Z; }
+FVector Cross(const FVector& a, const FVector& b) {
+    return FVector{a.Y * b.Z - a.Z * b.Y, a.Z * b.X - a.X * b.Z, a.X * b.Y - a.Y * b.X};
+}
+FQuat Normalized(const FQuat& q) {
+    const double n = std::sqrt(q.X * q.X + q.Y * q.Y + q.Z * q.Z + q.W * q.W);
+    if (n < 1e-9) return FQuat{};
+    return FQuat{q.X / n, q.Y / n, q.Z / n, q.W / n};
+}
 
 // Rotation whose X/Y/Z axes are the given orthonormal vectors.
 FQuat FromAxes(const FVector& x, const FVector& y, const FVector& z) {
@@ -90,12 +101,119 @@ const char* HolsterName(HolsterId id) {
     }
 }
 
-FVector SpotWorld(const HolsterSpot& s, const FVector& anchor, const FQuat& body_rot) {
-    return anchor + body_rot.Rotate(s.offset);
+const char* AnchorName(HolsterAnchor a) {
+    switch (a) {
+        case HolsterAnchor::kBelt: return "belt";
+        case HolsterAnchor::kChest: return "chest";
+        case HolsterAnchor::kThighL: return "left_thigh";
+        case HolsterAnchor::kThighR: return "right_thigh";
+        default: return "belt";
+    }
 }
 
-FVector SpotOffset(const FVector& world, const FVector& anchor, const FQuat& body_rot) {
-    return body_rot.Inverse().Rotate(world - anchor);
+const char* AnchorPlace(HolsterAnchor a) {
+    switch (a) {
+        case HolsterAnchor::kChest: return "your chest";
+        case HolsterAnchor::kThighL: return "your left thigh";
+        case HolsterAnchor::kThighR: return "your right thigh";
+        default: return "your belt";
+    }
+}
+
+FQuat FrameFromUp(const FVector& up, const FVector& forward) {
+    const double ul = Len(up);
+    if (ul < 1e-6) return FQuat{};
+    const FVector z = up * (1.0 / ul);
+    FVector x = forward - z * Dot(forward, z);
+    if (Len(x) < 1e-3) {
+        // Forward along up: any perpendicular will do.
+        x = std::fabs(z.Z) < 0.9 ? FVector{0, 0, 1} : FVector{1, 0, 0};
+        x = x - z * Dot(x, z);
+    }
+    x = x * (1.0 / Len(x));
+    const FVector y = Cross(z, x);
+    return Normalized(FromAxes(x, y, z));
+}
+
+HolsterAnchor NearestAnchor(const FVector& hand, const FVector* anchor_locs, const bool* anchor_valid) {
+    HolsterAnchor best = HolsterAnchor::kBelt;
+    double best_d = 1e18;
+    for (int i = 0; i < static_cast<int>(HolsterAnchor::kCount); ++i) {
+        if (!anchor_valid[i]) continue;
+        const double d = Len(hand - anchor_locs[i]);
+        if (d < best_d - 1e-9) {
+            best_d = d;
+            best = static_cast<HolsterAnchor>(i);
+        }
+    }
+    return best;
+}
+
+HolsterSpot PlaceSpot(const HolsterSpot& base, HolsterAnchor anchor, const FVector& anchor_loc,
+                      const FQuat& anchor_rot, const FVector& hand, const FQuat* item_rot) {
+    HolsterSpot s = base;
+    s.anchor = anchor;
+    s.offset = SpotOffset(hand, anchor_loc, anchor_rot);
+    s.turned = item_rot != nullptr;
+    s.rot = item_rot ? Normalized(anchor_rot.Inverse() * *item_rot) : FQuat{};
+    return s;
+}
+
+std::string FormatSpotLine(HolsterId id, const HolsterSpot& s) {
+    char buf[256];
+    int n = std::snprintf(buf, sizeof(buf), "%s=%s %.1f %.1f %.1f", HolsterName(id), AnchorName(s.anchor),
+                          s.offset.X, s.offset.Y, s.offset.Z);
+    if (s.turned && n > 0 && n < static_cast<int>(sizeof(buf)))
+        std::snprintf(buf + n, sizeof(buf) - n, " rot %.5f %.5f %.5f %.5f", s.rot.X, s.rot.Y, s.rot.Z, s.rot.W);
+    return buf;
+}
+
+bool ParseSpotLine(const char* line, HolsterId id, HolsterSpot* s) {
+    if (!line || line[0] == ';') return false;
+    const char* name = HolsterName(id);
+    const size_t nl = std::strlen(name);
+    if (std::strncmp(line, name, nl) != 0 || line[nl] != '=') return false;
+    const char* p = line + nl + 1;
+    HolsterSpot out = *s;
+    double x, y, z;
+    // Old form: three numbers from the belt, built-in hanging.
+    if (std::sscanf(p, "%lf %lf %lf", &x, &y, &z) == 3) {
+        out.anchor = HolsterAnchor::kBelt;
+        out.offset = FVector{x, y, z};
+        out.turned = false;
+        out.rot = FQuat{};
+        *s = out;
+        return true;
+    }
+    char anchor[32] = {};
+    int used = 0;
+    if (std::sscanf(p, "%31[a-z_] %lf %lf %lf%n", anchor, &x, &y, &z, &used) != 4) return false;
+    bool known = false;
+    for (int i = 0; i < static_cast<int>(HolsterAnchor::kCount); ++i) {
+        if (std::strcmp(anchor, AnchorName(static_cast<HolsterAnchor>(i))) == 0) {
+            out.anchor = static_cast<HolsterAnchor>(i);
+            known = true;
+        }
+    }
+    if (!known) return false;
+    out.offset = FVector{x, y, z};
+    out.turned = false;
+    out.rot = FQuat{};
+    FQuat q;
+    if (std::sscanf(p + used, " rot %lf %lf %lf %lf", &q.X, &q.Y, &q.Z, &q.W) == 4) {
+        out.turned = true;
+        out.rot = Normalized(q);
+    }
+    *s = out;
+    return true;
+}
+
+FVector SpotWorld(const HolsterSpot& s, const FVector& anchor, const FQuat& anchor_rot) {
+    return anchor + anchor_rot.Rotate(s.offset);
+}
+
+FVector SpotOffset(const FVector& world, const FVector& anchor, const FQuat& anchor_rot) {
+    return anchor_rot.Inverse().Rotate(world - anchor);
 }
 
 FQuat PistolHolsterFrame(const FQuat& body_rot, double cant_deg) {

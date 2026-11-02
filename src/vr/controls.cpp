@@ -151,7 +151,8 @@ void LoadSettings() {
 
 // ---- holster spots ----
 // Offsets from the belt come from hole-vr.ini (holster_<name>_forward_cm ...),
-// and spots moved in the headset are saved to hole-vr/holsters.ini, which wins.
+// and spots placed in the headset (on any body part, at any angle) are saved
+// to hole-vr/holsters.ini, which wins.
 using interact::HolsterId;
 constexpr int kPistolSpot = static_cast<int>(HolsterId::kPistol);
 constexpr int kMagSpot = static_cast<int>(HolsterId::kMag);
@@ -174,14 +175,14 @@ void LoadHolsterSpots() {
     if (FILE* f = _wfopen(HolsterFile().c_str(), L"r")) {
         char line[256];
         while (fgets(line, sizeof(line), f)) {
-            char name[64] = {};
-            double x, y, z;
-            if (line[0] == ';' || std::sscanf(line, "%63[a-z_]=%lf %lf %lf", name, &x, &y, &z) != 4) continue;
             for (int i = 0; i < static_cast<int>(HolsterId::kCount); ++i) {
-                if (std::strcmp(name, interact::HolsterName(static_cast<HolsterId>(i))) != 0) continue;
-                g_spots[i].offset = FVector{x, y, z};
+                if (!interact::ParseSpotLine(line, static_cast<HolsterId>(i), &g_spots[i])) continue;
                 g_spot_moved[i] = true;
-                log::Info("holster: %s spot from holsters.ini (%.1f %.1f %.1f) cm from the belt", name, x, y, z);
+                const interact::HolsterSpot& sp = g_spots[i];
+                log::Info("holster: %s spot from holsters.ini: on %s, (%.1f %.1f %.1f) cm, %s",
+                          interact::HolsterName(static_cast<HolsterId>(i)), interact::AnchorPlace(sp.anchor),
+                          sp.offset.X, sp.offset.Y, sp.offset.Z,
+                          sp.turned ? "at the angle it was placed" : "hanging the built-in way");
             }
         }
         fclose(f);
@@ -191,12 +192,13 @@ void LoadHolsterSpots() {
 bool SaveHolsterSpots() {
     FILE* f = _wfopen(HolsterFile().c_str(), L"w");
     if (!f) return false;
-    std::fputs("; Holster spots moved in the headset: forward, right, up (cm) from the belt.\n"
+    std::fputs("; Holsters placed in the headset: the body part each rides on (belt, chest,\n"
+               "; left_thigh, right_thigh), where the hand grabs in cm (forward, right, up in\n"
+               "; that part's frame), and how the item is turned there.\n"
                "; Delete a line (or this file) to go back to the holster_* values in hole-vr.ini.\n", f);
     for (int i = 0; i < static_cast<int>(HolsterId::kCount); ++i) {
         if (!g_spot_moved[i]) continue;
-        std::fprintf(f, "%s=%.1f %.1f %.1f\n", interact::HolsterName(static_cast<HolsterId>(i)), g_spots[i].offset.X,
-                     g_spots[i].offset.Y, g_spots[i].offset.Z);
+        std::fprintf(f, "%s\n", interact::FormatSpotLine(static_cast<HolsterId>(i), g_spots[i]).c_str());
     }
     fclose(f);
     return true;
@@ -204,14 +206,20 @@ bool SaveHolsterSpots() {
 
 // Where the holsters are this frame, in the world. Worked out by the late
 // tick (after the VR body is posed), so the controls tick sees last frame's.
+constexpr int kAnchors = static_cast<int>(interact::HolsterAnchor::kCount);
+static_assert(kAnchors == static_cast<int>(body::Anchor::kCount), "body anchors match holster anchors");
 struct HolsterWorld {
     bool valid = false;
-    bool on_body = false;   // from the VR body's belt; false: from the headset (body off)
+    bool on_body = false;   // from the VR body; false: from the headset (body off)
     FVector belt;
     FQuat body_rot;         // yaw only
-    FVector spot[2];        // pistol, magazine
+    hands::Pose anchor[kAnchors];  // belt, chest, left thigh, right thigh (interact::HolsterAnchor)
+    FVector spot[2];        // pistol, magazine: where the hand grabs
+    FQuat spot_anchor_rot[2];
     int logged_mode = -1;
 } g_hw;
+
+const hands::Pose& SpotAnchor(int spot) { return g_hw.anchor[static_cast<int>(g_spots[spot].anchor)]; }
 
 // ---- shared hand state for other systems ----
 std::mutex g_hands_mutex;
@@ -378,6 +386,7 @@ struct WeaponState {
     bool mag_seating = false;
     double seat_from = 0, seat_t0 = 0;
     FVector mag_shown;            // where the held mag is drawn
+    FQuat mag_shown_rot;          // and how it is turned
     bool seat_learned = false;
     FVector seat_offset;          // inserted mag origin minus MagazinePoint, actor space
     FQuat seat_rot;               // inserted mag rotation, actor space
@@ -1114,6 +1123,13 @@ FQuat MagPouchRotation(UObject g) {
     return g_hw.body_rot;
 }
 
+// How the pouch magazine sits: as it was held when the pouch was placed in
+// the headset, otherwise upright (MagPouchRotation).
+FQuat PouchRotation(UObject g) {
+    if (g_spots[kMagSpot].turned) return g_hw.spot_anchor_rot[1] * g_spots[kMagSpot].rot;
+    return MagPouchRotation(g);
+}
+
 void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState& lh, const input::HandInput& lin,
                       const input::HandInput& rin) {
     // Right A / primary: magazine release.
@@ -1153,14 +1169,15 @@ void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState& lh
     }
     if (!lh.valid) return;
 
-    // A spare magazine always sits in its holster (the pouch) on the left
-    // hip of the VR body. The late tick places it there each frame
-    // (PlacePouchMag); here the left hand takes it out or puts it back.
+    // A spare magazine always sits in its holster (the pouch), on the left
+    // hip of the VR body unless placed somewhere else. The late tick places
+    // it there each frame (PlacePouchMag); here the left hand takes it out
+    // or puts it back.
     const bool have_pouch = g_hw.valid;
     const FVector pouch_loc = g_hw.spot[kMagSpot];
     const double pouch_radius = g_spots[kMagSpot].radius;
     if (!W.pouch_mag && !W.held_mag && g_clock >= W.refill_pouch_at && have_pouch)
-        RefillPouch(gun, player, pouch_loc, MagPouchRotation(gun.Object()));
+        RefillPouch(gun, player, pouch_loc, PouchRotation(gun.Object()));
     const double pouch_dist = Len(lh.grip.location - pouch_loc);
     if (W.mag_zone.Update(pouch_dist, pouch_radius, have_pouch && W.pouch_mag && !W.held_mag && !W.slide.Held()))
         input::Haptic(input::kLeft, 0.15f, 0.015f);  // hand at the pouch
@@ -1238,6 +1255,7 @@ void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState& lh
             show_rot = seat_rot;
             SetActorTransform(W.held_mag, show_loc, show_rot);
             W.mag_shown = show_loc;
+            W.mag_shown_rot = show_rot;
             if (t < 1.0) return;
             W.mag_seating = false;
             W.mag_engaged = false;
@@ -1306,6 +1324,7 @@ void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState& lh
     }
     SetActorTransform(W.held_mag, show_loc, show_rot);
     W.mag_shown = show_loc;
+    W.mag_shown_rot = show_rot;
 
     // Let go of the grab: at the pouch it goes back in, anywhere else it drops.
     if (lin.grip_button.released) {
@@ -1700,43 +1719,60 @@ void LogShot(UObject player, game::Gun& gun) {
 }
 
 // ---- holsters ----
-// Where the holsters are, from the VR body's belt (this frame's pose: called
-// from the late tick, after the body), or from the headset when the body is
-// off (F9).
+// Where the holsters are: each rides on a part of the VR body (belt, chest,
+// a thigh; this frame's pose: called from the late tick, after the body), or
+// hangs from the headset when the body is off (F9).
 void ComputeHolsterWorld() {
     g_hw.valid = false;
-    hands::Pose belt;
-    if (body::GetAnchor(body::Anchor::kBelt, &belt)) {
+    hands::Pose a[kAnchors];
+    bool got = true;
+    for (int i = 0; i < kAnchors && got; ++i) got = body::GetAnchor(static_cast<body::Anchor>(i), &a[i]);
+    if (got) {
         g_hw.on_body = true;
-        g_hw.belt = belt.location;
-        g_hw.body_rot = belt.rotation;
     } else {
         hands::Pose head;
         if (!hands::Head(&head)) return;
         g_hw.on_body = false;
-        g_hw.body_rot = ToQuat(FRotator{0, YawOf(head.rotation), 0});
-        // The belt sits under the spine, a little behind the eyes.
-        g_hw.belt = head.location + g_hw.body_rot.Rotate(FVector{-8, 0, 0}) - FVector{0, 0, g_set.belt_below_head};
+        const FQuat yaw = ToQuat(FRotator{0, YawOf(head.rotation), 0});
+        // The belt sits under the spine, a little behind the eyes; the rest
+        // hang from it.
+        const FVector belt =
+            head.location + yaw.Rotate(FVector{-8, 0, 0}) - FVector{0, 0, g_set.belt_below_head};
+        a[0] = {belt, yaw};
+        a[1] = {belt + FVector{0, 0, 40}, yaw};
+        a[2] = {belt + yaw.Rotate(FVector{0, -10, -22}), yaw};
+        a[3] = {belt + yaw.Rotate(FVector{0, 10, -22}), yaw};
     }
-    g_hw.spot[0] = interact::SpotWorld(g_spots[kPistolSpot], g_hw.belt, g_hw.body_rot);
-    g_hw.spot[1] = interact::SpotWorld(g_spots[kMagSpot], g_hw.belt, g_hw.body_rot);
+    for (int i = 0; i < kAnchors; ++i) g_hw.anchor[i] = a[i];
+    g_hw.belt = a[0].location;
+    g_hw.body_rot = a[0].rotation;
+    for (int i = 0; i < 2; ++i) {
+        const hands::Pose& an = SpotAnchor(i);
+        g_hw.spot[i] = interact::SpotWorld(g_spots[i], an.location, an.rotation);
+        g_hw.spot_anchor_rot[i] = an.rotation;
+    }
     g_hw.valid = true;
     const int mode = g_hw.on_body ? 1 : 0;
     if (mode != g_hw.logged_mode) {
         g_hw.logged_mode = mode;
         hands::Pose head;
-        const double below = hands::Head(&head) ? head.location.Z - g_hw.belt.Z : 0.0;
-        const FVector& p = g_spots[kPistolSpot].offset;
-        const FVector& m = g_spots[kMagSpot].offset;
-        log::Info("holster: belt from %s, %.0f cm below the headset; pistol spot (%.1f %.1f %.1f), magazine spot "
-                  "(%.1f %.1f %.1f) cm from it (forward, right, up)",
-                  g_hw.on_body ? "the VR body's pelvis" : "the headset (VR body off)", below, p.X, p.Y, p.Z, m.X,
-                  m.Y, m.Z);
+        const bool hv = hands::Head(&head);
+        auto below = [&](int i) { return hv ? head.location.Z - a[i].location.Z : 0.0; };
+        log::Info("holster: body parts from %s: belt %.0f cm below the headset, chest %.0f, thighs %.0f and %.0f",
+                  g_hw.on_body ? "the VR body" : "the headset (VR body off)", below(0), below(1), below(2),
+                  below(3));
+        for (int i = 0; i < 2; ++i) {
+            const interact::HolsterSpot& sp = g_spots[i];
+            log::Info("holster: %s spot on %s, (%.1f %.1f %.1f) cm, %s", i == 0 ? "pistol" : "magazine",
+                      interact::AnchorPlace(sp.anchor), sp.offset.X, sp.offset.Y, sp.offset.Z,
+                      sp.turned ? "at the angle it was placed" : "hanging the built-in way");
+        }
     }
 }
 
-// The pistol in its holster on the right hip: muzzle down, grip up and back,
-// its right side facing out (interact::PistolHolsterFrame). Placed exactly as
+// The pistol in its holster: as it was held when the holster was placed in
+// the headset, otherwise the built-in hip hanging (muzzle down, grip up and
+// back, right side out: interact::PistolHolsterFrame). Placed exactly as
 // HoldGun would place it for a hand at the holster spot, so drawing it moves
 // the gun as little as possible. Flies or slides in from where it was let go.
 void PlaceGunInHolster(game::Gun& gun) {
@@ -1750,7 +1786,9 @@ void PlaceGunInHolster(game::Gun& gun) {
     const UETransform main_world = ComponentToWorld(main);
     const FVector rel = actor_rot.Inverse().Rotate(main_world.translation - actor_loc);
     if (!W.have_frame) LearnGunFrame(g, actor_loc, actor_rot, main_world.translation);
-    const FQuat frame = interact::PistolHolsterFrame(g_hw.body_rot, g_set.holster_cant);
+    const interact::HolsterSpot& sp = g_spots[kPistolSpot];
+    const FQuat frame = sp.turned ? g_hw.spot_anchor_rot[0] * sp.rot
+                                  : interact::PistolHolsterFrame(g_hw.spot_anchor_rot[0], g_set.holster_cant);
     const FVector grip_w = g_hw.spot[0] + frame.Rotate(GunGripOffset());
     FQuat rot = W.have_frame ? frame * W.gun_frame.Inverse() : frame;
     FVector loc = grip_w - rot.Rotate(rel);
@@ -1763,12 +1801,12 @@ void PlaceGunInHolster(game::Gun& gun) {
     SetActorTransform(g, loc, rot);
 }
 
-// The spare magazine sitting in its pouch on the left hip.
+// The spare magazine sitting in its pouch.
 void PlacePouchMag(UObject gun) {
     if (!W.pouch_mag) return;
     DetachIfAttached(W.pouch_mag);
     { ue::Call v(W.pouch_mag, "SetVisibility"); v.Set("IsVisible", true); v.Invoke(); }
-    SetActorTransform(W.pouch_mag, g_hw.spot[1], MagPouchRotation(gun));
+    SetActorTransform(W.pouch_mag, g_hw.spot[1], PouchRotation(gun));
 }
 
 void ReleaseTrigger(UObject player) {
@@ -1828,12 +1866,33 @@ void UpdatePistolHolster(UObject player, const hands::HandState& rh, const input
 }
 
 // Right stick click held 2 s: each holster moves to where the hand holding
-// its item is now (pistol in the right hand, magazine in the left), and is
-// saved to hole-vr/holsters.ini. Needs the VR body, since the spots ride on it.
+// its item is now (pistol in the right hand, magazine in the left), anywhere
+// on the body, and keeps the item at the angle it is held. It rides on the
+// nearest body part (belt, chest, a thigh) and is saved to
+// hole-vr/holsters.ini. Needs the VR body, since the spots ride on it.
 struct HolsterCalState {
     double down_at = -1;
     bool done = false;
 } g_cal;
+
+// Moves holster `spot` to the hand at `hand`, holding its item turned `item_rot`.
+void PlaceHolsterAt(int spot, const FVector& hand, const FQuat* item_rot) {
+    FVector locs[kAnchors];
+    bool valid[kAnchors];
+    for (int i = 0; i < kAnchors; ++i) {
+        locs[i] = g_hw.anchor[i].location;
+        valid[i] = true;
+    }
+    const interact::HolsterAnchor a = interact::NearestAnchor(hand, locs, valid);
+    const hands::Pose& an = g_hw.anchor[static_cast<int>(a)];
+    g_spots[spot] = interact::PlaceSpot(g_spots[spot], a, an.location, an.rotation, hand, item_rot);
+    g_spot_moved[spot] = true;
+    const interact::HolsterSpot& sp = g_spots[spot];
+    log::Info("holster: moved the %s to %s, (%.1f %.1f %.1f) cm (forward, right, up), %.0f cm from its centre, %s",
+              spot == kPistolSpot ? "pistol holster" : "magazine pouch", interact::AnchorPlace(a), sp.offset.X,
+              sp.offset.Y, sp.offset.Z, Len(hand - an.location),
+              sp.turned ? "at the angle you held it" : "hanging the built-in way (angle not known)");
+}
 
 void HolsterCalibration(const input::HandInput& rin, const hands::HandState& rh, const hands::HandState& lh) {
     if (rin.stick_click.pressed) {
@@ -1851,14 +1910,12 @@ void HolsterCalibration(const input::HandInput& rin, const hands::HandState& rh,
     }
     int moved = 0;
     if (W.uses_holster && W.in_hand && rh.valid) {
-        g_spots[kPistolSpot].offset = interact::SpotOffset(rh.grip.location, g_hw.belt, g_hw.body_rot);
-        g_spot_moved[kPistolSpot] = true;
+        PlaceHolsterAt(kPistolSpot, rh.grip.location, W.have_pose ? &W.frame_rot : nullptr);
         input::Haptic(input::kRight, 0.8f, 0.1f);
         ++moved;
     }
-    if (W.held_mag && lh.valid) {
-        g_spots[kMagSpot].offset = interact::SpotOffset(lh.grip.location, g_hw.belt, g_hw.body_rot);
-        g_spot_moved[kMagSpot] = true;
+    if (W.held_mag && lh.valid && !W.mag_engaged && !W.mag_seating) {
+        PlaceHolsterAt(kMagSpot, lh.grip.location, &W.mag_shown_rot);
         input::Haptic(input::kLeft, 0.8f, 0.1f);
         ++moved;
     }
@@ -1867,12 +1924,8 @@ void HolsterCalibration(const input::HandInput& rin, const hands::HandState& rh,
                   "right stick click 2 s");
         return;
     }
-    const FVector& p = g_spots[kPistolSpot].offset;
-    const FVector& m = g_spots[kMagSpot].offset;
     const bool saved = SaveHolsterSpots();
-    log::Info("holster: moved; pistol spot (%.1f %.1f %.1f), magazine spot (%.1f %.1f %.1f) cm from the belt "
-              "(forward, right, up), %s",
-              p.X, p.Y, p.Z, m.X, m.Y, m.Z, saved ? "saved to holsters.ini" : "NOT saved (holsters.ini not writable)");
+    log::Info("holster: %s", saved ? "saved to holsters.ini" : "NOT saved (holsters.ini not writable)");
     g_hw.logged_mode = -1;
 }
 
@@ -1922,7 +1975,9 @@ void OnTick(UObject player, float dt) {
             W.holster.Reset(interact::HolsterState::kHolstered);
             W.in_hand = !W.uses_holster;
             log::Info("controls: holding %s (%s)", gun.ClassName().c_str(), W.is_pistol ? "pistol" : "rifle");
-            if (W.uses_holster) log::Info("holster: the pistol starts in its holster on the right hip");
+            if (W.uses_holster)
+                log::Info("holster: the pistol starts in its holster (on %s)",
+                          interact::AnchorPlace(g_spots[kPistolSpot].anchor));
         }
     }
     if (!gun.Valid()) {
@@ -2052,10 +2107,11 @@ void Init() {
 
 void InitLate() {
     game::AddTickListener(&OnLateTick);
-    log::Info("controls: holsters ready (pistol %s, %s; magazine pouch on the left hip; hold the right stick click "
-              "2 s to move them)",
-              g_set.holster_pistol ? "on the right hip" : "always in the hand",
-              g_set.holster_toggle ? "squeeze to draw, squeeze at the hip to holster" : "hold the right grip to hold it");
+    log::Info("controls: holsters ready (pistol %s, %s; magazine pouch; to move one anywhere on the body, hold its "
+              "item there at the angle you want and hold the right stick click 2 s)",
+              g_set.holster_pistol ? "in a holster" : "always in the hand",
+              g_set.holster_toggle ? "squeeze to draw, squeeze at the holster to put it away"
+                                   : "hold the right grip to hold it");
 }
 
 }  // namespace holevr::vr::controls

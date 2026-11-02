@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdio>
 #include <initializer_list>
+#include <string>
 
 #include "vr/interact/holster.h"
 
@@ -42,6 +43,111 @@ static void TestSpots() {
     FVector hand{90, 230, 80};
     s.offset = SpotOffset(hand, belt, body);
     EXPECT(Near(SpotWorld(s, belt, body), hand));
+}
+
+static bool NearQ(const FQuat& a, const FQuat& b, double tol = 1e-6) {
+    // Same rotation (q and -q are the same).
+    const double d = a.X * b.X + a.Y * b.Y + a.Z * b.Z + a.W * b.W;
+    return std::fabs(std::fabs(d) - 1.0) < tol;
+}
+
+static void TestFrameFromUp() {
+    // Upright: the body's own yaw frame.
+    FQuat f = FrameFromUp(FVector{0, 0, 30}, FVector{1, 0, 0});
+    EXPECT(Near(f.Rotate(FVector{1, 0, 0}), FVector{1, 0, 0}, 1e-9));
+    EXPECT(Near(f.Rotate(FVector{0, 1, 0}), FVector{0, 1, 0}, 1e-9));
+    EXPECT(Near(f.Rotate(FVector{0, 0, 1}), FVector{0, 0, 1}, 1e-9));
+    // Leaning forward 30 degrees: Z up the spine, X still toward the front.
+    const double c = std::cos(30 * kDegToRad), s = std::sin(30 * kDegToRad);
+    f = FrameFromUp(FVector{s, 0, c}, FVector{1, 0, 0});
+    EXPECT(Near(f.Rotate(FVector{0, 0, 1}), FVector{s, 0, c}, 1e-9));
+    EXPECT(Near(f.Rotate(FVector{1, 0, 0}), FVector{c, 0, -s}, 1e-9));
+    EXPECT(Near(f.Rotate(FVector{0, 1, 0}), FVector{0, 1, 0}, 1e-9));
+    // Forward along up (degenerate): still a proper rotation with Z up.
+    f = FrameFromUp(FVector{0, 0, 1}, FVector{0, 0, 1});
+    EXPECT(Near(f.Rotate(FVector{0, 0, 1}), FVector{0, 0, 1}, 1e-9));
+    EXPECT(std::fabs(f.X * f.X + f.Y * f.Y + f.Z * f.Z + f.W * f.W - 1.0) < 1e-9);
+}
+
+// A standing body facing +X: belt at the pelvis, chest at the top of the
+// spine, mid-thighs.
+static const FVector kAnchorLocs[4] = {{0, 0, 100}, {0, 0, 145}, {0, -10, 74}, {0, 10, 74}};
+
+static void TestNearestAnchor() {
+    bool all[4] = {true, true, true, true};
+    // Right hip holster: the belt, not the right thigh.
+    EXPECT(NearestAnchor(FVector{0, 21, 100}, kAnchorLocs, all) == HolsterAnchor::kBelt);
+    // The owner's raised hip spots: belt-ish heights stay on the belt or chest.
+    HolsterAnchor a = NearestAnchor(FVector{4.9, 32.3, 118.2}, kAnchorLocs, all);
+    EXPECT(a == HolsterAnchor::kBelt);
+    // Drop-leg holster on the right thigh.
+    EXPECT(NearestAnchor(FVector{2, 18, 76}, kAnchorLocs, all) == HolsterAnchor::kThighR);
+    EXPECT(NearestAnchor(FVector{2, -18, 76}, kAnchorLocs, all) == HolsterAnchor::kThighL);
+    // Chest rig and left armpit (shoulder holster): the chest.
+    EXPECT(NearestAnchor(FVector{15, 0, 135}, kAnchorLocs, all) == HolsterAnchor::kChest);
+    EXPECT(NearestAnchor(FVector{0, -18, 128}, kAnchorLocs, all) == HolsterAnchor::kChest);
+    // An anchor that isn't there is skipped; a tie goes to the belt.
+    bool no_chest[4] = {true, false, true, true};
+    EXPECT(NearestAnchor(FVector{15, 0, 135}, kAnchorLocs, no_chest) == HolsterAnchor::kBelt);
+    const FVector mid = (kAnchorLocs[0] + kAnchorLocs[1]) * 0.5;
+    EXPECT(NearestAnchor(mid, kAnchorLocs, all) == HolsterAnchor::kBelt);
+}
+
+static void TestPlaceSpot() {
+    // Chest leaning 20 degrees forward, body turned 90 degrees.
+    const FQuat body = Yaw(90);
+    const FQuat chest_rot = body * ToQuat(FRotator{-20, 0, 0});
+    const FVector chest{50, 60, 140};
+    // A pistol held sideways under the left armpit, muzzle pointing back.
+    const FVector hand{45, 40, 125};
+    const FQuat gun = body * ToQuat(FRotator{0, 180, 90});
+    HolsterSpot base = DefaultSpot(HolsterId::kPistol);
+    HolsterSpot s = PlaceSpot(base, HolsterAnchor::kChest, chest, chest_rot, hand, &gun);
+    EXPECT(s.anchor == HolsterAnchor::kChest && s.turned);
+    EXPECT(s.radius == base.radius && s.hand == base.hand);
+    // Same body pose: exactly where and how it was held.
+    EXPECT(Near(SpotWorld(s, chest, chest_rot), hand, 1e-9));
+    EXPECT(NearQ(chest_rot * s.rot, gun));
+    // The torso moves and turns: the holster and the gun move with it.
+    const FQuat chest2 = Yaw(30) * ToQuat(FRotator{-5, 0, 10});
+    const FVector loc2{-20, 5, 130};
+    const FQuat moved = chest2 * chest_rot.Inverse();
+    EXPECT(Near(SpotWorld(s, loc2, chest2), loc2 + moved.Rotate(hand - chest), 1e-9));
+    EXPECT(NearQ(chest2 * s.rot, moved * gun));
+    // Angle not known: built-in hanging.
+    HolsterSpot n = PlaceSpot(base, HolsterAnchor::kBelt, FVector{0, 0, 100}, Yaw(0), FVector{0, 20, 100}, nullptr);
+    EXPECT(!n.turned && Near(n.offset, FVector{0, 20, 0}, 1e-9));
+}
+
+static void TestSpotLine() {
+    HolsterSpot s = DefaultSpot(HolsterId::kMag);
+    s.anchor = HolsterAnchor::kThighL;
+    s.offset = FVector{3.5, -12.25, -4.0};
+    s.turned = true;
+    s.rot = ToQuat(FRotator{10, -70, 25});
+    const std::string line = FormatSpotLine(HolsterId::kMag, s);
+    EXPECT(line.rfind("mag=left_thigh 3.5 -12.2", 0) == 0 || line.rfind("mag=left_thigh 3.5 -12.3", 0) == 0);
+    HolsterSpot back = DefaultSpot(HolsterId::kMag);
+    EXPECT(ParseSpotLine((line + "\n").c_str(), HolsterId::kMag, &back));
+    EXPECT(back.anchor == HolsterAnchor::kThighL && back.turned);
+    EXPECT(Near(back.offset, s.offset, 0.06));
+    EXPECT(NearQ(back.rot, s.rot, 1e-8));
+    EXPECT(back.radius == s.radius && back.hand == 0);
+    // Another holster's line, a comment, an unknown body part: untouched.
+    HolsterSpot p = DefaultSpot(HolsterId::kPistol);
+    EXPECT(!ParseSpotLine(line.c_str(), HolsterId::kPistol, &p));
+    EXPECT(!ParseSpotLine("; pistol=belt 1 2 3", HolsterId::kPistol, &p));
+    EXPECT(!ParseSpotLine("pistol=elbow 1 2 3", HolsterId::kPistol, &p));
+    EXPECT(!ParseSpotLine("pistol_x=belt 1 2 3", HolsterId::kPistol, &p));
+    EXPECT(Near(p.offset, DefaultSpot(HolsterId::kPistol).offset));
+    // The old three-number form (from the belt, built-in hanging) still loads.
+    EXPECT(ParseSpotLine("pistol=4.9 32.3 18.2\n", HolsterId::kPistol, &p));
+    EXPECT(p.anchor == HolsterAnchor::kBelt && !p.turned && Near(p.offset, FVector{4.9, 32.3, 18.2}, 1e-9));
+    // New form without a rotation.
+    EXPECT(ParseSpotLine("pistol=chest 1 2 3", HolsterId::kPistol, &p));
+    EXPECT(p.anchor == HolsterAnchor::kChest && !p.turned);
+    // A placed spot without rotation writes no "rot".
+    EXPECT(FormatSpotLine(HolsterId::kPistol, p).find("rot") == std::string::npos);
 }
 
 static void TestPistolFrame() {
@@ -210,6 +316,10 @@ static void TestZone() {
 
 int main() {
     TestSpots();
+    TestFrameFromUp();
+    TestNearestAnchor();
+    TestPlaceSpot();
+    TestSpotLine();
     TestPistolFrame();
     TestMagFrame();
     TestHoldMode();
