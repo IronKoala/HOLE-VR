@@ -15,9 +15,11 @@ Agreed with the project owner (Mtthew), who directs features and playtests.
 1. **Foundation** (in progress): loader DLL, engine discovery, class dump,
    logging, settings file. Next in this step: hook `UObject::ProcessEvent` and
    the game's tick so later steps can run code every frame.
-2. **Into the headset**: OpenXR session on SteamVR, enable UE's stereo rendering
+2. **Into the headset** (in progress): OpenXR session on SteamVR, enable UE's stereo rendering
    path and feed it headset poses, submit D3D12 eye textures. Correct world scale.
-   First playtest milestone.
+   First playtest milestone. Known v1 limits: the pose submitted to the
+   headset is the latest one the game rendered with (no per-frame history
+   yet), and the game's mouse pitch is ignored while the headset is on.
 3. **Native controls**: tracked hands drive aiming directly, smooth or snap
    turning, movement relative to head or controller. Then physical weapon
    handling and full-body IK (see below).

@@ -12,10 +12,13 @@
 #include "ue/names.h"
 #include "ue/objects.h"
 #include "ue/reflection.h"
+#include "vr/dxgi_hooks.h"
+#include "vr/openxr.h"
+#include "vr/stereo.h"
 
 namespace {
 
-constexpr const char* kVersion = "0.1.0-foundation";
+constexpr const char* kVersion = "0.2.0-stereo";
 HMODULE g_self = nullptr;
 
 std::wstring ModuleDir(HMODULE m) {
@@ -53,13 +56,30 @@ bool WaitFor(const char* what, bool (*fn)(), int timeout_ms) {
     return false;
 }
 
+std::wstring g_mod_dir;
+
+// Starts OpenXR and takes over the engine's stereo device. Waits quietly for
+// SteamVR/the headset if they are not running yet.
+void StartVr() {
+    using namespace holevr;
+    bool told = false;
+    while (!vr::xr::InitInstance()) {
+        if (!told) log::Info("Waiting for SteamVR and the headset...");
+        told = true;
+        Sleep(2000);
+    }
+    for (int tries = 0; !vr::stereo::Install(); ++tries) {
+        if (tries == 120) {
+            log::Error("Gave up hooking the stereo device");
+            return;
+        }
+        Sleep(500);
+    }
+}
+
 DWORD WINAPI InitThread(LPVOID) {
     using namespace holevr;
-    std::wstring mod_dir = ModuleDir(g_self) + L"\\hole-vr";
-    CreateDirectoryW(mod_dir.c_str(), nullptr);
-    log::Init(mod_dir);
-    log::Info("HOLE VR %s starting", kVersion);
-    config::Load(mod_dir);
+    const std::wstring& mod_dir = g_mod_dir;
     log::Info("Game module at %p, size 0x%zx, engine build %s",
               reinterpret_cast<void*>(mem::Game().base), mem::Game().size,
               EngineBuildString().c_str());
@@ -73,18 +93,26 @@ DWORD WINAPI InitThread(LPVOID) {
     if (config::GetBool("dump_on_start", true)) ue::dumper::DumpAll(mod_dir);
     log::Info("Press Ctrl+F9 in game to write a fresh dump (after loading a level, "
               "so weapon and player classes are included)");
+    if (config::GetBool("vr_enabled", true)) {
+        if (HANDLE t = CreateThread(nullptr, 0, [](LPVOID) -> DWORD { StartVr(); return 0; }, nullptr, 0, nullptr))
+            CloseHandle(t);
+    }
 
     // Development hotkeys. Polled rather than hooked so nothing here can
     // interfere with the game's own input.
-    bool was_down = false;
+    bool dump_was_down = false, recenter_was_down = false;
     for (;;) {
-        bool down = (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_F9) & 0x8000);
-        if (down && !was_down) {
+        bool ctrl = GetAsyncKeyState(VK_CONTROL) & 0x8000;
+        bool dump = ctrl && (GetAsyncKeyState(VK_F9) & 0x8000);
+        bool recenter = ctrl && (GetAsyncKeyState(VK_F8) & 0x8000);
+        if (dump && !dump_was_down) {
             log::Info("Ctrl+F9: dumping (%d live objects)", ue::objects::Count());
             ue::dumper::DumpAll(mod_dir);
         }
-        was_down = down;
-        Sleep(100);
+        if (recenter && !recenter_was_down) vr::stereo::Recenter();
+        dump_was_down = dump;
+        recenter_was_down = recenter;
+        Sleep(50);
     }
 }
 
@@ -109,6 +137,15 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
         // Only start the mod inside the game itself, never in crash reporters
         // or other tools that happen to load this dxgi.dll.
         if (IsTheGame()) {
+            // Logging, settings and the command-line hook must be ready
+            // before the engine's own startup code runs.
+            g_mod_dir = ModuleDir(inst) + L"\\hole-vr";
+            CreateDirectoryW(g_mod_dir.c_str(), nullptr);
+            holevr::log::Init(g_mod_dir);
+            holevr::log::Info("HOLE VR %s starting", kVersion);
+            holevr::config::Load(g_mod_dir);
+            holevr::proxy::SetFactoryCallback(&holevr::vr::dxgi_hooks::OnFactoryCreated);
+            holevr::vr::stereo::InstallCommandLineHook();
             if (HANDLE t = CreateThread(nullptr, 0, InitThread, nullptr, 0, nullptr)) CloseHandle(t);
         }
     }
