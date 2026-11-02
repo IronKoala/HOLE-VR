@@ -70,9 +70,10 @@ states from trigger touch and the analog trigger.
 - Slide: three holds, like Half-Life: Alyx, each posed and saved on its
   own (`<Class>.slide-over|rear|front.ini`). The hold is picked once, when
   the hand closes on the slide: fist over the FRONT half of the slide
-  (measured from the slide part's mesh) = **front**; on the rear half,
-  palm facing down onto it = **rear overhand**, palm facing the muzzle
-  (being behind the slide counts extra) = **rear pinch**. To pose one, grab
+  (measured from the slide part's mesh) = **front**; more than 7 cm behind
+  the slide's grab point, i.e. behind the slide (`hand_slide_pinch_behind_cm`)
+  = **rear pinch**; else **rear overhand**. A hold not posed yet keeps the
+  hand where the controller grabbed, carried along with the slide. To pose one, grab
   the slide that way, then open the editor (hold left Y 1 s). A hold not
   posed yet uses an old `<Class>.slide.ini` if there is one. The log line
   `slide grab: <hold> hold` shows which was picked and the slide's span.
