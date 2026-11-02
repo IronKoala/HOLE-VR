@@ -46,6 +46,15 @@ const Block kBlocks[] = {
      "\n"
      "; 1 = seated tracking space instead of standing/room scale.\n"
      "seated_space=0\n"},
+    {"start_steamvr",
+     "\n"
+     "; --- Launching straight into VR ---\n"
+     "; 1 = start SteamVR when the game starts and it isn't running yet, so the\n"
+     "; headset connects by itself. 0 = start SteamVR yourself first.\n"
+     "start_steamvr=1\n"
+     "; 1 = press START on the title screen for you once the headset shows the\n"
+     "; game, so you land straight in the level. 0 = leave the title screen alone.\n"
+     "title_auto_start=1\n"},
     {"vr_render_fixes",
      "\n"
      "; --- Effects that break in VR (1 = turn the effect off, 0 = leave it) ---\n"
