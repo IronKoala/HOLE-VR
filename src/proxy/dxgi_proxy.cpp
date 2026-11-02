@@ -51,13 +51,59 @@ void* holevr_dxgi_real[kExportCount] = {};
 }
 
 // Each stub is a bare tail jump through the table, so arguments and return
-// values pass through untouched whatever the real signature is.
+// values pass through untouched whatever the real signature is. The three
+// factory functions are real wrappers instead (below) so the mod can hook
+// the swap chain the game creates.
 #define HOLEVR_STUB(name, idx)                                              \
     extern "C" __attribute__((naked)) void holevr_##name() {                \
         __asm__ volatile("jmp *(holevr_dxgi_real + " #idx " * 8)(%rip)");   \
     }
-HOLEVR_DXGI_EXPORTS(HOLEVR_STUB)
+#define HOLEVR_STUB_UNLESS_FACTORY(name, idx) HOLEVR_STUB_##idx(name, idx)
+#define HOLEVR_STUB_0(n, i) HOLEVR_STUB(n, i)
+#define HOLEVR_STUB_1(n, i) HOLEVR_STUB(n, i)
+#define HOLEVR_STUB_2(n, i) HOLEVR_STUB(n, i)
+#define HOLEVR_STUB_3(n, i)
+#define HOLEVR_STUB_4(n, i)
+#define HOLEVR_STUB_5(n, i)
+#define HOLEVR_STUB_6(n, i) HOLEVR_STUB(n, i)
+#define HOLEVR_STUB_7(n, i) HOLEVR_STUB(n, i)
+#define HOLEVR_STUB_8(n, i) HOLEVR_STUB(n, i)
+#define HOLEVR_STUB_9(n, i) HOLEVR_STUB(n, i)
+#define HOLEVR_STUB_10(n, i) HOLEVR_STUB(n, i)
+#define HOLEVR_STUB_11(n, i) HOLEVR_STUB(n, i)
+#define HOLEVR_STUB_12(n, i) HOLEVR_STUB(n, i)
+#define HOLEVR_STUB_13(n, i) HOLEVR_STUB(n, i)
+#define HOLEVR_STUB_14(n, i) HOLEVR_STUB(n, i)
+#define HOLEVR_STUB_15(n, i) HOLEVR_STUB(n, i)
+#define HOLEVR_STUB_16(n, i) HOLEVR_STUB(n, i)
+#define HOLEVR_STUB_17(n, i) HOLEVR_STUB(n, i)
+#define HOLEVR_STUB_18(n, i) HOLEVR_STUB(n, i)
+#define HOLEVR_STUB_19(n, i) HOLEVR_STUB(n, i)
+HOLEVR_DXGI_EXPORTS(HOLEVR_STUB_UNLESS_FACTORY)
 #undef HOLEVR_STUB
+
+namespace {
+holevr::proxy::FactoryCallback g_factory_callback = nullptr;
+
+HRESULT AfterFactory(HRESULT hr, REFIID riid, void** out) {
+    if (SUCCEEDED(hr) && out && *out && g_factory_callback) g_factory_callback(*out, riid);
+    return hr;
+}
+}  // namespace
+
+extern "C" HRESULT WINAPI holevr_CreateDXGIFactory(REFIID riid, void** out) {
+    using Fn = HRESULT(WINAPI*)(REFIID, void**);
+    return AfterFactory(reinterpret_cast<Fn>(holevr_dxgi_real[3])(riid, out), riid, out);
+}
+extern "C" HRESULT WINAPI holevr_CreateDXGIFactory1(REFIID riid, void** out) {
+    using Fn = HRESULT(WINAPI*)(REFIID, void**);
+    return AfterFactory(reinterpret_cast<Fn>(holevr_dxgi_real[4])(riid, out), riid, out);
+}
+extern "C" HRESULT WINAPI holevr_CreateDXGIFactory2(UINT flags, REFIID riid, void** out) {
+    using Fn = HRESULT(WINAPI*)(UINT, REFIID, void**);
+    if (!holevr_dxgi_real[5]) return E_NOTIMPL;
+    return AfterFactory(reinterpret_cast<Fn>(holevr_dxgi_real[5])(flags, riid, out), riid, out);
+}
 
 namespace holevr::proxy {
 
@@ -78,5 +124,7 @@ bool LoadRealDxgi() {
 }
 
 HMODULE RealDxgi() { return g_real_module; }
+
+void SetFactoryCallback(FactoryCallback cb) { g_factory_callback = cb; }
 
 }  // namespace holevr::proxy

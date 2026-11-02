@@ -141,7 +141,17 @@ std::vector<PropertyInfo> GetProperties(UObject s) {
             p.type == "WeakObjectProperty" || p.type == "LazyObjectProperty" ||
             p.type == "InterfaceProperty" || p.type == "StructProperty") {
             uintptr_t t = mem::ReadOr<uintptr_t>(f + o_prop_size);
-            if (mem::LooksLikePointer(t) && mem::IsReadable(t, 0x28)) p.inner_type = GetName(t);
+            if (mem::LooksLikePointer(t) && mem::IsReadable(t, 0x28)) {
+                p.inner = t;
+                p.inner_type = GetName(t);
+            }
+        }
+        if (p.type == "BoolProperty") {
+            // FBoolProperty: FieldSize, ByteOffset, ByteMask, FieldMask. The
+            // value lives in the byte at Offset + ByteOffset under ByteMask
+            // (0xFF for a plain bool, one bit for a bitfield).
+            p.offset += mem::ReadOr<uint8_t>(f + o_prop_size + 1);
+            p.bool_mask = mem::ReadOr<uint8_t>(f + o_prop_size + 2);
         }
         out.push_back(std::move(p));
         f = mem::ReadOr<uintptr_t>(f + o_ffield_next);
@@ -174,6 +184,14 @@ int32_t FindPropertyOffset(UObject s, const std::string& name) {
             if (p.name == name) return p.offset;
     }
     return -1;
+}
+
+PropertyInfo FindProperty(UObject s, const std::string& name) {
+    for (int n = 0; s && n < 128; ++n, s = GetSuper(s)) {
+        for (auto& p : GetProperties(s))
+            if (p.name == name) return p;
+    }
+    return {};
 }
 
 }  // namespace holevr::ue::reflection

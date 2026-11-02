@@ -23,6 +23,12 @@ uintptr_t PoolAddress();
 std::string EntryToString(uint32_t comparison_index);
 // Full display string, e.g. "Bullet_3".
 std::string ToString(const FName& name);
+
+// Looks up an existing name (exact, case-sensitive ASCII match) by walking the
+// pool. Slow (a full pass over every name), so cache the result. Names the
+// engine registers at startup, like key names ("LeftMouseButton"), are
+// always there.
+bool Find(const std::string& text, FName* out);
 }  // namespace names
 
 }  // namespace holevr::ue
