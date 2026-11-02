@@ -726,6 +726,117 @@ bool Setup(UObject player) {
     return true;
 }
 
+// ---- walk check: which of the player's meshes actually animate walking ----
+// The owner saw the shadow walk but not the VR body's legs. The player has
+// both "BodyMesh" (our source) and the character "Mesh"; this logs, while the
+// character moves, how far the left foot swings in each and in the VR body.
+struct WalkCheck {
+    UObject comps[3] = {0, 0, 0};  // BodyMesh, Mesh (if different), VR body
+    double lo[3][3], hi[3][3];
+    bool have[3] = {false, false, false};
+    double t = 0, speed = 0;
+    int n = 0, reports = 0;
+    bool listed = false;
+    bool legs_from_mesh = false;
+    UObject player = 0;
+} g_walk;
+
+double ReadFootSwing(int i) {
+    double r = 0;
+    for (int a = 0; a < 3; ++a) r = std::max(r, g_walk.hi[i][a] - g_walk.lo[i][a]);
+    return r;
+}
+
+void WalkCheckTick(UObject player, double speed, double dt) {
+    static ue::FName foot{};
+    static bool foot_ok = ue::names::Find("foot_l", &foot);
+    if (!foot_ok) return;
+    if (g_walk.player != player || g_walk.comps[2] != G.pose_comp) {
+        g_walk = WalkCheck{};
+        g_walk.player = player;
+        UObject mesh = 0;
+        g_walk.comps[0] = G.source;
+        if (ue::GetProp(player, "Mesh", mesh) && mesh && mesh != G.source) g_walk.comps[1] = mesh;
+        g_walk.comps[2] = G.pose_comp;
+    }
+    if (!g_walk.listed) {
+        g_walk.listed = true;
+        const char* label[2] = {"BodyMesh (VR body copies this)", "character Mesh"};
+        for (int i = 0; i < 2; ++i) {
+            UObject c = g_walk.comps[i];
+            if (!c) {
+                if (i == 1) log::Info("body walk check: the character Mesh is the same as BodyMesh (or missing)");
+                continue;
+            }
+            ue::Call a(c, "GetSkinnedAsset");
+            UObject asset = a.Invoke() ? a.Result<UObject>() : 0;
+            ue::Call v(c, "IsVisible");
+            bool vis = v.Invoke() && v.Result<bool>();
+            log::Info("body walk check: %s = %s, mesh %s, %s", label[i], ue::GetName(c).c_str(),
+                      asset ? ue::GetName(asset).c_str() : "none", vis ? "visible" : "hidden");
+        }
+    }
+    if (speed < 30.0 || g_walk.reports >= 6) return;
+    for (int i = 0; i < 3; ++i) {
+        UObject c = g_walk.comps[i];
+        if (!c) continue;
+        ue::Call st(c, "GetSocketTransform");
+        st.Set("InSocketName", foot).Set("TransformSpace", static_cast<uint8_t>(2));  // RTS_Component
+        if (!st.Invoke()) continue;
+        FVector p = st.Result<Xf>().translation;
+        double v[3] = {p.X, p.Y, p.Z};
+        for (int a = 0; a < 3; ++a) {
+            if (!g_walk.have[i]) g_walk.lo[i][a] = g_walk.hi[i][a] = v[a];
+            g_walk.lo[i][a] = std::min(g_walk.lo[i][a], v[a]);
+            g_walk.hi[i][a] = std::max(g_walk.hi[i][a], v[a]);
+        }
+        g_walk.have[i] = true;
+    }
+    g_walk.t += dt;
+    g_walk.speed += speed;
+    ++g_walk.n;
+    if (g_walk.t < 2.0) return;
+    char mesh_part[64] = "same as BodyMesh";
+    if (g_walk.comps[1]) std::snprintf(mesh_part, sizeof(mesh_part), "%.0f cm", ReadFootSwing(1));
+    log::Info("body walk check (moving %.0f cm/s for 2 s): left foot swung %.0f cm in BodyMesh, %s in the "
+              "character Mesh, %.0f cm in the VR body",
+              g_walk.speed / g_walk.n, ReadFootSwing(0), mesh_part, ReadFootSwing(2));
+    // BodyMesh's legs stand still but the character Mesh walks (that's the
+    // shadow the owner saw): take the legs from the Mesh from now on.
+    if (!g_walk.legs_from_mesh && g_walk.comps[1] && ReadFootSwing(0) < 6.0 && ReadFootSwing(1) > 15.0) {
+        g_walk.legs_from_mesh = true;
+        log::Info("body: BodyMesh doesn't animate walking but the character Mesh does; legs now follow the Mesh");
+    }
+    ++g_walk.reports;
+    g_walk.t = g_walk.speed = 0;
+    g_walk.n = 0;
+    for (bool& h : g_walk.have) h = false;
+}
+
+
+// Animated foot (world) taken from the character Mesh, moved onto our pelvis.
+bool MeshFoot(int side, const Xf& our_pelvis, Xf* out) {
+    static ue::FName nm[3];
+    static bool ok = ue::names::Find("pelvis", &nm[0]) && ue::names::Find("foot_l", &nm[1]) &&
+                     ue::names::Find("foot_r", &nm[2]);
+    UObject mesh = g_walk.comps[1];
+    if (!ok || !g_walk.legs_from_mesh || !mesh) return false;
+    auto get = [&](const ue::FName& n, Xf* x) {
+        ue::Call st(mesh, "GetSocketTransform");
+        st.Set("InSocketName", n).Set("TransformSpace", static_cast<uint8_t>(0));  // RTS_World
+        if (!st.Invoke()) return false;
+        *x = st.Result<Xf>();
+        return true;
+    };
+    Xf mp, mf;
+    if (!get(nm[0], &mp) || !get(nm[side == kL ? 1 : 2], &mf)) return false;
+    FQuat to_ours = Normalized(our_pelvis.rotation * mp.rotation.Inverse());
+    out->translation = our_pelvis.translation + to_ours.Rotate(mf.translation - mp.translation);
+    out->rotation = Normalized(to_ours * mf.rotation);
+    out->scale = mf.scale;
+    return true;
+}
+
 // ---- world <-> component space (this frame) ----
 Xf g_w;  // the pose component's transform
 Xf WX(int i) { return skel::Compose(G.pose.C(i), g_w); }
@@ -1795,6 +1906,9 @@ void OnTick(UObject player, float dt_f) {
 
     // Legs keep the animated feet where they were (turned with the body).
     const double speed = std::sqrt(v.X * v.X + v.Y * v.Y);
+    WalkCheckTick(player, speed, dt);
+    for (int s = 0; s < 2; ++s)
+        if (k.legs_ok[s]) MeshFoot(s, pelvis, &foot_anim[s]);
     if (S.legs && k.pelvis >= 0)
         for (int s = 0; s < 2; ++s) {
             if (!k.legs_ok[s]) continue;
