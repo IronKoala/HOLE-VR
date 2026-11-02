@@ -1192,6 +1192,174 @@ void FireSelector(game::Gun& gun, const input::HandInput& rin) {
     log::Info("controls: fire selector -> mode %d", mode);
 }
 
+// ---- other game actions on the controllers ----
+// The game's own input events (keyboard/gamepad bindings) live on the player
+// as InpActEvt_<Action>_K2Node_InputActionEvent_<n> stubs; where an action
+// has a pressed and a released event, the lower number is "pressed" (the
+// Blueprint compiler creates Pressed before Released). Calling the stub is
+// what the engine does when the key goes down or up.
+struct ActionEvent { const char* name; UObject fn = 0; bool looked = false; };
+bool FireEvent(UObject player, ActionEvent& e) {
+    if (!player) return false;
+    if (!e.looked) {
+        e.looked = true;
+        e.fn = ue::FindFunction(ue::GetClass(player), e.name);
+        log::Info("controls: game input %s %s", e.name, e.fn ? "found" : "NOT found");
+    }
+    if (!e.fn) return false;
+    ue::Call c(player, e.fn);
+    return c.Invoke();
+}
+
+struct GameActionState {
+    ActionEvent jump_down{"InpActEvt_Jump_K2Node_InputActionEvent_19"};
+    ActionEvent jump_up{"InpActEvt_Jump_K2Node_InputActionEvent_20"};
+    ActionEvent crouch_down{"InpActEvt_Crouch_K2Node_InputActionEvent_17"};
+    ActionEvent crouch_up{"InpActEvt_Crouch_K2Node_InputActionEvent_18"};
+    ActionEvent sprint_down{"InpActEvt_Sprint_K2Node_InputActionEvent_13"};
+    ActionEvent sprint_up{"InpActEvt_Sprint_K2Node_InputActionEvent_14"};
+    ActionEvent walk_down{"InpActEvt_Walk_K2Node_InputActionEvent_15"};
+    ActionEvent walk_up{"InpActEvt_Walk_K2Node_InputActionEvent_16"};
+    ActionEvent nav{"InpActEvt_CheckNavigationIcon_K2Node_InputActionEvent_0"};
+    bool jump_armed = true, crouch_armed = true;
+    double jump_release_at = -1, crouch_release_at = -1, walk_release_at = -1;
+    bool sprinting = false;
+    double click_up_at = -1;    // left stick click released, waiting for a second click
+    double click_down_at = -1;
+    bool second_click = false;
+    double y_down_at = -1;
+    double melee_ready_at = 0;
+    double melee_release_at = -1;
+} GA;
+
+bool GunIsRifle(UObject player);
+
+// Every other game action, on buttons the gun, menus, wrist and grip editor
+// don't use (lean is left out: lean for real).
+//   Left trigger          interact (doors, pickups)
+//   Left stick click      tap: sprint on/off (ends when you stop); double tap: walk/run
+//   Right stick up        jump
+//   Right stick down      crouch / stand
+//   Left Y tap            switch weapon (holding Y for 1 s is the grip editor)
+//   Right stick click     fire selector on a rifle, otherwise objective markers
+//   Punch with the empty left hand   melee attack
+void GameActions(UObject player, const input::Snapshot& s) {
+    if (!player) return;
+    const input::HandInput& l = s.hand[input::kLeft];
+    const input::HandInput& r = s.hand[input::kRight];
+    if (ui_panel::MenuOpen()) {
+        if (GA.sprinting) { FireEvent(player, GA.sprint_up); GA.sprinting = false; }
+        return;
+    }
+    // Interact.
+    if (l.trigger_button.pressed && !W.held_mag && !W.slide.Held()) {
+        ue::Call c(player, "PlayerInput_Interact");
+        c.Invoke();
+        input::Haptic(input::kLeft, 0.2f, 0.02f);
+        log::Info("controls: interact");
+    }
+    // Jump / crouch: flick the right stick up or down (turning uses left/right).
+    const bool up = r.stick_y > 0.75f && std::fabs(r.stick_x) < 0.6f;
+    const bool down = r.stick_y < -0.75f && std::fabs(r.stick_x) < 0.6f;
+    if (up && GA.jump_armed) {
+        GA.jump_armed = false;
+        FireEvent(player, GA.jump_down);
+        GA.jump_release_at = g_clock + 0.15;
+        log::Info("controls: jump");
+    }
+    if (down && GA.crouch_armed) {
+        GA.crouch_armed = false;
+        FireEvent(player, GA.crouch_down);
+        GA.crouch_release_at = g_clock + 0.1;
+        log::Info("controls: crouch / stand");
+    }
+    if (r.stick_y < 0.4f) GA.jump_armed = true;
+    if (r.stick_y > -0.4f) GA.crouch_armed = true;
+    if (GA.jump_release_at > 0 && g_clock >= GA.jump_release_at) { FireEvent(player, GA.jump_up); GA.jump_release_at = -1; }
+    if (GA.crouch_release_at > 0 && g_clock >= GA.crouch_release_at) { FireEvent(player, GA.crouch_up); GA.crouch_release_at = -1; }
+
+    // Left stick click: a short tap toggles sprint, a double tap toggles
+    // walk/run. Long holds are left alone (holding it 2 s measures your arms).
+    if (l.stick_click.pressed) {
+        GA.click_down_at = g_clock;
+        GA.second_click = GA.click_up_at > 0 && g_clock - GA.click_up_at < 0.35;
+    }
+    if (l.stick_click.released && GA.click_down_at > 0) {
+        const bool tap = g_clock - GA.click_down_at < 0.4;
+        GA.click_down_at = -1;
+        if (tap && GA.second_click) {
+            GA.click_up_at = -1;
+            GA.second_click = false;
+            FireEvent(player, GA.walk_down);
+            GA.walk_release_at = g_clock + 0.1;
+            log::Info("controls: walk/run toggle");
+        } else if (tap) {
+            GA.click_up_at = g_clock;  // decide after the double-tap window
+        }
+    }
+    if (GA.click_up_at > 0 && g_clock - GA.click_up_at >= 0.35) {
+        GA.click_up_at = -1;
+        GA.sprinting = !GA.sprinting;
+        FireEvent(player, GA.sprinting ? GA.sprint_down : GA.sprint_up);
+        log::Info("controls: sprint %s", GA.sprinting ? "on" : "off");
+    }
+    if (GA.walk_release_at > 0 && g_clock >= GA.walk_release_at) { FireEvent(player, GA.walk_up); GA.walk_release_at = -1; }
+    // Sprint ends when you let go of the stick.
+    if (GA.sprinting && std::sqrt(l.stick_x * l.stick_x + l.stick_y * l.stick_y) < g_set.deadzone) {
+        GA.sprinting = false;
+        FireEvent(player, GA.sprint_up);
+        log::Info("controls: sprint off (stopped)");
+    }
+
+    // Left Y tap: next weapon. Held for the grip editor instead.
+    if (l.secondary.pressed) GA.y_down_at = g_clock;
+    if (l.secondary.released && GA.y_down_at > 0) {
+        if (g_clock - GA.y_down_at < 0.4) {
+            ue::Call c(player, "PlayerInput_ScrollWeapon");
+            c.Set("IsUp", true);
+            c.Invoke();
+            log::Info("controls: switch weapon");
+        }
+        GA.y_down_at = -1;
+    }
+
+    // Right stick click without a rifle: objective markers.
+    if (r.stick_click.pressed && !GunIsRifle(player)) {
+        FireEvent(player, GA.nav);
+        log::Info("controls: objective markers");
+    }
+
+    // Melee: punch with the empty left hand (fast, arm reaching out).
+    hands::HandState lh = hands::Get(hands::kLeft);
+    hands::Pose head;
+    if (lh.valid && hands::Head(&head) && !W.held_mag && !W.slide.Held() && !W.two_hand &&
+        g_clock >= GA.melee_ready_at) {
+        const XrVector3f& v = l.linear_velocity;
+        double speed = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+        FVector reach = lh.grip.location - head.location;
+        if (speed > 2.8 && Len(reach) > 40.0) {
+            ue::Call c(player, "PlayerInput_MeleeAttack");
+            c.Set("Press Released", false);
+            c.Invoke();
+            GA.melee_release_at = g_clock + 0.1;
+            GA.melee_ready_at = g_clock + 0.7;
+            input::Haptic(input::kLeft, 0.8f, 0.06f);
+            log::Info("controls: melee (left hand at %.1f m/s)", speed);
+        }
+    }
+    if (GA.melee_release_at > 0 && g_clock >= GA.melee_release_at) {
+        ue::Call c(player, "PlayerInput_MeleeAttack");
+        c.Set("Press Released", true);
+        c.Invoke();
+        GA.melee_release_at = -1;
+    }
+}
+
+bool GunIsRifle(UObject player) {
+    game::Gun gun = game::Gun::Current(player);
+    return gun.Valid() && gun.Object() == W.gun && !W.is_pistol;
+}
+
 void PublishGrabs(game::Gun& gun, const hands::HandState& rh, const hands::HandState& lh) {
     hands::HandGrab g[2];
     if (gun.Valid() && rh.valid) {
@@ -1335,6 +1503,7 @@ void OnTick(UObject player, float dt) {
     }
     Locomotion(player, s, dt);
     RoomScaleFollow(player);
+    GameActions(player, s);
     ApplyCameraShakeSetting(player);
 
     game::Gun gun = game::Gun::Current(player);

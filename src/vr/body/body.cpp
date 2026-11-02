@@ -460,6 +460,14 @@ struct ActiveGrip {
     double web_clip = 0;  // web between thumb and index (meets the tang)
 };
 
+// A foot planted in the world, or stepping (t in 0..1).
+struct Step {
+    bool init = false;
+    FVector planted, from;
+    FQuat planted_rot, from_rot;
+    double t = -1;
+};
+
 struct State {
     UObject player = 0;
     UObject source = 0;  // the game's BodyMesh
@@ -486,6 +494,8 @@ struct State {
     bool knee_known[2] = {false, false};
     double clav_amount[2] = {0, 0};
     double swivel[2] = {0, 0};     // elbow swivel, smoothed (the search is in steps)
+    Step step[2];                  // procedural stepping per foot
+    int steps_taken = 0;
     double twist_s[2] = {0, 0};    // forearm twist, smoothed
     bool swivel_init[2] = {false, false};
     double stand_dz = -1e9;
@@ -1426,7 +1436,11 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
     // if the wrist would still bend past its range, the elbow swings further.
     FVector outward = side == kL ? body_right * -1.0 : body_right;
     double above = std::max(0.0, hand_pos.Z - shoulder.Z) / reach;
-    FVector pole = FVector{0, 0, -1} * (1.0 - 0.6 * above) + outward * (0.7 + 0.6 * above) - body_fwd * 0.3;
+    // Hand low (arm hanging): the arm points down, so "down" says nothing
+    // and the elbow went sideways. A hanging arm's elbow points back.
+    double below = std::clamp((shoulder.Z - hand_pos.Z) / reach, 0.0, 1.0);
+    FVector pole = FVector{0, 0, -1} * (1.0 - 0.6 * above) + outward * (0.7 + 0.6 * above - 0.5 * below) -
+                   body_fwd * (0.3 + 1.5 * below);
     if (rig.ok) pole = pole + hand_rot.Rotate(rig.across_h * -1.0) * S.elbow_follow_hand;
     const double stretch = reach * (MaxStretch() - 1.0);
     const FVector axis = Normalize(hand_pos - shoulder);
@@ -1585,9 +1599,9 @@ void FitLog(double dt, double yaw_lag) {
             arms += buf;
         }
         log::Info("body fit: arm scale %.3f (%s), body %.0f deg behind head yaw, body moved %+.0f cm to put the "
-                  "shoulders under the eyes%s", ArmScale(),
+                  "shoulders under the eyes, %d steps taken%s", ArmScale(),
                   S.arm_scale_override > 0 ? "ini" : M.have ? "measured" : "not measured",
-                  G.fit_yaw_n ? G.fit_yaw_lag / G.fit_yaw_n : 0.0, G.body_dz, arms.c_str());
+                  G.fit_yaw_n ? G.fit_yaw_lag / G.fit_yaw_n : 0.0, G.body_dz, G.steps_taken, arms.c_str());
     }
     G.fit_time = G.fit_yaw_lag = 0;
     G.fit_yaw_n = 0;
@@ -1780,6 +1794,7 @@ void OnTick(UObject player, float dt_f) {
         if (hs[side].valid) SolveArm(side, hs[side], grab[side], grab[kR], body_fwd, body_right, dt);
 
     // Legs keep the animated feet where they were (turned with the body).
+    const double speed = std::sqrt(v.X * v.X + v.Y * v.Y);
     if (S.legs && k.pelvis >= 0)
         for (int s = 0; s < 2; ++s) {
             if (!k.legs_ok[s]) continue;
@@ -1789,10 +1804,54 @@ void OnTick(UObject player, float dt_f) {
             FVector outward = s == kL ? body_right * -1.0 : body_right;
             FVector foot_target =
                 pelvis.translation + pelvis_shift + yaw_q.Rotate(foot_anim[s].translation - pelvis.translation);
+            FQuat foot_rot = Normalized(yaw_q * foot_anim[s].rotation);
+            // Stepping: the game only animates walking when the stick moves
+            // the character. When the body moves because you walked or turned
+            // in the room, each foot stays planted and takes a step (one foot
+            // at a time, lifted in an arc) once it is too far from where it
+            // belongs under the body.
+            Step& st = G.step[s];
+            const bool game_walking = speed > 30.0;
+            if (!st.init || game_walking || Length(foot_target - st.planted) > 120.0) {
+                st.init = true;
+                st.planted = foot_target;
+                st.planted_rot = foot_rot;
+                st.t = -1;
+            } else if (st.t >= 0) {
+                st.t += dt / 0.28;
+                if (st.t >= 1.0) {
+                    st.planted = foot_target;
+                    st.planted_rot = foot_rot;
+                    st.t = -1;
+                    ++G.steps_taken;
+                } else {
+                    double e = st.t * st.t * (3.0 - 2.0 * st.t);
+                    FVector p = st.from + (foot_target - st.from) * e;
+                    p.Z += 9.0 * std::sin(st.t * kPi);
+                    foot_target = p;
+                    foot_rot = Normalized(Scale(Normalized(foot_rot * st.from_rot.Inverse()), e) * st.from_rot);
+                }
+            } else {
+                FVector off = foot_target - st.planted;
+                off.Z = 0;
+                FQuat dq = Normalized(foot_rot * st.planted_rot.Inverse());
+                double turn = 2.0 * std::acos(std::min(1.0, std::fabs(dq.W))) * kRadToDeg;
+                const bool other_stepping = G.step[1 - s].t >= 0;
+                if (!other_stepping && (Length(off) > 18.0 || turn > 35.0)) {
+                    st.t = 0;
+                    st.from = st.planted;
+                    st.from_rot = st.planted_rot;
+                    foot_target = st.planted;
+                    foot_rot = st.planted_rot;
+                } else {
+                    foot_target = st.planted;
+                    foot_rot = st.planted_rot;
+                }
+            }
             TwoBoneResult sol = SolveTwoBone(hip, foot_target, upper, lower, body_fwd + outward * 0.15, 0.0);
             SolveLimb(k.thigh[s], k.calf[s], k.foot[s], sol, &G.knee_hinge_local[s], &G.knee_known[s]);
             Xf foot = WX(k.foot[s]);
-            foot.rotation = Normalized(yaw_q * foot_anim[s].rotation);
+            foot.rotation = foot_rot;
             SetWX(k.foot[s], foot);
         }
 
