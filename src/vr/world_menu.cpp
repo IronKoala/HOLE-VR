@@ -53,7 +53,7 @@ struct Settings {
     float arm_width_m = 0.30f;
     float arm_along_m = 0.20f;    // from the controller grip toward the elbow
     float arm_back_m = 0.05f;     // out from the back of the forearm
-    float arm_roll_deg = 90.f;    // menu turned counter-clockwise on the arm
+    float arm_roll_deg = 0.f;     // extra turn of the menu on the arm
     bool hide_covers = true;      // the menus' full-screen click-catcher
     bool laser = true;
 } S;
@@ -423,7 +423,6 @@ bool PlaceOnForearm() {
     double side = S.arm == input::kLeft ? -1.0 : 1.0;
     FVector back = q.Rotate(FVector{0, side, 0});
     FVector thumb = q.Rotate(FVector{0, 0, 1});
-    G.centre = loc + q.Rotate(FVector{-S.arm_along_m * G.cm_per_m, side * S.arm_back_m * G.cm_per_m, 0});
     xr::EyeView eyes[2];
     if (xr::LatestViews(eyes)) {
         FQuat hq;
@@ -434,11 +433,37 @@ bool PlaceOnForearm() {
     }
     FVector up0 = thumb * G.up_sign;
     FVector y0 = Cross(up0, back);  // widget's left edge
-    // Turn the menu on the arm, counter-clockwise as you look at it. The owner
-    // asked for 90 degrees (2026-11-02); menu_forearm_roll_deg sets it.
+    // Where the old layout put the menu (off the side of the hand), and where
+    // it belongs: along the forearm toward the elbow, i.e. backwards along the
+    // controller's pointing direction, flattened onto the back of the arm.
+    // The whole layout (position and the menu's turn) is swung around the
+    // wrist from the first to the second, which is what the owner asked for
+    // (2026-11-02: "rotate the whole wrist menu ... so the pause menu is on
+    // the forearm").
+    FVector old_dir = q.Rotate(FVector{-1, 0, 0});
+    FVector elbow_dir = old_dir;
+    const input::HandInput& hi = in.hand[S.arm];
+    FQuat aq;
+    if (hi.aim_valid && stereo::TrackingToWorld(hi.aim, nullptr, &aq)) {
+        FVector fwd = aq.Rotate(FVector{1, 0, 0});
+        FVector e = fwd * -1.0;
+        e = e - back * DotV(e, back);
+        double len = std::sqrt(DotV(e, e));
+        if (len > 0.2) elbow_dir = e * (1.0 / len);
+    }
+    old_dir = old_dir - back * DotV(old_dir, back);
+    double ol = std::sqrt(DotV(old_dir, old_dir));
+    if (ol > 1e-3) old_dir = old_dir * (1.0 / ol);
+    double c = DotV(old_dir, elbow_dir);
+    double sn = DotV(Cross(old_dir, back), elbow_dir);
+    // Same turn applied to the menu's axes (in the plane of the back of the arm).
+    FVector up1 = up0 * c + Cross(up0, back) * sn;
+    FVector y1 = y0 * c + Cross(y0, back) * sn;
+    // An extra turn of the menu on its own, if wanted (menu_forearm_roll_deg).
     double r = S.arm_roll_deg * kDegToRad;
-    FVector up = up0 * std::cos(r) + y0 * std::sin(r);
-    FVector y = y0 * std::cos(r) - up0 * std::sin(r);
+    FVector up = up1 * std::cos(r) + y1 * std::sin(r);
+    FVector y = y1 * std::cos(r) - up1 * std::sin(r);
+    G.centre = loc + back * (S.arm_back_m * G.cm_per_m) + elbow_dir * (S.arm_along_m * G.cm_per_m);
     G.rot = FromAxes(back, y, up);
     G.placed = true;
     return true;
@@ -1080,7 +1105,7 @@ void Init() {
     S.arm_width_m = config::GetFloat("menu_forearm_width_m", 0.30f);
     S.arm_along_m = config::GetFloat("menu_forearm_along_m", 0.20f);
     S.arm_back_m = config::GetFloat("menu_forearm_back_m", 0.05f);
-    S.arm_roll_deg = config::GetFloat("menu_forearm_roll_deg", 90.f);
+    S.arm_roll_deg = config::GetFloat("menu_forearm_turn_deg", 0.f);
     S.hide_covers = config::GetBool("menu_hide_focus_cover", true);
     S.laser = config::GetBool("menu_world_laser", true);
     if (!S.enabled) {
