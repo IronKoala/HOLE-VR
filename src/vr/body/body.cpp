@@ -83,7 +83,7 @@ void LoadSettings() {
     S.animated_upper_body = config::GetBool("body_animated_upper_body", false);
     S.legs = config::GetBool("body_leg_ik", true);
     S.hide_head = config::GetBool("body_hide_head", true);
-    S.shadow = config::GetInt("body_shadow", 1);
+    S.shadow = config::GetInt("body_shadow_source", 2);
     S.hand_poses = config::GetBool("hand_poses", true);
     S.finger_scale = config::GetFloat("finger_curl_scale", 1.f);
     S.hand_offset[0] = config::GetFloat("hand_offset_forward_cm", 0.f);
@@ -472,6 +472,8 @@ struct State {
     UObject player = 0;
     UObject source = 0;  // the game's BodyMesh
     UObject pose_comp = 0;
+    UObject anim_src = 0;     // where the animation is copied from (BodyMesh or its leader)
+    int mesh_hidden_shadow = -1;  // character Mesh's own hidden-shadow flag, to restore
     EnginePose engine;
     skel::Pose pose;
     std::vector<Xf> ref;    // reference (rest) pose, local
@@ -654,8 +656,24 @@ bool CreatePose(UObject player, UObject source) {
     return true;
 }
 
+// Reads a (possibly bitfield) bool property. -1 if it can't be read.
+int ReadBoolProp(UObject obj, const char* name) {
+    auto p = ue::reflection::FindProperty(ue::GetClass(obj), name);
+    if (!p.valid() || p.type != "BoolProperty") return -1;
+    uint8_t b = 0;
+    if (!mem::Read(obj + p.offset, b)) return -1;
+    return (b & (p.bool_mask ? p.bool_mask : 0xFF)) ? 1 : 0;
+}
+
+// The game's hidden character Mesh casts the player's shadow on its own
+// (that's the walking shadow the owner saw, out of step with the VR body).
+// One shadow only: by default the VR body's, so it moves with you.
 void ApplyShadows() {
-    CallBool(G.source, "SetCastHiddenShadow", "NewCastHiddenShadow", S.shadow == 1);
+    if (G.anim_src && G.anim_src != G.source) {
+        if (G.mesh_hidden_shadow < 0) G.mesh_hidden_shadow = ReadBoolProp(G.anim_src, "bCastHiddenShadow");
+        CallBool(G.anim_src, "SetCastHiddenShadow", "NewCastHiddenShadow", S.shadow == 1);
+    }
+    CallBool(G.source, "SetCastHiddenShadow", "NewCastHiddenShadow", S.shadow == 1 && !G.anim_src);
     CallBool(G.pose_comp, "SetCastShadow", "NewCastShadow", S.shadow == 2);
 }
 
@@ -692,6 +710,9 @@ void Deactivate() {
         SetVisible(G.source, true);
         CallBool(G.source, "SetCastHiddenShadow", "NewCastHiddenShadow", false);
     }
+    if (G.anim_src && G.anim_src != G.source && G.mesh_hidden_shadow >= 0) {
+        CallBool(G.anim_src, "SetCastHiddenShadow", "NewCastHiddenShadow", G.mesh_hidden_shadow == 1);
+    }
     G.active = false;
     log::Info("body: VR body off, game body back");
 }
@@ -722,6 +743,23 @@ bool Setup(UObject player) {
         SetVisible(G.pose_comp, false);
         return false;
     }
+    // BodyMesh may not animate itself: it can follow the character Mesh's
+    // pose (LeaderPoseComponent), and then its own bone array never moves,
+    // so a copy of it has still legs. Copy from the Mesh that animates.
+    {
+        UObject mesh = 0;
+        int32_t loff = ue::PropertyOffset(source, "LeaderPoseComponent");
+        int32_t leader = loff >= 0 ? mem::ReadOr<int32_t>(source + loff, -1) : -1;
+        if (ue::GetProp(player, "Mesh", mesh) && mesh && mesh != source && leader >= 0 &&
+            leader == mem::ReadOr<int32_t>(mesh + ue::off::kObjIndex, -2)) {
+            G.anim_src = mesh;
+            ue::SetProp<uint8_t>(mesh, "VisibilityBasedAnimTickOption", 0);  // AlwaysTickPoseAndRefreshBones
+            log::Info("body: BodyMesh follows %s's animation, so the VR body copies from %s",
+                      ue::GetName(mesh).c_str(), ue::GetName(mesh).c_str());
+        } else {
+            log::Info("body: BodyMesh animates itself (leader %d), the VR body copies it", leader);
+        }
+    }
     G.ref_pending = true;
     return true;
 }
@@ -737,7 +775,6 @@ struct WalkCheck {
     double t = 0, speed = 0;
     int n = 0, reports = 0;
     bool listed = false;
-    bool legs_from_mesh = false;
     UObject player = 0;
 } g_walk;
 
@@ -761,7 +798,7 @@ void WalkCheckTick(UObject player, double speed, double dt) {
     }
     if (!g_walk.listed) {
         g_walk.listed = true;
-        const char* label[2] = {"BodyMesh (VR body copies this)", "character Mesh"};
+        const char* label[2] = {"BodyMesh", "character Mesh"};
         for (int i = 0; i < 2; ++i) {
             UObject c = g_walk.comps[i];
             if (!c) {
@@ -801,41 +838,12 @@ void WalkCheckTick(UObject player, double speed, double dt) {
     log::Info("body walk check (moving %.0f cm/s for 2 s): left foot swung %.0f cm in BodyMesh, %s in the "
               "character Mesh, %.0f cm in the VR body",
               g_walk.speed / g_walk.n, ReadFootSwing(0), mesh_part, ReadFootSwing(2));
-    // BodyMesh's legs stand still but the character Mesh walks (that's the
-    // shadow the owner saw): take the legs from the Mesh from now on.
-    if (!g_walk.legs_from_mesh && g_walk.comps[1] && ReadFootSwing(0) < 6.0 && ReadFootSwing(1) > 15.0) {
-        g_walk.legs_from_mesh = true;
-        log::Info("body: BodyMesh doesn't animate walking but the character Mesh does; legs now follow the Mesh");
-    }
     ++g_walk.reports;
     g_walk.t = g_walk.speed = 0;
     g_walk.n = 0;
     for (bool& h : g_walk.have) h = false;
 }
 
-
-// Animated foot (world) taken from the character Mesh, moved onto our pelvis.
-bool MeshFoot(int side, const Xf& our_pelvis, Xf* out) {
-    static ue::FName nm[3];
-    static bool ok = ue::names::Find("pelvis", &nm[0]) && ue::names::Find("foot_l", &nm[1]) &&
-                     ue::names::Find("foot_r", &nm[2]);
-    UObject mesh = g_walk.comps[1];
-    if (!ok || !g_walk.legs_from_mesh || !mesh) return false;
-    auto get = [&](const ue::FName& n, Xf* x) {
-        ue::Call st(mesh, "GetSocketTransform");
-        st.Set("InSocketName", n).Set("TransformSpace", static_cast<uint8_t>(0));  // RTS_World
-        if (!st.Invoke()) return false;
-        *x = st.Result<Xf>();
-        return true;
-    };
-    Xf mp, mf;
-    if (!get(nm[0], &mp) || !get(nm[side == kL ? 1 : 2], &mf)) return false;
-    FQuat to_ours = Normalized(our_pelvis.rotation * mp.rotation.Inverse());
-    out->translation = our_pelvis.translation + to_ours.Rotate(mf.translation - mp.translation);
-    out->rotation = Normalized(to_ours * mf.rotation);
-    out->scale = mf.scale;
-    return true;
-}
 
 // ---- world <-> component space (this frame) ----
 Xf g_w;  // the pose component's transform
@@ -1751,7 +1759,7 @@ void OnTick(UObject player, float dt_f) {
         perf::Scope t(g_perf_engine);
         auto copy_pose = [] {
             ue::Call copy(G.pose_comp, "CopyPoseFromSkeletalComponent");
-            copy.Set("InComponentToCopy", G.source);
+            copy.Set("InComponentToCopy", G.anim_src ? G.anim_src : G.source);
             return copy.Invoke();
         };
         if (!copy_pose()) return;
@@ -1907,8 +1915,6 @@ void OnTick(UObject player, float dt_f) {
     // Legs keep the animated feet where they were (turned with the body).
     const double speed = std::sqrt(v.X * v.X + v.Y * v.Y);
     WalkCheckTick(player, speed, dt);
-    for (int s = 0; s < 2; ++s)
-        if (k.legs_ok[s]) MeshFoot(s, pelvis, &foot_anim[s]);
     if (S.legs && k.pelvis >= 0)
         for (int s = 0; s < 2; ++s) {
             if (!k.legs_ok[s]) continue;
