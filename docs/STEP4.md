@@ -23,6 +23,22 @@ dump of the shipping game (`hole-vr/dump/game_classes.txt`).
   Each fix has its own switch in `hole-vr.ini`; new settings are appended to an
   existing ini automatically.
 
+- **Menus as panels in the world** (`src/vr/world_menu.*`). While a menu is
+  open (the game shows its mouse cursor), every top-level `UIM_*` widget the
+  game puts on the screen is moved into a `WidgetComponent` on a small actor
+  we spawn, 1.6 m in front of the head and 1.8 m wide (1920x1080 layout). It
+  is rendered by the engine in both eyes. The menu is attached to the panel
+  before it is removed from the screen, so the game never sees it destroyed.
+  A `WidgetInteractionComponent` is placed 3 cm in front of wherever the
+  controller ray hits a panel and traces 6 cm, so nothing else in the world
+  blocks it; trigger is the left mouse button, the stick scrolls. Beam and dot
+  are OpenXR quad layers. Menus are let go when the game reports them closed
+  (`BPI_UIControl.IsOpened`) or when the cursor goes away. `UIM_*` widgets
+  already showing during play stay on the flat HUD. Runs from
+  `stereo::SetGameFrameCallback` (game thread, every rendered frame, also
+  while paused). `menu_mode=window` brings back the flat-screen panel, which
+  is also the automatic fallback.
+
 ## Game UI inventory
 
 Menus are UMG widgets added to the viewport, which a headset can't show
