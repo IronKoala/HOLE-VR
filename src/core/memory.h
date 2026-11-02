@@ -43,6 +43,23 @@ T ReadOr(uintptr_t p, T fallback = T{}) {
     return Read(p, v) ? v : fallback;
 }
 
+// While one of these is alive, IsReadable on this thread remembers every
+// memory region it looked up (normally only the last 4), and forgets them
+// when the outermost one goes away. For short bursts of many reads spread
+// over many heap blocks, such as walking a menu's 800 widgets, where the
+// small cache keeps missing and each miss is a VirtualQuery system call.
+// Keep its life short (one walk): memory freed while it is alive would still
+// be taken as readable.
+class ScopedRegionCache {
+public:
+    ScopedRegionCache();
+    ~ScopedRegionCache();
+    ScopedRegionCache(const ScopedRegionCache&) = delete;
+    ScopedRegionCache& operator=(const ScopedRegionCache&) = delete;
+    // VirtualQuery calls made on this thread since the outermost one began.
+    static unsigned Lookups();
+};
+
 // True if [p, p+len) is committed read/write memory (heap objects, not code).
 bool IsWritable(uintptr_t p, size_t len);
 
