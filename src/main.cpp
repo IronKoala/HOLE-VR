@@ -126,6 +126,7 @@ DWORD WINAPI InitThread(LPVOID) {
         vr::body::Init();  // after controls: reads this frame's hand poses
         vr::cvars::Init();
         vr::wrist_hud::InitGame();
+        vr::world_menu::InitGame();
     }
 
     // Development hotkeys. Polled rather than hooked so nothing here can
