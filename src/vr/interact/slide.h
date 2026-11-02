@@ -40,6 +40,16 @@ struct SlideConfig {
     // along the pull axis, radius grab_radius_back. 0 = none.
     double grab_back = 0.0;           // cm
     double grab_radius_back = 5.0;    // cm
+    // Pistol, measured slide: grab anywhere within span_radius of the line
+    // along the slide's top from span_front to span_rear, reaching at most
+    // span_back_margin behind the rear end and span_front_margin past the
+    // front end (flat caps: nothing further behind). When set, the rear
+    // sphere and the forward/back capsules are not used.
+    bool use_span = false;
+    FVector span_rear, span_front;    // parent space, cm
+    double span_radius = 7.0;
+    double span_back_margin = 2.0;
+    double span_front_margin = 2.0;
     // Pistol: pinch at the rear sight. Extra sphere, radius 0 = none.
     FVector sight_center;             // parent space, cm
     double sight_radius = 0.0;        // cm

@@ -64,6 +64,23 @@ int main() {
             EXPECT(Slide(q).InZone(FVector{-12, 0, 10}));
             EXPECT(!Slide(c).InZone(FVector{-12, 0, 10}));
         }
+        {   // measured slide span: rear end at x -12, front end at x +8, top z 4
+            SlideConfig m = Pistol();
+            m.use_span = true;
+            m.span_rear = FVector{-12, 0, 4};
+            m.span_front = FVector{8, 0, 4};
+            m.sight_center = FVector{-10, 0, 5};
+            m.sight_radius = 6.5;
+            Slide z(m);
+            EXPECT(z.InZone(FVector{-11.4, -4.0, 0.5}));   // owner's rear overhand attempts
+            EXPECT(z.InZone(FVector{-13.1, -3.8, 0.2}));
+            EXPECT(z.InZone(FVector{6, 3, 6}));           // front
+            EXPECT(!z.InZone(FVector{-18, 0, 4}));         // well behind the rear end and sight
+            EXPECT(!z.InZone(FVector{-26.5, 0, 4.1}));     // the old ADS eye point
+            EXPECT(!z.InZone(FVector{-6, 0, -6}));         // under the slide (support hand)
+            EXPECT(!z.InZone(FVector{11, 0, 4}));          // past the muzzle
+            EXPECT(z.InZone(FVector{-14, 0, 8}));          // pinch at the rear sight
+        }
         SlideConfig r = Pistol();   // rear sphere only (default)
         EXPECT(!Slide(r).InZone(FVector{-20, 0, 2}));
         {   // pinch from behind (owner's log: hands 10-15 cm behind the rear point)
