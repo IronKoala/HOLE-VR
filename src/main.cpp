@@ -134,7 +134,20 @@ DWORD WINAPI InitThread(LPVOID) {
     // Development hotkeys. Polled rather than hooked so nothing here can
     // interfere with the game's own input.
     bool dump_was_down = false, recenter_was_down = false, aa_was_down = false;
+    // One automatic dump per launch once the game's own classes (weapons,
+    // player) are loaded, so the class list always covers them without a
+    // keypress (the start-up dump runs before any level and misses them).
+    int game_classes_seen_at = -1;
+    bool ingame_dumped = !config::GetBool("dump_in_game", true);
     for (int frame = 0;; ++frame) {
+        if (hooks && !ingame_dumped && frame % 60 == 45 && game::GunBaseClass()) {
+            if (game_classes_seen_at < 0) game_classes_seen_at = frame;
+            else if (frame - game_classes_seen_at >= 600) {   // ~10 s after the level loaded
+                ingame_dumped = true;
+                log::Info("dump: in-game class dump (once per launch, dump_in_game=0 turns it off)");
+                ue::dumper::DumpAll(mod_dir);
+            }
+        }
         if (hooks) {
             game::weapon_lab::PollHotkeys();
             if (frame % 60 == 0) game::Maintain();
