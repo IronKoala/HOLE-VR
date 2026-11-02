@@ -22,7 +22,8 @@ Manual install, if you prefer:
 1. Copy `dxgi.dll` into `HOLE\HOLE\Binaries\Win64\` (next to `HOLE-Win64-Shipping.exe`).
 2. Start SteamVR, put the headset on, then start the game normally from Steam.
 3. A `hole-vr` folder appears next to the DLL with `hole-vr.log`, `hole-vr.ini`
-   and a `dump` folder.
+   and a `dump` folder. `hole-vr.log` is the latest run; the three runs before
+   it are kept as `hole-vr.1.log` (newest) to `hole-vr.3.log`.
 
 Keys: **Ctrl+F8** recenters the view, **Ctrl+F9** refreshes the class dump.
 Set `vr_enabled=0` in `hole-vr.ini` to play flat with the mod installed.

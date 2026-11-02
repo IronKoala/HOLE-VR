@@ -8,6 +8,7 @@
 
 namespace holevr::log {
 namespace {
+constexpr int kKeepOldLogs = 3;
 std::mutex g_mutex;
 FILE* g_file = nullptr;
 
@@ -31,8 +32,24 @@ void Write(const char* level, const char* fmt, va_list args) {
 void Init(const std::wstring& mod_dir) {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_file) return;
-    std::wstring path = mod_dir + L"\\hole-vr.log";
-    g_file = _wfopen(path.c_str(), L"w");
+    // Keep the logs of the last few runs: starting the game again right after
+    // a playtest must not wipe the playtest's log.
+    //   hole-vr.log (this run), hole-vr.1.log (the run before), .2, .3
+    auto name = [&](int n) {
+        return n == 0 ? mod_dir + L"\\hole-vr.log"
+                      : mod_dir + L"\\hole-vr." + std::to_wstring(n) + L".log";
+    };
+    for (int n = kKeepOldLogs; n >= 1; --n)
+        MoveFileExW(name(n - 1).c_str(), name(n).c_str(), MOVEFILE_REPLACE_EXISTING);
+    g_file = _wfopen(name(0).c_str(), L"w");
+    if (g_file) {
+        // Lines carry only the time of day; this dates the run.
+        SYSTEMTIME t;
+        GetLocalTime(&t);
+        fprintf(g_file, "HOLE VR log, run started %04d-%02d-%02d %02d:%02d:%02d local time\n", t.wYear,
+                t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+        fflush(g_file);
+    }
 }
 
 #define HOLEVR_LOG_FN(name, level)       \
