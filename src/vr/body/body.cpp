@@ -1098,7 +1098,8 @@ struct FreeSlideHand {
 // overhand, palm facing the muzzle (hand behind the slide) = rear pinch.
 // Each is its own record.
 enum SlideHold { kSlideOver, kSlideRear, kSlideFront, kSlideHoldCount };
-const char* kSlideHoldKey[] = {"over", "rear", "front"};
+// (New names on 2026-11-02 so the owner's earlier test saves, slide-over/front, do not hide the built-in holds.)
+const char* kSlideHoldKey[] = {"rear-flat", "rear-pinch", "front-flat"};
 const char* kSlideHoldName[] = {"rear overhand", "rear pinch", "front"};
 int g_slide_hold[2] = {kSlideOver, kSlideOver};
 
@@ -2002,6 +2003,123 @@ void PoseFingers(int side, const fingers::Angles a[hand_pose::kFingerCount]) {
         }
 }
 
+// An empty hand on its controller (fist_at: where the fist goes).
+void FreeHand(int side, const hands::HandState& h, const FVector& fist_at, FQuat* rot, FVector* pos) {
+    const HandRig& rig = G.rig[side];
+    const FVector fist = fist_at + h.grip.rotation.Rotate(FVector{S.hand_offset[0], S.hand_offset[1], S.hand_offset[2]});
+    const FVector fwd = h.grip.rotation.Rotate(FVector{1, 0, 0});
+    FQuat hand_rot = rig.frame.valid ? HandRotation(rig.frame, fwd, h.palm_normal) : h.grip.rotation;
+    if (S.hand_rot[0] || S.hand_rot[1] || S.hand_rot[2]) {
+        double mirror = side == kL ? -1.0 : 1.0;
+        hand_rot = Normalized(h.grip.rotation *
+                              ToQuat(FRotator{S.hand_rot[0], S.hand_rot[1] * mirror, S.hand_rot[2] * mirror}) *
+                              h.grip.rotation.Inverse() * hand_rot);
+    }
+    *rot = hand_rot;
+    *pos = rig.frame.valid ? fist - hand_rot.Rotate(rig.frame.fist) : fist;
+}
+
+// ---- built-in slide holds (owner's description, 2026-11-02) ----
+// Front and rear overhand: hand flat, the thumb's pad against the slide.
+// Rear pinch: a fist with the thumb straight out, the side of the index
+// finger's first knuckle against the slide. The hand keeps the angle the
+// controller had when it grabbed; it is only moved so the contact point
+// touches the slide's surface, found with a line trace against the slide part.
+// Unsaved: the grip editor fine-tunes it and Y saves it as usual.
+bool TraceSlide(UObject slide, const FVector& a, const FVector& b, FVector* hit) {
+    // The game's gun parts have no collision; a line trace against one
+    // component needs query collision. Query-only and ignoring every channel:
+    // nothing in the game can hit it.
+    static UObject made = 0;
+    if (made != slide) {
+        made = slide;
+        uint8_t coll = 0;
+        ue::Call ce(slide, "GetCollisionEnabled");
+        if (ce.Invoke()) coll = ce.Result<uint8_t>();
+        if (coll == 0) {
+            ue::Call r(slide, "SetCollisionResponseToAllChannels");
+            r.Set("NewResponse", static_cast<uint8_t>(0));  // ECR_Ignore
+            ue::Call e(slide, "SetCollisionEnabled");
+            e.Set("NewType", static_cast<uint8_t>(1));  // QueryOnly
+            const bool ok = r.Invoke() && e.Invoke();
+            log::Info("body: slide part made traceable (query only, ignores every channel): %s", ok ? "ok" : "FAILED");
+        }
+    }
+    ue::Call c(slide, "K2_LineTraceComponent");
+    if (!c.Valid()) return false;
+    c.Set("TraceStart", a).Set("TraceEnd", b).Set("bTraceComplex", true);
+    if (!c.Invoke() || !c.Result<bool>()) return false;
+    *hit = c.Get<FVector>("HitLocation");
+    return true;
+}
+
+bool BuildSlidePreset(int side, const hands::HandState& h, const hands::Pose& obj, const hands::HandGrab& grab) {
+    static const bool enabled = config::GetBool("hand_slide_builtin_holds", true);
+    const HandRig& rig = G.rig[side];
+    if (!enabled || !rig.ok || !grab.object) return false;
+    UObject slide = 0;
+    if (!ue::GetProp(grab.object, "GunParts_Bolt(Slide)", slide) || !slide) return false;
+    const int hold = g_slide_hold[side];
+    const bool pinch = hold == kSlideRear;
+    // Hand where the controller grabbed, in the object frame.
+    FQuat hand_rot;
+    FVector hand_pos;
+    FreeHand(side, h, h.grip.location, &hand_rot, &hand_pos);
+    const FQuat inv = obj.rotation.Inverse();
+    FQuat rot_o = Normalized(inv * hand_rot);
+    FVector pos_o = inv.Rotate(hand_pos - obj.location);
+    // Fingers: flat, or a fist; the thumb straight either way.
+    gr::Record rec;
+    rec.name = RecordKey(side, grab);
+    rec.right_hand = side == kR;
+    FVector contact_h{};  // hand space
+    for (int t = 0; t < gr::kTipCount; ++t) {
+        const int f = TipFinger(t);
+        const fingers::Chain& c = rig.chain[f];
+        const bool thumb = f == hand_pose::kThumb;
+        fingers::Angles a = fingers::Curl(c, pinch && !thumb ? 1.0 : 0.0, fingers::DefaultLimits(thumb));
+        for (int j = 0; j < 3; ++j) rec.joint[t][j] = Normalized(c.ref[j].rotation.Inverse() * fingers::LocalRotation(c, j, a));
+        rec.posed[t] = true;
+        Xf js[3];
+        FVector tip;
+        fingers::Fk(c, a, js, &tip);
+        rec.tip[t] = tip;  // hand space for now
+        if (!pinch && thumb) contact_h = (js[2].translation + tip) * 0.5;  // thumb pad
+        if (pinch && t == gr::kIndexRest) contact_h = js[1].translation + rig.across_h * 0.9;  // side of the index knuckle
+    }
+    // Move the hand so the contact point sits on the slide: trace toward the
+    // slide's centre line (gun X through the slide part's origin).
+    const Xf sw = ComponentToWorld(slide);
+    FVector cw = obj.location + obj.rotation.Rotate(pos_o + rot_o.Rotate(contact_h));
+    const FVector axis = obj.rotation.Rotate(FVector{1, 0, 0});
+    FVector on_line = sw.translation + axis * Dot(cw - sw.translation, axis);
+    FVector d = on_line - cw;
+    const double dist = Length(d);
+    bool snapped = false;
+    FVector hit{};
+    if (dist > 0.1) {
+        d = d * (1.0 / dist);
+        snapped = TraceSlide(slide, cw - d * 8.0, on_line, &hit);
+        if (snapped) {
+            static const double pad = config::GetFloat("hand_slide_contact_skin_cm", 0.6f);
+            pos_o = pos_o + inv.Rotate(hit - d * pad - cw);
+        }
+    }
+    gr::StoreHand(&rec, rig.geo, rot_o, pos_o);
+    for (int t = 0; t < gr::kTipCount; ++t) rec.tip[t] = pos_o + rot_o.Rotate(rec.tip[t]);
+    ActiveGrip& g = G.grip[side];
+    g.key = rec.name;
+    g.rec = rec;
+    g.have = true;
+    g.from_file = false;
+    SolveGrip(side, -1, false);
+    log::Info("body: slide %s hold: built-in pose (%s), contact %s on the slide%s", kSlideHoldName[hold],
+              pinch ? "fist, thumb out, index knuckle on the slide" : "flat hand, thumb pad on the slide",
+              snapped ? "placed" : "NOT placed (the trace missed the slide; hand left where it grabbed)",
+              snapped ? "" : "");
+    return true;
+}
+
 void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, const hands::HandGrab& right_grab,
               const FVector& body_fwd, const FVector& body_right, double dt) {
     const Skeleton& k = G.skel;
@@ -2019,7 +2137,8 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
             g_slide_hold[side] = PickSlideHold(h, gun, grab.object);
         LoadGrip(side, grab);
         g_free_slide[side].on = false;
-        if (grab.kind == hands::GrabKind::kSlideGrab && !g.have && ObjectFrame(grab, right_grab, &gun)) {
+        if (grab.kind == hands::GrabKind::kSlideGrab && !g.have && ObjectFrame(grab, right_grab, &gun) &&
+            !BuildSlidePreset(side, h, gun, grab)) {
             const FQuat inv = gun.rotation.Inverse();
             g_free_slide[side] = {true, Normalized(inv * h.grip.rotation), inv.Rotate(h.grip.location - gun.location)};
         }
@@ -2043,19 +2162,9 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
             hv.grip.location = sobj.location + sobj.rotation.Rotate(g_free_slide[side].pos);
             hv.palm_normal = turn.Rotate(h.palm_normal);
         }
-        const hands::HandState& h = hv;
         const bool free_slide = grab.kind == hands::GrabKind::kSlideGrab && g_free_slide[side].on;
-        FVector fist = IsGrab(grab.kind) && !free_slide ? grab.target.location : h.grip.location;
-        fist = fist + h.grip.rotation.Rotate(FVector{S.hand_offset[0], S.hand_offset[1], S.hand_offset[2]});
-        FVector fwd = h.grip.rotation.Rotate(FVector{1, 0, 0});
-        hand_rot = rig.frame.valid ? HandRotation(rig.frame, fwd, h.palm_normal) : h.grip.rotation;
-        if (S.hand_rot[0] || S.hand_rot[1] || S.hand_rot[2]) {
-            double mirror = side == kL ? -1.0 : 1.0;
-            hand_rot = Normalized(h.grip.rotation *
-                                  ToQuat(FRotator{S.hand_rot[0], S.hand_rot[1] * mirror, S.hand_rot[2] * mirror}) *
-                                  h.grip.rotation.Inverse() * hand_rot);
-        }
-        hand_pos = rig.frame.valid ? fist - hand_rot.Rotate(rig.frame.fist) : fist;
+        FreeHand(side, hv, IsGrab(grab.kind) && !free_slide ? grab.target.location : hv.grip.location, &hand_rot,
+                 &hand_pos);
     }
 
     FVector shoulder = WP(k.upperarm[side]);
