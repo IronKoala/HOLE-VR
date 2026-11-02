@@ -105,6 +105,7 @@ std::mutex g_scan_mutex;
 std::vector<Candidate> g_candidates;
 std::atomic<bool> g_want_scan{false};
 std::atomic<bool> g_active{false};
+std::atomic<bool> g_title_up{false};
 
 UObject g_wbgc_class = 0;  // WidgetBlueprintGeneratedClass
 std::unordered_set<UObject> g_menu_classes;
@@ -550,7 +551,16 @@ void TakeNewMenus() {
     bool title_up = false;
     for (const auto& c : list) {
         if (ue::GetName(c.cls) != "UIM_Title_C" || !Alive(c.obj, c.index)) continue;
-        if (CallBool(c.obj, "IsInViewport")) title_up = true;
+        // The game keeps the title widget around during play, hidden.
+        uint8_t vis = Visibility(c.obj);
+        if (vis != kCollapsed && vis != kHidden && CallBool(c.obj, "IsInViewport")) {
+            title_up = true;
+            static uint8_t s_logged_vis = 255;
+            if (vis != s_logged_vis) {
+                s_logged_vis = vis;
+                log::Info("world menu: title widget on screen, visibility %d", vis);
+            }
+        }
     }
     static bool s_said_title = false;
     if (title_up != s_said_title) {
@@ -558,6 +568,7 @@ void TakeNewMenus() {
         log::Info("world menu: title screen %s", title_up ? "is up, menus stay on the flat screen until it's gone"
                                                           : "is gone, menus go on the forearm");
     }
+    g_title_up = title_up;
     if (title_up) return;
     for (const auto& c : list) {
         if (g_play_widgets.count(c.obj)) continue;
@@ -1161,6 +1172,7 @@ void InitGame() {
 }
 
 bool Active() { return g_active.load(); }
+bool TitleUp() { return g_title_up.load(); }
 bool Enabled() { return S.enabled; }
 
 }  // namespace holevr::vr::world_menu

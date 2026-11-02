@@ -24,6 +24,8 @@ void InitGame();
 void Scan();
 // True while at least one menu is on a world panel.
 bool Active();
+// True while the title screen is showing (its menus stay on the flat screen).
+bool TitleUp();
 // True when world panels are switched on in the settings.
 bool Enabled();
 

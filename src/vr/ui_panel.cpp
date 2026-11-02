@@ -389,8 +389,10 @@ struct UiListener : xr::Listener {
         // Menus on their own panels in the world (vr/world_menu) replace this
         // flat copy of the screen. It only comes back if no menu could be
         // moved there.
+        // Only the title screen still uses it; every other menu goes on the
+        // forearm and never gets the flat box.
         if (world_menu::Enabled()) {
-            if (world_menu::Active() || GetTickCount() - g_opened_at < 1500) {
+            if (!world_menu::TitleUp() || world_menu::Active() || GetTickCount() - g_opened_at < 300) {
                 if (PT.mouse_down && w) PostMessageW(w, WM_LBUTTONUP, 0, 0);
                 PT.mouse_down = false;
                 return;
@@ -398,7 +400,7 @@ struct UiListener : xr::Listener {
             static bool s_said = false;
             if (!s_said) {
                 s_said = true;
-                log::Warn("menu panel: no menu could be moved into the world; showing the flat screen instead");
+                log::Info("menu panel: title screen on the flat panel");
             }
         }
 
