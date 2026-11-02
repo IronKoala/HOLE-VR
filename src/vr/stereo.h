@@ -26,4 +26,13 @@ void Recenter();
 // false until the first headset frame has been rendered.
 bool TrackingToWorld(const XrPosef& tracking_pose, FVector* world_location, FQuat* world_rotation);
 
+// Room-scale support. HeadOffsetWorld gives the horizontal offset (world
+// axes, cm, Z = 0) of the player's head from the game camera on the latest
+// frame, minus any shift already requested. After moving the pawn by some
+// world delta, ShiftOriginWorld(delta) moves the tracking origin to match, so
+// the view stays where it was. Horizontal only; both are thread-safe and
+// return false until the first headset frame.
+bool HeadOffsetWorld(FVector* offset_cm);
+bool ShiftOriginWorld(const FVector& world_delta_cm);
+
 }  // namespace holevr::vr::stereo
