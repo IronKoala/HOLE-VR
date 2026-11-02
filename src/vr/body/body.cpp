@@ -486,6 +486,7 @@ struct State {
     bool knee_known[2] = {false, false};
     double clav_amount[2] = {0, 0};
     double stand_dz = -1e9;
+    double body_dz = 0;  // whole body moved up/down so the shoulders sit under the eyes
     int frames = 0;
     // fit log
     double fit_time = 0;
@@ -1432,7 +1433,7 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
     // owner's photos: forearm right behind the gun), so the elbow searches
     // wider and minimises the whole bend, not just what is past the limits.
     const bool straight = S.gun_wrist_straight && recorded && rig.ok && grab.kind == hands::GrabKind::kGunGrip;
-    const int steps = straight ? 18 : 6;
+    const int steps = straight ? 9 : 6;  // +-45 deg (+-90 flung the elbow up, 120 deg forearm twist)
     const double step_deg = straight ? 5.0 : 10.0;
     for (int step = -steps; step <= steps; ++step) {
         if (step != 0 && (!S.elbow_relieves_wrist || !rig.ok) && !straight) continue;
@@ -1442,7 +1443,7 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
         if (rig.ok) WristBend(rig, hand_rot, s.end - s.mid, &fl, &dv);
         double over_f = std::max(0.0, std::fabs(fl) - 55.0 * kDegToRad);
         double over_d = std::max(0.0, std::fabs(dv) - 25.0 * kDegToRad);
-        double cost = straight ? fl * fl + 2.0 * dv * dv + 0.05 * ang * ang
+        double cost = straight ? fl * fl + 2.0 * dv * dv + 0.4 * ang * ang
                                : over_f * over_f + 2.0 * over_d * over_d + 0.15 * ang * ang;
         if (cost < best_cost) {
             best_cost = cost;
@@ -1561,9 +1562,10 @@ void FitLog(double dt, double yaw_lag) {
                           G.fit_flex[s] / n, G.fit_dev[s] / n, G.fit_twist[s] / n, G.fit_swivel[s] / n);
             arms += buf;
         }
-        log::Info("body fit: arm scale %.3f (%s), body %.0f deg behind head yaw%s", ArmScale(),
+        log::Info("body fit: arm scale %.3f (%s), body %.0f deg behind head yaw, body moved %+.0f cm to put the "
+                  "shoulders under the eyes%s", ArmScale(),
                   S.arm_scale_override > 0 ? "ini" : M.have ? "measured" : "not measured",
-                  G.fit_yaw_n ? G.fit_yaw_lag / G.fit_yaw_n : 0.0, arms.c_str());
+                  G.fit_yaw_n ? G.fit_yaw_lag / G.fit_yaw_n : 0.0, G.body_dz, arms.c_str());
     }
     G.fit_time = G.fit_yaw_lag = 0;
     G.fit_yaw_n = 0;
@@ -1698,8 +1700,17 @@ void OnTick(UObject player, float dt_f) {
     FVector delta = sc_target - sc_anim_r;
     if (Length(delta) > 500.0) delta = FVector{};  // teleport in progress
     if (delta.Z > G.stand_dz) G.stand_dz = delta.Z;
-    const double down = delta.Z - G.stand_dz;
-    const double crouch = S.fixed_height ? 0.0 : std::clamp(down, -S.max_crouch, 0.0);
+    // Height: the avatar is taller than the game's camera (its shoulders
+    // came out level with the eyes, camera "in the collarbone"), so the whole
+    // body moves down (knees bend) until the shoulders are one head unit
+    // below the eyes. With fixed_height this is a constant; otherwise real
+    // crouching adds to it.
+    {
+        double lo = S.fixed_height ? -45.0 : -(S.max_crouch + 45.0);
+        double want_dz = std::clamp(delta.Z, lo, 10.0);
+        G.body_dz += (want_dz - G.body_dz) * (1.0 - std::exp(-8.0 * dt));
+    }
+    const double crouch = G.body_dz;
     FVector offset{delta.X, delta.Y, 0};
     // The body always goes under the head: a little of the offset is lean,
     // the rest moves the whole body. (It used to stop at 60 cm, so walking
@@ -1724,7 +1735,7 @@ void OnTick(UObject player, float dt_f) {
         SetWX(k.pelvis, p);
     }
     if (have_shoulders && !k.spine.empty() && k.pelvis >= 0) {
-        FVector want = sc_anim_r + pelvis_shift + FVector{0, 0, std::max(down, -S.max_crouch - 30.0)} + lean;
+        FVector want = sc_anim_r + pelvis_shift + FVector{0, 0, crouch} + lean;
         FVector base = WP(k.spine[0]);
         FVector now = (WP(k.upperarm[kL]) + WP(k.upperarm[kR])) * 0.5;
         FQuat bend = ClampAngle(Arc(now - base, want - base), S.max_spine_bend * kDegToRad);
