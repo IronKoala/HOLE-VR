@@ -416,9 +416,10 @@ bool PlaceOnForearm() {
     FVector head;
     double yaw;
     HeadInWorld(&head, &yaw);  // refreshes cm_per_m
-    // Grip axes in UE: +X through the fist, +Z along the thumb, +Y out of the
-    // back of the left hand.
-    double side = S.arm == input::kLeft ? 1.0 : -1.0;
+    // Grip axes in UE: +X through the fist, +Z along the thumb. +Y points out
+    // of the PALM of the left hand: with +1 here the owner saw the menu only
+    // when turning the palm up (2026-11-02 run), so the back of the hand is -Y.
+    double side = S.arm == input::kLeft ? -1.0 : 1.0;
     FVector back = q.Rotate(FVector{0, side, 0});
     FVector thumb = q.Rotate(FVector{0, 0, 1});
     G.centre = loc + q.Rotate(FVector{-S.arm_along_m * G.cm_per_m, side * S.arm_back_m * G.cm_per_m, 0});

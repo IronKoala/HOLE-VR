@@ -489,7 +489,10 @@ XrQuaternionf FromAxes(V3 x, V3 y, V3 z) {
 // always reads the right way up like a watch.
 bool WristPose(const input::HandInput& h, XrPosef* pose) {
     if (!h.grip_valid) return false;
-    float side = S.hand == input::kLeft ? 1.f : -1.f;  // which way +X is "back of the hand"
+    // The forearm menu, placed with this same +X-is-back rule, showed up on the
+    // owner's PALM side (2026-11-02, Steam Frame via SteamVR), so on this
+    // runtime +X points out of the left palm: the back of the hand is -X.
+    float side = S.hand == input::kLeft ? -1.f : 1.f;
     V3 local{side * S.offset_back_m, 0.f, S.offset_elbow_m};
     V3 p = Add(V3{h.grip.position.x, h.grip.position.y, h.grip.position.z}, Rotate(h.grip.orientation, local));
     V3 face = Rotate(h.grip.orientation, V3{side, 0, 0});
