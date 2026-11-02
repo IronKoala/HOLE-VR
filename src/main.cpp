@@ -24,6 +24,7 @@
 #include "vr/cvars.h"
 #include "vr/render_fixes.h"
 #include "vr/ui_panel.h"
+#include "vr/wrist_hud.h"
 #include "vr/stereo.h"
 
 namespace {
@@ -74,6 +75,7 @@ void StartVr() {
     using namespace holevr;
     vr::input::Init();  // controller actions must exist before the session starts
     vr::ui_panel::Init();
+    vr::wrist_hud::Init();
     bool told = false;
     while (!vr::xr::InitInstance()) {
         if (!told) log::Info("Waiting for SteamVR and the headset...");
@@ -121,6 +123,7 @@ DWORD WINAPI InitThread(LPVOID) {
         vr::controls::Init();
         vr::body::Init();  // after controls: reads this frame's hand poses
         vr::cvars::Init();
+        vr::wrist_hud::InitGame();
     }
 
     // Development hotkeys. Polled rather than hooked so nothing here can

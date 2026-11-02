@@ -360,9 +360,14 @@ struct UiListener : xr::Listener {
         HWND w = GameWindow();
 
         // Menu button on either controller toggles the pause menu (Escape).
+        // A half-second guard so a double press doesn't open and close it.
+        static DWORD s_last_menu = 0;
         for (int hnd = 0; hnd < 2; ++hnd) {
             bool m = in.valid && in.hand[hnd].menu.down;
-            if (S.pause_button && m && !PT.menu_down[hnd] && w) PostKey(w, VK_ESCAPE);
+            if (S.pause_button && m && !PT.menu_down[hnd] && w && GetTickCount() - s_last_menu > 500) {
+                PostKey(w, VK_ESCAPE);
+                s_last_menu = GetTickCount();
+            }
             PT.menu_down[hnd] = m;
         }
         if (!open || !S.enabled) return;
@@ -404,6 +409,8 @@ struct UiListener : xr::Listener {
             const auto& h = in.hand[PT.active_hand];
             if (HitPanel(h, &u, &v)) {
                 down = PT.trigger_down[PT.active_hand];
+                // A tick in the hand on each click, so you feel it land.
+                if (down && !PT.mouse_down) input::Haptic(static_cast<input::Hand>(PT.active_hand), 0.3f, 0.02f, 200.f);
                 // Thumbstick up/down scrolls lists, 3 notches a second at full tilt.
                 PT.scroll_accum += h.stick_y * 120.f * 3.f / 90.f;
                 float notch = 0.f;
