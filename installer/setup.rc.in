@@ -1,0 +1,28 @@
+#include <winver.h>
+#include "version.h"
+
+1 24 "@SETUP_MANIFEST@"
+// The mod itself, written to the game folder on install.
+101 RCDATA "@DXGI_DLL@"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION HOLEVR_VERSION_MAJOR, HOLEVR_VERSION_MINOR, HOLEVR_VERSION_PATCH, 0
+PRODUCTVERSION HOLEVR_VERSION_MAJOR, HOLEVR_VERSION_MINOR, HOLEVR_VERSION_PATCH, 0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "ProductName", HOLEVR_PRODUCT_NAME " Setup"
+            VALUE "FileDescription", "Installs or removes the HOLE VR mod"
+            VALUE "ProductVersion", HOLEVR_VERSION_STR
+            VALUE "FileVersion", HOLEVR_VERSION_STR
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
