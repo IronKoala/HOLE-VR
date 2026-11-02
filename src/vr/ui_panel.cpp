@@ -113,8 +113,14 @@ struct UiListener : xr::Listener {
             }
             PT.menu_down[hnd] = m;
         }
-        if (!open) return;
-        // B/Y goes back (Escape).
+        // The cursor never shows for the VR pause menu, so a menu on the
+        // forearm counts too; before this, B/Y did nothing in a forearm menu.
+        if (!open && !world_menu::MenuUp()) {
+            // Only a press that starts while a menu is up counts.
+            for (int hnd = 0; hnd < 2; ++hnd) PT.back_down[hnd] = in.valid && in.hand[hnd].secondary.down;
+            return;
+        }
+        // B/Y goes back (Escape): out of Options to the pause menu, and so on.
         if (in.valid) {
             for (int hnd = 0; hnd < 2; ++hnd) {
                 bool back = in.hand[hnd].secondary.down;

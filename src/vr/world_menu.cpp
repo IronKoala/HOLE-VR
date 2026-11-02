@@ -56,6 +56,7 @@ struct Settings {
     float arm_roll_deg = 0.f;     // extra turn of the menu on the arm
     bool hide_covers = true;      // the menus' full-screen click-catcher
     bool laser = true;
+    bool stack = true;            // a sub-menu takes the place of the menu under it
 } S;
 
 // The game's menus are laid out for a 1920x1080 screen.
@@ -150,6 +151,7 @@ struct Panel {
     bool open_unreliable = false;
     uint8_t last_vis = 255;
     int layer = 0;             // 0 = the first menu, sub-menus come forward
+    bool shown = true;         // false while a sub-menu covers it
 };
 
 struct Pointer {
@@ -648,6 +650,39 @@ void DropClosedMenus() {
     if (G.panels.empty()) G.placed = false;
 }
 
+// ---------------------------------------------------------- sub-menus --
+// The pause menu stays on the screen while Options (or a Yes/No dialog, Task,
+// Credits...) is up: the 2026-11-02 study saw Pause only lose focus, never
+// close. On the arm both would sit in the same spot, the pause buttons
+// showing through the sub-menu. So only the top menu is shown, like a watch
+// face changing page; the one underneath comes back when the top one closes.
+
+bool WidgetShows(const Panel& p) {
+    uint8_t vis = p.last_vis == 255 ? kVisible : p.last_vis;
+    return vis != kCollapsed && vis != kHidden;
+}
+
+void SetShown(Panel& p, bool shown) {
+    if (p.shown == shown) return;
+    p.shown = shown;
+    if (!Alive(p.comp, p.comp_index)) return;
+    ue::Call c(p.comp, "SetVisibility");
+    c.Set("bNewVisibility", shown).Set("bPropagateToChildren", true);
+    c.Invoke();
+    log::Info("world menu: %s %s", p.name.c_str(),
+              shown ? "shown again (the menu on top of it closed)" : "hidden under the sub-menu on top of it");
+}
+
+// Cheap: a few property reads and at most one call per change, no searches.
+void UpdateStack() {
+    // The top menu is the newest one the game hasn't hidden itself.
+    int top = -1;
+    for (int i = static_cast<int>(G.panels.size()) - 1; i >= 0 && top < 0; --i)
+        if (WidgetShows(G.panels[i])) top = i;
+    for (int i = 0; i < static_cast<int>(G.panels.size()); ++i)
+        SetShown(G.panels[i], !S.stack || top < 0 || i == top);
+}
+
 // ------------------------------------------------------------ pointer --
 
 struct Hit {
@@ -703,8 +738,7 @@ void UpdatePointer() {
     if (h.aim_valid && stereo::TrackingToWorld(h.aim, &o, &q)) {
         FVector d = q.Rotate(FVector{1, 0, 0});
         for (const auto& p : G.panels) {
-            uint8_t vis = p.last_vis == 255 ? kVisible : p.last_vis;
-            if (vis == kCollapsed || vis == kHidden) continue;
+            if (!p.shown || !WidgetShows(p)) continue;
             Hit hit = RayPanel(o, d, p);
             if (hit.ok && (!best.ok || hit.t < best.t)) best = hit;
         }
@@ -783,6 +817,7 @@ void OnGameFrame() {
     double now = Now();
     TakeNewMenus();
     DropClosedMenus();
+    UpdateStack();
     g_menu_up = !G.panels.empty();
     if (G.panels.empty()) {
         g_active = false;
@@ -1108,6 +1143,7 @@ void Init() {
     S.arm_roll_deg = config::GetFloat("menu_forearm_turn_deg", 0.f);
     S.hide_covers = config::GetBool("menu_hide_focus_cover", true);
     S.laser = config::GetBool("menu_world_laser", true);
+    S.stack = config::GetBool("menu_submenu_replaces", true);
     if (!S.enabled) {
         log::Info("world menu: off (menu_mode=%s)", mode.c_str());
         return;

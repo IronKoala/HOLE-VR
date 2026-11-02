@@ -123,6 +123,13 @@ const Block kBlocks[] = {
      "; Ammo and health over the back of the hand (from the grip, out and along)\n"
      "hand_hud_offset_back_m=0.045\n"
      "hand_hud_offset_along_m=0.0\n"},
+    {"menu_submenu_replaces",
+     "\n"
+     "; --- Sub-menus on the forearm (Options, Yes/No, Task, Credits) ---\n"
+     "; 1 = a sub-menu takes the place of the menu it came from on your arm, and\n"
+     ";     that menu comes back when you leave the sub-menu\n"
+     "; 0 = both stay on the arm, the sub-menu just in front\n"
+     "menu_submenu_replaces=1\n"},
     {"wrist_hud",
      "\n"
      "; --- Wrist display ---\n"
