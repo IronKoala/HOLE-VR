@@ -1072,11 +1072,35 @@ bool ObjectFrame(const hands::HandGrab& grab, const hands::HandGrab& right, hand
     }
 }
 
-std::string RecordKey(const hands::HandGrab& grab) {
+// Slide grabs have three poses, picked once when the hand closes on the slide
+// from how the palm faces the gun and where the hand is (like Half-Life:
+// Alyx): overhand (palm down on top), rear pinch (from behind the slide, palm
+// facing forward) and side (palm against the side). Each is its own record.
+enum SlideHold { kSlideOver, kSlideRear, kSlideSide, kSlideHoldCount };
+const char* kSlideHoldKey[] = {"over", "rear", "side"};
+const char* kSlideHoldName[] = {"overhand", "rear pinch", "side"};
+int g_slide_hold[2] = {kSlideOver, kSlideOver};
+
+int PickSlideHold(const hands::HandState& h, const hands::Pose& gun) {
+    const FQuat inv = gun.rotation.Inverse();
+    const FVector n = inv.Rotate(h.palm_normal);                    // palm direction, gun frame
+    const FVector at = inv.Rotate(h.grip.location - gun.location);  // fist from the grab point, gun frame
+    // Behind the grab point (toward the shooter) favours the rear pinch.
+    const double behind = std::clamp((-at.X - 2.0) / 6.0, 0.0, 1.0) * 0.35;
+    const double score[kSlideHoldCount] = {-n.Z, n.X + behind, std::fabs(n.Y)};
+    int best = kSlideOver;
+    for (int i = 1; i < kSlideHoldCount; ++i)
+        if (score[i] > score[best]) best = i;
+    log::Info("body: slide grab: %s hold (palm in gun frame %.2f %.2f %.2f, fist %.1f cm %s the grab point)",
+              kSlideHoldName[best], n.X, n.Y, n.Z, std::fabs(at.X), at.X < 0 ? "behind" : "ahead of");
+    return best;
+}
+
+std::string RecordKey(int side, const hands::HandGrab& grab) {
     std::string cls = grab.object ? ue::GetName(ue::GetClass(grab.object)) : "unknown";
     switch (grab.kind) {
         case hands::GrabKind::kGunGrip: return cls + ".grip";
-        case hands::GrabKind::kSlideGrab: return cls + ".slide";
+        case hands::GrabKind::kSlideGrab: return cls + ".slide-" + kSlideHoldKey[g_slide_hold[side]];
         case hands::GrabKind::kSupportGrip: return cls + ".support";
         default: return cls + ".mag";
     }
@@ -1358,7 +1382,7 @@ void LoadGrip(int side, const hands::HandGrab& grab, bool from_disk = false) {
     g.object = grab.object;
     g.kind = grab.kind;
     if (!S.grip_records || !G.rig[side].ok || !IsGrab(grab.kind) || !grab.object) return;
-    g.key = RecordKey(grab);
+    g.key = RecordKey(side, grab);
     auto cached = g_grip_cache.find(CacheKey(side, g.key));
     if (!from_disk && cached != g_grip_cache.end()) {
         g = cached->second;
@@ -1383,7 +1407,14 @@ void LoadGrip(int side, const hands::HandGrab& grab, bool from_disk = false) {
         rec.name = g.key;
         have = true;
     }
-    if (ReadText(RecordPath(g.key), &text)) {
+    bool found = ReadText(RecordPath(g.key), &text);
+    // A slide grip saved before there were three slide holds: use it for any
+    // hold not posed yet.
+    if (!found && grab.kind == hands::GrabKind::kSlideGrab) {
+        std::string cls = ue::GetName(ue::GetClass(grab.object));
+        found = ReadText(RecordPath(cls + ".slide"), &text);
+    }
+    if (found) {
         if (!have || is_mag) rec.right_hand = side == kR;
         if (gr::Parse(text, &rec)) {
             have = true;
@@ -1656,7 +1687,7 @@ void UpdateEditor(const hands::HandGrab grab[2], const hands::HandState hs[2], d
         hands::SetEditorHand(ctrl);
         if (!g.have) {
             // New record from the current hand: its pose and fingertips now.
-            g.key = RecordKey(grab[side]);
+            g.key = RecordKey(side, grab[side]);
             g.rec = gr::Record{};
             g.rec.name = g.key;
             g.rec.right_hand = side == kR;
@@ -1914,6 +1945,9 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
     ActiveGrip& g = G.grip[side];
     if (grab.object != g.object || grab.kind != g.kind) {
         if (g_editor.Active() && g_edit_side == side) StopEditor();
+        hands::Pose gun;
+        if (grab.kind == hands::GrabKind::kSlideGrab && ObjectFrame(grab, right_grab, &gun))
+            g_slide_hold[side] = PickSlideHold(h, gun);
         LoadGrip(side, grab);
     }
     hands::Pose obj;
