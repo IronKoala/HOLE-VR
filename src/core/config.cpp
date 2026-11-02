@@ -135,6 +135,14 @@ const Block kBlocks[] = {
      ";     that menu comes back when you leave the sub-menu\n"
      "; 0 = both stay on the arm, the sub-menu just in front\n"
      "menu_submenu_replaces=1\n"},
+    {"menu_forearm_size",
+     "\n"
+     "; How big the forearm menus are, times menu_forearm_width_m (1.25 = 25%\n"
+     "; bigger than 0.30 m, what the owner asked for on 2026-11-02)\n"
+     "menu_forearm_size=1.25\n"
+     "; 1 = hide the see-through grey box some menus draw behind their buttons\n"
+     "; (Options has one); it shows as a shadowy box on the arm\n"
+     "menu_hide_backdrops=1\n"},
     {"wrist_hud",
      "\n"
      "; --- Wrist display ---\n"
