@@ -11,6 +11,7 @@
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 
+#include <string>
 #include <vector>
 
 namespace holevr::vr::xr {
@@ -39,6 +40,10 @@ PFN_xrVoidFunction GetProc(const char* name);
 bool InitInstance();
 bool InstanceReady();
 
+// Library path of the active OpenXR runtime (from its registered manifest),
+// e.g. <SteamVR>\bin\vrclient_x64.dll. "" if none is registered. Does not load it.
+std::wstring ActiveRuntimeLibrary();
+
 // Per-eye render size the runtime recommends (already scaled by settings).
 void RecommendedEyeSize(uint32_t* width, uint32_t* height);
 
@@ -65,6 +70,8 @@ bool LatestViews(EyeView out[2]);
 void SetRenderedViews(const EyeView views[2]);
 
 bool SessionRunning();
+// True once the headset is showing this game (session VISIBLE or FOCUSED).
+bool SessionVisible();
 XrInstance Instance();
 XrSession Session();
 XrSpace TrackingSpace();

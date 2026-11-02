@@ -35,6 +35,11 @@ struct SlideConfig {
     // grab_radius_forward. 0 = rear sphere only.
     double grab_forward = 0.0;        // cm
     double grab_radius_forward = 6.0; // cm
+    // Pistol: pinch grab from behind the slide (the hand is behind the rear
+    // of the slide, on the bore line). Capsule this far back of grab_center
+    // along the pull axis, radius grab_radius_back. 0 = none.
+    double grab_back = 0.0;           // cm
+    double grab_radius_back = 5.0;    // cm
 };
 
 enum class SlideEvent { kNone, kGrabbed, kReachedBack, kRacked, kPartialRelease, kSlipped };

@@ -565,6 +565,7 @@ const SlotDef kSlots[static_cast<int>(Slot::kCount)] = {
     {true, {-16, 0, 4}},     // back
 };
 hands::Pose g_slots[static_cast<int>(Slot::kCount)];
+hands::Pose g_anchors[2];  // belt, chest (holsters)
 bool g_slots_valid = false;
 
 UObject g_poseable_class = 0;
@@ -1072,6 +1073,15 @@ bool ObjectFrame(const hands::HandGrab& grab, const hands::HandGrab& right, hand
     }
 }
 
+// A slide grab with no posed hold yet: the hand stays where the controller
+// was on the slide when it grabbed (relative to the grab point), instead of
+// being pulled onto the grab point inside the slide.
+struct FreeSlideHand {
+    bool on = false;
+    FQuat rot;     // controller grip in the object frame
+    FVector pos;
+} g_free_slide[2];
+
 // Slide grabs have three poses, picked once when the hand closes on the
 // slide (like Half-Life: Alyx). Hand on the FRONT half of the slide = front
 // hold. On the rear half the angle decides: palm facing down onto it =
@@ -1112,14 +1122,12 @@ int PickSlideHold(const hands::HandState& h, const hands::Pose& gun, UObject gun
     // Front half of the slide (unknown length: well ahead of the grab point).
     const double split = span ? (back + front) * 0.5 : 5.0;
     int best;
-    if (at.X > split) {
-        best = kSlideFront;
-    } else {
-        // Rear: palm down on top vs palm toward the muzzle; being behind the
-        // grab point favours the pinch.
-        const double behind = std::clamp((-at.X - 2.0) / 6.0, 0.0, 1.0) * 0.35;
-        best = n.X + behind > -n.Z ? kSlideRear : kSlideOver;
-    }
+    // Behind the slide (owner: "the pinch zone needs to be behind the
+    // slide"): the rear pinch, whatever the palm does.
+    static const double pinch_behind = config::GetFloat("hand_slide_pinch_behind_cm", 7.f);
+    if (at.X > split) best = kSlideFront;
+    else if (at.X < -pinch_behind) best = kSlideRear;
+    else best = kSlideOver;
     log::Info("body: slide grab: %s hold (fist %.1f cm along the slide from the grab point; slide %s; "
               "front half from %.1f; palm in gun frame %.2f %.2f %.2f)",
               kSlideHoldName[best], at.X,
@@ -1982,6 +1990,11 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
         if (grab.kind == hands::GrabKind::kSlideGrab && ObjectFrame(grab, right_grab, &gun))
             g_slide_hold[side] = PickSlideHold(h, gun, grab.object);
         LoadGrip(side, grab);
+        g_free_slide[side].on = false;
+        if (grab.kind == hands::GrabKind::kSlideGrab && !g.have && ObjectFrame(grab, right_grab, &gun)) {
+            const FQuat inv = gun.rotation.Inverse();
+            g_free_slide[side] = {true, Normalized(inv * h.grip.rotation), inv.Rotate(h.grip.location - gun.location)};
+        }
     }
     hands::Pose obj;
     const bool recorded = g.have && rig.ok && ObjectFrame(grab, right_grab, &obj);
@@ -1993,7 +2006,18 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
         hand_rot = Normalized(obj.rotation * g.hand_rot);
         hand_pos = obj.location + obj.rotation.Rotate(g.hand_pos);
     } else {
-        FVector fist = IsGrab(grab.kind) ? grab.target.location : h.grip.location;
+        // Unposed slide hold: a controller carried along with the slide.
+        hands::HandState hv = h;
+        hands::Pose sobj;
+        if (grab.kind == hands::GrabKind::kSlideGrab && g_free_slide[side].on && ObjectFrame(grab, right_grab, &sobj)) {
+            const FQuat turn = Normalized(sobj.rotation * g_free_slide[side].rot * h.grip.rotation.Inverse());
+            hv.grip.rotation = Normalized(sobj.rotation * g_free_slide[side].rot);
+            hv.grip.location = sobj.location + sobj.rotation.Rotate(g_free_slide[side].pos);
+            hv.palm_normal = turn.Rotate(h.palm_normal);
+        }
+        const hands::HandState& h = hv;
+        const bool free_slide = grab.kind == hands::GrabKind::kSlideGrab && g_free_slide[side].on;
+        FVector fist = IsGrab(grab.kind) && !free_slide ? grab.target.location : h.grip.location;
         fist = fist + h.grip.rotation.Rotate(FVector{S.hand_offset[0], S.hand_offset[1], S.hand_offset[2]});
         FVector fwd = h.grip.rotation.Rotate(FVector{1, 0, 0});
         hand_rot = rig.frame.valid ? HandRotation(rig.frame, fwd, h.palm_normal) : h.grip.rotation;
@@ -2467,6 +2491,8 @@ void OnTick(UObject player, float dt_f) {
             g_slots[i].location = (kSlots[i].chest ? chest : belt) + body_q.Rotate(kSlots[i].offset);
             g_slots[i].rotation = body_q;
         }
+        g_anchors[static_cast<int>(Anchor::kBelt)] = {belt, body_q};
+        g_anchors[static_cast<int>(Anchor::kChest)] = {chest, body_q};
         g_slots_valid = true;
     }
     g_perf_solve.Add(perf::NowMs() - t_solve);
@@ -2488,6 +2514,13 @@ bool GetSlot(Slot slot, hands::Pose* out) {
     int i = static_cast<int>(slot);
     if (!g_slots_valid || i < 0 || i >= static_cast<int>(Slot::kCount)) return false;
     *out = g_slots[i];
+    return true;
+}
+
+bool GetAnchor(Anchor anchor, hands::Pose* out) {
+    int i = static_cast<int>(anchor);
+    if (!g_slots_valid || i < 0 || i > 1) return false;
+    *out = g_anchors[i];
     return true;
 }
 
