@@ -16,16 +16,19 @@
 #include "core/config.h"
 #include "core/log.h"
 #include "core/memory.h"
+#include "core/perf.h"
 #include "game/game.h"
 #include "ue/call.h"
 #include "ue/names.h"
 #include "ue/objects.h"
 #include "ue/process_event.h"
 #include "ue/reflection.h"
+#include "vr/cvars.h"
 #include "vr/dxgi_hooks.h"
 #include "vr/input.h"
 #include "vr/math.h"
 #include "vr/openxr.h"
+#include "vr/render_fixes.h"
 #include "vr/stereo.h"
 #include "vr/ui_panel.h"
 
@@ -201,11 +204,45 @@ Laser g_laser;
 
 // ------------------------------------------------------------ helpers --
 
-UObject Ksl() {
-    static UObject k = 0;
-    if (!k) k = ue::FindObject("KismetSystemLibrary /Script/Engine.Default__KismetSystemLibrary");
-    return k;
+// Engine objects looked up by name. A lookup by name walks every object in
+// the game, which took over a second with a level loaded and froze the game
+// when it ran as the pause menu opened (2026-11-02 log: 2.5 s stall). So all
+// of them are found once, on the start-up thread, in ResolveLookups().
+struct Lookups {
+    UObject ksl = 0;            // KismetSystemLibrary default object
+    UObject statics = 0;        // GameplayStatics default object
+    UObject actor_class = 0;
+    UObject widget_comp_class = 0;
+    UObject wic_class = 0;      // WidgetInteractionComponent
+    UObject panel_class = 0;    // PanelWidget: has child widgets
+    UObject user_widget_class = 0;
+    UObject blur_class = 0;     // BackgroundBlur
+    FName ui_profile;           // collision profile "UI"
+    bool have_ui_profile = false;
+    FName left_mouse;           // key name "LeftMouseButton", for the laser
+} L;
+
+UObject Lookup(const char* full_name) {
+    UObject o = ue::FindObject(full_name);
+    if (!o) log::Warn("world menu: %s not found", full_name);
+    return o;
 }
+
+void ResolveLookups() {
+    L.ksl = Lookup("KismetSystemLibrary /Script/Engine.Default__KismetSystemLibrary");
+    L.statics = Lookup("GameplayStatics /Script/Engine.Default__GameplayStatics");
+    L.actor_class = Lookup("Class /Script/Engine.Actor");
+    L.widget_comp_class = Lookup("Class /Script/UMG.WidgetComponent");
+    L.wic_class = Lookup("Class /Script/UMG.WidgetInteractionComponent");
+    L.panel_class = Lookup("Class /Script/UMG.PanelWidget");
+    L.user_widget_class = Lookup("Class /Script/UMG.UserWidget");
+    L.blur_class = Lookup("Class /Script/UMG.BackgroundBlur");
+    L.have_ui_profile = ue::names::Find("UI", &L.ui_profile);
+    if (!ue::names::Find("LeftMouseButton", &L.left_mouse))
+        log::Warn("world menu: name \"LeftMouseButton\" not found");
+}
+
+UObject Ksl() { return L.ksl; }
 
 // The object still lives in the same slot and the engine calls it valid.
 bool Alive(UObject obj, int index) {
@@ -237,28 +274,12 @@ uint8_t Visibility(UObject widget) {
     return v;
 }
 
-bool FindName(const char* text, FName* out) {
-    if (ue::names::Find(text, out)) return true;
-    log::Warn("world menu: name \"%s\" not found", text);
-    return false;
-}
-
-FName LeftMouse() {
-    static FName n;
-    static bool tried = false;
-    if (!tried) {
-        tried = true;
-        FindName("LeftMouseButton", &n);
-    }
-    return n;
-}
+FName LeftMouse() { return L.left_mouse; }
 
 // ---------------------------------------------------------- the actor --
 
 UObject SpawnHost(UObject world_context) {
-    static UObject statics = 0, actor_class = 0;
-    if (!statics) statics = ue::FindObject("GameplayStatics /Script/Engine.Default__GameplayStatics");
-    if (!actor_class) actor_class = ue::FindObject("Class /Script/Engine.Actor");
+    UObject statics = L.statics, actor_class = L.actor_class;
     if (!statics || !actor_class) return 0;
     Xf t;
     ue::Call begin(statics, "BeginDeferredActorSpawnFromClass");
@@ -272,12 +293,8 @@ UObject SpawnHost(UObject world_context) {
     return finish.Result<UObject>() ? finish.Result<UObject>() : actor;
 }
 
-UObject AddComponent(UObject actor, const char* class_name, bool deferred) {
-    UObject cls = ue::FindObject(class_name);
-    if (!cls) {
-        log::Error("world menu: %s not found", class_name);
-        return 0;
-    }
+UObject AddComponent(UObject actor, UObject cls, bool deferred) {
+    if (!cls) return 0;
     ue::Call add(actor, "AddComponentByClass");
     add.Set("Class", cls).Set("bManualAttachment", true).Set("RelativeTransform", Xf{})
         .Set("bDeferredFinish", deferred);
@@ -329,7 +346,7 @@ bool EnsureActor(UObject world_context) {
         G.actor_index = IndexOf(G.actor);
         log::Info("world menu: panel holder %s", ue::GetName(G.actor).c_str());
     }
-    UObject wic = AddComponent(G.actor, "Class /Script/UMG.WidgetInteractionComponent", true);
+    UObject wic = AddComponent(G.actor, L.wic_class, true);
     if (!wic) {
         log::Error("world menu: could not create the pointer");
         return false;
@@ -490,11 +507,55 @@ void PlacePanels(const FVector& head, double yaw) {
     for (auto& p : G.panels) PosePanel(p);
 }
 
+// ---------------------------------------------------- widget tree walk --
+
+bool IsA(UObject obj, UObject base) {
+    UObject cls = ue::GetClass(obj);
+    return cls && base && ue::reflection::IsChildOf(cls, base);
+}
+
+// Walks a menu's widget tree (and the trees of the user widgets inside it,
+// e.g. its buttons) and collects any BackgroundBlur. Returns how many widgets
+// it looked at. Uses the engine's own PanelWidget.GetChildAt, so it only
+// touches the menu's widgets.
+int FindBlurs(UObject menu, std::vector<UObject>* blurs) {
+    if (!L.panel_class || !L.user_widget_class) return 0;
+    int seen = 0;
+    std::vector<std::pair<UObject, int>> todo;  // widget, depth
+    auto push_tree = [&](UObject user_widget, int depth) {
+        UObject tree = 0, root = 0;
+        if (ue::GetProp(user_widget, "WidgetTree", tree) && tree && ue::GetProp(tree, "RootWidget", root) && root)
+            todo.push_back({root, depth});
+    };
+    push_tree(menu, 0);
+    while (!todo.empty() && seen < 2000) {
+        auto [w, depth] = todo.back();
+        todo.pop_back();
+        ++seen;
+        if (L.blur_class && IsA(w, L.blur_class)) blurs->push_back(w);
+        if (depth >= 32) continue;
+        if (IsA(w, L.user_widget_class)) {
+            push_tree(w, depth + 1);
+        } else if (IsA(w, L.panel_class)) {
+            ue::Call count(w, "GetChildrenCount");
+            int n = count.Invoke() ? count.Result<int32_t>() : 0;
+            for (int i = 0; i < n && i < 256; ++i) {
+                ue::Call child(w, "GetChildAt");
+                child.Set("Index", static_cast<int32_t>(i));
+                if (child.Invoke() && child.Result<UObject>()) todo.push_back({child.Result<UObject>(), depth + 1});
+            }
+        }
+    }
+    return seen;
+}
+
 // ------------------------------------------------------------ hosting --
 
 bool Host(const Candidate& c) {
+    double t0 = perf::NowMs();
+    bool holder_ready = G.actor && G.wic;  // made at level start (PrepareHolder)
     if (!EnsureActor(c.obj)) return false;
-    UObject comp = AddComponent(G.actor, "Class /Script/UMG.WidgetComponent", true);
+    UObject comp = AddComponent(G.actor, L.widget_comp_class, true);
     if (!comp) {
         log::Error("world menu: could not create a panel for %s", ue::GetName(c.obj).c_str());
         return false;
@@ -511,10 +572,9 @@ bool Host(const Candidate& c) {
     ue::SetProp(comp, "BackgroundColor", LinearColor{0.f, 0.f, 0.f, S.backdrop});
     FinishComponent(G.actor, comp);
     TickWhenPaused(comp);
-    FName ui;
-    if (ue::names::Find("UI", &ui)) {
+    if (L.have_ui_profile) {
         ue::Call cp(comp, "SetCollisionProfileName");
-        cp.Set("InCollisionProfileName", ui).Set("bUpdateOverlaps", false);
+        cp.Set("InCollisionProfileName", L.ui_profile).Set("bUpdateOverlaps", false);
         cp.Invoke();
     }
 
@@ -557,29 +617,20 @@ bool Host(const Candidate& c) {
             v.Invoke();
         }
     }
-    // Full-screen backdrops inside the menu (a background blur or image the
-    // size of the screen) would read as a box on the arm. List what the menu
-    // is built from, and hide any background blur.
-    std::string prefix = ue::GetPathName(c.obj) + ".";
-    std::unordered_map<std::string, int> kinds;
+    // Full-screen backdrops inside the menu (a background blur the size of
+    // the screen) would read as a box on the arm, so any background blur is
+    // hidden. Found by walking the menu's own widget tree (a few dozen
+    // widgets), never by scanning every object in the game.
     std::vector<UObject> blurs;
-    ue::objects::ForEach([&](int, UObject o) {
-        if (ue::IsDefaultObject(o)) return;
-        std::string path = ue::GetPathName(o);
-        if (path.compare(0, prefix.size(), prefix) != 0) return;
-        std::string cn = ue::GetName(ue::GetClass(o));
-        ++kinds[cn];
-        if (cn == "BackgroundBlur") blurs.push_back(o);
-    });
-    std::string list;
-    for (const auto& k : kinds) list += " " + k.first + " x" + std::to_string(k.second) + ";";
-    log::Info("world menu: %s is built from:%s", p.name.c_str(), list.c_str());
+    int widgets = FindBlurs(c.obj, &blurs);
     for (UObject b : blurs) {
         ue::Call v(b, "SetVisibility");
         v.Set("InVisibility", kCollapsed);
         v.Invoke();
         log::Info("world menu: hid %s (a background blur)", ue::GetName(b).c_str());
     }
+    log::Info("world menu: %s on the arm in %.1f ms (%d widgets looked at; holder %s)", p.name.c_str(),
+              perf::NowMs() - t0, widgets, holder_ready ? "made at level start" : "made just now");
     return true;
 }
 
@@ -819,6 +870,18 @@ void OnGameFrame() {
     DropClosedMenus();
     UpdateStack();
     g_menu_up = !G.panels.empty();
+    // Blur the world past arm's length while a menu is on the arm.
+    static bool s_blur = false;
+    if (s_blur != !G.panels.empty()) {
+        s_blur = !G.panels.empty();
+        int n = render_fixes::SetPauseBlur(s_blur);
+        if (n >= 0 && s_blur)
+            log::Info("world menu: pause blur on (%d cameras/post-process components; r.DepthOfFieldQuality %d, "
+                      "r.DOF.Kernel.MaxForegroundRadius set to 0 at level start)",
+                      n, cvars::ReadIntNow("r.DepthOfFieldQuality", -1));
+        else if (n >= 0)
+            log::Info("world menu: pause blur off (%d cameras/post-process components)", n);
+    }
     if (G.panels.empty()) {
         g_active = false;
         std::lock_guard<std::mutex> lock(g_laser_mutex);
@@ -1160,6 +1223,21 @@ void Init() {
 // keeps running while the game is paused (the 2026-11-02 study counted it at
 // the frame rate during the pause menu), and from the player's tick until the
 // controller is found. Nothing runs from inside the stereo view setup.
+// The panel holder (an actor with the laser's interaction component) is
+// made during play, once per level, so opening a menu only has to add the
+// menu's own panel. Before this the holder was made the moment the pause
+// menu opened, as part of a 2.5 s stall.
+void PrepareHolder(UObject player) {
+    static double s_checked = 0;
+    double now = Now();
+    if (now - s_checked < 1.0) return;
+    s_checked = now;
+    if (G.actor && Alive(G.actor, G.actor_index) && G.wic && Alive(G.wic, G.wic_index)) return;
+    double t0 = perf::NowMs();
+    if (EnsureActor(player))
+        log::Info("world menu: forearm menu holder ready for this level (%.1f ms)", perf::NowMs() - t0);
+}
+
 void AfterControllerTick(UObject, UObject, void*) { OnGameFrame(); }
 
 // Follows one object's per-frame Blueprint event (its class's own override
@@ -1207,6 +1285,7 @@ void FollowFromPlayer(UObject player) {
 
 void OnPlayerTick(UObject player, float) {
     if (S.enabled && ue::process_event::Ready()) FollowFromPlayer(player);
+    if (S.enabled && player && G.panels.empty()) PrepareHolder(player);
     OnGameFrame();
 }
 
@@ -1247,6 +1326,7 @@ void OnAnyEvent(UObject self, UObject function, void*) {
 
 void InitGame() {
     if (!S.enabled) return;
+    ResolveLookups();  // before any game-thread code can need them
     game::AddTickListener(&OnPlayerTick);
     g_wbgc_class = ue::FindObject("Class /Script/UMG.WidgetBlueprintGeneratedClass");
     UObject uw = ue::FindObject("UserWidget /Script/UMG.Default__UserWidget");

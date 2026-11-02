@@ -112,6 +112,13 @@ void Want(const std::string& name, const std::string& value) {
     g_wanted[name] = value;
 }
 
+int ReadIntNow(const std::string& name, int fallback) {
+    UObject ksl = Library();
+    int v = fallback;
+    if (!ksl || !ReadInt(ksl, name, &v)) return fallback;
+    return v;
+}
+
 void Init() {
     std::string aa = config::GetString("vr_anti_aliasing", "fxaa");
     for (int i = 0; i < static_cast<int>(sizeof(kAaModes) / sizeof(kAaModes[0])); ++i)

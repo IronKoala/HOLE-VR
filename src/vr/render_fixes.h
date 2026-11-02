@@ -12,4 +12,9 @@ namespace holevr::vr::render_fixes {
 // volumes and captures are picked up on the next call).
 bool Init();
 void Apply();
+// Game thread, when a forearm menu opens (true) or the last one closes
+// (false): world past arm's length goes out of focus, near things stay sharp.
+// Returns how many cameras/post-process components were updated, or -1 if
+// the pause blur is off.
+int SetPauseBlur(bool on);
 }  // namespace holevr::vr::render_fixes

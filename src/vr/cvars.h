@@ -14,4 +14,6 @@ void Maintain();
 void CycleAntiAliasing();
 // Wanted value for a console variable; applied on the next Maintain().
 void Want(const std::string& name, const std::string& value);
+// Game thread: current integer value of a console variable, or fallback.
+int ReadIntNow(const std::string& name, int fallback);
 }  // namespace holevr::vr::cvars
