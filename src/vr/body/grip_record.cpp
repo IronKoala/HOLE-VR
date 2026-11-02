@@ -92,6 +92,16 @@ std::string Serialize(const Record& r) {
     Put(o, "fingers", r.fingers);
     Put(o, "across", r.across);
     for (int t = 0; t < kTipCount; ++t) Put(o, (std::string("tip_") + TipName(t)).c_str(), r.tip[t]);
+    for (int t = 0; t < kTipCount; ++t) {
+        if (!r.posed[t]) continue;
+        char buf[400];
+        int n = std::snprintf(buf, sizeof(buf), "pose_%s=", TipName(t));
+        for (int j = 0; j < 3; ++j) {
+            const FQuat& q = r.joint[t][j];
+            n += std::snprintf(buf + n, sizeof(buf) - n, "%s%.5f %.5f %.5f %.5f", j ? "  " : "", q.X, q.Y, q.Z, q.W);
+        }
+        o << buf << "\n";
+    }
     for (const OutlineBox& b : r.outline) {
         char buf[200];
         std::snprintf(buf, sizeof(buf), "box=%s %.2f %.2f %.2f %.2f %.2f %.2f %.1f\n", b.name.c_str(), b.centre.X,
@@ -132,6 +142,19 @@ bool Parse(const std::string& text, Record* r) {
                 boxes = true;
                 b.name = name;
                 r->outline.push_back(b);
+            }
+        } else if (k.rfind("pose_", 0) == 0) {
+            double q[12];
+            if (std::sscanf(v.c_str(), "%lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf", &q[0], &q[1], &q[2], &q[3],
+                            &q[4], &q[5], &q[6], &q[7], &q[8], &q[9], &q[10], &q[11]) == 12) {
+                bool ok = true;
+                for (double x : q) ok = ok && std::isfinite(x);
+                for (int t = 0; ok && t < kTipCount; ++t)
+                    if (k.substr(5) == TipName(t)) {
+                        r->posed[t] = true;
+                        for (int j = 0; j < 3; ++j)
+                            r->joint[t][j] = Normalized(FQuat{q[j * 4], q[j * 4 + 1], q[j * 4 + 2], q[j * 4 + 3]});
+                    }
             }
         } else if (k.rfind("tip_", 0) == 0 && Vec(v, &vec)) {
             for (int t = 0; t < kTipCount; ++t)

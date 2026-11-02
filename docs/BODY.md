@@ -79,18 +79,26 @@ and how deep anything sits inside the object's outline
 
 ## Grip editor (in the headset)
 
-Hold **left Y for 1 s** while holding the pistol: the editor is on and the
-left controller becomes the editing hand (its buttons stop reaching the game,
-and the gun won't fire). Squeeze grip near a fingertip and move it: that
-finger re-solves live. Squeeze near the palm: the whole hand moves and turns
-with the controller. While editing, a small ball sits on each fingertip
-and on the palm, and one on the editing controller; the ball a squeeze
-would take grows and the controller ticks when it changes
-(`hand_editor_show_grab_points`). Pull the real trigger to edit the "resting" and
-"pulled" index poses. **Tap Y** to save, **click the left stick** to undo to
-the saved grip, **hold Y 1 s** to save and finish. With a magazine, the slide
-or a handguard in the left hand, the same buttons edit that grip and the
-right controller does the moving.
+Hold **left Y for 1 s** while holding the pistol (or a magazine in the
+left hand): the editor is on and the OTHER controller becomes the editing
+hand (its buttons stop reaching the game, and the gun won't fire).
+
+- **Finger joints**: a small ball sits on every finger joint (15: base,
+  middle and tip joint of each finger). Squeeze grip on one and turn the
+  controller: that joint turns with it in all three axes (pitch, yaw,
+  roll), the rest of the finger follows. Once a finger has been turned it
+  keeps exactly those joint angles (saved as `pose_<finger>=` lines, four
+  numbers per joint); it is no longer solved to a fingertip target.
+- **Magazine**: a big ball sits on the magazine. Squeeze it and move/turn
+  the controller: the magazine moves and turns in the hand (the hand stays
+  where it is on its controller while editing).
+- **Pistol**: the palm ball moves and turns the whole hand on the gun.
+- The ball a squeeze would take grows and the controller ticks when it
+  changes (`hand_editor_show_grab_points`). Pull the real trigger to edit
+  the "resting" and "pulled" index poses.
+- **Tap Y** to save, **click the left stick** to undo to the saved grip,
+  **hold Y 1 s** to save and finish. Grips are saved per object class in
+  `hole-vr/grips/<Class>.<grip|mag|slide|support>.ini`.
 
 ## Body
 

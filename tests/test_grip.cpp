@@ -196,7 +196,7 @@ static void TestEditor() {
     FQuat hr;
     FVector hp{1, 2, 3};
     grip_editor::Scene sc;
-    for (int t = 0; t < grip_record::kTipCount; ++t) sc.tip[t] = rec.tip[t];
+    for (int m = 0; m < grip_editor::kJointItems; ++m) sc.joint[m] = {m * 3.0, 0, 0};
     sc.palm = {0, 0, 8};
     grip_editor::Input in;
     in.dt = 0.1;
@@ -210,16 +210,18 @@ static void TestEditor() {
     in.y_down = false;
     o = ed.Update(in, sc, &rec, &hr, &hp);
     EXPECT(!o.save);  // releasing after the long hold is not a tap
-    // Grab near the thumb tip and drag 1 cm forward: only the thumb target moves.
-    FVector thumb0 = rec.tip[grip_record::kThumb], mid0 = rec.tip[grip_record::kMiddle];
-    in.pointer = thumb0 + FVector{0, -1, 0};
+    // Squeeze next to joint 4 (index middle joint): it is grabbed, once.
+    in.pointer = sc.joint[4] + FVector{0, -1, 0};
     in.grab_down = true;
     o = ed.Update(in, sc, &rec, &hr, &hp);
-    EXPECT(o.grabbed == grip_record::kThumb);
-    in.pointer = in.pointer + FVector{1, 0, 0};
+    EXPECT(o.grabbed == 4 && o.started);
     o = ed.Update(in, sc, &rec, &hr, &hp);
-    EXPECT(o.changed && Near(rec.tip[grip_record::kThumb], thumb0 + FVector{1, 0, 0}));
-    EXPECT(Near(rec.tip[grip_record::kMiddle], mid0));
+    EXPECT(o.grabbed == 4 && !o.started);
+    // The object ball, when there is one, is a bigger target than a joint.
+    sc.has_object = true;
+    sc.object = sc.joint[4] + FVector{0, 0, 2.0};
+    EXPECT(grip_editor::Pick(sc.joint[4] + FVector{0, 0, 1.2}, sc) == grip_editor::kObjectItem);
+    sc.has_object = false;
     in.grab_down = false;
     ed.Update(in, sc, &rec, &hr, &hp);
     // Grab the palm and turn: the hand turns with the controller.
@@ -261,7 +263,37 @@ static void BenchPose() {
     std::printf("pose math: %.0f us per frame (68 bones, 60 edits)\n", us);
 }
 
+// Joint poses set in the editor survive a save/load and drive the finger.
+static void TestPosedJoints() {
+    grip_record::Record r = grip_record::DefaultPistol();
+    r.posed[grip_record::kMiddle] = true;
+    r.joint[grip_record::kMiddle][1] = AxisAngle(Normalize(FVector{0.2, 1, 0.3}), 0.7);
+    grip_record::Record back;
+    EXPECT(grip_record::Parse(grip_record::Serialize(r), &back));
+    EXPECT(back.posed[grip_record::kMiddle] && !back.posed[grip_record::kThumb]);
+    const FQuat& q = back.joint[grip_record::kMiddle][1];
+    const FQuat& w = r.joint[grip_record::kMiddle][1];
+    EXPECT(Near(q.X, w.X, 1e-4) && Near(q.Y, w.Y, 1e-4) && Near(q.Z, w.Z, 1e-4) && Near(q.W, w.W, 1e-4));
+    // extra[j] turns joint j in its own frame, after flex.
+    fingers::Chain c;
+    for (int j = 0; j < 3; ++j) {
+        c.ref[j].translation = {j ? 4.0 : 0.0, 0, 0};
+        c.flex[j] = {0, 1, 0};
+    }
+    c.spread = {0, 0, 1};
+    c.tip = {3, 0, 0};
+    fingers::Angles a;
+    a.extra[0] = AxisAngle({0, 0, 1}, kPi / 2);
+    FVector tip;
+    skel::Xf jx[3];
+    fingers::Fk(c, a, jx, &tip);
+    EXPECT(Near(tip, FVector{0, 11, 0}));
+    fingers::Angles h = fingers::Blend(fingers::Angles{}, a, 0.5);
+    EXPECT(Near(h.extra[0].Z, std::sin(kPi / 8), 1e-6));
+}
+
 int main() {
+    TestPosedJoints();
     TestEditor();
     BenchPose();
     TestCompose();

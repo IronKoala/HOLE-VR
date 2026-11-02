@@ -43,7 +43,7 @@ Limits DefaultLimits(bool thumb) {
 FQuat LocalRotation(const Chain& c, int j, const Angles& a) {
     FQuat q = AxisAngle(c.flex[j], a.flex[j]);
     if (j == 0) q = AxisAngle(c.spread, a.spread) * q;
-    return Normalized(c.ref[j].rotation * q);
+    return Normalized(c.ref[j].rotation * q * a.extra[j]);
 }
 
 void Fk(const Chain& c, const Angles& a, skel::Xf out[3], FVector* tip) {
@@ -179,6 +179,7 @@ Angles Blend(const Angles& a, const Angles& b, double t) {
     Angles r;
     for (int j = 0; j < 3; ++j) r.flex[j] = a.flex[j] + (b.flex[j] - a.flex[j]) * t;
     r.spread = a.spread + (b.spread - a.spread) * t;
+    for (int j = 0; j < 3; ++j) r.extra[j] = Normalized(a.extra[j] * Scale(a.extra[j].Inverse() * b.extra[j], t));
     return r;
 }
 

@@ -42,6 +42,11 @@ struct Record {
     FVector fingers;      // wrist -> middle knuckle direction
     FVector across;       // pinky knuckle -> index knuckle direction
     FVector tip[kTipCount];
+    // Joint poses set in the editor: when posed[t], finger t's three joints
+    // take these rotations (relative to the skeleton's reference pose, in
+    // each joint's own frame) instead of being solved to tip[t].
+    bool posed[kTipCount] = {};
+    FQuat joint[kTipCount][3];
     std::vector<OutlineBox> outline;
 };
 

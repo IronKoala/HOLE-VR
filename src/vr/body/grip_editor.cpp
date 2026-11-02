@@ -8,19 +8,19 @@ using grip_record::kTipCount;
 int Pick(const FVector& pointer, const Scene& scene) {
     double best = kGrabRadius;
     int item = kNoItem;
-    auto consider = [&](int i, const FVector& p) {
-        double d = Length(p - pointer);
-        if (d < best) {
-            best = d;
-            item = i;
-        }
-    };
-    consider(grip_record::kThumb, scene.tip[grip_record::kThumb]);
-    consider(scene.index_state, scene.tip[scene.index_state]);
-    for (int t = grip_record::kMiddle; t < grip_record::kTipCount; ++t) consider(t, scene.tip[t]);
-    // The palm is a bigger target: pick it unless a fingertip is clearly nearer.
-    double palm_d = Length(scene.palm - pointer) - 1.5;
-    if (palm_d < best) item = kHandItem;
+    for (int i = 0; i < kJointItems; ++i) {
+        double d = Length(scene.joint[i] - pointer);
+        if (d < best) best = d, item = i;
+    }
+    // Palm and object are bigger targets: picked unless a joint is clearly nearer.
+    if (scene.has_palm) {
+        double d = Length(scene.palm - pointer) - 1.5;
+        if (d < best) best = d, item = kHandItem;
+    }
+    if (scene.has_object) {
+        double d = Length(scene.object - pointer) - 1.5;
+        if (d < best) best = d, item = kObjectItem;
+    }
     return item;
 }
 
@@ -69,19 +69,15 @@ Output Editor::Update(const Input& in, const Scene& scene, grip_record::Record* 
             pointer_rot0_ = in.pointer_rot;
             hand_rot0_ = *hand_rot;
             hand_pos0_ = *hand_pos;
-            if (grabbed_ >= 0) item0_ = rec->tip[grabbed_];
+            out.started = true;
             out.haptic = 0.3f;
         }
     }
     if (!in.grab_down) grabbed_ = kNoItem;
     grab_was_down_ = in.grab_down;
 
-    if (grabbed_ >= 0) {
-        // Fingertip target follows the pointer's movement (not its absolute
-        // position, so it doesn't jump on grab).
-        rec->tip[grabbed_] = item0_ + (in.pointer - pointer0_);
-        out.changed = true;
-    } else if (grabbed_ == kHandItem) {
+    (void)rec;  // joints and the object are turned by the caller (vr/body)
+    if (grabbed_ == kHandItem) {
         // The hand rides rigidly on the editing controller.
         FQuat dq = Normalized(in.pointer_rot * pointer_rot0_.Inverse());
         *hand_rot = Normalized(dq * hand_rot0_);

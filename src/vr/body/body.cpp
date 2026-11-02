@@ -1005,7 +1005,43 @@ bool IsGrab(hands::GrabKind k) {
 // The frame a grip is stored in. Gun: the gun frame at its grip point.
 // Slide / charging handle / rifle handguard: the gun frame at the point the
 // hand holds. Magazine: the magazine itself.
+// While a magazine grip is edited, the hand stays where it was on the
+// controller and the magazine is placed from the hand (so moving the
+// magazine in the editor moves the magazine, not the hand).
+struct MagPin {
+    bool on = false;
+    int side = -1;
+    UObject object = 0;
+    Xf hand_in_ctrl;  // hand bone relative to the holding controller's grip
+} g_pin;
+
+Xf PoseXf(const hands::Pose& p) {
+    Xf x;
+    x.translation = p.location;
+    x.rotation = p.rotation;
+    return x;
+}
+
+bool PinnedObject(const hands::HandGrab& grab, hands::Pose* out) {
+    if (!g_pin.on || grab.object != g_pin.object || G.grip[g_pin.side].object != grab.object) return false;
+    hands::HandState h = hands::Get(g_pin.side == kL ? hands::kLeft : hands::kRight);
+    if (!h.valid) return false;
+    const Xf hand = skel::Compose(g_pin.hand_in_ctrl, PoseXf(h.grip));
+    const ActiveGrip& g = G.grip[g_pin.side];
+    out->rotation = Normalized(hand.rotation * g.hand_rot.Inverse());
+    out->location = hand.translation - out->rotation.Rotate(g.hand_pos);
+    Xf t;
+    t.translation = out->location;
+    t.rotation = out->rotation;
+    ue::Call c(grab.object, "K2_SetActorTransform");
+    c.Set("NewTransform", t).Set("bSweep", false).Set("bTeleport", true);
+    c.Invoke();
+    return true;
+}
+
 bool ObjectFrame(const hands::HandGrab& grab, const hands::HandGrab& right, hands::Pose* out) {
+    if ((grab.kind == hands::GrabKind::kMagHeld || grab.kind == hands::GrabKind::kMagInsert) && PinnedObject(grab, out))
+        return true;
     switch (grab.kind) {
         case hands::GrabKind::kGunGrip:
             *out = grab.target;
@@ -1059,6 +1095,17 @@ void SolveGrip(int side, int only_tip, bool quick) {
     for (int tip = 0; tip < gr::kTipCount; ++tip) {
         if (only_tip >= 0 && tip != only_tip) continue;
         const int f = TipFinger(tip);
+        if (g.rec.posed[tip]) {
+            // Set joint by joint in the editor: no solving.
+            fingers::Angles a;
+            for (int j = 0; j < 3; ++j) a.extra[j] = g.rec.joint[tip][j];
+            g.tip_angles[tip] = a;
+            g.err[tip] = 0;
+            g.clip[tip] = g.rec.outline.empty()
+                              ? 0.0
+                              : fingers::FingerDepth(r.chain[f], a, fn, S.finger_radius);
+            continue;
+        }
         FVector target = g.hand_rot.Inverse().Rotate(g.rec.tip[tip] - g.hand_pos);
         g.tip_angles[tip] = fingers::Solve(r.chain[f], target, fingers::DefaultLimits(f == hand_pose::kThumb),
                                            &g.err[tip], g.rec.outline.empty() ? nullptr : &fn, S.finger_radius,
@@ -1364,6 +1411,7 @@ int g_edit_side = -1;      // hand whose grip is edited
 int g_edit_ctrl = -1;      // controller doing the editing
 FVector g_tip_world[2][gr::kTipCount];
 FVector g_palm_world[2];
+Xf g_joint_world[2][hand_pose::kFingerCount][3];  // posed finger joints, world
 Xf g_hand_world[2];
 bool g_tips_valid[2] = {false, false};
 
@@ -1371,6 +1419,7 @@ void HideMarkers();
 void StopEditor() {
     if (g_editor.Active()) log::Info("body: grip editor off");
     g_editor.Stop();
+    g_pin.on = false;
     HideMarkers();
     g_edit_side = g_edit_ctrl = -1;
     hands::SetEditorHand(-1);
@@ -1393,7 +1442,8 @@ bool SaveGrip(int side) {
 // ---- editor grab points: small balls on the fingertips, palm and pointer ----
 // Uses a sphere mesh the game already has loaded (engine basic shape), on
 // plain StaticMeshComponents with no collision, shown only while editing.
-enum Marker : int { kMkThumb, kMkIndex, kMkMiddle, kMkRing, kMkPinky, kMkPalm, kMkPointer, kMkCount };
+// Balls: 15 finger joints (grip_editor item order), palm, object, pointer.
+enum Marker : int { kMkPalm = grip_editor::kJointItems, kMkObject, kMkPointer, kMkCount };
 struct EditorMarkers {
     bool tried = false;
     UObject mesh = 0;
@@ -1401,6 +1451,7 @@ struct EditorMarkers {
     UObject owner = 0;
     UObject comp[kMkCount] = {};
     bool shown = false;
+    bool object_shown = false;
 } g_mk;
 
 UObject FindMarkerMesh(double* size) {
@@ -1498,30 +1549,49 @@ void HideMarkers() {
 }
 
 // hover: the editor item a squeeze would take (or is holding).
-void ShowMarkers(UObject player, int side, int index_tip, int hover, const FVector& pointer) {
+void ShowMarkers(UObject player, int side, int hover, const FVector& pointer, const FVector* object) {
     if (!S.editor_markers || !MakeMarkers(player)) return;
     if (!g_mk.shown) {
         for (UObject c : g_mk.comp) SetVisible(c, true);
         g_mk.shown = true;
+        g_mk.object_shown = true;
     }
-    auto item_of = [](int m, int index_tip) {
-        switch (m) {
-        case kMkThumb: return static_cast<int>(gr::kThumb);
-        case kMkIndex: return index_tip;
-        case kMkMiddle: return static_cast<int>(gr::kMiddle);
-        case kMkRing: return static_cast<int>(gr::kRing);
-        case kMkPinky: return static_cast<int>(gr::kPinky);
-        default: return grip_editor::kHandItem;
-        }
-    };
-    for (int m = 0; m < kMkPointer; ++m) {
-        FVector at = m == kMkPalm ? g_palm_world[side] : g_tip_world[side][item_of(m, index_tip)];
-        bool hot = item_of(m, index_tip) == hover;
-        double d = m == kMkPalm ? (hot ? 4.0 : 2.0) : (hot ? 2.6 : 1.1);
-        PlaceMarker(m, at, d);
+    for (int m = 0; m < grip_editor::kJointItems; ++m) {
+        bool hot = m == hover;
+        PlaceMarker(m, g_joint_world[side][m / 3][m % 3].translation, hot ? 2.0 : 0.9);
+    }
+    // The palm ball (move the hand) or, holding a magazine, the magazine ball.
+    if (object) PlaceMarker(kMkObject, *object, hover == grip_editor::kObjectItem ? 4.5 : 2.5);
+    else PlaceMarker(kMkPalm, g_palm_world[side], hover == grip_editor::kHandItem ? 4.0 : 2.0);
+    if (g_mk.object_shown != (object != nullptr)) {
+        g_mk.object_shown = object != nullptr;
+        SetVisible(g_mk.comp[kMkObject], g_mk.object_shown);
+        SetVisible(g_mk.comp[kMkPalm], !g_mk.object_shown);
     }
     PlaceMarker(kMkPointer, pointer, 0.8);
 }
+
+// The grip-record entry a finger's joints belong to (the index: the trigger
+// state showing).
+int FingerTip(int f, int index_state) {
+    switch (f) {
+        case hand_pose::kThumb: return gr::kThumb;
+        case hand_pose::kIndex: return index_state;
+        case hand_pose::kMiddle: return gr::kMiddle;
+        case hand_pose::kRing: return gr::kRing;
+        default: return gr::kPinky;
+    }
+}
+
+const char* kFingerName[] = {"thumb", "index", "middle", "ring", "pinky"};
+const char* kJointName[] = {"base", "middle", "tip"};
+
+// Drag state for joints and the object (grip_editor handles the palm).
+struct JointDrag {
+    int finger = -1, joint = -1, tip = -1;
+    FQuat joint_world0, ctrl_rot0;
+    Xf obj_in_hand0, ctrl_in_hand0;
+} g_drag;
 
 void UpdateEditor(const hands::HandGrab grab[2], const hands::HandState hs[2], double dt) {
     const hands::EditButtons b = hands::GetEditButtons();
@@ -1539,6 +1609,7 @@ void UpdateEditor(const hands::HandGrab grab[2], const hands::HandState hs[2], d
         return;
     }
     const int ctrl = 1 - side;
+    const bool is_mag = grab[side].kind == hands::GrabKind::kMagHeld || grab[side].kind == hands::GrabKind::kMagInsert;
     hands::Pose obj;
     if (!ObjectFrame(grab[side], grab[kR], &obj) || !hs[ctrl].valid) return;
     const FQuat inv = obj.rotation.Inverse();
@@ -1549,17 +1620,24 @@ void UpdateEditor(const hands::HandGrab grab[2], const hands::HandState hs[2], d
     in.y_down = b.y_down;
     in.stick_click_pressed = b.left_stick_pressed;
     in.grab_down = b.grip_down[ctrl];
-    in.pointer = local(hs[ctrl].grip.location + hs[ctrl].aim.rotation.Rotate(FVector{3, 0, 0}));
+    const FVector pointer_w = hs[ctrl].grip.location + hs[ctrl].aim.rotation.Rotate(FVector{3, 0, 0});
+    in.pointer = local(pointer_w);
     in.pointer_rot = Normalized(inv * hs[ctrl].grip.rotation);
     grip_editor::Scene sc;
-    for (int t = 0; t < gr::kTipCount; ++t) sc.tip[t] = local(g_tip_world[side][t]);
+    for (int m = 0; m < grip_editor::kJointItems; ++m) sc.joint[m] = local(g_joint_world[side][m / 3][m % 3].translation);
     sc.palm = local(g_palm_world[side]);
+    ActiveGrip& g = G.grip[side];
+    FVector object_w = obj.location;
+    if (is_mag && !g.rec.outline.empty()) object_w = obj.location + obj.rotation.Rotate(g.rec.outline[0].centre);
+    sc.has_palm = !is_mag;
+    sc.has_object = is_mag;
+    sc.object = local(object_w);
     sc.index_state = G.index_pull[side] > 0.5 ? gr::kIndexPull : G.index_touch[side] > 0.5 ? gr::kIndexRest
                                                                                              : gr::kIndexOff;
-    ActiveGrip& g = G.grip[side];
     FQuat hand_rot = g.hand_rot;
     FVector hand_pos = g.hand_pos;
     grip_editor::Output out = g_editor.Update(in, sc, &g.rec, &hand_rot, &hand_pos);
+    const Xf hand_w = g_hand_world[side];  // last frame's posed hand
     if (out.entered) {
         g_edit_side = side;
         g_edit_ctrl = ctrl;
@@ -1570,40 +1648,89 @@ void UpdateEditor(const hands::HandGrab grab[2], const hands::HandState hs[2], d
             g.rec = gr::Record{};
             g.rec.name = g.key;
             g.rec.right_hand = side == kR;
-            const Xf& hw = g_hand_world[side];  // last frame's posed hand
-            gr::StoreHand(&g.rec, G.rig[side].geo, Normalized(inv * hw.rotation), local(hw.translation));
-            for (int t = 0; t < gr::kTipCount; ++t) g.rec.tip[t] = sc.tip[t];
+            gr::StoreHand(&g.rec, G.rig[side].geo, Normalized(inv * hand_w.rotation), local(hand_w.translation));
+            for (int t = 0; t < gr::kTipCount; ++t) g.rec.tip[t] = local(g_tip_world[side][t]);
             g.have = true;
             g.object = grab[side].object;
             g.kind = grab[side].kind;
             SolveGrip(side, -1, false);
         }
-        log::Info("body: grip editor on for %s (edit with the %s controller: squeeze near a fingertip or the palm "
-                  "and move; tap Y to save, click the left stick to undo, hold Y 1 s to save and finish)",
-                  g.key.c_str(), ctrl == kL ? "left" : "right");
+        if (is_mag && hs[side].valid) {
+            g_pin.on = true;
+            g_pin.side = side;
+            g_pin.object = grab[side].object;
+            g_pin.hand_in_ctrl = skel::Relative(hand_w, PoseXf(hs[side].grip));
+        }
+        log::Info("body: grip editor on for %s (edit with the %s controller: squeeze on a finger joint and turn the "
+                  "controller to turn that joint; %s; tap Y to save, click the left stick to undo, hold Y 1 s to save "
+                  "and finish)",
+                  g.key.c_str(), ctrl == kL ? "left" : "right",
+                  is_mag ? "squeeze the big ball on the magazine to move and turn the magazine in the hand"
+                         : "squeeze the palm to move and turn the hand on the gun");
     }
-    if (out.changed) {
-        if (out.grabbed == grip_editor::kHandItem) {
-            gr::StoreHand(&g.rec, G.rig[side].geo, hand_rot, hand_pos);
-            SolveGrip(side, -1, true);
-        } else if (out.grabbed >= 0) {
-            SolveGrip(side, out.grabbed, true);
+    const HandRig& rig = G.rig[side];
+    if (out.started && out.grabbed >= 0) {
+        g_drag.finger = out.grabbed / 3;
+        g_drag.joint = out.grabbed % 3;
+        g_drag.tip = FingerTip(g_drag.finger, sc.index_state);
+        g_drag.joint_world0 = g_joint_world[side][g_drag.finger][g_drag.joint].rotation;
+        g_drag.ctrl_rot0 = hs[ctrl].grip.rotation;
+        // From now on this finger is posed joint by joint: start from what it shows.
+        const int t = g_drag.tip;
+        if (!g.rec.posed[t]) {
+            const fingers::Chain& c = rig.chain[g_drag.finger];
+            for (int j = 0; j < 3; ++j)
+                g.rec.joint[t][j] = Normalized(c.ref[j].rotation.Inverse() * fingers::LocalRotation(c, j, g.tip_angles[t]));
+            g.rec.posed[t] = true;
         }
     }
+    if (out.started && out.grabbed == grip_editor::kObjectItem) {
+        Xf objx;
+        objx.translation = obj.location;
+        objx.rotation = obj.rotation;
+        g_drag.obj_in_hand0 = skel::Relative(objx, hand_w);
+        g_drag.ctrl_in_hand0 = skel::Relative(PoseXf(hs[ctrl].grip), hand_w);
+    }
+    if (out.grabbed >= 0 && g_drag.tip >= 0) {
+        // The joint turns with the controller (all three axes).
+        const int f = g_drag.finger, n = g_drag.joint, t = g_drag.tip;
+        const fingers::Chain& c = rig.chain[f];
+        FQuat d = Normalized(hs[ctrl].grip.rotation * g_drag.ctrl_rot0.Inverse());
+        FQuat want_h = Normalized(hand_w.rotation.Inverse() * d * g_drag.joint_world0);
+        fingers::Angles a;
+        for (int j = 0; j < 3; ++j) a.extra[j] = g.rec.joint[t][j];
+        Xf jx[3];
+        fingers::Fk(c, a, jx, nullptr);
+        FQuat parent = n == 0 ? FQuat{} : jx[n - 1].rotation;
+        FQuat want_local = Normalized(parent.Inverse() * want_h);
+        g.rec.joint[t][n] = Normalized(c.ref[n].rotation.Inverse() * want_local);
+        SolveGrip(side, t, true);
+    } else if (out.grabbed == grip_editor::kObjectItem) {
+        // The magazine moves and turns with the controller, relative to the hand.
+        Xf ctrl_h = skel::Relative(PoseXf(hs[ctrl].grip), hand_w);
+        FQuat d = Normalized(ctrl_h.rotation * g_drag.ctrl_in_hand0.rotation.Inverse());
+        Xf o;
+        o.rotation = Normalized(d * g_drag.obj_in_hand0.rotation);
+        o.translation = ctrl_h.translation + d.Rotate(g_drag.obj_in_hand0.translation - g_drag.ctrl_in_hand0.translation);
+        FQuat hr = o.rotation.Inverse();
+        FVector hp = hr.Rotate(o.translation) * -1.0;
+        gr::StoreHand(&g.rec, rig.geo, hr, hp);
+        SolveGrip(side, -1, true);
+    } else if (out.changed && out.grabbed == grip_editor::kHandItem) {
+        gr::StoreHand(&g.rec, rig.geo, hand_rot, hand_pos);
+        SolveGrip(side, -1, true);
+    }
+    if (out.grabbed < 0) g_drag.tip = -1;
     static int last_grab = grip_editor::kNoItem;
     if (out.grabbed != last_grab) {
         if (out.grabbed == grip_editor::kHandItem) log::Info("body: editor: moving the hand");
-        else if (out.grabbed >= 0) log::Info("body: editor: moving the %s fingertip", gr::TipName(out.grabbed));
-        else if (last_grab != grip_editor::kNoItem) {
-            const ActiveGrip& gg = G.grip[side];
-            if (last_grab >= 0)
-                log::Info("body: editor: %s tip at (%.1f %.1f %.1f), %.1f cm off, %.1f cm inside", gr::TipName(last_grab),
-                          gg.rec.tip[last_grab].X, gg.rec.tip[last_grab].Y, gg.rec.tip[last_grab].Z, gg.err[last_grab],
-                          gg.clip[last_grab]);
-            else
-                log::Info("body: editor: hand knuckle at (%.1f %.1f %.1f), palm %.1f cm inside", gg.rec.knuckle.X,
-                          gg.rec.knuckle.Y, gg.rec.knuckle.Z, gg.palm_clip);
-        }
+        else if (out.grabbed == grip_editor::kObjectItem) log::Info("body: editor: moving the magazine in the hand");
+        else if (out.grabbed >= 0)
+            log::Info("body: editor: turning the %s finger's %s joint", kFingerName[out.grabbed / 3],
+                      kJointName[out.grabbed % 3]);
+        else if (last_grab != grip_editor::kNoItem)
+            log::Info("body: editor: hand knuckle at (%.1f %.1f %.1f) in the object, palm %.1f cm inside",
+                      g.rec.knuckle.X, g.rec.knuckle.Y, g.rec.knuckle.Z, g.palm_clip);
         last_grab = out.grabbed;
     }
     if (out.revert) {
@@ -1613,12 +1740,11 @@ void UpdateEditor(const hands::HandGrab grab[2], const hands::HandState hs[2], d
     }
     if (out.save) SaveGrip(side);
     if (out.exited) StopEditor();
-    // Grab points: a ball on each fingertip and the palm; the one a squeeze
-    // would take grows, with a light tick in the editing hand when it changes.
+    // Grab points: a ball on each joint, the palm (gun) or the magazine; the
+    // one a squeeze would take grows, with a light tick when it changes.
     static int last_hover = grip_editor::kNoItem;
     if (g_editor.Active()) {
-        FVector pointer_w = hs[ctrl].grip.location + hs[ctrl].aim.rotation.Rotate(FVector{3, 0, 0});
-        ShowMarkers(G.player, side, sc.index_state, out.hover, pointer_w);
+        ShowMarkers(G.player, side, out.hover, pointer_w, is_mag ? &object_w : nullptr);
         if (out.hover != last_hover && out.hover != grip_editor::kNoItem && out.grabbed == grip_editor::kNoItem &&
             out.haptic <= 0.f)
             out.haptic = 0.1f;
@@ -1945,6 +2071,11 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
         FVector tip;
         fingers::Fk(rig.chain[f], G.cur[side][f], j, &tip);
         g_tip_world[side][t] = skel::Apply(hw, tip);
+    }
+    for (int f = 0; f < hand_pose::kFingerCount; ++f) {
+        Xf j[3];
+        fingers::Fk(rig.chain[f], G.cur[side][f], j, nullptr);
+        for (int n = 0; n < 3; ++n) g_joint_world[side][f][n] = skel::Compose(j[n], hw);
     }
     g_palm_world[side] = skel::Apply(hw, rig.palm_centre);
     g_hand_world[side] = hw;

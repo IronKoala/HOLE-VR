@@ -33,6 +33,9 @@ Chain Build(const skel::Xf joints[3], const FVector& palm, const FVector& pinky_
 struct Angles {
     double flex[3] = {0, 0, 0};  // radians
     double spread = 0;
+    // Free rotation of each joint after flex/spread, in the joint's own
+    // frame (the grip editor turns joints in all three axes with it).
+    FQuat extra[3] = {FQuat{}, FQuat{}, FQuat{}};
 };
 
 struct Limits {
