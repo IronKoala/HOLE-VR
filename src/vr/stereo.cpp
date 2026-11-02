@@ -177,9 +177,14 @@ struct WorldMapping {
     FVector origin_m;
     double world_to_meters = 100.0;
     double height_drop_m = 0.0;  // fixed_height: real head height above the recentre point, removed from everything
+    FVector head_offset_cm;  // midpoint of the eyes from the game camera, world axes, horizontal
 };
 std::mutex g_world_mutex;
 WorldMapping g_world;
+// Origin shifts requested by ShiftOriginWorld, applied at the next left-eye
+// request so both eyes of a frame use the same origin. Guarded by g_world_mutex.
+FVector g_pending_origin_m;
+FVector g_pending_world_cm;
 
 void HookCalcOffset(void* self, int32_t view_index, FRotator* rotation, float world_to_meters, FVector* location) {
     HOLEVR_FIRST_CALL("CalculateStereoViewOffset");
@@ -190,6 +195,12 @@ void HookCalcOffset(void* self, int32_t view_index, FRotator* rotation, float wo
         return;
     }
     if (view_index == 1) xr::SetRenderedViews(views);
+    if (view_index == 0) {
+        std::lock_guard<std::mutex> lock(g_world_mutex);
+        g_origin_m = g_origin_m + g_pending_origin_m;
+        g_pending_origin_m = FVector{};
+        g_pending_world_cm = FVector{};
+    }
 
     if (g_recenter.exchange(false)) {
         const XrVector3f& a = views[0].pose.position;
@@ -223,8 +234,13 @@ void HookCalcOffset(void* self, int32_t view_index, FRotator* rotation, float wo
     FQuat base = config::GetBool("use_game_pitch", false) ? ToQuat(*rotation) : YawOnly(rotation->Yaw);
     if (view_index == 0) {
         std::lock_guard<std::mutex> lock(g_world_mutex);
+        const XrVector3f& a = views[0].pose.position;
+        const XrVector3f& b = views[1].pose.position;
+        FVector head_p = XrToUePosition((a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f, (a.z + b.z) * 0.5f, 1.0);
+        FVector head_offset = base.Rotate(recenter.Rotate(head_p - g_origin_m) * world_to_meters);
+        head_offset.Z = 0;
         g_world = {true, *location, base, FQuat{recenter.X, recenter.Y, recenter.Z, recenter.W}, g_origin_m,
-                   world_to_meters, height_drop_m};
+                   world_to_meters, height_drop_m, head_offset};
     }
     *rotation = ToRotator(base * local_q);
     *location = *location + base.Rotate(local_p);
@@ -479,6 +495,29 @@ bool TrackingToWorld(const XrPosef& pose, FVector* world_location, FQuat* world_
     local_p.Z -= m.height_drop_m * m.world_to_meters;
     if (world_location) *world_location = m.camera_location + m.base.Rotate(local_p);
     if (world_rotation) *world_rotation = m.base * (m.recenter * q);
+    return true;
+}
+
+bool HeadOffsetWorld(FVector* offset_cm) {
+    std::lock_guard<std::mutex> lock(g_world_mutex);
+    if (!g_world.valid) return false;
+    // Include shifts already requested but not yet applied to a frame, so a
+    // caller that moves the pawn every tick never counts a step twice.
+    *offset_cm = g_world.head_offset_cm - g_pending_world_cm;
+    offset_cm->Z = 0;
+    return true;
+}
+
+bool ShiftOriginWorld(const FVector& world_delta_cm) {
+    std::lock_guard<std::mutex> lock(g_world_mutex);
+    if (!g_world.valid || g_world.world_to_meters <= 0) return false;
+    FVector d = world_delta_cm;
+    d.Z = 0;
+    // world offset = base * recenter * (head - origin) * w2m, so moving the
+    // origin by recenter^-1 * base^-1 * d / w2m moves the view back by d.
+    FVector local = g_world.recenter.Inverse().Rotate(g_world.base.Inverse().Rotate(d));
+    g_pending_origin_m = g_pending_origin_m + local * (1.0 / g_world.world_to_meters);
+    g_pending_world_cm = g_pending_world_cm + d;
     return true;
 }
 
