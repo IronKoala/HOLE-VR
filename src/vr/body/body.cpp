@@ -485,6 +485,9 @@ struct State {
     FVector knee_hinge_local[2];
     bool knee_known[2] = {false, false};
     double clav_amount[2] = {0, 0};
+    double swivel[2] = {0, 0};     // elbow swivel, smoothed (the search is in steps)
+    double twist_s[2] = {0, 0};    // forearm twist, smoothed
+    bool swivel_init[2] = {false, false};
     double stand_dz = -1e9;
     double body_dz = 0;  // whole body moved up/down so the shoulders sit under the eyes
     int frames = 0;
@@ -1453,6 +1456,19 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
             dev = dv;
         }
     }
+    // The search moves in 5-10 deg steps; jumping between them each frame
+    // made the arms jitter. Ease toward the best step and solve there.
+    {
+        double& sw = G.swivel[side];
+        if (!G.swivel_init[side]) {
+            sw = best_ang;
+            G.swivel_init[side] = true;
+        }
+        sw += (best_ang - sw) * (1.0 - std::exp(-dt / 0.12));
+        sol = SolveTwoBone(shoulder, hand_pos, upper, lower, AxisAngle(axis, sw).Rotate(pole), stretch);
+        if (rig.ok) WristBend(rig, hand_rot, sol.end - sol.mid, &flex, &dev);
+        best_ang = sw;
+    }
     SolveLimb(k.upperarm[side], k.lowerarm[side], k.hand[side], sol, &G.elbow_hinge_local[side],
               &G.hinge_known[side]);
 
@@ -1469,6 +1485,12 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
         FQuat rel_ref = G.ref[k.hand[side]].rotation;
         FVector axis_local = fore.rotation.Inverse().Rotate(fa);
         twist = TwistAngle(Normalized(rel_now * rel_ref.Inverse()), axis_local);
+        // A real forearm turns about +-90 deg; past that the angle could flip
+        // sign between frames (jitter). Clamp, then ease along the short way.
+        twist = std::clamp(twist, -100.0 * kDegToRad, 100.0 * kDegToRad);
+        double d = twist - G.twist_s[side];
+        G.twist_s[side] += d * (1.0 - std::exp(-dt / 0.04));
+        twist = G.twist_s[side];
         // The halfway reference keeps the forearm from following the hand alone.
         RotW(k.lowerarm[side], AxisAngle(fa, twist * S.forearm_roll_share));
         if (k.forearm_twist[side] >= 0)
@@ -1693,7 +1715,10 @@ void OnTick(UObject player, float dt_f) {
     if (!(eye_h > 100.0 && eye_h < 230.0)) eye_h = 165.0;
     const double unit = eye_h / 7.5;
     const double below = S.shoulder_below > 0 ? S.shoulder_below : unit;
-    const double behind = S.shoulder_behind > 0 ? S.shoulder_behind : unit * 0.5;
+    // Looking down, the body slides back (up to one more head unit) so the
+    // chest no longer fills the view and the legs and feet show in front.
+    const double look_down = std::clamp(-head.rotation.Rotate(FVector{1, 0, 0}).Z, 0.0, 1.0);
+    const double behind = (S.shoulder_behind > 0 ? S.shoulder_behind : unit * 0.5) + unit * 1.0 * look_down;
     const FVector head_fwd = YawDir(head_yaw);
     const FVector sc_target = head.location - head_fwd * behind - FVector{0, 0, below};
     const FVector sc_anim_r = pelvis.translation + yaw_q.Rotate(sc_anim - pelvis.translation);
