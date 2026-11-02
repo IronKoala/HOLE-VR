@@ -1,6 +1,8 @@
 #include "vr/render_fixes.h"
 
+#include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -10,6 +12,7 @@
 #include "core/memory.h"
 #include "ue/objects.h"
 #include "ue/reflection.h"
+#include "vr/cvars.h"
 
 namespace holevr::vr::render_fixes {
 namespace {
@@ -55,6 +58,45 @@ std::vector<Fix> g_fixes = {
     {"vr_disable_film_grain", "bOverride_FilmGrainIntensity", "FilmGrainIntensity", 0.f},
 };
 
+// Pause blur: while a forearm menu is up, depth of field is switched on and
+// focused about arm's length away, so the world behind the menu goes soft
+// while the hands, arms and menu stay sharp. Foreground blur is turned off
+// (r.DOF.Kernel.MaxForegroundRadius 0), so nothing nearer than the focus is
+// blurred. It is written into the same cameras and post-process components
+// as the fixes above, so the forced "no depth of field" never fights it.
+struct PauseSetting {
+    const char* override;
+    const char* value;
+    float target;
+    int32_t value_offset = -1;
+    int32_t flag_offset = -1;
+    uint8_t flag_mask = 0;
+};
+// The focal distance comes last, so the blur only starts once the others are in.
+std::vector<PauseSetting> g_pause = {
+    {"bOverride_DepthOfFieldFstop", "DepthOfFieldFstop", 1.2f},
+    {"bOverride_DepthOfFieldMinFstop", "DepthOfFieldMinFstop", 1.2f},
+    // A wide "sensor" makes the lens model blur more for the same headset view.
+    {"bOverride_DepthOfFieldSensorWidth", "DepthOfFieldSensorWidth", 300.f},
+    {"bOverride_DepthOfFieldFocalDistance", "DepthOfFieldFocalDistance", 100.f},  // cm
+};
+bool g_pause_ready = false;
+std::atomic<bool> g_pause_on{false};
+int32_t g_dof_focal_offset = -1;  // the "no depth of field" fix's value
+// Serialises writes into one object's settings between the background Apply
+// and the game thread's SetPauseBlur, and the pause flag with them.
+std::mutex g_write_mutex;
+
+// Post-process settings we write, kept so the pause blur can be switched on
+// the moment a menu opens without scanning every object again.
+struct Target {
+    UObject obj;
+    int index;
+    int32_t offset;
+};
+std::mutex g_targets_mutex;
+std::vector<Target> g_targets;
+
 struct Kind {
     int32_t settings_offset = -1;  // FPostProcessSettings inside the object, or -1
     bool is_capture = false;
@@ -84,13 +126,26 @@ bool SetBool(uintptr_t addr, uint8_t mask, bool on) {
     return nb == b || mem::Write(addr, nb);
 }
 
+void WriteFloat(uintptr_t addr, float v) {
+    float cur;
+    if (mem::Read(addr, cur) && cur != v) mem::Write(addr, v);
+}
+
+// Caller holds g_write_mutex.
 void ForceNeutral(uintptr_t settings) {
+    const bool pause = g_pause_ready && g_pause_on.load();
     for (const Fix& f : g_fixes) {
         if (f.value_offset < 0) continue;
         float cur;
         if (!mem::Read(settings + f.value_offset, cur)) return;
+        if (pause && f.value_offset == g_dof_focal_offset) continue;  // written below
         if (cur != f.neutral) mem::Write(settings + f.value_offset, f.neutral);
         SetBool(settings + f.flag_offset, f.flag_mask, true);
+    }
+    if (!pause) return;
+    for (const PauseSetting& p : g_pause) {
+        WriteFloat(settings + p.value_offset, p.target);
+        SetBool(settings + p.flag_offset, p.flag_mask, true);
     }
 }
 
@@ -154,6 +209,39 @@ bool Init() {
         f.value_offset = val.offset;
         ++enabled;
     }
+    for (const Fix& f : g_fixes)
+        if (f.value_offset >= 0 && std::string(f.value) == "DepthOfFieldFocalDistance") g_dof_focal_offset = f.value_offset;
+    if (!config::GetBool("pause_blur", true)) {
+        log::Info("render fixes: pause blur off (pause_blur=0)");
+    } else if (g_dof_focal_offset < 0) {
+        log::Info("render fixes: pause blur off (needs vr_disable_depth_of_field=1)");
+    } else {
+        g_pause[0].target = config::GetFloat("pause_blur_fstop", 1.2f);
+        g_pause[1].target = g_pause[0].target;
+        g_pause[2].target = config::GetFloat("pause_blur_sensor_mm", 300.f);
+        g_pause[3].target = config::GetFloat("pause_blur_focus_m", 1.0f) * 100.f;
+        bool ok = true;
+        for (PauseSetting& p : g_pause) {
+            refl::PropertyInfo flag = refl::FindProperty(pp_struct, p.override);
+            refl::PropertyInfo val = refl::FindProperty(pp_struct, p.value);
+            if (!flag.valid() || flag.type != "BoolProperty" || !flag.bool_mask || !val.valid() ||
+                val.type != "FloatProperty") {
+                log::Warn("render fixes: %s/%s not found, pause blur off", p.override, p.value);
+                ok = false;
+                break;
+            }
+            p.flag_offset = flag.offset;
+            p.flag_mask = flag.bool_mask;
+            p.value_offset = val.offset;
+        }
+        if (ok) {
+            // Nothing nearer than the focus gets blurred: hands, arms, body, menu.
+            vr::cvars::Want("r.DOF.Kernel.MaxForegroundRadius", "0.0");
+            g_pause_ready = true;
+            log::Info("render fixes: pause blur ready (focus %.2f m, f/%.1f, sensor %.0f mm)",
+                      g_pause[3].target / 100.f, g_pause[0].target, g_pause[2].target);
+        }
+    }
     log::Info("render fixes: %d post-process overrides active; camera settings at 0x%x, "
               "component 0x%x, volume 0x%x; player scene capture %s",
               enabled, g_camera_settings, g_pp_component_settings, g_pp_volume_settings,
@@ -165,6 +253,7 @@ bool Init() {
 void Apply() {
     if (!g_ready) return;
     Counts c;
+    std::vector<Target> targets;
     ue::objects::ForEach([&](int, UObject obj) {
         uint32_t flags = mem::ReadOr<uint32_t>(obj + ue::off::kObjFlags, kSkipFlags);
         if (flags & kSkipFlags) return;
@@ -176,7 +265,11 @@ void Apply() {
         if (k.settings_offset >= 0) {
             // Forcing the neutral value everywhere (camera, unbound and local
             // volumes) means it wins however the engine blends them.
-            ForceNeutral(obj + k.settings_offset);
+            {
+                std::lock_guard<std::mutex> lock(g_write_mutex);
+                ForceNeutral(obj + k.settings_offset);
+            }
+            targets.push_back({obj, mem::ReadOr<int32_t>(obj + ue::off::kObjIndex, -1), k.settings_offset});
             if (k.settings_offset == g_camera_settings) ++c.cameras;
             else if (k.settings_offset == g_pp_component_settings) ++c.components;
             else ++c.volumes;
@@ -189,12 +282,39 @@ void Apply() {
             if (ok) ++c.captures;
         }
     });
+    {
+        std::lock_guard<std::mutex> lock(g_targets_mutex);
+        g_targets.swap(targets);
+    }
     if (c != g_last) {
         log::Info("render fixes applied: %d cameras, %d post-process components, %d volumes, "
                   "%d player scene captures stopped",
                   c.cameras, c.components, c.volumes, c.captures);
         g_last = c;
     }
+}
+
+int SetPauseBlur(bool on) {
+    if (!g_pause_ready) return -1;
+    {
+        std::lock_guard<std::mutex> lock(g_write_mutex);
+        g_pause_on = on;
+    }
+    std::vector<Target> targets;
+    {
+        std::lock_guard<std::mutex> lock(g_targets_mutex);
+        targets = g_targets;
+    }
+    int n = 0;
+    for (const Target& t : targets) {
+        if (t.index < 0 || ue::objects::Get(t.index) != t.obj) continue;
+        uint32_t flags = mem::ReadOr<uint32_t>(t.obj + ue::off::kObjFlags, kSkipFlags);
+        if (flags & kSkipFlags) continue;
+        std::lock_guard<std::mutex> lock(g_write_mutex);
+        ForceNeutral(t.obj + t.offset);
+        ++n;
+    }
+    return n;
 }
 
 }  // namespace holevr::vr::render_fixes
