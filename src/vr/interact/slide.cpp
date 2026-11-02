@@ -9,7 +9,14 @@ double Dot(const FVector& a, const FVector& b) { return a.X * b.X + a.Y * b.Y + 
 double Length(const FVector& a) { return std::sqrt(Dot(a, a)); }
 
 bool Slide::InZone(const FVector& hand) const {
-    return Length(hand - cfg_.grab_center) <= cfg_.grab_radius;
+    if (Length(hand - cfg_.grab_center) <= cfg_.grab_radius) return true;
+    if (cfg_.grab_forward <= 0.0) return false;
+    // Forward along the slide: distance to the segment from grab_center to
+    // grab_center - axis * grab_forward.
+    const double fwd = -Dot(hand - cfg_.grab_center, cfg_.axis);
+    const double t = std::clamp(fwd, 0.0, cfg_.grab_forward);
+    const FVector on_seg = cfg_.grab_center - cfg_.axis * t;
+    return Length(hand - on_seg) <= cfg_.grab_radius_forward;
 }
 
 SlideEvent Slide::Update(const FVector& hand, bool grab_down, double dt) {

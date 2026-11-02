@@ -94,6 +94,7 @@ struct Settings {
     double pouch_side = -15.0;
     double pouch_down = 55.0;
     double pouch_radius = 14.0;
+    double slide_grab_forward = 16.0;   // pistol slide grab zone reaches this far forward of the rear grab point
     bool wall_collision = true;    // keep the gun out of walls
     double recoil_kick = 1.0;      // scale of the in-hand recoil kick, 0 = off
     bool game_recoil = false;      // let the game's camera/aim recoil run
@@ -131,6 +132,7 @@ void LoadSettings() {
     g_set.pouch_side = config::GetFloat("mag_pouch_side_cm", -15.f);
     g_set.pouch_down = config::GetFloat("mag_pouch_down_cm", 55.f);
     g_set.pouch_radius = config::GetFloat("mag_pouch_grab_radius_cm", 14.f);
+    g_set.slide_grab_forward = config::GetFloat("slide_grab_forward_cm", 16.f);
     g_set.virtual_stock = config::GetBool("rifle_virtual_stock", true);
     g_set.stock_snap = config::GetFloat("rifle_stock_snap_cm", 12.f);
     g_set.stock_release = config::GetFloat("rifle_stock_release_cm", 20.f);
@@ -782,7 +784,9 @@ void SlideHandling(game::Gun& gun, const hands::HandState& lh, const input::Hand
     ue::Vec3d o = gun.SlideOrigin();
     cfg.grab_center = FVector{o.x, o.y, o.z} + cfg.axis * 4.0;
     cfg.grab_radius = 8.0;
+    cfg.grab_forward = g_set.slide_grab_forward;   // whole slide, front serrations included
     if (!W.is_pistol) {
+        cfg.grab_forward = 0.0;
         // AR-15: the left hand works the T-shaped charging handle at the
         // back of the upper receiver. It always sits forward (it does not
         // stay back with a locked bolt), so it is grabbed at its rest point.

@@ -29,6 +29,12 @@ struct SlideConfig {
     // pull the handle back to the bolt before the bolt moves. Pistol slide:
     // false, the hand grabs the slide wherever it is.
     bool grab_at_closed = false;
+    // Pistol: the slide can be grabbed anywhere along its length, not only at
+    // the rear (front serrations, press checks). The zone runs this far forward
+    // of grab_center (against the pull axis) as a capsule of radius
+    // grab_radius_forward. 0 = rear sphere only.
+    double grab_forward = 0.0;        // cm
+    double grab_radius_forward = 6.0; // cm
 };
 
 enum class SlideEvent { kNone, kGrabbed, kReachedBack, kRacked, kPartialRelease, kSlipped };

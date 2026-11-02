@@ -194,7 +194,9 @@ const Block kBlocks[] = {
      "mag_pouch_forward_cm=15\n"
      "mag_pouch_side_cm=-15\n"
      "mag_pouch_down_cm=55\n"
-     "mag_pouch_grab_radius_cm=14\n"},
+     "mag_pouch_grab_radius_cm=14\n"
+     "; Pistol slide can be grabbed this far forward of its rear (front serrations, press checks)\n"
+     "slide_grab_forward_cm=16\n"},
     {"fixed_height",
      "\n"
      "; 1 = your in-game height is always the character's, seated or standing\n"

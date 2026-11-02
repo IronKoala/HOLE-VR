@@ -39,6 +39,27 @@ static SlideEvent Stroke(Slide& s, double cm, bool* reached_back, int steps = 20
 }
 
 int main() {
+    {   // front of the slide: grabbable along its length, and a pull from there racks
+        SlideConfig c = Pistol();
+        c.grab_radius = 8.0;
+        c.grab_forward = 16.0;
+        c.grab_radius_forward = 6.0;
+        Slide s(c);
+        EXPECT(s.InZone(FVector{8, 0, 3}));      // 14 cm forward of the rear point, on the slide
+        EXPECT(s.InZone(FVector{-6, 7, 2}));     // rear sphere still 8 cm
+        EXPECT(!s.InZone(FVector{8, 0, -6}));    // 8 cm below the front: not the slide
+        EXPECT(!s.InZone(FVector{17, 0, 2}));    // well past the muzzle end
+        FVector f{8, 0, 2};
+        s.Update(f, false, 0.011);
+        EXPECT(s.Update(f, true, 0.011) == SlideEvent::kGrabbed);
+        bool back = false;
+        for (int i = 1; i <= 20; ++i)
+            if (s.Update(FVector{8 - 5.0 * i / 20, 0, 2}, true, 0.011) == SlideEvent::kReachedBack) back = true;
+        EXPECT(back);
+        EXPECT(s.Update(FVector{3, 0, 2}, false, 0.011) == SlideEvent::kRacked);
+        SlideConfig r = Pistol();   // rear sphere only (default)
+        EXPECT(!Slide(r).InZone(FVector{8, 0, 2}));
+    }
     {   // full rack
         Slide s(Pistol());
         bool back;
