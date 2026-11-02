@@ -71,4 +71,8 @@ XrSpace TrackingSpace();
 // The game's D3D12 device (valid once the session exists).
 ID3D12Device* Device();
 
+// Saves the next picture sent to the headset (both eyes, half size) as
+// <mod folder>/capture-<tag>.bmp. For checking what the player sees.
+void RequestCapture(const char* tag);
+
 }  // namespace holevr::vr::xr

@@ -43,7 +43,8 @@ struct Callback {
 constexpr int kMaxCallbacks = 64;
 Callback g_callbacks[kMaxCallbacks];
 std::atomic<int> g_callback_count{0};
-std::atomic<PostFn> g_any{nullptr};
+constexpr int kMaxAny = 4;
+std::atomic<PostFn> g_any[kMaxAny]{};
 
 const mem::Section* Text() { return mem::Game().Find(".text"); }
 
@@ -188,7 +189,8 @@ void Hook(UObject self, UObject function, void* params) {
 
     double t_post = perf::NowMs();
     ++t_depth;
-    if (PostFn any = g_any.load(std::memory_order_acquire)) any(self, function, params);
+    for (int i = 0; i < kMaxAny; ++i)
+        if (PostFn any = g_any[i].load(std::memory_order_acquire)) any(self, function, params);
     if (match && match->post) match->post(self, function, params);
     --t_depth;
     g_hook_perf.Add((t_mid - t_pre) + (perf::NowMs() - t_post));
@@ -266,6 +268,15 @@ bool On(UObject function, PreFn pre, PostFn post) {
     return true;
 }
 
-void OnAny(PostFn post) { g_any.store(post, std::memory_order_release); }
+void OnAny(PostFn post) {
+    for (int i = 0; i < kMaxAny; ++i) {
+        PostFn cur = g_any[i].load(std::memory_order_acquire);
+        if (cur == post) return;
+        if (!cur) {
+            g_any[i].store(post, std::memory_order_release);
+            return;
+        }
+    }
+}
 
 }  // namespace holevr::ue::process_event

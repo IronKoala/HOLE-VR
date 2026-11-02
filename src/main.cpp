@@ -26,6 +26,7 @@
 #include "vr/ui_panel.h"
 #include "vr/wrist_hud.h"
 #include "vr/world_menu.h"
+#include "vr/menu_study.h"
 #include "vr/stereo.h"
 
 namespace {
@@ -127,6 +128,7 @@ DWORD WINAPI InitThread(LPVOID) {
         vr::cvars::Init();
         vr::wrist_hud::InitGame();
         vr::world_menu::InitGame();
+        vr::menu_study::InitGame();
     }
 
     // Development hotkeys. Polled rather than hooked so nothing here can
@@ -143,6 +145,7 @@ DWORD WINAPI InitThread(LPVOID) {
         if (render_fixes && frame % 60 == 0) vr::render_fixes::Apply();
         if (frame % 60 == 15) vr::ui_panel::Maintain();
         if (frame % 15 == 7) vr::world_menu::Scan();
+        if (hooks) vr::menu_study::Poll();
         bool ctrl = GetAsyncKeyState(VK_CONTROL) & 0x8000;
         bool dump = ctrl && (GetAsyncKeyState(VK_F9) & 0x8000);
         bool recenter = ctrl && (GetAsyncKeyState(VK_F8) & 0x8000);
