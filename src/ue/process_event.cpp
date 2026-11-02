@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <cstring>
+#include <mutex>
 
 #include "core/log.h"
 #include "core/perf.h"
@@ -43,6 +44,9 @@ struct Callback {
 constexpr int kMaxCallbacks = 64;
 Callback g_callbacks[kMaxCallbacks];
 std::atomic<int> g_callback_count{0};
+// Registration (not the hook itself) can come from the game thread and from
+// background threads at once; this keeps two of them from taking one slot.
+std::mutex g_register_mutex;
 constexpr int kMaxAny = 4;
 std::atomic<PostFn> g_any[kMaxAny]{};
 
@@ -228,6 +232,7 @@ void Invoke(UObject obj, UObject function, void* params) {
 
 bool HookVtableOf(UObject sample) {
     if (!g_ready || !sample) return false;
+    std::lock_guard<std::mutex> lock(g_register_mutex);
     uintptr_t vt = mem::ReadOr<uintptr_t>(sample);
     if (!vt) return false;
     if (OriginalFor(vt)) return true;
@@ -254,6 +259,7 @@ bool HookVtableOf(UObject sample) {
 
 bool On(UObject function, PreFn pre, PostFn post) {
     if (!function) return false;
+    std::lock_guard<std::mutex> lock(g_register_mutex);
     int n = g_callback_count.load();
     for (int i = 0; i < n; ++i) {
         if (g_callbacks[i].function == function) {

@@ -1160,8 +1160,55 @@ void Init() {
 // keeps running while the game is paused (the 2026-11-02 study counted it at
 // the frame rate during the pause menu), and from the player's tick until the
 // controller is found. Nothing runs from inside the stereo view setup.
-void OnPlayerTick(UObject, float) { OnGameFrame(); }
 void AfterControllerTick(UObject, UObject, void*) { OnGameFrame(); }
+
+// Follows one object's per-frame Blueprint event (its class's own override
+// only, so we never take over a function object other code shares).
+std::mutex g_follow_mutex;  // the player tick and the background Scan both call
+UObject g_pc_cls = 0, g_cam_cls = 0;
+
+void FollowFrameEventOf(UObject obj, const char* fn_name, UObject* hooked_cls) {
+    UObject cls = ue::GetClass(obj);
+    if (!cls) return;
+    std::lock_guard<std::mutex> lock(g_follow_mutex);
+    if (cls == *hooked_cls) return;
+    *hooked_cls = cls;
+    UObject fn = ue::FindFunction(cls, fn_name);
+    if (!fn || ue::GetOuter(fn) != cls) {
+        log::Info("world menu: %s has no %s of its own", ue::GetName(cls).c_str(), fn_name);
+        return;
+    }
+    if (ue::process_event::HookVtableOf(obj) && ue::process_event::On(fn, nullptr, &AfterControllerTick))
+        log::Info("world menu: driven by %s.%s (runs while paused)", ue::GetName(cls).c_str(), fn_name);
+    else
+        log::Warn("world menu: could not follow %s.%s", ue::GetName(cls).c_str(), fn_name);
+}
+
+// The player's own controller and camera manager, read straight off the
+// player every frame (two property reads, no searches). The background Scan
+// used to be the only way to find them, and it can lag far behind: on the
+// owner's 2026-11-02 11:17 run the camera manager was found 64 s after the
+// level started, so a pause 30 s in left the forearm menu frozen in place
+// with a dead laser for 21 s.
+void FollowFromPlayer(UObject player) {
+    static UObject s_pc = 0, s_cam = 0;  // game thread only
+    UObject pc = 0;
+    if (!player || !ue::GetProp(player, "Controller", pc) || !pc) return;
+    if (pc != s_pc) {
+        s_pc = pc;
+        FollowFrameEventOf(pc, "ReceiveTick", &g_pc_cls);
+    }
+    UObject cam = 0;
+    if (ue::GetProp(pc, "PlayerCameraManager", cam) && cam && cam != s_cam) {
+        s_cam = cam;
+        FollowFrameEventOf(cam, "BlueprintUpdateCamera", &g_cam_cls);
+    }
+}
+
+void OnPlayerTick(UObject player, float) {
+    if (S.enabled && ue::process_event::Ready()) FollowFromPlayer(player);
+    OnGameFrame();
+}
 
 // The game's Blueprints took a widget away (or we did, which is skipped).
 void ExecRemoveFromParent(UObject context, void* stack, void* result) {
@@ -1214,37 +1261,27 @@ void InitGame() {
                    widgets ? 1 : 0, removal ? 1 : 0);
 }
 
-// Background thread: finds the player controller and its camera manager and
-// follows their per-frame Blueprint events. Both kept firing at the frame rate
-// during the pause menu in the 2026-11-02 study (ReceiveTick and
-// BlueprintUpdateCamera). Only a class's own override is followed, so we
-// never take over a function object other code shares.
+// Background thread, the fallback when there is no player: finds the player
+// controller and its camera manager by searching. Both kept firing at the
+// frame rate during the pause menu in the 2026-11-02 study (ReceiveTick and
+// BlueprintUpdateCamera). Skipped once the player tick has found them.
 void FollowFrameEvent(const char* base_class, const char* fn_name, UObject* hooked_cls) {
+    {
+        std::lock_guard<std::mutex> lock(g_follow_mutex);
+        if (*hooked_cls) return;
+    }
     UObject base = ue::FindObject(base_class);
     if (!base) return;
     UObject obj = ue::FindFirstInstance(base);
-    if (!obj) return;
-    UObject cls = ue::GetClass(obj);
-    if (cls == *hooked_cls) return;
-    *hooked_cls = cls;
-    UObject fn = ue::FindFunction(cls, fn_name);
-    if (!fn || ue::GetOuter(fn) != cls) {
-        log::Info("world menu: %s has no %s of its own", ue::GetName(cls).c_str(), fn_name);
-        return;
-    }
-    if (ue::process_event::HookVtableOf(obj) && ue::process_event::On(fn, nullptr, &AfterControllerTick))
-        log::Info("world menu: driven by %s.%s (runs while paused)", ue::GetName(cls).c_str(), fn_name);
-    else
-        log::Warn("world menu: could not follow %s.%s", ue::GetName(cls).c_str(), fn_name);
+    if (obj) FollowFrameEventOf(obj, fn_name, hooked_cls);
 }
 
 void Scan() {
     if (!S.enabled || !ue::objects::Ready() || !ue::process_event::Ready()) return;
     static int s_calls = 0;
     if ((s_calls++ % 4) != 0) return;
-    static UObject s_pc = 0, s_cam = 0;
-    FollowFrameEvent("Class /Script/Engine.PlayerController", "ReceiveTick", &s_pc);
-    FollowFrameEvent("Class /Script/Engine.PlayerCameraManager", "BlueprintUpdateCamera", &s_cam);
+    FollowFrameEvent("Class /Script/Engine.PlayerController", "ReceiveTick", &g_pc_cls);
+    FollowFrameEvent("Class /Script/Engine.PlayerCameraManager", "BlueprintUpdateCamera", &g_cam_cls);
 }
 
 bool MenuUp() { return g_menu_up.load(); }
