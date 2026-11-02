@@ -160,6 +160,7 @@ ProcessEventFn OriginalFor(uintptr_t vtable) {
 }
 
 thread_local int t_depth = 0;
+thread_local int t_open = 0;  // calls at this depth still reach the callbacks (GameCodeScope)
 perf::Counter g_hook_perf{"ProcessEvent callbacks"};
 std::atomic<bool> g_hook_perf_registered{false};
 
@@ -169,7 +170,7 @@ void Hook(UObject self, UObject function, void* params) {
     if (!original) return;  // cannot happen: only patched tables point here
     // Do not re-enter our callbacks from calls our callbacks make, and keep
     // the hook transparent if something deep in the engine recurses a lot.
-    if (t_depth > 0) {
+    if (t_depth > t_open) {
         original(self, function, params);
         return;
     }
@@ -201,6 +202,9 @@ void Hook(UObject self, UObject function, void* params) {
 }
 
 }  // namespace
+
+GameCodeScope::GameCodeScope() : saved_(t_open) { t_open = t_depth; }
+GameCodeScope::~GameCodeScope() { t_open = saved_; }
 
 bool Init() {
     if (g_ready) return true;

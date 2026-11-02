@@ -106,6 +106,7 @@ struct Candidate {
     UObject obj = 0;
     int index = -1;
     UObject cls = 0;
+    bool late = false;  // caught when it took focus, not when it was built
 };
 std::atomic<bool> g_active{false};
 
@@ -638,6 +639,9 @@ void ReleaseKey() {
     if (!G.pt.key_down) return;
     G.pt.key_down = false;
     if (!Alive(G.wic, G.wic_index)) return;
+    // The click lands here (on release), and the game's OnClicked may put
+    // up the next menu right away: let our menu catcher see it.
+    ue::process_event::GameCodeScope game_code;
     ue::Call c(G.wic, "ReleasePointerKey");
     c.Set("Key", Key{LeftMouse()});
     c.Invoke();
@@ -663,10 +667,14 @@ void TakeNewMenus() {
         for (auto& p : G.panels) hosted = hosted || p.widget == c.obj;
         if (hosted || !Alive(c.obj, c.index)) continue;
         if (!CallBool(c.obj, "IsInViewport")) {
-            log::Info("world menu: %s came up but isn't on the screen, left alone",
-                      ue::GetName(c.cls).c_str());
+            if (!c.late)
+                log::Info("world menu: %s came up but isn't on the screen, left alone",
+                          ue::GetName(c.cls).c_str());
             continue;
         }
+        if (c.late)
+            log::Warn("world menu: %s was on the flat screen without being caught when it was built; "
+                      "caught now that it took focus", ue::GetName(c.cls).c_str());
         Host(c);
     }
 }
@@ -732,6 +740,19 @@ void UpdateStack() {
         if (WidgetShows(G.panels[i])) top = i;
     for (int i = 0; i < static_cast<int>(G.panels.size()); ++i)
         SetShown(G.panels[i], !S.stack || top < 0 || i == top);
+    // A sub-menu on top gets the keyboard focus, so B/Y (Escape) reaches it
+    // (Options closes on Escape). Moving it from the flat screen onto the arm
+    // can leave the focus behind on the flat screen. When the sub-menu
+    // closes the game gives the focus back to the menu underneath itself.
+    static UObject s_focused = 0;
+    UObject want = top > 0 ? G.panels[top].widget : 0;
+    if (want && want != s_focused) {
+        CallVoid(want, "SetFocus");
+        log::Info("world menu: keyboard focus to %s (%s)", G.panels[top].name.c_str(),
+                  CallBool(want, "HasAnyUserFocus") || CallBool(want, "HasFocusedDescendants")
+                      ? "has it" : "asked for; B/Y may not reach it");
+    }
+    s_focused = want;
 }
 
 // ------------------------------------------------------------ pointer --
@@ -812,6 +833,7 @@ void UpdatePointer() {
 
     bool down = G.pt.trigger_down[G.pt.hand] && best.ok;
     if (down && !G.pt.key_down) {
+        ue::process_event::GameCodeScope game_code;  // see ReleaseKey
         ue::Call c(G.wic, "PressPointerKey");
         c.Set("Key", Key{LeftMouse()});
         c.Invoke();
@@ -847,6 +869,7 @@ void UpdatePointer() {
         if (std::fabs(G.pt.scroll_accum) >= 1.f) {
             float notch = G.pt.scroll_accum > 0 ? 1.f : -1.f;
             G.pt.scroll_accum -= notch;
+            ue::process_event::GameCodeScope game_code;  // see ReleaseKey
             ue::Call c(G.wic, "ScrollWheel");
             c.Set("ScrollDelta", notch);
             c.Invoke();
@@ -1306,19 +1329,29 @@ void ExecRemoveFromParent(UObject context, void* stack, void* result) {
     g_orig_remove(context, stack, result);
 }
 
-// A menu's Construct: the game just put it up.
+// A menu's Construct: the game just put it up. A menu taking keyboard focus
+// (OnAddedToFocusPath, which Slate fires on its own every time) is the
+// backup, so a menu built where we couldn't see it still leaves the flat
+// screen instead of sitting in front of the face; already hosted ones are
+// skipped by TakeNewMenus.
 void OnAnyEvent(UObject self, UObject function, void*) {
     if (!S.enabled || !self || !function) return;
-    // Each widget class has its own Construct function object: remember
-    // which function objects are a Construct.
+    // Each widget class has its own function objects: remember which ones
+    // are a Construct (1) or an OnAddedToFocusPath (2).
+    enum : uint8_t { kOther = 0, kConstruct = 1, kFocus = 2 };
     static std::mutex s_mutex;
-    static std::unordered_map<UObject, bool> s_is_construct;
+    static std::unordered_map<UObject, uint8_t> s_kind;
+    uint8_t kind;
     {
         std::lock_guard<std::mutex> lock(s_mutex);
-        auto it = s_is_construct.find(function);
-        if (it == s_is_construct.end())
-            it = s_is_construct.emplace(function, ue::GetName(function) == "Construct").first;
-        if (!it->second) return;
+        auto it = s_kind.find(function);
+        if (it == s_kind.end()) {
+            std::string n = ue::GetName(function);
+            it = s_kind.emplace(function, n == "Construct" ? kConstruct : n == "OnAddedToFocusPath" ? kFocus : kOther)
+                     .first;
+        }
+        kind = it->second;
+        if (kind == kOther) return;
     }
     UObject cls = ue::GetClass(self);
     if (!cls || !IsMenuClass(cls)) return;
@@ -1327,9 +1360,10 @@ void OnAnyEvent(UObject self, UObject function, void*) {
     UObject slot = 0;
     if (ue::GetProp(self, "Slot", slot) && slot) return;
     int index = IndexOf(self);
-    log::Info("world menu: the game put up %s", ue::GetName(cls).c_str());
+    bool late = kind == kFocus;
+    if (!late) log::Info("world menu: the game put up %s", ue::GetName(cls).c_str());
     std::lock_guard<std::mutex> lock(g_events_mutex);
-    g_new_menus.push_back({self, index, cls});
+    g_new_menus.push_back({self, index, cls, late});
 }
 
 void InitGame() {

@@ -44,4 +44,23 @@ using NativeFn = void (*)(UObject context, void* stack, void* result);
 // which the hook must call. Finds UFunction::Func by layout on first use.
 bool HookNative(UObject function, NativeFn hook, NativeFn* original);
 
+// Calls made from inside one of our callbacks skip all callbacks, so a
+// callback never re-enters itself. That also hid game code a callback sets
+// off: a laser click on "Options" runs the button's OnClicked and builds the
+// Options menu right inside our per-frame callback, so the menu's Construct
+// never reached us and Options stayed on the flat screen (owner's run
+// 2026-11-02 12:32 UTC). While one of these is alive on the game thread, the
+// game's own calls are seen as if the game had made them at the top level;
+// calls our callbacks make are still skipped.
+class GameCodeScope {
+public:
+    GameCodeScope();
+    ~GameCodeScope();
+    GameCodeScope(const GameCodeScope&) = delete;
+    GameCodeScope& operator=(const GameCodeScope&) = delete;
+
+private:
+    int saved_;
+};
+
 }  // namespace holevr::ue::process_event
