@@ -24,7 +24,7 @@ XrInstance g_instance = XR_NULL_HANDLE;
 XrSystemId g_system = XR_NULL_SYSTEM_ID;
 XrSession g_session = XR_NULL_HANDLE;
 XrSpace g_space = XR_NULL_HANDLE;
-XrSessionState g_state = XR_SESSION_STATE_UNKNOWN;
+std::atomic<XrSessionState> g_state{XR_SESSION_STATE_UNKNOWN};
 std::atomic<bool> g_running{false};
 std::atomic<bool> g_instance_ready{false};
 bool g_session_failed = false;
@@ -535,7 +535,7 @@ void PollEvents() {
         if (ev.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
             auto* sc = reinterpret_cast<XrEventDataSessionStateChanged*>(&ev);
             g_state = sc->state;
-            log::Info("OpenXR: session state %d", static_cast<int>(g_state));
+            log::Info("OpenXR: session state %d", static_cast<int>(g_state.load()));
             if (g_state == XR_SESSION_STATE_READY) {
                 XrSessionBeginInfo bi{XR_TYPE_SESSION_BEGIN_INFO};
                 bi.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
@@ -604,7 +604,7 @@ void RunFrame() {
             static DWORD last_log = 0;
             if (GetTickCount() - last_log > 1000) {
                 last_log = GetTickCount();
-                log::Info("OpenXR: game frame gap %.0f ms (session state %d)", gap, static_cast<int>(g_state));
+                log::Info("OpenXR: game frame gap %.0f ms (session state %d)", gap, static_cast<int>(g_state.load()));
             }
         }
     }
@@ -821,6 +821,11 @@ bool InitInstance() {
 
 bool InstanceReady() { return g_instance_ready; }
 
+std::wstring ActiveRuntimeLibrary() {
+    std::wstring manifest = ActiveRuntimeManifest();
+    return manifest.empty() ? std::wstring() : RuntimeLibraryFromManifest(manifest);
+}
+
 void RecommendedEyeSize(uint32_t* width, uint32_t* height) {
     *width = g_eye_w;
     *height = g_eye_h;
@@ -863,6 +868,10 @@ void SetRenderedViews(const EyeView views[2]) {
 }
 
 bool SessionRunning() { return g_running; }
+bool SessionVisible() {
+    XrSessionState s = g_state.load();
+    return g_running && (s == XR_SESSION_STATE_VISIBLE || s == XR_SESSION_STATE_FOCUSED);
+}
 XrInstance Instance() { return g_instance; }
 XrSession Session() { return g_session; }
 XrSpace TrackingSpace() { return g_space; }
