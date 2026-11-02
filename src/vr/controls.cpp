@@ -9,6 +9,7 @@
 
 #include "core/config.h"
 #include "core/log.h"
+#include "core/memory.h"
 #include "game/game.h"
 #include "game/gun.h"
 #include "game/weapon_lab.h"
@@ -98,6 +99,14 @@ struct Settings {
     bool game_recoil = false;      // let the game's camera/aim recoil run
     bool camera_shake = false;     // the game's camera shake option
     bool log_grabs = true;
+    // Rifle virtual stock: near the shoulder the rifle pivots from it.
+    bool virtual_stock = true;
+    double stock_snap = 12.0;      // cm from the shoulder pocket to lock on
+    double stock_release = 20.0;   // cm the hands must pull it away to let go
+    double stock_forward = 0.0;    // move the shoulder pocket, cm (head frame)
+    double stock_right = 0.0;
+    double stock_up = 0.0;
+    bool right_eye = true;         // aiming eye (the stock sits on that side)
 };
 Settings g_set;
 
@@ -121,6 +130,13 @@ void LoadSettings() {
     g_set.pouch_side = config::GetFloat("mag_pouch_side_cm", -15.f);
     g_set.pouch_down = config::GetFloat("mag_pouch_down_cm", 55.f);
     g_set.pouch_radius = config::GetFloat("mag_pouch_grab_radius_cm", 14.f);
+    g_set.virtual_stock = config::GetBool("rifle_virtual_stock", true);
+    g_set.stock_snap = config::GetFloat("rifle_stock_snap_cm", 12.f);
+    g_set.stock_release = config::GetFloat("rifle_stock_release_cm", 20.f);
+    g_set.stock_forward = config::GetFloat("rifle_stock_forward_cm", 0.f);
+    g_set.stock_right = config::GetFloat("rifle_stock_right_cm", 0.f);
+    g_set.stock_up = config::GetFloat("rifle_stock_up_cm", 0.f);
+    g_set.right_eye = config::GetInt("dominant_eye_right", 1) != 0;
 }
 
 // ---- shared hand state for other systems ----
@@ -133,6 +149,7 @@ bool g_head_valid = false;
 hands::EditButtons g_edit_buttons;
 std::atomic<int> g_editor_hand{-1};
 double g_clock = 0.0;
+double g_dt = 0.0;
 
 bool ToWorld(const XrPosef& p, hands::Pose* out) {
     return stereo::TrackingToWorld(p, &out->location, &out->rotation);
@@ -293,6 +310,13 @@ struct WeaponState {
     FVector support_point;        // where the support hand holds the handguard, world
     bool last_has_mag = false;
     double kick_t0 = -1;          // time of the last shot, for the in-hand kick
+    double kick_side = 0;         // this shot's random sideways part, -1..1
+    // Virtual stock (rifles): gun-frame points, from the grip.
+    FVector stock_local;          // middle of the butt pad
+    FVector ads_local;            // the game's aiming eye point (DefaultADSPoint)
+    bool have_stock = false;
+    bool shouldered = false;
+    double shoulder_blend = 0;    // 0 hands only .. 1 pivoting from the shoulder
     FVector gun_set_loc;          // where HoldGun put the gun this frame
 } W;
 
@@ -334,6 +358,18 @@ FQuat FromAxes(const FVector& x, const FVector& y, const FVector& z) {
     }
     return q;
 }
+
+FQuat Nlerp(const FQuat& a, FQuat b, double t) {
+    if (a.X * b.X + a.Y * b.Y + a.Z * b.Z + a.W * b.W < 0) { b.X = -b.X; b.Y = -b.Y; b.Z = -b.Z; b.W = -b.W; }
+    FQuat q;
+    q.X = a.X + (b.X - a.X) * t; q.Y = a.Y + (b.Y - a.Y) * t;
+    q.Z = a.Z + (b.Z - a.Z) * t; q.W = a.W + (b.W - a.W) * t;
+    double n = std::sqrt(q.X * q.X + q.Y * q.Y + q.Z * q.Z + q.W * q.W);
+    q.X /= n; q.Y /= n; q.Z /= n; q.W /= n;
+    return q;
+}
+
+void MeasureStock(UObject g, const FVector& actor_loc, const FQuat& actor_rot, const FVector& grip, UObject sight);
 
 // Shortest rotation taking direction a onto direction b (both unit length).
 FQuat FromTo(const FVector& a, const FVector& b) {
@@ -399,6 +435,7 @@ bool LearnGunFrame(UObject g, const FVector& actor_loc, const FQuat& actor_rot, 
     W.have_frame = true;
     W.muzzle_dist = std::fmax(10.0, DotV(m - grip, fwd));
     W.bore_height = DotV(m - grip, up);
+    MeasureStock(g, actor_loc, actor_rot, grip, sight);
     // The slide/bolt is pulled straight back along the bore. Express that in
     // the slide's parent space (the pistol's came out -X, as measured in the
     // weapon lab); a rifle's bolt parent may be turned differently.
@@ -464,6 +501,71 @@ FVector WallPushback(UObject gun, const FQuat& frame, const FVector& grip) {
     return dir * -back;
 }
 
+// Rifle stock: finds the back end of the gun (the butt pad) from the
+// bounds of all its parts, in the gun frame (X barrel, Z up, from the grip),
+// and the game's aiming eye point. Falls back to AR-15 sizes.
+void MeasureStock(UObject g, const FVector& actor_loc, const FQuat& actor_rot, const FVector& grip, UObject sight) {
+    if (W.is_pistol) return;
+    const FQuat to_frame = W.gun_frame.Inverse();   // actor space -> gun frame
+    const FQuat inv = actor_rot.Inverse();
+    double min_x = 0;
+    int counted = 0;
+    static UObject prim_class = 0;
+    if (!prim_class) prim_class = ue::FindObject("Class /Script/Engine.PrimitiveComponent");
+    ue::Call list(g, "K2_GetComponentsByClass");
+    list.Set("ComponentClass", prim_class);
+    int32_t size = 0;
+    const uint8_t* raw = prim_class && list.Invoke() ? list.Raw("ReturnValue", &size) : nullptr;
+    struct Arr { uintptr_t data; int32_t num, max; } arr{};
+    if (raw && size >= (int32_t)sizeof(Arr)) std::memcpy(&arr, raw, sizeof(Arr));
+    for (int i = 0; i < arr.num && i < 128; ++i) {
+        UObject c = mem::ReadOr<uintptr_t>(arr.data + i * sizeof(uintptr_t), 0);
+        if (!c) continue;
+        ue::Call b(c, "GetLocalBounds");
+        if (!b.Invoke()) continue;
+        ue::Vec3d mn = b.Get<ue::Vec3d>("Min"), mx = b.Get<ue::Vec3d>("Max");
+        if (mx.x - mn.x < 0.5 && mx.y - mn.y < 0.5 && mx.z - mn.z < 0.5) continue;  // empty
+        UETransform t = ComponentToWorld(c);
+        for (int k = 0; k < 8; ++k) {
+            FVector corner{k & 1 ? mx.x : mn.x, k & 2 ? mx.y : mn.y, k & 4 ? mx.z : mn.z};
+            corner = FVector{corner.X * t.scale.X, corner.Y * t.scale.Y, corner.Z * t.scale.Z};
+            FVector w = t.translation + t.rotation.Rotate(corner);
+            FVector f = to_frame.Rotate(inv.Rotate(w - actor_loc) - grip);
+            if (f.X < min_x) min_x = f.X;
+        }
+        ++counted;
+    }
+    // AR-15 / M4: butt about 28 cm behind the pistol grip, pad centre a
+    // little below the bore line.
+    double back = -min_x;
+    const bool measured = counted > 0 && back > 12.0 && back < 50.0;
+    if (!measured) back = 28.0;
+    W.stock_local = FVector{-back, 0, W.bore_height - 3.0};
+    W.ads_local = FVector{0, 0, W.bore_height + 6.5};   // red dot height over the bore
+    if (sight) {
+        FVector a = to_frame.Rotate(inv.Rotate(ComponentToWorld(sight).translation - actor_loc) - grip);
+        if (a.Z > W.bore_height && a.Z < W.bore_height + 15.0 && a.X > -back) W.ads_local = a;
+    }
+    W.have_stock = true;
+    log::Info("controls: rifle stock %s at %.1f cm behind the grip (%d parts), aim point (%.1f %.1f %.1f)",
+              measured ? "measured" : "assumed", back, counted, W.ads_local.X, W.ads_local.Y, W.ads_local.Z);
+}
+
+// Where the butt goes when the aiming eye looks down the sights: the
+// shoulder pocket, worked out from the headset and the gun's own geometry.
+bool ShoulderPocket(FVector* out) {
+    hands::Pose head;
+    if (!hands::Head(&head)) return false;
+    FVector eye = head.location + head.rotation.Rotate(FVector{0, g_set.right_eye ? 3.2 : -3.2, 0});
+    // Eye at the sight line, butt behind and below it along the bore. Keep
+    // the eye-to-butt distance in a human range (12-30 cm).
+    FVector d = W.stock_local - W.ads_local;
+    d.X = std::fmax(-30.0, std::fmin(-12.0, d.X));
+    d = d + FVector{g_set.stock_forward, g_set.stock_right, g_set.stock_up};
+    *out = eye + head.rotation.Rotate(d);
+    return true;
+}
+
 void HoldGun(game::Gun& gun, const hands::HandState& rh) {
     UObject g = gun.Object();
     UObject main = 0;
@@ -483,46 +585,90 @@ void HoldGun(game::Gun& gun, const hands::HandState& rh) {
     // Third test: barrel about 5 degrees left of where the hand points.
     constexpr double kBasePitch = -30.0;
     constexpr double kBaseYaw = 5.0;
-    // Recoil kick: the muzzle flips up and the gun pushes back into the hand,
-    // then returns (about 20 ms up, 100 ms back). Visual only; aim is the hand.
+    // `hand` is the gun's own frame in the world (X barrel, Y right, Z up).
+    FQuat hand = rh.aim.rotation * ToQuat(FRotator{kBasePitch + g_set.gun_pitch, kBaseYaw + g_set.gun_yaw,
+                                                   g_set.gun_roll});
+    // Fourth test: gun sat about 5 cm too far forward and 1.3 cm too far left.
+    // Fifth test: about 5 cm too high.
+    constexpr double kBaseForward = -5.0, kBaseRight = 1.3, kBaseUp = -5.0;
+    const FVector offset{kBaseForward + g_set.gun_forward, kBaseRight + g_set.gun_right, kBaseUp};
+    FVector grip_w = rh.grip.location + hand.Rotate(offset);
+    // Two hands: the support hand on the handguard steers the barrel. Turn
+    // the one-hand pose so the point the support hand grabbed lies toward
+    // where that hand is now; roll still comes from the firing hand.
+    hands::HandState lh2 = hands::Get(hands::kLeft);
+    const bool two = W.two_hand && lh2.valid && Len(W.support_local) > 5.0;
+    if (two) {
+        FVector v1 = Norm(hand.Rotate(W.support_local));
+        FVector v2 = Norm(lh2.grip.location - grip_w);
+        hand = FromTo(v1, v2) * hand;
+        grip_w = rh.grip.location + hand.Rotate(offset);
+    }
+    // Virtual stock (rifles, like Into the Radius and Zero Caliber): when
+    // the butt comes within a hand's width of the shoulder pocket it locks
+    // there and the rifle pivots from the shoulder, aiming from it through
+    // the support hand (or the firing hand when one-handed). The hands'
+    // small wobbles no longer move the back of the gun. Pull it well away
+    // to let go.
+    FVector pocket;
+    if (!W.is_pistol && W.have_stock && g_set.virtual_stock && ShoulderPocket(&pocket)) {
+        double d = Len(grip_w + hand.Rotate(W.stock_local) - pocket);
+        if (!W.shouldered && d < g_set.stock_snap) {
+            W.shouldered = true;
+            input::Haptic(input::kRight, 0.2f, 0.03f);
+            log::Info("controls: rifle shouldered (%.1f cm from the pocket)", d);
+        } else if (W.shouldered && d > g_set.stock_release) {
+            W.shouldered = false;
+            log::Info("controls: rifle off the shoulder");
+        }
+        W.shoulder_blend += (W.shouldered ? 1.0 : -1.0) * g_dt / 0.12;
+        W.shoulder_blend = std::fmax(0.0, std::fmin(1.0, W.shoulder_blend));
+        if (W.shoulder_blend > 0) {
+            FVector front_local = two ? W.support_local : hand.Inverse().Rotate(rh.grip.location - grip_w);
+            FVector front_w = two ? lh2.grip.location : rh.grip.location;
+            FVector gun_dir = Norm(hand.Rotate(front_local - W.stock_local));
+            FVector want = front_w - pocket;
+            if (Len(want) > 5.0) {
+                FQuat hs = FromTo(gun_dir, Norm(want)) * hand;
+                FVector gs = pocket - hs.Rotate(W.stock_local);
+                hand = Nlerp(hand, hs, W.shoulder_blend);
+                grip_w = grip_w + (gs - grip_w) * W.shoulder_blend;
+            }
+        }
+    } else {
+        W.shouldered = false;
+        W.shoulder_blend = 0;
+    }
+    // Recoil kick, at the grip so the arms follow it, never the camera:
+    // the muzzle flips up (with a little random side) and the gun pushes
+    // back, then returns (about 20 ms up, 100 ms back). A pistol in one
+    // hand flips hard; a rifle less with two hands and least on the shoulder,
+    // where it pivots from the butt and mostly pushes straight back.
     double kick = 0;
     if (W.kick_t0 >= 0 && g_set.recoil_kick > 0) {
         double t = g_clock - W.kick_t0;
         if (t > 0.4) W.kick_t0 = -1;
         else kick = g_set.recoil_kick * (1.0 - std::exp(-t / 0.012)) * std::exp(-t / 0.07) * 1.6;
     }
-    // Pistol: sharp muzzle flip. Rifle (stock, 5.56): little flip, more push.
-    const double kKickPitch = W.is_pistol ? 7.0 : 2.5, kKickBack = W.is_pistol ? 2.0 : 3.0;
-    FQuat hand = rh.aim.rotation * ToQuat(FRotator{kBasePitch + g_set.gun_pitch + kick * kKickPitch,
-                                                   kBaseYaw + g_set.gun_yaw, g_set.gun_roll});
-    FQuat rot = W.have_frame ? hand * W.gun_frame.Inverse() : hand;
-    // `hand` is the gun's own frame in the world (X barrel, Y right, Z up).
-    // Fourth test: gun sat about 5 cm too far forward and 1.3 cm too far left.
-    // Fifth test: about 5 cm too high.
-    constexpr double kBaseForward = -5.0, kBaseRight = 1.3, kBaseUp = -5.0;
-    FVector shift = hand.Rotate(FVector{kBaseForward + g_set.gun_forward - kick * kKickBack,
-                                        kBaseRight + g_set.gun_right, kBaseUp});
-    FVector grip_w = rh.grip.location + shift;
-    // Two hands: the support hand on the handguard steers the barrel. Turn
-    // the one-hand pose so the point the support hand grabbed lies toward
-    // where that hand is now; roll still comes from the firing hand.
-    hands::HandState lh2 = hands::Get(hands::kLeft);
-    if (W.two_hand && lh2.valid && Len(W.support_local) > 5.0) {
-        FVector v1 = Norm(hand.Rotate(W.support_local));
-        FVector v2 = Norm(lh2.grip.location - grip_w);
-        FQuat q = FromTo(v1, v2);
-        hand = q * hand;
-        rot = W.have_frame ? hand * W.gun_frame.Inverse() : hand;
-        shift = hand.Rotate(FVector{kBaseForward + g_set.gun_forward - kick * kKickBack,
-                                    kBaseRight + g_set.gun_right, kBaseUp});
-        grip_w = rh.grip.location + shift;
+    if (kick > 0) {
+        double up, back, side;
+        if (W.is_pistol) { up = 7.0; back = 2.0; side = 1.0; }
+        else if (W.shoulder_blend > 0.5) { up = 1.2; back = 1.5; side = 0.4; }
+        else if (two) { up = 2.5; back = 2.5; side = 0.6; }
+        else { up = 6.0; back = 3.0; side = 1.5; }
+        FQuat kicked = hand * ToQuat(FRotator{kick * up, kick * side * W.kick_side, 0});
+        FVector pivot = W.shoulder_blend > 0.5 ? grip_w + hand.Rotate(W.stock_local) : grip_w;
+        FQuat delta = kicked * hand.Inverse();
+        grip_w = pivot + delta.Rotate(grip_w - pivot) - kicked.Rotate(FVector{kick * back, 0, 0});
+        hand = kicked;
     }
+    FQuat rot = W.have_frame ? hand * W.gun_frame.Inverse() : hand;
     FVector loc = grip_w - rot.Rotate(rel);
     FVector push = WallPushback(g, hand, grip_w);
     loc = loc + push;
     W.grip_world = grip_w + push;
-    W.have_support_point = W.two_hand && Len(W.support_local) > 5.0;
-    if (W.have_support_point) W.support_point = W.grip_world + hand.Rotate(W.support_local);
+    W.have_support_point = two;
+    if (two) W.support_point = W.grip_world + hand.Rotate(W.support_local);
     SetActorTransform(g, loc, rot);
     W.have_pose = true;
     W.gun_set_loc = loc;
@@ -1143,6 +1289,7 @@ void HookChargeTimeline() {
 
 void OnTick(UObject player, float dt) {
     g_clock += dt;
+    g_dt = dt;
     input::Snapshot s = input::Consume();
     if (!s.valid || !g_set.enabled) return;
     UpdateHands(s);
@@ -1181,7 +1328,10 @@ void OnTick(UObject player, float dt) {
         int rounds = st.chamber + (st.magazine > 0 ? st.magazine : 0);
         if (W.last_rounds >= 0 && rounds < W.last_rounds && st.has_magazine == W.last_has_mag &&
             s.hand[input::kRight].trigger_button.down && !W.slide.Held())
+        {
             W.kick_t0 = g_clock;
+            W.kick_side = (std::rand() % 2001) / 1000.0 - 1.0;
+        }
         W.last_rounds = rounds;
         W.last_has_mag = st.has_magazine;
     }
