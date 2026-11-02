@@ -1371,7 +1371,11 @@ void LoadGrip(int side, const hands::HandGrab& grab, bool from_disk = false) {
         have = true;
     }
     const bool is_mag = grab.kind == hands::GrabKind::kMagHeld || grab.kind == hands::GrabKind::kMagInsert;
-    if (is_mag && DefaultMagRecord(side, grab.object, &rec)) {
+    // No built-in magazine hold (the owner poses it in the editor): until a
+    // grip is saved, the hand stays as it is on the controller, and the
+    // editor starts from that.
+    static const bool builtin_mag = config::GetBool("body_mag_builtin_hold", false);
+    if (is_mag && builtin_mag && DefaultMagRecord(side, grab.object, &rec)) {
         rec.name = g.key;
         have = true;
     }
@@ -1649,7 +1653,15 @@ void UpdateEditor(const hands::HandGrab grab[2], const hands::HandState hs[2], d
             g.rec.name = g.key;
             g.rec.right_hand = side == kR;
             gr::StoreHand(&g.rec, G.rig[side].geo, Normalized(inv * hand_w.rotation), local(hand_w.translation));
-            for (int t = 0; t < gr::kTipCount; ++t) g.rec.tip[t] = local(g_tip_world[side][t]);
+            // Fingers exactly as they look now, joint by joint.
+            for (int t = 0; t < gr::kTipCount; ++t) {
+                g.rec.tip[t] = local(g_tip_world[side][t]);
+                const int f = TipFinger(t);
+                const fingers::Chain& c = G.rig[side].chain[f];
+                for (int j = 0; j < 3; ++j)
+                    g.rec.joint[t][j] = Normalized(c.ref[j].rotation.Inverse() * fingers::LocalRotation(c, j, G.cur[side][f]));
+                g.rec.posed[t] = true;
+            }
             g.have = true;
             g.object = grab[side].object;
             g.kind = grab[side].kind;
