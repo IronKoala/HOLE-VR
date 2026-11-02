@@ -53,6 +53,7 @@ struct Settings {
     float arm_width_m = 0.30f;
     float arm_along_m = 0.20f;    // from the controller grip toward the elbow
     float arm_back_m = 0.05f;     // out from the back of the forearm
+    float arm_roll_deg = 90.f;    // menu turned counter-clockwise on the arm
     bool hide_covers = true;      // the menus' full-screen click-catcher
     bool laser = true;
 } S;
@@ -431,8 +432,13 @@ bool PlaceOnForearm() {
             if (DotV(thumb, head_up) * G.up_sign < -0.25) G.up_sign = -G.up_sign;
         }
     }
-    FVector up = thumb * G.up_sign;
-    FVector y = Cross(up, back);  // widget's left edge
+    FVector up0 = thumb * G.up_sign;
+    FVector y0 = Cross(up0, back);  // widget's left edge
+    // Turn the menu on the arm, counter-clockwise as you look at it. The owner
+    // asked for 90 degrees (2026-11-02); menu_forearm_roll_deg sets it.
+    double r = S.arm_roll_deg * kDegToRad;
+    FVector up = up0 * std::cos(r) + y0 * std::sin(r);
+    FVector y = y0 * std::cos(r) - up0 * std::sin(r);
     G.rot = FromAxes(back, y, up);
     G.placed = true;
     return true;
@@ -1074,6 +1080,7 @@ void Init() {
     S.arm_width_m = config::GetFloat("menu_forearm_width_m", 0.30f);
     S.arm_along_m = config::GetFloat("menu_forearm_along_m", 0.20f);
     S.arm_back_m = config::GetFloat("menu_forearm_back_m", 0.05f);
+    S.arm_roll_deg = config::GetFloat("menu_forearm_roll_deg", 90.f);
     S.hide_covers = config::GetBool("menu_hide_focus_cover", true);
     S.laser = config::GetBool("menu_world_laser", true);
     if (!S.enabled) {
