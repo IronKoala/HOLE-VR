@@ -1111,9 +1111,10 @@ void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState& lh
             }
             if (game_mag) {
                 SetActorTransform(game_mag, show_loc, show_rot);
-                ue::Call destroy(W.held_mag, "K2_DestroyActor");
-                destroy.Invoke();
-                log::Info("controls: seating the game's own magazine %s (pouch magazine removed)",
+                // Keep our magazine and put it back in the pouch for the next
+                // reload. Destroying it left its rounds floating in the air.
+                W.pouch_mag = W.held_mag;
+                log::Info("controls: seating the game's own magazine %s (pouch magazine goes back to the pouch)",
                           ue::GetName(game_mag).c_str());
             } else {
                 ue::SetProp<UObject>(gun.Object(), "MagazineObj_Temp", W.held_mag);
