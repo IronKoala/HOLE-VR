@@ -505,6 +505,15 @@ bool WristPose(const input::HandInput& h, XrPosef* pose) {
         if (d < -0.25f) s_up_sign = -s_up_sign;  // a little hysteresis so it doesn't flip back and forth
     }
     V3 up = Mul(thumb, s_up_sign);
+    // Read level, like a watch you've turned toward you: the display's up is
+    // your head's up laid flat onto the back of the hand. Following the thumb
+    // left it standing on end (owner, 2026-11-02: "vertical not horizontal").
+    if (xr::LatestViews(eyes)) {
+        V3 head_up = Rotate(eyes[0].pose.orientation, V3{0, 1, 0});
+        V3 flat = Sub(head_up, Mul(face, Dot(head_up, face)));
+        float len = Len(flat);
+        if (len > 0.3f) up = Mul(flat, 1.f / len);
+    }
     V3 right = Cross(up, face);
     pose->orientation = FromAxes(right, up, face);
     pose->position = {p.x, p.y, p.z};
