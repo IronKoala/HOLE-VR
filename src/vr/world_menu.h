@@ -18,6 +18,8 @@ namespace holevr::vr::world_menu {
 
 // Before the VR session starts (registers the laser layer with OpenXR).
 void Init();
+// After game::Init(): hooks the game-thread events that drive the panels.
+void InitGame();
 // Background thread, a few times a second: finds the game's menu widgets.
 void Scan();
 // True while at least one menu is on a world panel.
