@@ -70,8 +70,8 @@ states from trigger touch and the analog trigger.
 - Slide: three holds, like Half-Life: Alyx, each posed and saved on its
   own (`<Class>.slide-over|rear|front.ini`). The hold is picked once, when
   the hand closes on the slide: fist over the FRONT half of the slide
-  (measured from the slide part's mesh) = **front**; more than 7 cm behind
-  the slide's grab point, i.e. behind the slide (`hand_slide_pinch_behind_cm`)
+  (measured from the slide part's mesh) = **front**; fist within 6 cm of
+  the rear sight (the gun's `DefaultADSPoint`, `hand_slide_pinch_sight_cm`)
   = **rear pinch**; else **rear overhand**. A hold not posed yet keeps the
   hand where the controller grabbed, carried along with the slide. To pose one, grab
   the slide that way, then open the editor (hold left Y 1 s). A hold not
@@ -90,6 +90,10 @@ and how deep anything sits inside the object's outline
 Hold **left Y for 1 s** while holding the pistol (or a magazine in the
 left hand): the editor is on and the OTHER controller becomes the editing
 hand (its buttons stop reaching the game, and the gun won't fire).
+While the editor runs, both hands and the held gun/magazine/slide stay
+frozen where they were when it started; only the editing controller's grab
+point follows the real controller (controls freezes the game's gun, slide
+and grabs on its side while `hands::EditorHand() >= 0`).
 
 - **Finger joints**: a small ball sits on every finger joint (15: base,
   middle and tip joint of each finger). Squeeze grip on one and turn the

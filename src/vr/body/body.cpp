@@ -1013,6 +1013,16 @@ bool IsGrab(hands::GrabKind k) {
 // While a magazine grip is edited, the hand stays where it was on the
 // controller and the magazine is placed from the hand (so moving the
 // magazine in the editor moves the magazine, not the hand).
+// While the grip editor runs, both hands and the held objects stay where
+// they were when it started (owner: "when i initiate the pose editor i want
+// my vr hands to freeze in place"); only the editing controller's grab point
+// follows the real controller.
+struct EditFreeze {
+    bool on = false;
+    hands::HandState hs[2];
+    hands::HandGrab grab[2];
+} g_freeze;
+
 struct MagPin {
     bool on = false;
     int side = -1;
@@ -1029,7 +1039,7 @@ Xf PoseXf(const hands::Pose& p) {
 
 bool PinnedObject(const hands::HandGrab& grab, hands::Pose* out) {
     if (!g_pin.on || grab.object != g_pin.object || G.grip[g_pin.side].object != grab.object) return false;
-    hands::HandState h = hands::Get(g_pin.side == kL ? hands::kLeft : hands::kRight);
+    hands::HandState h = g_freeze.on ? g_freeze.hs[g_pin.side] : hands::Get(g_pin.side == kL ? hands::kLeft : hands::kRight);
     if (!h.valid) return false;
     const Xf hand = skel::Compose(g_pin.hand_in_ctrl, PoseXf(h.grip));
     const ActiveGrip& g = G.grip[g_pin.side];
@@ -1122,15 +1132,25 @@ int PickSlideHold(const hands::HandState& h, const hands::Pose& gun, UObject gun
     // Front half of the slide (unknown length: well ahead of the grab point).
     const double split = span ? (back + front) * 0.5 : 5.0;
     int best;
-    // Behind the slide (owner: "the pinch zone needs to be behind the
-    // slide"): the rear pinch, whatever the palm does.
+    // The pinch is taken at the rear sight (owner: "the pinch grab zone
+    // should be the rear iron sights"): fist within reach of the gun's sight
+    // point. Without a sight point: behind the slide.
+    static const double pinch_sight = config::GetFloat("hand_slide_pinch_sight_cm", 6.f);
     static const double pinch_behind = config::GetFloat("hand_slide_pinch_behind_cm", 7.f);
-    if (at.X > split) best = kSlideFront;
-    else if (at.X < -pinch_behind) best = kSlideRear;
+    UObject sight = 0;
+    FVector sight_at{};
+    double to_sight = -1;
+    if (gun_actor && ue::GetProp(gun_actor, "DefaultADSPoint", sight) && sight) {
+        sight_at = inv.Rotate(ComponentToWorld(sight).translation - gun.location);
+        to_sight = Length(at - sight_at);
+    }
+    const bool pinch = to_sight >= 0 ? to_sight < pinch_sight : at.X < -pinch_behind;
+    if (pinch) best = kSlideRear;
+    else if (at.X > split) best = kSlideFront;
     else best = kSlideOver;
-    log::Info("body: slide grab: %s hold (fist %.1f cm along the slide from the grab point; slide %s; "
-              "front half from %.1f; palm in gun frame %.2f %.2f %.2f)",
-              kSlideHoldName[best], at.X,
+    log::Info("body: slide grab: %s hold (fist (%.1f %.1f %.1f) from the grab point, rear sight at (%.1f %.1f %.1f), "
+              "%.1f cm from it, pinch within %.1f; slide %s; front half from %.1f; palm in gun frame %.2f %.2f %.2f)",
+              kSlideHoldName[best], at.X, at.Y, at.Z, sight_at.X, sight_at.Y, sight_at.Z, to_sight, pinch_sight,
               span ? (std::to_string(int(back * 10) / 10.0) + ".." + std::to_string(int(front * 10) / 10.0)).c_str()
                    : "size unknown",
               split, n.X, n.Y, n.Z);
@@ -1500,6 +1520,7 @@ void StopEditor() {
     if (g_editor.Active()) log::Info("body: grip editor off");
     g_editor.Stop();
     g_pin.on = false;
+    g_freeze.on = false;
     HideMarkers();
     g_edit_side = g_edit_ctrl = -1;
     hands::SetEditorHand(-1);
@@ -1673,7 +1694,10 @@ struct JointDrag {
     Xf obj_in_hand0, ctrl_in_hand0;
 } g_drag;
 
-void UpdateEditor(const hands::HandGrab grab[2], const hands::HandState hs[2], double dt) {
+// grab/hs: frozen while editing; live: the real controllers (the editing
+// controller's grab point follows them).
+void UpdateEditor(const hands::HandGrab grab[2], const hands::HandState hs[2], const hands::HandState live[2],
+                  double dt) {
     const hands::EditButtons b = hands::GetEditButtons();
     // Which grip: a magazine or the slide in the left hand first (the right
     // controller edits), else the gun in the right hand (the left edits).
@@ -1691,7 +1715,7 @@ void UpdateEditor(const hands::HandGrab grab[2], const hands::HandState hs[2], d
     const int ctrl = 1 - side;
     const bool is_mag = grab[side].kind == hands::GrabKind::kMagHeld || grab[side].kind == hands::GrabKind::kMagInsert;
     hands::Pose obj;
-    if (!ObjectFrame(grab[side], grab[kR], &obj) || !hs[ctrl].valid) return;
+    if (!ObjectFrame(grab[side], grab[kR], &obj) || !live[ctrl].valid) return;
     const FQuat inv = obj.rotation.Inverse();
     auto local = [&](const FVector& w) { return inv.Rotate(w - obj.location); };
 
@@ -1704,9 +1728,9 @@ void UpdateEditor(const hands::HandGrab grab[2], const hands::HandState hs[2], d
     // gun it sits in front of the barrel, so the gun doesn't hide it or get in
     // the way.
     const double reach = grab[ctrl].kind == hands::GrabKind::kGunGrip ? S.reach_gun : 3.0;
-    const FVector pointer_w = hs[ctrl].grip.location + hs[ctrl].aim.rotation.Rotate(FVector{reach, 0, 0});
+    const FVector pointer_w = live[ctrl].grip.location + live[ctrl].aim.rotation.Rotate(FVector{reach, 0, 0});
     in.pointer = local(pointer_w);
-    in.pointer_rot = Normalized(inv * hs[ctrl].grip.rotation);
+    in.pointer_rot = Normalized(inv * live[ctrl].grip.rotation);
     grip_editor::Scene sc;
     for (int m = 0; m < grip_editor::kJointItems; ++m) sc.joint[m] = local(g_joint_world[side][m / 3][m % 3].translation);
     sc.palm = local(g_palm_world[side]);
@@ -1723,6 +1747,10 @@ void UpdateEditor(const hands::HandGrab grab[2], const hands::HandState hs[2], d
     grip_editor::Output out = g_editor.Update(in, sc, &g.rec, &hand_rot, &hand_pos);
     const Xf hand_w = g_hand_world[side];  // last frame's posed hand
     if (out.entered) {
+        g_freeze.on = true;
+        for (int i = 0; i < 2; ++i) g_freeze.hs[i] = hs[i], g_freeze.grab[i] = grab[i];
+        log::Info("body: grip editor: hands and %s frozen in place; the %s controller's grab point is live",
+                  is_mag ? "magazine" : "gun", ctrl == kR ? "right" : "left");
         g_edit_side = side;
         g_edit_ctrl = ctrl;
         hands::SetEditorHand(ctrl);
@@ -1766,7 +1794,7 @@ void UpdateEditor(const hands::HandGrab grab[2], const hands::HandState hs[2], d
         g_drag.joint = out.grabbed % 3;
         g_drag.tip = FingerTip(g_drag.finger, sc.index_state);
         g_drag.joint_world0 = g_joint_world[side][g_drag.finger][g_drag.joint].rotation;
-        g_drag.ctrl_rot0 = hs[ctrl].grip.rotation;
+        g_drag.ctrl_rot0 = live[ctrl].grip.rotation;
         // From now on this finger is posed joint by joint: start from what it shows.
         const int t = g_drag.tip;
         if (!g.rec.posed[t]) {
@@ -1781,13 +1809,13 @@ void UpdateEditor(const hands::HandGrab grab[2], const hands::HandState hs[2], d
         objx.translation = obj.location;
         objx.rotation = obj.rotation;
         g_drag.obj_in_hand0 = skel::Relative(objx, hand_w);
-        g_drag.ctrl_in_hand0 = skel::Relative(PoseXf(hs[ctrl].grip), hand_w);
+        g_drag.ctrl_in_hand0 = skel::Relative(PoseXf(live[ctrl].grip), hand_w);
     }
     if (out.grabbed >= 0 && g_drag.tip >= 0) {
         // The joint turns with the controller (all three axes).
         const int f = g_drag.finger, n = g_drag.joint, t = g_drag.tip;
         const fingers::Chain& c = rig.chain[f];
-        FQuat d = Normalized(hs[ctrl].grip.rotation * g_drag.ctrl_rot0.Inverse());
+        FQuat d = Normalized(live[ctrl].grip.rotation * g_drag.ctrl_rot0.Inverse());
         FQuat want_h = Normalized(hand_w.rotation.Inverse() * d * g_drag.joint_world0);
         fingers::Angles a;
         for (int j = 0; j < 3; ++j) a.extra[j] = g.rec.joint[t][j];
@@ -1799,7 +1827,7 @@ void UpdateEditor(const hands::HandGrab grab[2], const hands::HandState hs[2], d
         SolveGrip(side, t, true);
     } else if (out.grabbed == grip_editor::kObjectItem) {
         // The magazine moves and turns with the controller, relative to the hand.
-        Xf ctrl_h = skel::Relative(PoseXf(hs[ctrl].grip), hand_w);
+        Xf ctrl_h = skel::Relative(PoseXf(live[ctrl].grip), hand_w);
         FQuat d = Normalized(ctrl_h.rotation * g_drag.ctrl_in_hand0.rotation.Inverse());
         Xf o;
         o.rotation = Normalized(d * g_drag.obj_in_hand0.rotation);
@@ -2286,8 +2314,11 @@ void OnTick(UObject player, float dt_f) {
     G.pose.ClearChanged();
     ++G.frames;
 
-    hands::HandState hs[2] = {hands::Get(hands::kLeft), hands::Get(hands::kRight)};
+    const hands::HandState live[2] = {hands::Get(hands::kLeft), hands::Get(hands::kRight)};
+    hands::HandState hs[2] = {live[0], live[1]};
     hands::HandGrab grab[2] = {hands::GetGrab(hands::kLeft), hands::GetGrab(hands::kRight)};
+    if (g_freeze.on)
+        for (int i = 0; i < 2; ++i) hs[i] = g_freeze.hs[i], grab[i] = g_freeze.grab[i];
 
     // The upper body belongs to the player, not the flat-screen animation:
     // no recoil kick, aim pitch or idle sway in the spine and shoulders.
@@ -2413,7 +2444,7 @@ void OnTick(UObject player, float dt_f) {
         G.pose.SetL(k.head, l);
     }
 
-    UpdateEditor(grab, hs, dt);
+    UpdateEditor(grab, hs, live, dt);
     StepMeasure(hs, sc_target, body_right, dt);
     for (int side = 0; side < 2; ++side)
         if (hs[side].valid) SolveArm(side, hs[side], grab[side], grab[kR], body_fwd, body_right, dt);
