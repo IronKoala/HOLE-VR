@@ -545,6 +545,20 @@ void TakeNewMenus() {
         std::lock_guard<std::mutex> lock(g_scan_mutex);
         list = g_candidates;
     }
+    // The title screen and anything opened from it stay as the game made
+    // them: the forearm menu only starts once the title is gone.
+    bool title_up = false;
+    for (const auto& c : list) {
+        if (ue::GetName(c.cls) != "UIM_Title_C" || !Alive(c.obj, c.index)) continue;
+        if (CallBool(c.obj, "IsInViewport")) title_up = true;
+    }
+    static bool s_said_title = false;
+    if (title_up != s_said_title) {
+        s_said_title = title_up;
+        log::Info("world menu: title screen %s", title_up ? "is up, menus stay on the flat screen until it's gone"
+                                                          : "is gone, menus go on the forearm");
+    }
+    if (title_up) return;
     for (const auto& c : list) {
         if (g_play_widgets.count(c.obj)) continue;
         bool hosted = false;
