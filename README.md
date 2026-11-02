@@ -20,10 +20,7 @@ Run it again and click **Uninstall** to remove the mod and restore that backup.
 Manual install, if you prefer:
 
 1. Copy `dxgi.dll` into `HOLE\HOLE\Binaries\Win64\` (next to `HOLE-Win64-Shipping.exe`).
-2. Put the headset on and start the game normally from Steam. The mod starts
-   SteamVR if it isn't running and presses START on the title screen once the
-   headset shows the game, so you land in the level in VR
-   (`start_steamvr=0` / `title_auto_start=0` in `hole-vr.ini` turn these off).
+2. Start SteamVR, put the headset on, then start the game normally from Steam.
 3. A `hole-vr` folder appears next to the DLL with `hole-vr.log`, `hole-vr.ini`
    and a `dump` folder.
 
