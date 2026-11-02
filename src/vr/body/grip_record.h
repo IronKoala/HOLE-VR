@@ -51,6 +51,11 @@ struct Record {
 // pistol (scan 2026-11-01: grip 5.6 cm deep, 3.1 wide, trigger guard bottom
 // at 7.8 cm, slant 13 degrees).
 Record DefaultPistol();
+// The built-in pistol hand placement (knuckle, fingers, across).
+void PistolHand(Record* r);
+// True for a saved grip that still has the first built-in hand (before
+// 2026-11-02), so the loader can move it to the new one and keep its tips.
+bool HasOldPistolHand(const Record& r);
 
 std::string Serialize(const Record& r);
 // Fills *r from text; keys missing from the text keep their current values.

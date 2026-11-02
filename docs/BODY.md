@@ -47,6 +47,14 @@ the fingers are solved to the targets once (a few ms, cached per record) and
 held. Only the index finger is live: it blends between its three stored
 states from trigger touch and the analog trigger.
 
+- Pistol hand (2026-11-02, owner's photos): the hand runs in line with the
+  barrel (about 7 deg off), so with a straight wrist the forearm sits right
+  behind the gun; the web of the hand sits low behind the back strap, under
+  the tang (a `tang` box in the outline). Saved grips with the first hand
+  placement get the new one on load, keeping their fingertips. Holding the
+  pistol, the elbow is placed where the wrist bends least
+  (`body_gun_wrist_straight`). The log line `grip ... hand:` gives the
+  forearm-to-barrel angle and how deep the web sits in the gun.
 - Pistol grip: built in (`grip_record::DefaultPistol`), from the owner's
   reference photos and the measured pistol: high grip, middle finger just
   under the trigger guard, thumb forward along the LEFT side of the frame,
@@ -69,7 +77,10 @@ Hold **left Y for 1 s** while holding the pistol: the editor is on and the
 left controller becomes the editing hand (its buttons stop reaching the game,
 and the gun won't fire). Squeeze grip near a fingertip and move it: that
 finger re-solves live. Squeeze near the palm: the whole hand moves and turns
-with the controller. Pull the real trigger to edit the "resting" and
+with the controller. While editing, a small ball sits on each fingertip
+and on the palm, and one on the editing controller; the ball a squeeze
+would take grows and the controller ticks when it changes
+(`hand_editor_show_grab_points`). Pull the real trigger to edit the "resting" and
 "pulled" index poses. **Tap Y** to save, **click the left stick** to undo to
 the saved grip, **hold Y 1 s** to save and finish. With a magazine, the slide
 or a handguard in the left hand, the same buttons edit that grip and the

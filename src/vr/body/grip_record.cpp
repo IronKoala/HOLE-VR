@@ -13,16 +13,34 @@ const char* TipName(int t) {
     return t >= 0 && t < kTipCount ? n[t] : "?";
 }
 
+namespace {
+// The first built-in hand (2026-11-01): turned 27 deg off the barrel, web in
+// the tang. Saved grips that still carry it get the new hand on load.
+const FVector kOldKnuckle{6.2, 0.6, 7.1}, kOldFingers{0.93, 0.37, 0.0}, kOldAcross{0.225, 0.0, 0.974};
+}  // namespace
+
+void PistolHand(Record* r) {
+    r->knuckle = {6.0, -0.6, 6.8};
+    r->fingers = Normalize(FVector{0.999, 0.035, 0.0});
+    r->across = Normalize(FVector{0.211, -0.077, 0.974});  // up the grip, 13 degree slant
+}
+
+bool HasOldPistolHand(const Record& r) {
+    auto near = [](const FVector& a, const FVector& b) { return Length(a - b) < 0.02; };
+    return near(r.knuckle, kOldKnuckle) && near(r.fingers, Normalize(kOldFingers)) &&
+           near(r.across, Normalize(kOldAcross));
+}
+
 Record DefaultPistol() {
     Record r;
     r.name = "pistol";
     r.right_hand = true;
-    // Middle knuckle at the front strap's right corner, one finger below the
-    // trigger guard (high grip). Wrist behind the grip, in line with the bore
-    // (the hand turns ~22 degrees around the grip for that).
-    r.knuckle = {6.2, 0.6, 7.1};
-    r.fingers = Normalize(FVector{0.93, 0.37, 0.0});
-    r.across = Normalize(FVector{0.225, 0.0, 0.974});  // up the grip, 13 degree slant
+    // Middle knuckle on the front strap's right corner, one finger below the
+    // trigger guard (high grip). The hand runs in line with the barrel (7 deg
+    // off, measured on the avatar's hand) so a straight wrist puts the
+    // forearm behind the gun as in the owner's photos (2026-11-02), with the
+    // web of the hand centred low behind the back strap, under the tang.
+    PistolHand(&r);
     r.tip[kThumb] = {9.5, -5.9, 11.0};       // forward along the left side of the frame, under the slide
     r.tip[kIndexOff] = {15.5, -1.0, 11.0};   // straight along the right side of the frame
     r.tip[kIndexRest] = {8.6, -4.0, 9.0};    // pad on the trigger face
@@ -41,6 +59,8 @@ Record DefaultPistol() {
         {"slide", {8.25, -3.45, 13.5}, {9.75, 1.75, 1.5}, 0.0},
         {"guard_bottom", {9.75, -3.45, 8.1}, {2.75, 0.8, 0.3}, 0.0},
         {"guard_front", {12.3, -3.45, 9.1}, {0.3, 0.8, 1.3}, 0.0},
+        // Beavertail/tang over the web of the hand (behind the back strap).
+        {"tang", {-1.3, -3.45, 10.8}, {0.9, 1.2, 0.5}, 0.0},
     };
     return r;
 }

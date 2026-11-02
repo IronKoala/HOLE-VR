@@ -220,11 +220,17 @@ const Block kBlocks[] = {
      "; swing further to keep the wrist from bending too far.\n"
      "body_elbow_follow_hand=0.7\n"
      "body_elbow_relieves_wrist=1\n"
+     "; Holding the pistol: the elbow goes where the wrist stays straightest\n"
+     "; (forearm in line behind the gun).\n"
+     "body_gun_wrist_straight=1\n"
      "; 1 = stored grips (hole-vr/grips, tuned with the grip editor: hold left Y\n"
      "; for 1 s while holding the gun). 0 = simple finger curls only.\n"
      "hand_grip_records=1\n"
      "; Finger thickness the grip solver keeps out of the gun, cm.\n"
      "hand_finger_radius_cm=0.5\n"
+     "; Grip editor: show a dot on each fingertip and the palm (the one a\n"
+     "; squeeze would take grows) and a dot on the editing controller.\n"
+     "hand_editor_show_grab_points=1\n"
      "; Log a body fit line (reach, wrist bend, body turn) every 10 s.\n"
      "body_fit_log=1\n"},
 };
