@@ -32,13 +32,16 @@ well, and a proposed VR spec.
   shell goes up through the loading port under the gun and is pushed forward
   until its rim clicks past the stop. If you don't push it far enough, it
   pops back out.
-- **Proposed VR controls:** right trigger fires, right **B** is the bolt
-  release (same as the pistol's slide release), right **A** is the drop lever /
-  carrier stop. Shells are loaded by hand into the port under the gun.
-  Emergency loads go through the ejection port on the right. The charging
-  handle works like the pistol slide, with a partial pull to check the chamber.
-- **Owner decisions** are listed at the end. The main one is whether to keep
-  the real "racking doesn't feed" rule.
+- **VR controls (owner decisions 2026-11-03 applied):** right trigger fires,
+  right **B** is the bolt release (same as the pistol's slide release).
+  Shells are loaded by hand into the port under the gun, four per grab from
+  the pouch. Emergency loads go through the ejection port on the right. The
+  charging handle works like the pistol slide, with a partial pull to check
+  the chamber.
+- **Owner's choices:** racking works like a pump and always loads the next
+  shell (unlike the real guns). The tube is locked while the bolt is open.
+  You get four shells per grab. There is no safety. Riding the handle does
+  not stop the bolt. See section 7.
 
 ## 1. What HOLE's shotgun is made of
 
@@ -270,11 +273,10 @@ for the ini and need tuning in the headset.
 ### 4.1 What the mod tracks
 
 The bolt position (0 = closed, 1 = fully back), whether the bolt is locked
-open, the hammer (cocked or down), the chamber (empty, live or fired), the
-lifter (empty or holding a shell), the tube count (the game's), and
-**feed armed**: whether the next bolt cycle lets a shell out of the tube.
-Feed armed is set when the hammer falls (a shot or a dry click) or when **A**
-is pressed. It is cleared when a shell feeds.
+open, the chamber (empty, live or fired), the lifter (empty or holding a
+shell), and the tube count (the game's). The owner chose pump-like feeding,
+so no "feed armed" flag is needed: every full bolt cycle feeds from the tube
+if it has a shell.
 
 ### 4.2 Holding and firing
 
@@ -284,10 +286,8 @@ is pressed. It is cleared when a shell feeds.
 - Right trigger fires one shell per press. Bolt cycle and feed follow 2.1.
   On the last shell the bolt locks open with the `BoltRelease_EmptyAmmo` /
   `BoltForward_EmptyAmmo` sounds.
-- Trigger on an empty chamber: `DryFire` click, hammer down, feed armed.
-- Safety: off by default (the game has none). With `shotgun_safety=1`, a
-  right stick click toggles it with a haptic tick, and the trigger is dead
-  while it's on.
+- Trigger on an empty chamber: `DryFire` click.
+- No manual safety (owner decision). The game has none either.
 
 ### 4.3 Charging handle
 
@@ -298,14 +298,12 @@ is pressed. It is cleared when a shell feeds.
   chambered shell and nothing changes when you let go.
 - Full pull (90% or more) throws out the chambered shell (live shells are
   thrown out unfired). On the way forward:
-  - If feed is armed and the tube has a shell, the shell goes onto the
-    lifter and is chambered.
+  - If the tube has a shell, it goes onto the lifter and is chambered, like
+    a pump gun. (Owner decision. A real M4 or 1301 would close on an empty
+    chamber here, see 2.1.)
   - If the tube is empty, the bolt locks open.
-  - Otherwise the bolt closes on an **empty chamber**, as on the real guns.
-- *Riding the handle* (optional, `shotgun_ride_stops_bolt=1`): if you keep
-  holding the handle and ease it forward, the bolt stops just short of
-  closing and the gun won't fire. Push the handle fully forward or press B to
-  finish.
+- Letting the handle ride forward slowly still closes the bolt fully (owner
+  decision: the real guns' "stops short" quirk is off).
 
 ### 4.4 Bolt release (right B)
 
@@ -313,21 +311,18 @@ B closes a locked-open bolt. If a shell is on the lifter or in the chamber, it
 chambers with `BoltRelease_InAmmo`. Otherwise the bolt closes on empty. Same
 button as the pistol's slide release.
 
-### 4.5 Drop lever / carrier stop (right A)
+### 4.5 Right A
 
-A lets one shell out of the tube onto the lifter (feed armed). If the bolt
-is closed with a live chamber, nothing happens until the next cycle. If the
-bolt is held back, letting it go chambers that shell. With the tube empty,
-pressing A before pulling the handle makes the bolt lock open. This is how
-you load from the tube without firing, and how you swap the chambered shell.
+Not used on the shotgun. Because racking always feeds, the M4's drop lever
+(or the 1301's carrier stop) has no job to do, so it is left out.
 
 ### 4.6 Shells in the hand
 
 - **Where from.** A shell pouch on the body, default left hip in front of the
   magazine pouch, movable with the holsters system like the other holsters.
   It is always visible and can be grabbed any time.
-- **How many.** One grab gives the game's `OneReloadMaxShell` shells (logged
-  at pickup), capped at 4 (`shotgun_shells_per_grab`, 0 = game value). They are
+- **How many.** One grab gives **four** shells (owner decision,
+  `shotgun_shells_per_grab=4`), or what is left in reserve if fewer. They are
   held in a fan between the fingers. After each one goes in, the next moves
   into the pushing position.
 - **Letting go away from the gun** drops the shells. They return to reserve
@@ -404,9 +399,9 @@ Max Payne 2 VR and F.E.A.R. VR):
 | Input | Does |
 |---|---|
 | Right trigger | Fire |
-| Right A | Drop lever / carrier stop: one shell onto the lifter |
+| Right A | Not used |
 | Right B | Bolt release |
-| Right stick click | Kick (or safety on/off with `shotgun_safety=1`) |
+| Right stick click | Kick (unchanged) |
 | Left grip on handguard | Support hold, virtual stock |
 | Left grip on charging handle | Rack, chamber check |
 | Left grip at shell pouch | Take shells |
@@ -419,14 +414,18 @@ Ghost loading (an extra shell on the lifter), the shell-dump malfunction,
 mixed ammo types in one tube (HOLE loads one ammo type per gun from the
 workbench), Dragon's Breath failing to cycle, decocking with the bolt held
 2 cm back, and the M4's "can't load the tube with the hammer down" edge case.
-All are possible later if the owner wants them.
+All are possible later if the owner wants them. Left out by owner decision:
+a manual safety, the drop lever, the real "racking doesn't feed" rule, and
+riding the handle stopping the bolt short.
 
 ## 5. How it hooks into the game
 
 The same approach as the pistol magazine:
 
 - **Taking shells:** `ReloadShell_TakeNewShell` (game creates
-  `OneReloadMaxShell` shells in `ShellObj_Temp`). The mod attaches those actors
+  `OneReloadMaxShell` shells in `ShellObj_Temp`). If that is fewer than four,
+  call `Gun_ShellCreate(4)` or take again until the hand holds four. The mod
+  attaches those actors
   to the VR hand every frame and checks they still exist each tick (the
   `LiveObject` lesson from the pouch magazines).
 - **Each shell in:** `ReloadShell_InsertShell_Begin` + `_End` (`Gun_ShellLoad`),
@@ -437,9 +436,10 @@ The same approach as the pistol magazine:
   and the visible shell is the one in the port.
 - **Bolt:** `Gun_ChargeBolt(false)` at the back of the stroke and
   `Gun_ChargeBolt(true)` on release, `Gun_ReleaseBolt` for B, then
-  `SetIsBoltCharging(false)`, as on the pistol. **Unknown:** whether the game's
-  `ChargeBolt(true)` always feeds from the tube. If it does, "racking doesn't
-  feed" needs the mod to hold the shell back. The weapon lab will show this.
+  `SetIsBoltCharging(false)`, as on the pistol. The owner chose pump-like
+  feeding, which is most likely what the game's `ChargeBolt(true)` already
+  does. The weapon lab confirms it. If it doesn't feed, the mod chambers from
+  the tube with `BPI_Magazine.ChamberingOneRound`.
 - **Lifter:** write the `GunParts_ShellCarrier` rotation directly (0 to
   `ShellCarrierOpenAngle`), or call `RotateShellCarrier`.
 - **Animations:** suppress `ALS_SG_UClamp_Reload_Montage`,
@@ -462,21 +462,17 @@ The same approach as the pistol magazine:
    `InsertShell_*` and `BoltCatchRelease`, and whether `ChargeBolt` feeds.
 4. Only then build it. Nothing in this spec has been tested in the headset.
 
-## 7. Decisions for the owner
+## 7. Owner decisions (2026-11-03)
 
-1. **Real feed rule (recommended: yes).** Racking a loaded shotgun throws out
-   the chambered shell without loading the next, as on the M4 and 1301. A, or
-   a trigger pull first, is needed to feed from the tube. The alternative is
-   pump-like: racking always feeds the next shell.
-2. **Tube locked while the bolt is open (recommended: yes).** From empty you
-   must port-load and press B before filling the tube, as both manuals do it.
-   The alternative is filling the tube first and pressing B.
-3. **Shells per grab (recommended: the game's own number, max 4).** One per
-   grab is the most realistic. Two to four is faster (Alyx uses two).
-4. **Manual safety (recommended: off).** The game has none. It can be turned
-   on with the right stick click.
-5. **Riding the handle stops the bolt short (recommended: on).** Realistic,
-   but it can feel like a bug the first time.
+1. **Feeding: pump-like.** A full rack always throws out the chambered shell
+   and loads the next one from the tube, unlike the real M4 and 1301. No drop
+   lever on A.
+2. **Tube locked while the bolt is open: yes.** From empty you port-load and
+   press B, then fill the tube, as both manuals do it.
+3. **Shells per grab: four.**
+4. **Manual safety: none.**
+5. **Riding the handle stops the bolt short: off.** The bolt always closes
+   fully.
 
 ## Sources
 
