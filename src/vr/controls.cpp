@@ -358,15 +358,14 @@ void UpdateHands(const input::Snapshot& s) {
         g_fingers[i].thumb_touch = in.primary.down || in.secondary.down || in.stick_click.down;
         g_edit_buttons.grip_down[i] = in.grip_value > 0.6f;
     }
-    // The grip editor's buttons (left Y, left stick click) only reach it
-    // while it is open; it is opened from the VR tab (RequestGripEditor),
-    // which holds Y for it for 1.1 s. Left stick hold no longer measures the
-    // arms (VR tab: Measure arms).
+    // The grip editor opens on left Y held 1 s (or from the VR tab, which
+    // holds Y for it for 1.1 s); left stick click held 2 s measures the arms.
     const bool editor_open = hands::EditorHand() >= 0;
     const bool synth_y = g_clock < g_editor_y_until;
-    g_edit_buttons.y_down = synth_y || (editor_open && s.hand[input::kLeft].secondary.down);
-    g_edit_buttons.left_stick_pressed = editor_open && s.hand[input::kLeft].stick_click.pressed;
-    g_edit_buttons.left_stick_down = false;
+    (void)editor_open;
+    g_edit_buttons.y_down = synth_y || s.hand[input::kLeft].secondary.down;
+    g_edit_buttons.left_stick_pressed = s.hand[input::kLeft].stick_click.pressed;
+    g_edit_buttons.left_stick_down = s.hand[input::kLeft].stick_click.down;
     g_hands[0] = h[0];
     g_hands[1] = h[1];
     g_head = head;
@@ -1558,6 +1557,7 @@ struct GameActionState {
     bool jump_armed = true, crouch_armed = true;
     double jump_release_at = -1, crouch_release_at = -1;
     bool sprinting = false;
+    double y_down_at = -1;
     double melee_ready_at = 0;
     double melee_release_at = -1;
     bool light_down = false;     // left trigger is pressing the weapon light
@@ -1755,13 +1755,12 @@ void PhysicalCrouchAndJump(UObject player) {
     }
 }
 
-// Every other game action, one press of one button each; no gestures (no
-// flicks, taps, holds or punches). Lean is left out: lean for real.
+// Every other game action on the controllers. No motion gestures (owner's
+// rule: no punching or swinging to act). Lean is left out: lean for real.
 //   Left stick            move; click: sprint on/off (ends when you stop)
 //   Left trigger          weapon light with the left hand right next to the gun, else interact
-//   Left X                jump
-//   Left Y                crouch / stand
-//   Right stick           turn; click: kick (fire selector on a rifle)
+//   Left Y                tap: switch weapon; hold 1 s: grip editor
+//   Right stick           left/right turn, up jump, down crouch / stand; click: kick (fire selector on a rifle)
 //   Right trigger         fire with the gun in hand, interact with the hand empty
 //   Right A / B           magazine release / slide release with the gun in hand;
 //                         switch weapon / objective markers with the hand empty
@@ -1933,18 +1932,34 @@ void GameActions(UObject player, const input::Snapshot& s) {
     // No gestures (owner's rule): every action is one press of one button,
     // and the combat ones never need the left thumb off the move stick.
     const bool gun_in_hand = W.gun && W.in_hand;
-    // Left X: jump.
-    if (l.primary.pressed && GA.jump_release_at < 0) {
+    // Right stick up: jump. Right stick down: crouch / stand.
+    const bool up = r.stick_y > 0.75f && std::fabs(r.stick_x) < 0.6f;
+    const bool down = r.stick_y < -0.75f && std::fabs(r.stick_x) < 0.6f;
+    if (up && GA.jump_armed && GA.jump_release_at < 0) {
+        GA.jump_armed = false;
         FireEvent(player, GA.jump_down);
         GA.jump_release_at = g_clock + 0.15;
-        log::Info("controls: jump (left X)");
+        log::Info("controls: jump (right stick up)");
     }
-    // Left Y: crouch / stand.
-    if (l.secondary.pressed && GA.crouch_release_at < 0) {
+    if (down && GA.crouch_armed && GA.crouch_release_at < 0) {
+        GA.crouch_armed = false;
         FireEvent(player, GA.crouch_down);
         g_crouch_pressed = true;
         GA.crouch_release_at = g_clock + 0.1;
-        log::Info("controls: crouch / stand (left Y)");
+        log::Info("controls: crouch / stand (right stick down)");
+    }
+    if (r.stick_y < 0.4f) GA.jump_armed = true;
+    if (r.stick_y > -0.4f) GA.crouch_armed = true;
+    // Left Y tap: next weapon (holding Y 1 s is the grip editor).
+    if (l.secondary.pressed) GA.y_down_at = g_clock;
+    if (l.secondary.released && GA.y_down_at > 0) {
+        if (g_clock - GA.y_down_at < 0.4) {
+            ue::Call c(player, "PlayerInput_ScrollWeapon");
+            c.Set("IsUp", true);
+            c.Invoke();
+            log::Info("controls: switch weapon (left Y)");
+        }
+        GA.y_down_at = -1;
     }
     if (GA.jump_release_at > 0 && g_clock >= GA.jump_release_at) { FireEvent(player, GA.jump_up); GA.jump_release_at = -1; }
     if (GA.crouch_release_at > 0 && g_clock >= GA.crouch_release_at) { FireEvent(player, GA.crouch_up); GA.crouch_release_at = -1; }
