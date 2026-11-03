@@ -122,6 +122,11 @@ static void TestDefaultsAndActions() {
     EXPECT(RowNamed("Edit hand grips").kind == RowKind::kGripEditor);
     EXPECT(RowNamed("Edit hand grips").choices.size() == 2);  // closed, open
     EXPECT(RowNamed("Move holsters").kind == RowKind::kMoveHolsters);
+    // The monitor shows the right eye unless chosen otherwise.
+    const Row& monitor = RowNamed("Monitor shows");
+    EXPECT(std::string(monitor.choices[static_cast<size_t>(CurrentChoice(monitor, get))].text) == "Right eye");
+    ini["monitor_view"] = "Both";
+    EXPECT(std::string(monitor.choices[static_cast<size_t>(CurrentChoice(monitor, get))].text) == "Both eyes");
 }
 
 int main() {

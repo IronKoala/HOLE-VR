@@ -426,6 +426,15 @@ const Block kBlocks[] = {
      "; Your standing eye height, cm, from Calibrate body on the VR tab (stand\n"
      "; straight, arms out). 0 = learned while you play. Real crouch uses it.\n"
      "standing_height_cm=0\n"},
+    {"monitor_view",
+     "\n"
+     "; What the game window on the monitor shows, and so what OBS or the NVIDIA\n"
+     "; app records: right = the right eye's view as a normal 16:9 picture,\n"
+     "; left = the left eye's, both = both eyes side by side (the old way).\n"
+     "; The headset picture is the same either way.\n"
+     "monitor_view=right\n"
+     "; Shape of the one-eye view, width / height (1.778 = 16:9).\n"
+     "monitor_view_aspect=1.778\n"},
 };
 
 std::string Trim(const std::string& s) {
