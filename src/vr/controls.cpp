@@ -11,6 +11,7 @@
 #include <mutex>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "core/config.h"
 #include "core/log.h"
@@ -1987,6 +1988,103 @@ void HandInteract(UObject player, int hand) {
               game_target ? ue::GetName(game_target).c_str() : "none, and nothing at the hand");
 }
 
+// ---- physical buttons ----
+// Owner 2026-11-03: "the ready button for the shooting range? i want to be
+// able to physically press it to start the timer". A fingertip of either
+// hand (about 8 cm ahead of the fist along the pointing ray) pushing into the
+// timer's mesh presses it: the timer's own Interact, as the game's interact
+// key does. A press needs the fingertip to come from outside; 1.5 s apart.
+struct PressButton {
+    UObject actor = 0;
+    UObject mesh = 0;
+    bool inside[2] = {false, false};
+};
+struct {
+    UObject cls = 0;
+    double next_class_lookup = 0;
+    double next_refresh = 0;
+    double ready_at = 0;
+    std::vector<PressButton> buttons;
+    bool logged_bounds = false;
+} g_press;
+
+void RefreshPressButtons(UObject player) {
+    if (g_clock < g_press.next_refresh) return;
+    g_press.next_refresh = g_clock + 2.0;
+    if (!g_press.cls) {
+        if (g_clock < g_press.next_class_lookup) return;
+        g_press.next_class_lookup = g_clock + 10.0;
+        g_press.cls = ue::FindObject(
+            "BlueprintGeneratedClass /Game/Props/00_Home/ShootingTimer/BP_ShootingTimer.BP_ShootingTimer_C");
+        if (!g_press.cls) return;
+        log::Info("controls: shooting range timer class found; its button can be pressed by hand");
+    }
+    static UObject gps = 0;
+    if (!gps) gps = ue::FindObject("GameplayStatics /Script/Engine.Default__GameplayStatics");
+    if (!gps) return;
+    ue::Call all(gps, "GetAllActorsOfClass");
+    all.Set("WorldContextObject", player).Set("ActorClass", g_press.cls);
+    std::vector<PressButton> found;
+    if (all.Invoke()) {
+        int32_t size = 0;
+        const uint8_t* raw = all.Raw("OutActors", &size);
+        struct Arr { uintptr_t data; int32_t num, max; } arr{};
+        if (raw && size >= (int32_t)sizeof(Arr)) std::memcpy(&arr, raw, sizeof(Arr));
+        for (int i = 0; i < arr.num && i < 16; ++i) {
+            UObject a = mem::ReadOr<uintptr_t>(arr.data + i * sizeof(uintptr_t), 0);
+            if (!a) continue;
+            PressButton b;
+            b.actor = a;
+            ue::GetProp(a, "Mesh", b.mesh);
+            if (!b.mesh) continue;
+            for (const PressButton& old : g_press.buttons)
+                if (old.actor == a) { b.inside[0] = old.inside[0]; b.inside[1] = old.inside[1]; }
+            found.push_back(b);
+        }
+    }
+    g_press.buttons.swap(found);
+}
+
+void PhysicalButtons(UObject player) {
+    RefreshPressButtons(player);
+    for (PressButton& b : g_press.buttons) {
+        if (!LiveObject(b.actor) || !LiveObject(b.mesh)) continue;
+        ue::Call lb(b.mesh, "GetLocalBounds");
+        if (!lb.Invoke()) continue;
+        const ue::Vec3d mn = lb.Get<ue::Vec3d>("Min"), mx = lb.Get<ue::Vec3d>("Max");
+        const UETransform t = ComponentToWorld(b.mesh);
+        if (!g_press.logged_bounds) {
+            g_press.logged_bounds = true;
+            log::Info("controls: range timer mesh %.1f x %.1f x %.1f cm (scale %.2f %.2f %.2f) at (%.0f %.0f %.0f)",
+                      (mx.x - mn.x) * t.scale.X, (mx.y - mn.y) * t.scale.Y, (mx.z - mn.z) * t.scale.Z, t.scale.X,
+                      t.scale.Y, t.scale.Z, t.translation.X, t.translation.Y, t.translation.Z);
+        }
+        for (int h = 0; h < 2; ++h) {
+            const hands::HandState hs = hands::Get(h == 0 ? hands::kLeft : hands::kRight);
+            if (!hs.valid) { b.inside[h] = false; continue; }
+            const FVector tip = hs.grip.location + hs.aim.rotation.Rotate(FVector{8, 0, 0});
+            FVector l = t.rotation.Inverse().Rotate(tip - t.translation);
+            l = FVector{l.X / std::fmax(1e-3, t.scale.X), l.Y / std::fmax(1e-3, t.scale.Y),
+                        l.Z / std::fmax(1e-3, t.scale.Z)};
+            const double m = 1.0;   // cm of slack around the mesh
+            const bool in = l.X > mn.x - m && l.X < mx.x + m && l.Y > mn.y - m && l.Y < mx.y + m &&
+                            l.Z > mn.z - m && l.Z < mx.z + m;
+            if (in && !b.inside[h] && g_clock >= g_press.ready_at) {
+                g_press.ready_at = g_clock + 1.5;
+                bool on = false;
+                ue::GetProp(b.actor, "IsTimerON", on);
+                ue::Call c(b.actor, "Interact");
+                c.Set("Actor", player).Set("SelectIndex", int32_t{0});
+                const bool ok = c.Invoke();
+                input::Haptic(h == 0 ? input::kLeft : input::kRight, 0.6f, 0.05f);
+                log::Info("controls: %s hand pressed the range timer button (timer was %s)%s",
+                          h == 0 ? "left" : "right", on ? "running" : "stopped", ok ? "" : ", call failed");
+            }
+            b.inside[h] = in;
+        }
+    }
+}
+
 void GameActions(UObject player, const input::Snapshot& s) {
     if (!player) return;
     LabTraceTick();
@@ -2003,6 +2101,7 @@ void GameActions(UObject player, const input::Snapshot& s) {
         return;
     }
     PhysicalCrouchAndJump(player);
+    PhysicalButtons(player);
     // Left trigger: the weapon light when the left hand is right next to the
     // gun in your hand, otherwise interact. The light press lasts as long as
     // the trigger is held (the game toggles on the press).
