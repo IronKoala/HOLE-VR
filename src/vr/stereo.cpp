@@ -228,17 +228,36 @@ std::string LeadReport(double) {
     }
     const long long f = s.frames > 0 ? s.frames : 1;
     const long long tf = s.turn_frames > 0 ? s.turn_frames : 1;
+    // Where the misses go (forward, sideways, up) and the worst frames.
+    std::string worst;
+    for (int i = 0; i < s.worst_count; ++i) {
+        const view_lead::Stats::Worst& w = s.worst[i];
+        char b[200];
+        std::snprintf(b, sizeof(b), "%s%.1f cm (fwd %.1f side %.1f up %.1f; moved %.1f, predicted", i ? "; " : "",
+                      w.cm, w.miss.X, w.miss.Y, w.miss.Z, view_lead::Length(w.actual));
+        worst += b;
+        for (int k = 0; k < view_lead::kKinds; ++k) {
+            if (!w.leads.valid[k]) continue;
+            std::snprintf(b, sizeof(b), " %s%s %.1f", view_lead::kKindNames[k], k == w.used ? "*" : "",
+                          view_lead::Length(w.leads.move[k]));
+            worst += b;
+        }
+        worst += ")";
+    }
     // A hand at arm's length (about 45 cm out from the eyes) trails a turn
     // of a degrees by about 45 * a * pi / 180 cm.
     char line[640];
     std::snprintf(line, sizeof(line),
                   "frame timing: hands vs view while moving: %lld frames; uncorrected they would trail the view by "
                   "%.1f cm on average (worst %.1f), corrected %.1f cm (worst %.1f) with view_lead %d; by anchor: %s "
-                  "cm. Turning: %lld frames, %.2f deg a frame on average (worst %.1f), about %.1f cm at arm's length",
+                  "cm; corrected miss forward %.1f, sideways %.1f, up %.1f cm. Turning: %lld frames, %.2f deg a frame "
+                  "on average (worst %.1f), about %.1f cm at arm's length",
                   s.frames, s.none_sum / f, s.none_max, s.used_sum / f, s.used_max, choice,
-                  each.empty() ? "none" : each.c_str(), s.turn_frames, s.turn_sum / tf, s.turn_max,
-                  45.0 * (s.turn_sum / tf) * kDegToRad);
-    return line;
+                  each.empty() ? "none" : each.c_str(), s.axis_sum[0] / f, s.axis_sum[1] / f, s.axis_sum[2] / f,
+                  s.turn_frames, s.turn_sum / tf, s.turn_max, 45.0 * (s.turn_sum / tf) * kDegToRad);
+    std::string out = line;
+    if (!worst.empty()) out += ". Worst frames: " + worst;
+    return out;
 }
 
 // The 10 s report line: how much the held gun shakes as the eyes see it.
@@ -251,13 +270,18 @@ std::string GunReport(double) {
     }
     if (g.n[0] + g.n[1] == 0 && g.checked_frames == 0) return {};
     auto avg = [](double sum, long long n) { return n > 0 ? sum / n : 0.0; };
-    char b[400];
+    char b[700];
     std::snprintf(b, sizeof(b),
                   "frame timing: the gun as seen from the eyes shakes %.2f cm / %.2f deg a frame while moving "
                   "(worst %.1f cm / %.1f deg, %lld frames) and %.2f cm / %.2f deg standing still (%lld frames); "
+                  "against the controller holding it (the mod's own part) it wobbles %.2f cm / %.2f deg a frame "
+                  "while moving (worst %.1f cm / %.1f deg, %lld frames) and %.2f cm / %.2f deg still (%lld frames); "
                   "something else moved it after the mod placed it in %lld of %lld frames (worst %.1f cm)",
                   avg(g.cm_sum[1], g.n[1]), avg(g.deg_sum[1], g.n[1]), g.cm_max[1], g.deg_max[1], g.n[1],
-                  avg(g.cm_sum[0], g.n[0]), avg(g.deg_sum[0], g.n[0]), g.n[0], g.moved_frames, g.checked_frames,
+                  avg(g.cm_sum[0], g.n[0]), avg(g.deg_sum[0], g.n[0]), g.n[0],
+                  avg(g.place_cm_sum[1], g.place_n[1]), avg(g.place_deg_sum[1], g.place_n[1]), g.place_cm_max[1],
+                  g.place_deg_max[1], g.place_n[1], avg(g.place_cm_sum[0], g.place_n[0]),
+                  avg(g.place_deg_sum[0], g.place_n[0]), g.place_n[0], g.moved_frames, g.checked_frames,
                   g.moved_max);
     return b;
 }
@@ -360,7 +384,7 @@ void HookCalcOffset(void* self, int32_t view_index, FRotator* rotation, float en
         g_moving_this_view = measured && view_lead::Length(actual) > 0.5;
         if (measured) {
             std::lock_guard<std::mutex> lock(g_lead_stats_mutex);
-            g_lead_stats.Add(actual, leads, used);
+            g_lead_stats.Add(actual, leads, used, rotation->Yaw);
             g_lead_stats.AddTurn(turn);
         }
     }
@@ -415,8 +439,22 @@ void HookCalcOffset(void* self, int32_t view_index, FRotator* rotation, float en
         const FQuat inv = base.Inverse();
         const FVector gun_at = held ? inv.Rotate(g_anchor_view.held_at - eye) : FVector{};
         const FQuat gun_rot = held ? inv * g_anchor_view.held_rot : FQuat{};
+        // The gun in the controller's own axes, the controller as these eyes
+        // see it (same tracking frame as the tick that placed the gun). The
+        // origin, fixed height and raise cancel between eyes and hand.
+        const bool grip = held && g_anchor_view.grip;
+        FVector in_hand;
+        FQuat in_hand_rot;
+        if (grip) {
+            const FQuat hand_rot = recenter * g_anchor_view.grip_rot;
+            const FVector hand_at = recenter.Rotate(g_anchor_view.grip_m - head_p) * world_to_meters;
+            const FQuat hand_inv = hand_rot.Inverse();
+            in_hand = hand_inv.Rotate(gun_at - hand_at);
+            in_hand_rot = hand_inv * gun_rot;
+        }
         std::lock_guard<std::mutex> stats(g_lead_stats_mutex);  // leaf, taken inside g_world_mutex only here
         g_gun_shake.Add(held, gun_at, gun_rot, g_moving_this_view);
+        g_gun_shake.AddPlacement(grip, in_hand, in_hand_rot, g_moving_this_view);
     }
     *rotation = ToRotator(base * local_q);
     *location = *location + base.Rotate(local_p);
