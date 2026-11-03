@@ -37,11 +37,18 @@ struct Counter {
 // Registers a counter (static storage) to be included in the periodic report.
 void Register(Counter* c);
 // Logs every registered counter (average and worst per call, calls per second)
-// at most once per 10 s, then resets them. Call from any frequent place.
+// at most once per 10 s, then resets them. Call from any frequent place, but
+// never while holding a lock that a report line takes (the report lines run
+// on the calling thread).
 void MaybeReport();
+// Tests only: report more often than every 10 s.
+void SetReportInterval(double seconds);
 
 // Extra lines for the same 10 s report (e.g. the frame summary). Called with
-// the report's span in seconds; return an empty string for nothing.
+// the report's span in seconds, on whichever thread reports (game or render
+// thread), without perf's lock; return an empty string for nothing. Keep them
+// lock-free or on leaf locks: a report line that waited on the render
+// thread's frame lock froze the game (2026-11-03).
 using ReportFn = std::string (*)(double span_s);
 void AddReportLine(ReportFn fn);
 
