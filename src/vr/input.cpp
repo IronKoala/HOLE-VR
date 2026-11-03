@@ -1,5 +1,7 @@
 #include "vr/input.h"
 
+#include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <mutex>
@@ -7,6 +9,7 @@
 #include <vector>
 
 #include "core/log.h"
+#include "core/perf.h"
 #include "vr/openxr.h"
 
 namespace holevr::vr::input {
@@ -43,6 +46,33 @@ struct GamePoses {
 };
 GamePoses g_game[2];
 bool g_have_game = false;
+// The same controllers located for each moment the head was located for
+// this headset frame (xr::PictureFrames), so the game can take them at
+// exactly the moment its picture's eyes are for (xr::NewPictureShownTime).
+// Hands taken at the smoothed lag instead were a frame off the eyes
+// whenever the game's pipeline depth changed (often in a busy match), so a
+// moving hand and its gun jumped against the view. Guarded by g_mutex.
+constexpr int kMaxPictures = 8;
+struct PicturePoses {
+    XrTime time = 0;
+    GamePoses hand[2];
+};
+PicturePoses g_pic[kMaxPictures];
+int g_pic_count = 0;
+XrDuration g_pic_period = 0;
+// For the log: game frames whose hands matched their picture's moment.
+std::atomic<long long> g_hand_matched{0}, g_hand_fallback{0};
+
+std::string HandReport(double) {
+    const long long m = g_hand_matched.exchange(0), f = g_hand_fallback.exchange(0);
+    if (m + f == 0) return {};
+    char line[200];
+    std::snprintf(line, sizeof(line),
+                  "frame timing: hands taken at their picture's own moment in %.0f%% of game frames "
+                  "(else at the smoothed lag)",
+                  100.0 * m / (m + f));
+    return line;
+}
 Snapshot g_consumed;   // what the game thread last saw (for edges)
 bool g_pending_edges[2][6][2] = {};  // [hand][button][pressed/released] accumulated
 
@@ -212,6 +242,11 @@ struct InputListener : xr::Listener {
         s.valid = true;
         GamePoses game[2];
         const XrDuration ahead = xr::PredictAhead();
+        static bool s_report = [] {
+            perf::AddReportLine(&HandReport);
+            return true;
+        }();
+        (void)s_report;
         s.time = time;
         for (int h = 0; h < 2; ++h) {
             HandInput& hi = s.hand[h];
@@ -287,9 +322,43 @@ struct InputListener : xr::Listener {
             }
         }
 
+        // Each moment the head was located for (see g_pic).
+        PicturePoses pic[kMaxPictures];
+        int pic_count = 0;
+        int lo = 0, hi = -1;
+        XrDuration period = 0;
+        xr::PictureFrames(&lo, &hi, &period);
+        constexpr XrSpaceLocationFlags kTrackedBoth =
+            XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+        for (int k = lo; k <= hi && pic_count < kMaxPictures; ++k) {
+            PicturePoses& pp = pic[pic_count];
+            pp.time = time + static_cast<XrTime>(k) * period;
+            for (int h = 0; h < 2; ++h) {
+                GamePoses& gp = pp.hand[h];
+                XrSpaceVelocity gvel{XR_TYPE_SPACE_VELOCITY};
+                XrSpaceLocation gloc{XR_TYPE_SPACE_LOCATION, &gvel};
+                if (g_grip_space[h] && XR_SUCCEEDED(locate(g_grip_space[h], space, pp.time, &gloc)) &&
+                    (gloc.locationFlags & kTrackedBoth) == kTrackedBoth) {
+                    gp.grip_valid = true;
+                    gp.grip = gloc.pose;
+                    if (gvel.velocityFlags & XR_SPACE_VELOCITY_LINEAR_VALID_BIT) gp.linear_velocity = gvel.linearVelocity;
+                }
+                XrSpaceLocation galoc{XR_TYPE_SPACE_LOCATION};
+                if (g_aim_space[h] && XR_SUCCEEDED(locate(g_aim_space[h], space, pp.time, &galoc)) &&
+                    (galoc.locationFlags & kTrackedBoth) == kTrackedBoth) {
+                    gp.aim_valid = true;
+                    gp.aim = galoc.pose;
+                }
+            }
+            ++pic_count;
+        }
+
         std::vector<HapticRequest> haptics;
         {
             std::lock_guard<std::mutex> lock(g_mutex);
+            for (int i = 0; i < pic_count; ++i) g_pic[i] = pic[i];
+            g_pic_count = pic_count;
+            g_pic_period = period;
             // Accumulate edges so a press shorter than a game frame still counts.
             for (int h = 0; h < 2; ++h) {
                 const HandInput& prev = g_latest.hand[h];
@@ -329,6 +398,7 @@ struct InputListener : xr::Listener {
         std::lock_guard<std::mutex> lock(g_mutex);
         g_latest = Snapshot();
         g_have_game = false;
+        g_pic_count = 0;
     }
 };
 
@@ -338,24 +408,41 @@ InputListener g_listener;
 
 void Init() { xr::RegisterListener(&g_listener); }
 
-// g_latest with the game's (predicted ahead) controller poses. Under g_mutex.
-Snapshot ForGame() {
+// g_latest with the game's controller poses: those located for the moment
+// the picture being prepared will be shown (`shown`, from
+// xr::NewPictureShownTime, taken before g_mutex so the two locks never
+// nest), else the smoothed lag. Under g_mutex.
+Snapshot ForGame(XrTime shown, bool count) {
     Snapshot s = g_latest;
     if (!g_have_game) return s;
+    const GamePoses* use = g_game;
+    if (shown > 0 && g_pic_period > 0) {
+        for (int i = 0; i < g_pic_count; ++i) {
+            const XrTime d = g_pic[i].time > shown ? g_pic[i].time - shown : shown - g_pic[i].time;
+            if (d * 2 < g_pic_period) {
+                use = g_pic[i].hand;
+                break;
+            }
+        }
+    }
+    if (count) (use == g_game ? g_hand_fallback : g_hand_matched).fetch_add(1);
     for (int h = 0; h < 2; ++h) {
         HandInput& hi = s.hand[h];
-        hi.grip_valid = g_game[h].grip_valid;
-        hi.grip = g_game[h].grip;
-        hi.linear_velocity = g_game[h].linear_velocity;
-        hi.aim_valid = g_game[h].aim_valid;
-        hi.aim = g_game[h].aim;
+        // A hand lost at that moment keeps the smoothed-lag pose.
+        const GamePoses& gp = use[h].grip_valid ? use[h] : g_game[h];
+        hi.grip_valid = gp.grip_valid;
+        hi.grip = gp.grip;
+        hi.linear_velocity = gp.linear_velocity;
+        hi.aim_valid = gp.aim_valid;
+        hi.aim = gp.aim;
     }
     return s;
 }
 
 Snapshot Consume() {
+    const XrTime shown = xr::NewPictureShownTime();
     std::lock_guard<std::mutex> lock(g_mutex);
-    Snapshot s = ForGame();
+    Snapshot s = ForGame(shown, true);
     for (int h = 0; h < 2; ++h) {
         Button* buttons[6] = {&s.hand[h].stick_click, &s.hand[h].primary, &s.hand[h].secondary,
                               &s.hand[h].menu, &s.hand[h].trigger_button, &s.hand[h].grip_button};
@@ -375,8 +462,9 @@ Snapshot Peek() {
 }
 
 Snapshot PeekGame() {
+    const XrTime shown = xr::NewPictureShownTime();
     std::lock_guard<std::mutex> lock(g_mutex);
-    return ForGame();
+    return ForGame(shown, false);
 }
 
 void Haptic(Hand hand, float amplitude, float seconds, float frequency_hz) {

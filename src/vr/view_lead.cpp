@@ -5,6 +5,7 @@
 #include "game/game.h"
 #include "ue/call.h"
 #include "vr/body/skeleton.h"
+#include "vr/hands.h"
 #include "vr/stereo.h"
 #include "vr/view_lead_math.h"
 
@@ -43,6 +44,17 @@ Anchors Sample(UObject player) {
         const skel::Xf x = c.Result<skel::Xf>();
         a.mesh_at = x.translation;
         a.mesh_rot = x.rotation;
+    }
+    // The gun in the right hand, for the shake line in the log.
+    const hands::HandGrab grab = hands::GetGrab(hands::kRight);
+    if (grab.kind == hands::GrabKind::kGunGrip && grab.object) {
+        ue::Call c(grab.object, "GetTransform");
+        if (c.Invoke()) {
+            const skel::Xf x = c.Result<skel::Xf>();
+            a.held = grab.object;
+            a.held_at = x.translation;
+            a.held_rot = x.rotation;
+        }
     }
     static bool s_logged = false;
     if (!s_logged) {

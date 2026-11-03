@@ -204,6 +204,8 @@ FVector g_lead_cm;  // added to the camera by TrackingToWorld and GameCameraLoca
 // line takes it and nothing else is taken while it is held.
 std::mutex g_lead_stats_mutex;
 view_lead::Stats g_lead_stats;
+view_lead::GunShake g_gun_shake;   // also under g_lead_stats_mutex
+bool g_moving_this_view = false;   // the camera moved between the latest two views (view thread)
 
 // The 10 s report line: how far the hands would have trailed the view, and
 // how far off each anchor's prediction was.
@@ -239,6 +241,27 @@ std::string LeadReport(double) {
     return line;
 }
 
+// The 10 s report line: how much the held gun shakes as the eyes see it.
+std::string GunReport(double) {
+    view_lead::GunShake g;
+    {
+        std::lock_guard<std::mutex> lock(g_lead_stats_mutex);
+        g = g_gun_shake;
+        g_gun_shake.ResetTotals();
+    }
+    if (g.n[0] + g.n[1] == 0 && g.checked_frames == 0) return {};
+    auto avg = [](double sum, long long n) { return n > 0 ? sum / n : 0.0; };
+    char b[400];
+    std::snprintf(b, sizeof(b),
+                  "frame timing: the gun as seen from the eyes shakes %.2f cm / %.2f deg a frame while moving "
+                  "(worst %.1f cm / %.1f deg, %lld frames) and %.2f cm / %.2f deg standing still (%lld frames); "
+                  "something else moved it after the mod placed it in %lld of %lld frames (worst %.1f cm)",
+                  avg(g.cm_sum[1], g.n[1]), avg(g.deg_sum[1], g.n[1]), g.cm_max[1], g.deg_max[1], g.n[1],
+                  avg(g.cm_sum[0], g.n[0]), avg(g.deg_sum[0], g.n[0]), g.n[0], g.moved_frames, g.checked_frames,
+                  g.moved_max);
+    return b;
+}
+
 std::atomic<void (*)()> g_frame_callback{nullptr};
 std::atomic<DWORD> g_view_thread{0};
 
@@ -260,6 +283,7 @@ void RunFrameCallback() {
         perf::Register(&g_perf_gt_frame);
         perf::Register(&g_perf_after_eyes);
         perf::AddReportLine(&LeadReport);
+        perf::AddReportLine(&GunReport);
         ue::process_event::SetGameThread(me);
     }
     if (s_last > 0.0 && now - s_last < 1000.0) g_perf_gt_frame.Add(now - s_last);
@@ -333,6 +357,7 @@ void HookCalcOffset(void* self, int32_t view_index, FRotator* rotation, float en
             g_lead_used = -1;
             g_lead_cm = FVector{};
         }
+        g_moving_this_view = measured && view_lead::Length(actual) > 0.5;
         if (measured) {
             std::lock_guard<std::mutex> lock(g_lead_stats_mutex);
             g_lead_stats.Add(actual, leads, used);
@@ -381,6 +406,17 @@ void HookCalcOffset(void* self, int32_t view_index, FRotator* rotation, float en
         head_offset.Z = 0;
         g_world = {true, *location, base, FQuat{recenter.X, recenter.Y, recenter.Z, recenter.W}, g_origin_m,
                    world_to_meters, height_drop_m, head_offset, raise_cm};
+        // The held gun as this picture's eyes see it (eye-yaw axes), for the
+        // shake line in the log. g_anchor_view is this frame's tick end.
+        FVector eye_local = recenter.Rotate(head_p - g_origin_m) * world_to_meters;
+        eye_local.Z += raise_cm - height_drop_m * world_to_meters;
+        const FVector eye = *location + base.Rotate(eye_local);
+        const bool held = g_anchor_view.held != 0;
+        const FQuat inv = base.Inverse();
+        const FVector gun_at = held ? inv.Rotate(g_anchor_view.held_at - eye) : FVector{};
+        const FQuat gun_rot = held ? inv * g_anchor_view.held_rot : FQuat{};
+        std::lock_guard<std::mutex> stats(g_lead_stats_mutex);  // leaf, taken inside g_world_mutex only here
+        g_gun_shake.Add(held, gun_at, gun_rot, g_moving_this_view);
     }
     *rotation = ToRotator(base * local_q);
     *location = *location + base.Rotate(local_p);
@@ -636,7 +672,18 @@ bool TrackingToWorld(const XrPosef& pose, FVector* world_location, FQuat* world_
     FQuat q = XrToUeQuat(pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w);
     FVector p = XrToUePosition(pose.position.x, pose.position.y, pose.position.z, 1.0);
     FVector local_p = m.recenter.Rotate(p - m.origin_m) * m.world_to_meters;
-    local_p.Z -= m.height_drop_m * m.world_to_meters;
+    // Fixed height takes the head's own height off everything. Use the head
+    // of the picture these poses are for, not the latest frame's: the hands
+    // are for that picture's moment, and with the latest frame's head every
+    // real crouch or head bob moved the gun up and down against the view by
+    // a frame of head movement (more when frame times vary).
+    double drop_m = m.height_drop_m;
+    if (m.height_drop_m != 0.0) {
+        xr::EyeView v[2];
+        if (xr::ViewsForNewPicture(v))
+            drop_m = XrToUePosition(0, (v[0].pose.position.y + v[1].pose.position.y) * 0.5f, 0, 1.0).Z - m.origin_m.Z;
+    }
+    local_p.Z -= drop_m * m.world_to_meters;
     local_p.Z += m.raise_cm;
     if (world_location) *world_location = m.camera_location + lead + m.base.Rotate(local_p);
     if (world_rotation) *world_rotation = m.base * (m.recenter * q);
@@ -676,6 +723,10 @@ bool GameCameraLocation(FVector* world_cm) {
 void CharacterAtTickStart(const view_lead::Anchors& now) {
     const int choice = static_cast<int>(config::GetFloat("view_lead", -1.f));
     std::lock_guard<std::mutex> lock(g_world_mutex);
+    if (now.held && now.held == g_anchor_end.held) {
+        std::lock_guard<std::mutex> stats(g_lead_stats_mutex);
+        g_gun_shake.AddMovedAfter(view_lead::Length(now.held_at - g_anchor_end.held_at));
+    }
     if (!g_world.valid) return;
     g_leads = view_lead::Predict(g_anchor_view, now, g_world.camera_location, kMaxLeadCm);
     g_leads_set = true;

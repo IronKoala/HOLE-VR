@@ -71,4 +71,47 @@ void Stats::AddTurn(double degrees) {
     if (a > turn_max) turn_max = a;
 }
 
+double AngleDeg(const FQuat& q) {
+    const double w = std::fmin(1.0, std::fabs(q.W) / std::sqrt(q.X * q.X + q.Y * q.Y + q.Z * q.Z + q.W * q.W));
+    return 2.0 * std::acos(w) * kRadToDeg;
+}
+
+void GunShake::Add(bool valid, const FVector& at, const FQuat& rot, bool moving) {
+    if (!valid) {
+        have_ = 0;
+        return;
+    }
+    if (have_ >= 2) {
+        const FVector acc = at - p1_ * 2.0 + p2_;
+        const FQuat a = rot * q1_.Inverse(), b = q1_ * q2_.Inverse();
+        const double cm = Length(acc), deg = AngleDeg(a * b.Inverse());
+        // Bigger than this is a draw, holster or teleport, not shake.
+        if (cm < 30.0 && deg < 30.0) {
+            const int m = moving ? 1 : 0;
+            ++n[m];
+            cm_sum[m] += cm;
+            deg_sum[m] += deg;
+            if (cm > cm_max[m]) cm_max[m] = cm;
+            if (deg > deg_max[m]) deg_max[m] = deg;
+        }
+    }
+    p2_ = p1_;
+    q2_ = q1_;
+    p1_ = at;
+    q1_ = rot;
+    if (have_ < 2) ++have_;
+}
+
+void GunShake::AddMovedAfter(double cm) {
+    ++checked_frames;
+    if (cm > 0.05) ++moved_frames;
+    if (cm > moved_max) moved_max = cm;
+}
+
+void GunShake::ResetTotals() {
+    for (int m = 0; m < 2; ++m) n[m] = 0, cm_sum[m] = cm_max[m] = deg_sum[m] = deg_max[m] = 0;
+    moved_frames = checked_frames = 0;
+    moved_max = 0;
+}
+
 }  // namespace holevr::vr::view_lead

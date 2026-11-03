@@ -881,15 +881,25 @@ void PollEvents() {
 
 // Locates the eye views for this headset frame (base, its display time) and
 // the next few, for the game to pick from (see ViewsForNewPicture).
-void LocateViews(XrTime base, XrDuration period) {
+// Which headset frames ahead of the current one the head is located for
+// (k = lo..hi), shared with input so the controllers are located for the
+// same moments.
+void AheadRange(XrDuration period, int* lo, int* hi) {
     const bool pairing = g_pairing_on.load();
     const double fixed = config::GetFloat("predict_ahead_frames", -1.f);
     const int max_k = MaxAheadFrames();
-    int lo = 0, hi = 0;
+    *lo = *hi = 0;
     if (pairing && period > 0) {
-        if (fixed >= 0) lo = hi = std::min(static_cast<int>(std::lround(fixed)), max_k);
-        else if (max_k > 0) lo = 1, hi = max_k;  // a new picture is always at least one frame away
+        if (fixed >= 0) *lo = *hi = std::min(static_cast<int>(std::lround(fixed)), max_k);
+        else if (max_k > 0) *lo = 1, *hi = max_k;  // a new picture is always at least one frame away
     }
+}
+
+std::atomic<XrDuration> g_frame_period{0};  // this headset frame's period, set before the listeners run
+
+void LocateViews(XrTime base, XrDuration period) {
+    int lo = 0, hi = 0;
+    AheadRange(period, &lo, &hi);
     EyeView cand[kMaxAhead + 1][2];
     for (int k = lo; k <= hi; ++k) {
         const XrTime t = base + static_cast<XrTime>(k) * period;
@@ -1035,10 +1045,12 @@ void RunFrame() {
     XrFrameBeginInfo bi{XR_TYPE_FRAME_BEGIN_INFO};
     if (XR_FAILED(Proc<PFN_xrBeginFrame>("xrBeginFrame")(g_session, &bi))) return;
 
+    g_frame_period.store(fs.predictedDisplayPeriod);
     for (Listener* l : Listeners()) l->OnFrame(g_session, g_space, fs.predictedDisplayTime);
     step(g_perf_begin);
     // Head poses for the game, predicted for when its pictures will be shown
-    // (see ViewsForNewPicture); controllers by the smoothed lag (input::Consume).
+    // (see ViewsForNewPicture); input locates the controllers for the same
+    // moments (PictureFrames) and the game picks the same one.
     LocateViews(fs.predictedDisplayTime, fs.predictedDisplayPeriod);
     step(g_perf_locate);
 
@@ -1281,17 +1293,8 @@ ID3D12Resource* WindowTexture() { return g_fallback_texture; }
 
 XrDuration PredictAhead() { return g_ahead_ns.load(); }
 
-bool LatestViews(EyeView out[2]) {
-    std::lock_guard<std::mutex> lock(g_view_mutex);
-    if (!g_have_latest) return false;
-    out[0] = g_latest[0];
-    out[1] = g_latest[1];
-    return true;
-}
-
-bool ViewsForNewPicture(EyeView out[2]) {
-    std::lock_guard<std::mutex> lock(g_view_mutex);
-    if (!g_have_latest) return false;
+// The candidate the next picture's head views come from. g_view_mutex held.
+int NewPictureK() {
     int k;
     if (config::GetFloat("predict_ahead_frames", -1.f) >= 0 || !g_pairing_on.load()) {
         k = g_cand_lo;  // fixed (or off): the one frame located
@@ -1301,10 +1304,33 @@ bool ViewsForNewPicture(EyeView out[2]) {
         // counted from the frame the candidates were located for.
         k = g_vq_size + 1 + static_cast<int>(g_takes - g_cand_takes);
     }
-    k = std::clamp(k, g_cand_lo, std::max(g_cand_lo, g_cand_hi));
+    return std::clamp(k, g_cand_lo, std::max(g_cand_lo, g_cand_hi));
+}
+
+bool ViewsForNewPicture(EyeView out[2]) {
+    std::lock_guard<std::mutex> lock(g_view_mutex);
+    if (!g_have_latest) return false;
+    const int k = NewPictureK();
     out[0] = g_cand[k][0];
     out[1] = g_cand[k][1];
     return true;
+}
+
+// The same views as the picture being prepared, so everything placed from
+// the head (body, menus, wrist) matches the eyes of that picture. Until
+// 2026-11-03 this was the frame nearest the smoothed lag, which differs from
+// the picture's own frame whenever the game's pipeline depth changes.
+bool LatestViews(EyeView out[2]) { return ViewsForNewPicture(out); }
+
+void PictureFrames(int* lo, int* hi, XrDuration* period) {
+    *period = g_frame_period.load();
+    AheadRange(*period, lo, hi);
+}
+
+XrTime NewPictureShownTime() {
+    std::lock_guard<std::mutex> lock(g_view_mutex);
+    if (!g_have_latest) return 0;
+    return g_cand[NewPictureK()][0].shown_time;
 }
 
 void SetRenderedViews(const EyeView views[2]) {

@@ -67,12 +67,20 @@ struct EyeView {
 // poses are predicted: the game shows a picture about this much later than
 // the frame it took its poses at (its own pipeline, smoothed). 0 when off.
 XrDuration PredictAhead();
-// Latest eye views, predicted by the smoothed lag. Returns false until
-// tracking is running.
+// The eye views of the picture being prepared (same as ViewsForNewPicture).
+// Returns false until tracking is running.
 bool LatestViews(EyeView out[2]);
 // Game thread, once per picture as it starts drawing: the eye views predicted
 // for the headset frame that picture will be shown in.
 bool ViewsForNewPicture(EyeView out[2]);
+// From a Listener's OnFrame: the head is located this frame for k = lo..hi
+// headset frames past its predicted display time (period apart), so other
+// poses can be located for the same moments.
+void PictureFrames(int* lo, int* hi, XrDuration* period);
+// Game thread: the display time the next picture's head views are predicted
+// for (their shown_time), so the controllers can be taken at the same
+// moment. 0 if unknown.
+XrTime NewPictureShownTime();
 // Tell the frame loop which views the engine actually rendered with, so the
 // headset reprojects from the right pose.
 void SetRenderedViews(const EyeView views[2]);
