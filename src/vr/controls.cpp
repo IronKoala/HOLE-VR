@@ -2511,8 +2511,8 @@ void HolsterCalibration(const input::HandInput&, const hands::HandState& rh, con
         ++moved;
     }
     if (!moved) {
-        log::Info("holster: to move a holster, hold the pistol and/or a magazine where you want it, then hold the "
-                  "right stick click 2 s");
+        log::Info("holster: nothing moved: during the 5 s countdown (VR tab: Move holsters), hold the pistol "
+                  "and/or a magazine where you want it");
         return;
     }
     const bool saved = SaveHolsterSpots();
@@ -2766,7 +2766,7 @@ void Init() {
 void InitLate() {
     game::AddTickListener(&OnLateTick);
     log::Info("controls: holsters ready (pistol %s, %s; magazine pouch; to move one anywhere on the body, hold its "
-              "item there at the angle you want and hold the right stick click 2 s)",
+              "item there at the angle you want after VR tab: Move holsters)",
               g_set.holster_pistol ? "in a holster" : "always in the hand",
               g_set.holster_toggle ? "squeeze to draw, squeeze at the holster to put it away"
                                    : "hold the right grip to hold it");
