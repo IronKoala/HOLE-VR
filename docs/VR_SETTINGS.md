@@ -78,7 +78,11 @@ levels. Each frame picks one part of it.
   Strong the clear circle is about 33 deg wide each side of centre.
 - Head in a wall: a line from the body's middle at head height to the head.
   If it hits something, the view fades to black over the last 1 to 9 cm.
-  The player and the held gun are ignored.
+  The player and the held gun are ignored. No fade while a menu is on the
+  forearm, or when the view is more than 1 m from the character's capsule
+  (the game moving its camera, as on the extract results screen; menus
+  thread, PR #79). Owner 2026-11-03: "if i successfully extract i cant see
+  the menu".
 
 ## Height, real crouch and hop to jump (controls.cpp `PhysicalCrouchAndJump`)
 
