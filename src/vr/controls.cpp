@@ -93,6 +93,7 @@ struct Settings {
     double smooth_speed = 180.0;   // degrees per second at full stick
     bool move_with_hand = false;   // false: head direction
     double deadzone = 0.15;
+    double light_reach = 12.0;     // left hand this close to the gun: left trigger = weapon light, cm
     double gun_pitch = 0.0;        // extra pitch on the held gun, degrees
     double gun_yaw = 0.0;
     double gun_roll = 0.0;
@@ -145,6 +146,7 @@ void LoadSettings() {
     g_set.smooth_speed = config::GetFloat("smooth_turn_speed", 90.f);
     g_set.move_with_hand = config::GetInt("move_direction", 0) == 1;
     g_set.deadzone = config::GetFloat("stick_deadzone", 0.15f);
+    g_set.light_reach = config::GetFloat("light_hand_reach_cm", 12.f);
     g_set.gun_pitch = config::GetFloat("gun_pitch_offset", 0.f);
     g_set.gun_yaw = config::GetFloat("gun_yaw_offset", 0.f);
     g_set.gun_roll = config::GetFloat("gun_roll_offset", 0.f);
@@ -1546,6 +1548,7 @@ struct GameActionState {
     double rclick_down_at = -1;  // right stick click: tap = objective markers, hold 2 s = move holsters
     double melee_ready_at = 0;
     double melee_release_at = -1;
+    bool light_down = false;     // left trigger is pressing the weapon light
 } GA;
 
 bool GunIsRifle(UObject player);
@@ -1696,7 +1699,8 @@ void PhysicalCrouchAndJump(UObject player) {
 
 // Every other game action, on buttons the gun, menus, wrist and grip editor
 // don't use (lean is left out: lean for real).
-//   Left trigger          interact (doors, pickups)
+//   Left trigger          weapon light with the left hand right next to the gun, else interact
+//   Right trigger         interact while the right hand is empty (fires with the gun in hand)
 //   Left stick click      tap: sprint on/off (ends when you stop); double tap: walk/run
 //   Right stick up        jump
 //   Right stick down      crouch / stand
@@ -1704,21 +1708,66 @@ void PhysicalCrouchAndJump(UObject player) {
 //   Right stick click     fire selector on a rifle, otherwise objective markers (tap)
 //   Right stick click held 2 s   move the holsters to where the hands are
 //   Punch with the empty left hand   melee attack
+// Is the left hand right next to the gun in the right hand? Distance from
+// the left grip to the gun's line, from just behind the grip to the muzzle.
+bool LeftHandNearGun() {
+    if (!W.gun || !W.in_hand || !W.have_pose) return false;
+    if (W.two_hand) return true;
+    hands::HandState lh = hands::Get(hands::kLeft);
+    if (!lh.valid) return false;
+    FVector p = W.frame_rot.Inverse().Rotate(lh.grip.location - W.grip_world);
+    const double x = std::clamp(p.X, -8.0, W.muzzle_dist + 2.0);
+    const double dz = p.Z - std::clamp(p.Z, -12.0, W.bore_height);   // grip below the bore counts as the gun
+    const double d = std::sqrt((p.X - x) * (p.X - x) + p.Y * p.Y + dz * dz);
+    return d <= g_set.light_reach;
+}
+
 void GameActions(UObject player, const input::Snapshot& s) {
     if (!player) return;
     const input::HandInput& l = s.hand[input::kLeft];
     const input::HandInput& r = s.hand[input::kRight];
     if (ui_panel::MenuOpen()) {
         if (GA.sprinting) { FireEvent(player, GA.sprint_up); GA.sprinting = false; }
+        if (GA.light_down) {
+            ue::Call c(player, "PlayerInput_SwitchLight");
+            c.Set("IsPressed", false);
+            c.Invoke();
+            GA.light_down = false;
+        }
         return;
     }
     PhysicalCrouchAndJump(player);
-    // Interact.
+    // Left trigger: the weapon light when the left hand is right next to the
+    // gun in your hand, otherwise interact. The light press lasts as long as
+    // the trigger is held (the game toggles on the press).
     if (l.trigger_button.pressed && !W.held_mag && !W.slide.Held()) {
+        if (LeftHandNearGun()) {
+            ue::Call c(player, "PlayerInput_SwitchLight");
+            c.Set("IsPressed", true);
+            c.Invoke();
+            GA.light_down = true;
+            input::Haptic(input::kLeft, 0.25f, 0.02f);
+            log::Info("controls: weapon light (left trigger, hand at the gun)");
+        } else {
+            ue::Call c(player, "PlayerInput_Interact");
+            c.Invoke();
+            input::Haptic(input::kLeft, 0.2f, 0.02f);
+            log::Info("controls: interact (left hand)");
+        }
+    }
+    if (GA.light_down && !l.trigger_button.down) {
+        ue::Call c(player, "PlayerInput_SwitchLight");
+        c.Set("IsPressed", false);
+        c.Invoke();
+        GA.light_down = false;
+    }
+    // Right trigger interacts too while the right hand is empty (pistol
+    // holstered, or no gun); with the gun in hand it only fires.
+    if (r.trigger_button.pressed && !W.in_hand) {
         ue::Call c(player, "PlayerInput_Interact");
         c.Invoke();
-        input::Haptic(input::kLeft, 0.2f, 0.02f);
-        log::Info("controls: interact");
+        input::Haptic(input::kRight, 0.2f, 0.02f);
+        log::Info("controls: interact (right hand)");
     }
     // Jump / crouch: flick the right stick up or down (turning uses left/right).
     const bool up = r.stick_y > 0.75f && std::fabs(r.stick_x) < 0.6f;
@@ -2458,15 +2507,6 @@ void OnTick(UObject player, float dt) {
                           W.seat_offset.X, W.seat_offset.Y, W.seat_offset.Z,
                           2.0 * std::acos(std::fmin(1.0, dq)) * 180.0 / 3.14159265358979);
             }
-        }
-    }
-    {
-        // Left X: weapon light.
-        const input::HandInput& l = s.hand[input::kLeft];
-        if ((l.primary.pressed || l.primary.released) && !ui_panel::MenuOpen()) {
-            ue::Call c(player, "PlayerInput_SwitchLight");
-            c.Set("IsPressed", l.primary.down);
-            c.Invoke();
         }
     }
     hands::HandState rh = hands::Get(hands::kRight), lh = hands::Get(hands::kLeft);

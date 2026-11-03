@@ -214,6 +214,8 @@ const Block kBlocks[] = {
      "; Left stick moves toward: 0 = where you look, 1 = where your left hand points.\n"
      "move_direction=0\n"
      "stick_deadzone=0.15\n"
+     "; left hand this close to the gun (cm): left trigger toggles the weapon light instead of interacting\n"
+     "light_hand_reach_cm=12\n"
      "; Tilts the gun in your hand up (+) or down (-), degrees.\n"
      "gun_pitch_offset=0\n"
      "; Turns the gun left (-) or right (+), and rolls it left (-) or right (+), degrees.\n"
