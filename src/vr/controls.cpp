@@ -18,7 +18,10 @@
 #include "game/weapon_lab.h"
 #include "ue/call.h"
 #include "ue/process_event.h"
+#include "ue/reflection.h"
 #include "vr/body/body.h"
+#include "vr/comfort.h"
+#include "vr/comfort_math.h"
 #include "vr/hands.h"
 #include "vr/input.h"
 #include "vr/interact/holster.h"
@@ -116,6 +119,14 @@ struct Settings {
     double stock_up = 0.0;
     bool right_eye = true;         // aiming eye (the stock sits on that side)
     bool room_scale = true;        // the character follows you around the room
+    // VR tab settings (2026-11-03).
+    bool grip_toggle = false;      // magazines: squeeze to take, squeeze again to let go
+    double aim_smoothing = 0.0;    // 0 off .. 1 strongest
+    bool real_height = false;      // fixed_height=0: the view follows your real head height
+    bool seated = false;           // height_mode=seated
+    bool physical_crouch = true;
+    double physical_crouch_cm = 35.0;
+    bool physical_jump = false;
 };
 Settings g_set;
 
@@ -153,6 +164,16 @@ void LoadSettings() {
     g_set.stock_up = config::GetFloat("rifle_stock_up_cm", 0.f);
     g_set.right_eye = config::GetInt("dominant_eye_right", 1) != 0;
     g_set.room_scale = config::GetBool("room_scale_follow", true);
+    // One grip toggle for everything held (the pistol's own key still works
+    // when grip_toggle isn't in the ini yet).
+    g_set.grip_toggle = config::GetBool("grip_toggle", false);
+    g_set.holster_toggle = config::GetBool("grip_toggle", config::GetBool("holster_pistol_grip_toggle", false));
+    g_set.aim_smoothing = std::fmax(0.0, std::fmin(1.0, config::GetFloat("aim_smoothing", 0.f)));
+    g_set.real_height = !config::GetBool("fixed_height", true);
+    g_set.seated = !g_set.real_height && config::GetString("height_mode", "fixed") == "seated";
+    g_set.physical_crouch = config::GetBool("physical_crouch", true) && !g_set.seated;
+    g_set.physical_crouch_cm = config::GetFloat("physical_crouch_cm", 35.f);
+    g_set.physical_jump = config::GetBool("physical_jump", false) && !g_set.seated;
     LoadHolsterSpots();
 }
 
@@ -364,6 +385,17 @@ void Locomotion(UObject player, const input::Snapshot& s, double dt) {
         } else if (std::fabs(right.stick_x) < 0.4) {
             g_snap_armed = true;
         }
+    }
+    // Comfort vignette: how fast the character really moves (walls stop the
+    // stick, falls count) and how fast the stick turns you. Snap turns are
+    // instant, so they have nothing to darken.
+    {
+        ue::Call v(player, "GetVelocity");
+        FVector vel = v.Invoke() ? v.Result<FVector>() : FVector{};
+        double horiz = std::sqrt(vel.X * vel.X + vel.Y * vel.Y);
+        double move01 = std::fmax(horiz / 300.0, std::fabs(vel.Z) / 600.0);
+        double turn01 = g_set.smooth_turn && dt > 0 ? std::fabs(turn) / dt / 90.0 : 0.0;
+        comfort::SetMotion(move01, turn01);
     }
     if (turn != 0) {
         ue::Call gc(player, "GetController");
@@ -742,6 +774,8 @@ bool ShoulderPocket(FVector* out) {
 // Where the gun's grip point (MainHandPosition) sits from the controller's
 // grip, in the gun frame. Fourth headset test: the gun sat about 5 cm too far
 // forward and 1.3 cm too far left; fifth test: about 5 cm too high.
+comfort::AimSmoother g_aim_smoother;
+
 FVector GunGripOffset() {
     constexpr double kBaseForward = -5.0, kBaseRight = 1.3, kBaseUp = -5.0;
     return FVector{kBaseForward + g_set.gun_forward, kBaseRight + g_set.gun_right, kBaseUp};
@@ -817,6 +851,9 @@ void HoldGun(game::Gun& gun, const hands::HandState& rh) {
         W.shouldered = false;
         W.shoulder_blend = 0;
     }
+    // Aim smoothing (VR tab): slow shakes of the hand are smoothed out, fast
+    // moves pass straight through. Turns about the grip.
+    hand = g_aim_smoother.Step(hand, g_dt, g_set.aim_smoothing);
     // Recoil kick, at the grip so the arms follow it, never the camera:
     // the muzzle flips up (with a little random side) and the gun pushes
     // back, then returns (about 20 ms up, 100 ms back). A pistol in one
@@ -1481,6 +1518,101 @@ struct GameActionState {
 
 bool GunIsRifle(UObject player);
 
+// ---- physical crouch and jump (VR tab) ----
+// Crouching for real crouches the character (hitbox, speed, cover) and
+// standing up stands it up; a quick hop jumps (off by default). The
+// character's Crouch/UnCrouch are called directly, so it works whether the
+// game's own crouch is set to hold or toggle. Only changes of your real
+// stance act: the stick crouch still works in between.
+comfort::PhysicalBody g_phys;
+struct CrouchRead {
+    bool looked = false;
+    int32_t offset = -1;
+    uint8_t mask = 0;
+    const char* how = "none";
+} g_crouch_read;
+
+// Is the character crouched? ACharacter.bIsCrouched (the engine's own flag,
+// set by Crouch/UnCrouch, which the game's ALS stance follows).
+bool GameCrouched(UObject player, bool* known) {
+    if (!g_crouch_read.looked) {
+        g_crouch_read.looked = true;
+        auto p = ue::reflection::FindProperty(ue::GetClass(player), "bIsCrouched");
+        if (p.valid() && p.type == "BoolProperty") {
+            g_crouch_read.offset = p.offset;
+            g_crouch_read.mask = p.bool_mask ? p.bool_mask : 0xFF;
+            g_crouch_read.how = "Character.bIsCrouched";
+        }
+        log::Info("controls: physical crouch reads the character's crouch from %s", g_crouch_read.how);
+    }
+    *known = g_crouch_read.offset >= 0;
+    if (!*known) return false;
+    return (mem::ReadOr<uint8_t>(player + g_crouch_read.offset, 0) & g_crouch_read.mask) != 0;
+}
+
+// Real-height mode: the view follows your real head, so the game camera's
+// own crouch drop is given back (else crouching for real would lower the
+// view twice: once for your head, once for the character).
+struct CamHeight {
+    bool have_stand = false;
+    double stand_rel = 0;   // camera above the capsule's bottom while standing, cm
+    double extra = 0;       // what is given back to the view now, cm
+} g_cam;
+
+void RealHeightCrouchView(UObject player, bool crouched, bool known) {
+    double want = 0;
+    FVector cam;
+    if (g_set.real_height && known && stereo::GameCameraLocation(&cam)) {
+        ue::Call loc(player, "K2_GetActorLocation");
+        UObject capsule = 0;
+        double half = 0;
+        if (ue::GetProp(player, "CapsuleComponent", capsule) && capsule) {
+            ue::Call h(capsule, "GetScaledCapsuleHalfHeight");
+            if (h.Invoke()) half = h.Result<float>();
+        }
+        if (loc.Invoke() && half > 10.0) {
+            double rel = cam.Z - (loc.Result<FVector>().Z - half);
+            if (!crouched) {
+                g_cam.stand_rel = g_cam.have_stand ? g_cam.stand_rel + (rel - g_cam.stand_rel) * 0.1 : rel;
+                g_cam.have_stand = true;
+            } else if (g_cam.have_stand) {
+                want = std::fmax(0.0, std::fmin(80.0, g_cam.stand_rel - rel));
+            }
+        }
+    }
+    g_cam.extra += (want - g_cam.extra) * (1.0 - std::exp(-12.0 * g_dt));
+    if (std::fabs(g_cam.extra) < 0.05 && want == 0) g_cam.extra = 0;
+    stereo::SetViewRaiseCm(g_cam.extra);
+}
+
+void PhysicalCrouchAndJump(UObject player) {
+    bool known = false;
+    const bool crouched = GameCrouched(player, &known);
+    RealHeightCrouchView(player, crouched, known);
+    g_phys.Configure(g_set.physical_crouch, g_set.physical_crouch_cm, g_set.physical_jump);
+    if (!g_set.physical_crouch && !g_set.physical_jump) return;
+    xr::EyeView v[2];
+    if (!xr::LatestViews(v)) return;
+    const double head_m = (v[0].pose.position.y + v[1].pose.position.y) * 0.5;
+    const comfort::BodyEvent e = g_phys.Update(head_m, g_dt);
+    using E = comfort::BodyEvent;
+    if (e == E::kCrouch || e == E::kStand) {
+        const bool down = e == E::kCrouch;
+        log::Info("controls: physical %s (head %.0f cm below standing %.0f cm; character %s)",
+                  down ? "crouch" : "stand", g_phys.Drop() * 100.0, g_phys.Standing() * 100.0,
+                  !known ? "stance unknown" : crouched ? "crouched" : "standing");
+        if (known && crouched == down) return;  // already there (stick crouch)
+        ue::Call c(player, down ? "Crouch" : "UnCrouch");
+        c.Set("bClientSimulation", false);
+        if (!c.Invoke()) log::Warn("controls: the character has no %s", down ? "Crouch" : "UnCrouch");
+        input::Haptic(input::kLeft, 0.15f, 0.02f);
+    } else if (e == E::kJump && GA.jump_armed && GA.jump_release_at < 0) {
+        FireEvent(player, GA.jump_down);
+        GA.jump_release_at = g_clock + 0.15;
+        log::Info("controls: physical jump (head rising fast)");
+    }
+}
+
 // Every other game action, on buttons the gun, menus, wrist and grip editor
 // don't use (lean is left out: lean for real).
 //   Left trigger          interact (doors, pickups)
@@ -1499,6 +1631,7 @@ void GameActions(UObject player, const input::Snapshot& s) {
         if (GA.sprinting) { FireEvent(player, GA.sprint_up); GA.sprinting = false; }
         return;
     }
+    PhysicalCrouchAndJump(player);
     // Interact.
     if (l.trigger_button.pressed && !W.held_mag && !W.slide.Held()) {
         ue::Call c(player, "PlayerInput_Interact");
@@ -2163,13 +2296,43 @@ void OnTick(UObject player, float dt) {
     } else {
         if (W.in_hand) Trigger(player, gun, s.hand[input::kRight]);
         SlideHandling(gun, lh, s.hand[input::kLeft], dt, W.in_hand);
-        MagazineHandling(gun, player, lh, s.hand[input::kLeft], s.hand[input::kRight]);
+        // Grip toggle (VR tab): a held magazine stays in the hand until the
+        // next squeeze. The slide and the support hand always hold.
+        const input::HandInput& lraw = s.hand[input::kLeft];
+        input::HandInput lmag = lraw;
+        const bool toggle_drop = g_set.grip_toggle && W.held_mag && lraw.grip_button.pressed;
+        {
+            comfort::GripView gv = comfort::ToggleGrip(g_set.grip_toggle, W.held_mag != 0, lraw.grip_button.down,
+                                                       lraw.grip_button.pressed, lraw.grip_button.released);
+            lmag.grip_button.down = gv.down;
+            lmag.grip_button.pressed = gv.pressed;
+            lmag.grip_button.released = gv.released;
+        }
+        MagazineHandling(gun, player, lh, lmag, s.hand[input::kRight]);
         HolsterCalibration(s.hand[input::kRight], rh, lh);
-        SupportGrip(lh, s.hand[input::kLeft]);
+        input::HandInput lsup = lraw;
+        if (toggle_drop) lsup.grip_button.pressed = false;  // that squeeze let go of the magazine
+        SupportGrip(lh, lsup);
         FireSelector(gun, s.hand[input::kRight]);
     }
     PublishGrabs(gun, rh, lh);
     RackTrace(gun, dt);
+}
+
+// The VR tab changed a setting: read them again and apply what needs more
+// than a new value (the pistol holster's hold/toggle mode).
+void ReloadSettings() {
+    LoadSettings();
+    if (W.gun)
+        W.holster.Configure(g_spots[kPistolSpot].radius,
+                            g_set.holster_toggle ? interact::DrawMode::kToggle : interact::DrawMode::kHold);
+    g_aim_smoother.Reset();
+    log::Info("controls: settings changed (%s turn %.0f deg / %.0f deg/s, move by %s, grip %s, aim smoothing %.2f, "
+              "height %s, physical crouch %s, physical jump %s)",
+              g_set.smooth_turn ? "smooth" : "snap", g_set.snap_degrees, g_set.smooth_speed,
+              g_set.move_with_hand ? "hand" : "head", g_set.grip_toggle ? "toggle" : "hold", g_set.aim_smoothing,
+              g_set.real_height ? "real" : g_set.seated ? "seated" : "fixed", g_set.physical_crouch ? "on" : "off",
+              g_set.physical_jump ? "on" : "off");
 }
 
 }  // namespace
@@ -2177,6 +2340,7 @@ void OnTick(UObject player, float dt) {
 void Init() {
     LoadSettings();
     LoadMagSeats();
+    config::AddChangeListener(&ReloadSettings);
     game::AddTickListener(&OnTick);
     log::Info("controls: ready (%s turn, move by %s)", g_set.smooth_turn ? "smooth" : "snap",
               g_set.move_with_hand ? "hand" : "head");

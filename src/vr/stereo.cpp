@@ -180,7 +180,9 @@ struct WorldMapping {
     double world_to_meters = 100.0;
     double height_drop_m = 0.0;  // fixed_height: real head height above the recentre point, removed from everything
     FVector head_offset_cm;  // midpoint of the eyes from the game camera, world axes, horizontal
+    double raise_cm = 0.0;   // SetViewRaiseCm: added to the eyes' (and hands') height
 };
+std::atomic<double> g_view_raise_cm{0.0};
 std::mutex g_world_mutex;
 WorldMapping g_world;
 // Origin shifts requested by ShiftOriginWorld, applied at the next left-eye
@@ -272,6 +274,8 @@ void HookCalcOffset(void* self, int32_t view_index, FRotator* rotation, float wo
         height_drop_m = XrToUePosition(0, (a.y + b.y) * 0.5f, 0, 1.0).Z - g_origin_m.Z;
         local_p.Z -= height_drop_m * world_to_meters;
     }
+    const double raise_cm = g_view_raise_cm.load();
+    local_p.Z += raise_cm;
 
     // The game keeps steering yaw (mouse/stick turning); the headset owns
     // pitch and roll so the horizon never moves on its own.
@@ -284,7 +288,7 @@ void HookCalcOffset(void* self, int32_t view_index, FRotator* rotation, float wo
         FVector head_offset = base.Rotate(recenter.Rotate(head_p - g_origin_m) * world_to_meters);
         head_offset.Z = 0;
         g_world = {true, *location, base, FQuat{recenter.X, recenter.Y, recenter.Z, recenter.W}, g_origin_m,
-                   world_to_meters, height_drop_m, head_offset};
+                   world_to_meters, height_drop_m, head_offset, raise_cm};
     }
     *rotation = ToRotator(base * local_q);
     *location = *location + base.Rotate(local_p);
@@ -539,6 +543,7 @@ bool TrackingToWorld(const XrPosef& pose, FVector* world_location, FQuat* world_
     FVector p = XrToUePosition(pose.position.x, pose.position.y, pose.position.z, 1.0);
     FVector local_p = m.recenter.Rotate(p - m.origin_m) * m.world_to_meters;
     local_p.Z -= m.height_drop_m * m.world_to_meters;
+    local_p.Z += m.raise_cm;
     if (world_location) *world_location = m.camera_location + m.base.Rotate(local_p);
     if (world_rotation) *world_rotation = m.base * (m.recenter * q);
     return true;
@@ -566,5 +571,14 @@ bool ShiftOriginWorld(const FVector& world_delta_cm) {
     g_pending_world_cm = g_pending_world_cm + d;
     return true;
 }
+
+bool GameCameraLocation(FVector* world_cm) {
+    std::lock_guard<std::mutex> lock(g_world_mutex);
+    if (!g_world.valid) return false;
+    *world_cm = g_world.camera_location;
+    return true;
+}
+
+void SetViewRaiseCm(double cm) { g_view_raise_cm.store(cm); }
 
 }  // namespace holevr::vr::stereo

@@ -35,6 +35,7 @@
 #include "vr/render_fixes.h"
 #include "vr/stereo.h"
 #include "vr/ui_panel.h"
+#include "vr/vr_options.h"
 
 namespace holevr::vr::world_menu {
 namespace {
@@ -1368,6 +1369,7 @@ bool Host(const Candidate& c) {
     p.layer = G.panels.empty() ? 0 : G.panels.back().layer + 1;
     G.panels.push_back(p);
     log::Info("world menu: %s is now a panel on the forearm (layer %d), off the flat screen", p.name.c_str(), p.layer);
+    vr_options::OnMenuHosted(c.obj, p.name);  // Options gets its VR tab before it is fitted to the arm
     g_capture_at = Now() + 1.0;
     g_capture_name = p.name;
 
@@ -1872,6 +1874,7 @@ void OnGameFrame() {
         }
     }
     KeepBoxesAway();
+    vr_options::Tick();
     UpdatePointer();
     // A laser click can put up the next menu right now (Options, Task...).
     // Take it onto the arm before this frame is drawn: left for the next

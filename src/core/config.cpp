@@ -1,15 +1,23 @@
 #include "core/config.h"
 
+#include <windows.h>
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
 #include <map>
+#include <mutex>
 #include <string>
 
+#include "core/ini_edit.h"
 #include "core/log.h"
 
 namespace holevr::config {
 namespace {
+// Read from the game thread every frame (and at start-up from others);
+// changed from the game thread by Set.
+std::mutex g_mutex;
 std::map<std::string, std::string> g_values;
 
 // Settings blocks, keyed by the setting they introduce. Blocks missing from
@@ -59,7 +67,7 @@ const Block kBlocks[] = {
      "vr_disable_motion_blur=1\n"
      "vr_disable_depth_of_field=1\n"
      "; Screen-edge darkening from the game's own effects. The comfort vignette\n"
-     "; for turning and moving is a separate setting.\n"
+     "; for turning and moving is a separate setting (comfort_vignette_*).\n"
      "vr_disable_vignette=1\n"
      "vr_disable_lens_flares=1\n"
      "vr_disable_chromatic_aberration=1\n"
@@ -85,9 +93,9 @@ const Block kBlocks[] = {
     {"menu_panel",
      "\n"
      "; --- Menus in the headset ---\n"
-     "; While a game menu is open, the game screen floats in front of you and\n"
-     "; either controller is a laser pointer: trigger clicks, thumbstick scrolls,\n"
-     "; B/Y goes back. The controller menu button opens/closes the pause menu.\n"
+     "; Game menus go on your forearm (see menu_world_place below); the other\n"
+     "; hand is a laser pointer: trigger clicks, thumbstick scrolls, B/Y goes\n"
+     "; back. The controller menu button opens/closes the pause menu.\n"
      "menu_panel=1\n"
      "menu_panel_width_m=1.6\n"
      "menu_panel_distance_m=1.6\n"
@@ -99,9 +107,8 @@ const Block kBlocks[] = {
     {"menu_mode",
      "\n"
      "; --- Menus as panels in the world ---\n"
-     "; world  = each game menu is taken off the flat screen and shown on its own\n"
-     ";          panel floating in front of you (like other VR games)\n"
-     "; window = the old way: the whole game screen on a flat panel\n"
+     "; world = each game menu is taken off the flat screen and put in the world\n"
+     ";         (on your forearm unless menu_world_place=front)\n"
      "menu_mode=world\n"
      "menu_world_width_m=1.8\n"
      "menu_world_distance_m=1.6\n"
@@ -345,6 +352,34 @@ const Block kBlocks[] = {
      "hand_editor_show_grab_points=1\n"
      "; Log a body fit line (reach, wrist bend, body turn) every 10 s.\n"
      "body_fit_log=1\n"},
+    {"comfort_vignette_move",
+     "\n"
+     "; --- Comfort and the VR tab (2026-11-03) ---\n"
+     "; These can all be changed in the game: pause, Options, VR tab. Each click\n"
+     "; on a row there picks the next choice and saves it here at once.\n"
+     "; Comfort vignette: the edges of your view darken while the stick moves\n"
+     "; or turns you (0 = off .. 1 = strongest). Real walking never darkens it.\n"
+     "comfort_vignette_move=0\n"
+     "comfort_vignette_turn=0\n"
+     "; 1 = the view fades to black when your head goes into a wall or object.\n"
+     "head_wall_fade=1\n"
+     "; Height: fixed = always the character's eye height (real crouching does\n"
+     "; not lower you unless physical_crouch crouches the character),\n"
+     "; real = your own head height, seated = the character's height and\n"
+     "; physical crouch and jump off.\n"
+     "height_mode=fixed\n"
+     "; 1 = crouching for real makes the character crouch (and standing up\n"
+     "; stands it up). How far your head must drop, cm.\n"
+     "physical_crouch=1\n"
+     "physical_crouch_cm=35\n"
+     "; 1 = a quick hop (head rising fast) makes the character jump.\n"
+     "physical_jump=0\n"
+     "; 1 = squeeze once to take the pistol or a magazine and once more to let\n"
+     "; go, instead of holding the grip (slide and support hand stay hold).\n"
+     "grip_toggle=0\n"
+     "; Steadier aim: smooths small shakes of the gun hand, never big moves\n"
+     "; (0 = off .. 1 = strongest).\n"
+     "aim_smoothing=0\n"},
 };
 
 std::string Trim(const std::string& s) {
@@ -402,6 +437,7 @@ void Load(const std::wstring& mod_dir) {
 }
 
 bool GetBool(const char* key, bool fallback) {
+    std::lock_guard<std::mutex> lock(g_mutex);
     const std::string* v = Find(key);
     if (!v || v->empty()) return fallback;
     char c = (*v)[0];
@@ -409,21 +445,88 @@ bool GetBool(const char* key, bool fallback) {
 }
 
 int GetInt(const char* key, int fallback) {
+    std::lock_guard<std::mutex> lock(g_mutex);
     const std::string* v = Find(key);
     return (v && !v->empty()) ? std::atoi(v->c_str()) : fallback;
 }
 
 float GetFloat(const char* key, float fallback) {
+    std::lock_guard<std::mutex> lock(g_mutex);
     const std::string* v = Find(key);
     return (v && !v->empty()) ? static_cast<float>(std::atof(v->c_str())) : fallback;
 }
 
 std::string GetString(const char* key, const char* fallback) {
+    std::lock_guard<std::mutex> lock(g_mutex);
     const std::string* v = Find(key);
     return (v && !v->empty()) ? *v : std::string(fallback);
 }
 
+namespace {
+std::atomic<ChangeFn> g_listeners[16];
+
+bool ReadFile(const std::wstring& path, std::string* out) {
+    FILE* f = _wfopen(path.c_str(), L"rb");
+    if (!f) return false;
+    out->clear();
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) out->append(buf, n);
+    fclose(f);
+    return true;
+}
+}  // namespace
+
+bool Set(const char* key, const std::string& value) {
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_values[key] = value;
+    }
+    if (g_dir.empty()) return false;
+    const std::wstring path = g_dir + L"\\hole-vr.ini";
+    std::string text;
+    if (!ReadFile(path, &text)) {
+        log::Warn("settings: could not read hole-vr.ini to save %s=%s", key, value.c_str());
+        return false;
+    }
+    std::string changed = SetIniValue(text, key, value);
+    if (changed == text) return true;
+    // Written beside it first, then swapped in, so a crash mid-write never
+    // leaves a half-written settings file.
+    const std::wstring tmp = path + L".new";
+    FILE* f = _wfopen(tmp.c_str(), L"wb");
+    if (!f) {
+        log::Warn("settings: could not write hole-vr.ini to save %s=%s", key, value.c_str());
+        return false;
+    }
+    bool ok = fwrite(changed.data(), 1, changed.size(), f) == changed.size();
+    ok = fclose(f) == 0 && ok;
+    if (ok) ok = MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
+    if (!ok) {
+        log::Warn("settings: saving %s=%s to hole-vr.ini failed", key, value.c_str());
+        return false;
+    }
+    log::Info("settings: saved %s=%s in hole-vr.ini", key, value.c_str());
+    return true;
+}
+
+void AddChangeListener(ChangeFn fn) {
+    for (auto& slot : g_listeners) {
+        ChangeFn cur = slot.load();
+        if (cur == fn) return;
+        ChangeFn expected = nullptr;
+        if (!cur && slot.compare_exchange_strong(expected, fn)) return;
+    }
+    log::Error("settings: too many change listeners");
+}
+
+void NotifyChanged() {
+    for (auto& slot : g_listeners)
+        if (ChangeFn fn = slot.load()) fn();
+}
+
 std::vector<std::pair<std::string, std::string>> WithPrefix(const char* prefix) {
+    std::lock_guard<std::mutex> lock(g_mutex);
     std::vector<std::pair<std::string, std::string>> out;
     const size_t n = std::strlen(prefix);
     for (const auto& [k, v] : g_values)

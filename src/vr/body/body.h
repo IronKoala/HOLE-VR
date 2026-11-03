@@ -58,6 +58,11 @@ bool GetAnchor(Anchor anchor, hands::Pose* out);
 // now. False until measured (or if the gun has no traceable slide).
 bool SlideMarks(uintptr_t gun, FVector* rear_sight, FVector* rear_end, FVector* front_end);
 
+// Measures the arms like holding the left stick click 2 s does: a 5 s
+// countdown (buzzes) once the game runs again, then stand straight with both
+// arms straight out to the sides. For the VR tab in Options.
+void RequestMeasure();
+
 // Registers the game tick listener. Call after controls::Init() so hand
 // poses for this frame are already published.
 void Init();

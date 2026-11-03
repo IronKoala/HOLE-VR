@@ -10,6 +10,7 @@ add_library(hole_vr SHARED
     src/proxy/dxgi.rc
     src/core/log.cpp
     src/core/config.cpp
+    src/core/ini_edit.cpp
     src/core/memory.cpp
     src/core/perf.cpp
     src/ue/names.cpp
@@ -23,6 +24,10 @@ add_library(hole_vr SHARED
     src/vr/stereo.cpp
     src/vr/input.cpp
     src/vr/controls.cpp
+    src/vr/comfort.cpp
+    src/vr/comfort_math.cpp
+    src/vr/vr_menu_model.cpp
+    src/vr/vr_options.cpp
     src/vr/interact/slide.cpp
     src/vr/interact/holster.cpp
     src/vr/body/ik_math.cpp

@@ -40,4 +40,12 @@ void SetGameFrameCallback(void (*fn)());
 bool HeadOffsetWorld(FVector* offset_cm);
 bool ShiftOriginWorld(const FVector& world_delta_cm);
 
+// The game camera's location on the latest frame, before the headset's
+// offset is added. False until the first headset frame.
+bool GameCameraLocation(FVector* world_cm);
+// Raises the eyes (and the hands with them) this many cm above where they
+// would be, from the next frame on. Real-height mode uses it to give back
+// the game camera's own crouch drop. Thread-safe.
+void SetViewRaiseCm(double cm);
+
 }  // namespace holevr::vr::stereo

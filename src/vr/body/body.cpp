@@ -2778,8 +2778,20 @@ bool GetAnchor(Anchor anchor, hands::Pose* out) {
     return true;
 }
 
+void RequestMeasure() {
+    // Starts the same 3 s countdown as holding the left stick click, once the
+    // body ticks again (it doesn't while the game is paused in a menu).
+    game::Post([] {
+        g_meas = MeasureRun{};
+        g_meas.countdown = 5.0;
+        g_meas.last_beat = 5;
+        log::Info("body: arm measure asked for from the VR tab: in 5 s, stand straight, arms straight out to the sides");
+    });
+}
+
 void Init() {
     LoadSettings();
+    config::AddChangeListener(&LoadSettings);
     game::AddTickListener(&OnTick);
     NotifyStudyInit();
     log::Info("body: ready (%s; F9 toggles; grip editor: hold left Y 1 s while holding the gun)",

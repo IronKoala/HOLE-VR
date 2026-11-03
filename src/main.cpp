@@ -19,6 +19,7 @@
 #include "ue/reflection.h"
 #include "vr/dxgi_hooks.h"
 #include "vr/body/body.h"
+#include "vr/comfort.h"
 #include "vr/controls.h"
 #include "vr/input.h"
 #include "vr/openxr.h"
@@ -26,6 +27,7 @@
 #include "vr/render_fixes.h"
 #include "vr/ui_panel.h"
 #include "vr/wrist_hud.h"
+#include "vr/vr_options.h"
 #include "vr/world_menu.h"
 #include "vr/menu_study.h"
 #include "vr/launch.h"
@@ -81,6 +83,7 @@ void StartVr() {
     vr::ui_panel::Init();
     vr::world_menu::Init();
     vr::wrist_hud::Init();
+    vr::comfort::Init();  // after the menus and wrist: its layer goes on top
     bool told = false;
     while (!vr::xr::InitInstance()) {
         if (!told) log::Info("Waiting for SteamVR and the headset...");
@@ -133,6 +136,8 @@ DWORD WINAPI InitThread(LPVOID) {
         vr::cvars::Init();
         vr::wrist_hud::InitGame();
         vr::world_menu::InitGame();
+        vr::vr_options::InitGame();
+        vr::comfort::InitGame();
         vr::menu_study::InitGame();
         vr::ui_panel::InitGame();
     }
