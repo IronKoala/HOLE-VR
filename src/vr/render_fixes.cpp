@@ -363,6 +363,8 @@ std::string Describe(uintptr_t settings) {
     return out;
 }
 
+bool PauseBlurOn() { return g_pause_on.load(); }
+
 int SetPauseBlur(bool on) {
     if (!g_pause_ready) return -1;
     {

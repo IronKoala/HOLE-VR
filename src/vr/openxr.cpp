@@ -14,6 +14,7 @@
 #include "core/config.h"
 #include "core/log.h"
 #include "core/perf.h"
+#include "vr/square_watch.h"
 
 namespace holevr::vr::xr {
 namespace {
@@ -767,6 +768,7 @@ bool CopyEyes(ID3D12Resource* source, D3D12_RESOURCE_STATES src_state, const uin
     };
     g_cmd->ResourceBarrier(3, before);
     RecordCapture(source);
+    square_watch::Record(g_device, g_cmd, source);
     for (int eye = 0; eye < 2; ++eye) {
         const Swapchain& sc = g_swapchains[eye];
         D3D12_TEXTURE_COPY_LOCATION dst{};
@@ -798,6 +800,7 @@ bool CopyEyes(ID3D12Resource* source, D3D12_RESOURCE_STATES src_state, const uin
     g_queue->ExecuteCommandLists(1, lists);
     g_queue->Signal(g_fence, ++g_fence_value);
     g_allocator_fence_value[slot] = g_fence_value;
+    square_watch::Submitted(g_fence, g_fence_value);
     FinishCapture(source->GetDesc().Format);
     return true;
 }
