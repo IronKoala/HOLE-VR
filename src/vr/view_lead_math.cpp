@@ -43,7 +43,9 @@ int Pick(const Leads& l, int choice) {
     return -1;
 }
 
-void Stats::Add(const FVector& actual, const Leads& l, int used) {
+void Stats::Add(const FVector& actual, const Leads& l, int used) { Add(actual, l, used, 0.0); }
+
+void Stats::Add(const FVector& actual, const Leads& l, int used, double yaw_deg) {
     const double none = Length(actual);
     // Count frames where the camera moved, or a prediction said it did.
     bool moving = none > 0.5;
@@ -53,9 +55,25 @@ void Stats::Add(const FVector& actual, const Leads& l, int used) {
     ++frames;
     none_sum += none;
     if (none > none_max) none_max = none;
-    const double u = used >= 0 && used < kKinds ? Length(actual - l.move[used]) : none;
+    const FVector miss = used >= 0 && used < kKinds ? actual - l.move[used] : actual;
+    const double u = Length(miss);
     used_sum += u;
     if (u > used_max) used_max = u;
+    const double yaw = yaw_deg * kDegToRad, c = std::cos(yaw), s = std::sin(yaw);
+    const FVector local{miss.X * c + miss.Y * s, -miss.X * s + miss.Y * c, miss.Z};
+    axis_sum[0] += std::fabs(local.X);
+    axis_sum[1] += std::fabs(local.Y);
+    axis_sum[2] += std::fabs(local.Z);
+    // Keep the worst few, largest first.
+    if (u > 1.0) {
+        int at = worst_count < kWorst ? worst_count : kWorst;
+        while (at > 0 && worst[at - 1].cm < u) --at;
+        if (at < kWorst) {
+            for (int i = (worst_count < kWorst ? worst_count : kWorst - 1); i > at; --i) worst[i] = worst[i - 1];
+            worst[at] = Worst{u, local, actual, used, l};
+            if (worst_count < kWorst) ++worst_count;
+        }
+    }
     for (int k = 0; k < kKinds; ++k) {
         if (!l.valid[k]) continue;
         ++n[k];
@@ -108,7 +126,33 @@ void GunShake::AddMovedAfter(double cm) {
     if (cm > moved_max) moved_max = cm;
 }
 
+void GunShake::AddPlacement(bool valid, const FVector& at, const FQuat& rot, bool moving) {
+    if (!valid) {
+        place_have_ = false;
+        return;
+    }
+    if (place_have_) {
+        const double cm = Length(at - place_p_), deg = AngleDeg(rot * place_q_.Inverse());
+        // Bigger than this is a re-grip, two hands taking over or a teleport.
+        if (cm < 20.0 && deg < 30.0) {
+            const int m = moving ? 1 : 0;
+            ++place_n[m];
+            place_cm_sum[m] += cm;
+            place_deg_sum[m] += deg;
+            if (cm > place_cm_max[m]) place_cm_max[m] = cm;
+            if (deg > place_deg_max[m]) place_deg_max[m] = deg;
+        }
+    }
+    place_p_ = at;
+    place_q_ = rot;
+    place_have_ = true;
+}
+
 void GunShake::ResetTotals() {
+    for (int m = 0; m < 2; ++m) {
+        place_n[m] = 0;
+        place_cm_sum[m] = place_cm_max[m] = place_deg_sum[m] = place_deg_max[m] = 0;
+    }
     for (int m = 0; m < 2; ++m) n[m] = 0, cm_sum[m] = cm_max[m] = deg_sum[m] = deg_max[m] = 0;
     moved_frames = checked_frames = 0;
     moved_max = 0;
