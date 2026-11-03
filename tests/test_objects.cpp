@@ -234,6 +234,55 @@ int main() {
         EXPECT(g_queries - before <= 2);  // the name pool's readability check
     }
 
+    // ObjectRef: a kept Blueprint class that the engine frees with its level
+    // (the 2026-11-03 "CD pickup" Fatal Error) is noticed and found again.
+    {
+        const char* kOther = "BlueprintGeneratedClass /Game/Other.BP_Other_C";
+        ObjectRef ref(kOther, 10.0);
+        EXPECT(ref.Get(0.0) == other_c);
+        EXPECT(ref.Get(1.0) == other_c);
+        EXPECT(ref.times_lost() == 0);
+        EXPECT(IsLive(other_c));
+
+        // Level unloaded: the engine clears the class's slot. Not found again
+        // (not loaded), and not looked for again until the retry time.
+        UObject zero = 0;
+        uintptr_t chunk0 = g_chunk_ptrs[0];
+        std::memcpy(reinterpret_cast<void*>(chunk0 + 8 * 24), &zero, 8);
+        EXPECT(!IsLive(other_c));
+        EXPECT(ref.Get(2.0) == 0);
+        EXPECT(ref.times_lost() == 1);
+        EXPECT(ref.Get(3.0) == 0);
+
+        // Its memory is reused by a different object that takes the same
+        // slot (same address, same index, another name): still not the class.
+        uintptr_t stranger = NewObject(8, cls_package, N(n_mesh), pkg_other, reinterpret_cast<unsigned char*>(other_c));
+        EXPECT(stranger == other_c && IsLive(stranger));
+        EXPECT(ref.Get(4.0) == 0);  // before the retry time: nothing
+        int before = g_queries;
+        EXPECT(ref.Get(12.5) == 0);  // looked up: the class is not loaded
+        EXPECT(g_queries > before);
+        EXPECT(ref.times_lost() == 1);
+
+        // The level loads again: the class comes back at a new address.
+        uintptr_t other_c2 = NewObject(30, cls_bpgc, N(n_other_c), pkg_other);
+        EXPECT(ref.Get(13.0) == 0);   // retry not due yet
+        EXPECT(ref.Get(22.6) == other_c2);
+        EXPECT(ref.Get(22.7) == other_c2);
+
+        // Freed again, and the memory reused by a new object of the same
+        // class and name at the same address: that IS the class again.
+        std::memcpy(reinterpret_cast<void*>(chunk0 + 30 * 24), &zero, 8);
+        uintptr_t again = NewObject(31, cls_bpgc, N(n_other_c), pkg_other, reinterpret_cast<unsigned char*>(other_c2));
+        EXPECT(ref.Get(23.0) == again);
+        EXPECT(ref.times_lost() == 1);  // index moved 30 -> 31, but the slot holds it
+
+        // A name never loaded: found later once it is.
+        ObjectRef missing("BlueprintGeneratedClass /Engine/Transient.UIM_Title_C", 5.0);
+        EXPECT(missing.Get(0.0) == cls_title);
+        EXPECT(!IsLive(0));
+    }
+
     if (failures) {
         std::printf("%d failure(s)\n", failures);
         return 1;
