@@ -28,6 +28,8 @@ add_library(hole_vr SHARED
     src/vr/comfort_math.cpp
     src/vr/vr_menu_model.cpp
     src/vr/vr_options.cpp
+    src/vr/teleport.cpp
+    src/vr/teleport_math.cpp
     src/vr/interact/slide.cpp
     src/vr/interact/holster.cpp
     src/vr/body/ik_math.cpp

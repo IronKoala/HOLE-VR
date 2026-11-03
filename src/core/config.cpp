@@ -380,6 +380,20 @@ const Block kBlocks[] = {
      "; Steadier aim: smooths small shakes of the gun hand, never big moves\n"
      "; (0 = off .. 1 = strongest).\n"
      "aim_smoothing=0\n"},
+    {"world_scale",
+     "\n"
+     "; smooth = the left stick walks; teleport = push the left stick forward to\n"
+     "; aim an arc, let go to jump there, pull it back to cancel.\n"
+     "locomotion=smooth\n"
+     "; Which stick moves you: left (default) or right (the other one turns,\n"
+     "; jumps and crouches; the moving stick's click sprints).\n"
+     "move_stick=left\n"
+     "; How big the world looks: 1 = true size, 1.1 = 10% bigger (you feel\n"
+     "; smaller), 0.9 = 10% smaller (0.5 - 2).\n"
+     "world_scale=1\n"
+     "; Your standing eye height, cm, from Calibrate body on the VR tab (stand\n"
+     "; straight, arms out). 0 = learned while you play. Real crouch uses it.\n"
+     "standing_height_cm=0\n"},
 };
 
 std::string Trim(const std::string& s) {

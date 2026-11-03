@@ -3,9 +3,11 @@
 Owner request (2026-11-03): a dedicated VR sub-menu in Options, plus the
 comfort, height, grip and aiming features from the VR reference study. The
 full list and build order is in the project plan (vr-features-2026-11-03).
-This page covers build 1. Teleport, world scale, left-handed mode, body
-calibration and muzzle trace come in build 2. Physics hands and finger
-physics come in build 3.
+Build 1 (PR #68): the VR tab, vignette, head-in-wall fade, height modes,
+real crouch and jump, grip toggle, aim smoothing. Build 2: teleport, world
+size, which stick moves, body calibration (height and arms) and the shot
+study (does the game shoot from the muzzle?). Still to come: the gun in the
+left hand (full left-handed mode), then physics hands and finger physics.
 
 ## The VR tab (src/vr/vr_options.cpp, src/vr/vr_menu_model.cpp)
 
@@ -22,16 +24,19 @@ writes the ini key(s) into `hole-vr.ini` in place (comments and layout kept,
 
 | Row | Choices | ini key(s) |
 |---|---|---|
+| Moving | Smooth, Teleport | `locomotion` |
 | Turning | Smooth, Snap | `turn_mode` |
 | Snap turn | 15, 30, 45, 60, 90 deg | `snap_turn_degrees` |
 | Turn speed | 60, 90, 120, 180, 240 deg/s | `smooth_turn_speed` |
-| Move toward | Where you look, Left hand | `move_direction` |
+| Move stick | Left, Right | `move_stick` |
+| Move toward | Where you look, Stick hand | `move_direction` |
 | Vignette moving | Off, Light, Medium, Strong | `comfort_vignette_move` (0, 0.35, 0.6, 0.85) |
 | Vignette turning | Off, Light, Medium, Strong | `comfort_vignette_turn` |
 | Head in a wall | Fades, No fade | `head_wall_fade` |
 | Height | Character, Your own, Seated | `fixed_height` + `height_mode` |
 | Real crouch | On, Off | `physical_crouch` |
 | Hop to jump | Off, On | `physical_jump` |
+| World size | 80% to 120% | `world_scale` (0.8 to 1.2) |
 | Room walking | On, Off | `room_scale_follow` |
 | Grip | Hold, Toggle | `grip_toggle` |
 | Aiming eye | Right, Left | `dominant_eye_right` |
@@ -39,7 +44,7 @@ writes the ini key(s) into `hole-vr.ini` in place (comments and layout kept,
 | Rifle stock | On, Off | `rifle_virtual_stock` |
 | Gun stops at walls | On, Off | `gun_wall_collision` |
 | Gun kick | Off, Light, Normal, Strong | `gun_recoil_kick` |
-| Measure arms | (action) | starts the arm measure 5 s after the menu closes |
+| Calibrate body | (action) | after the menu closes: height at 2 to 4 s (`standing_height_cm`), arms at 5 s (`body-measure.ini`) |
 
 Why cycle buttons and not the game's sliders, checkboxes and dropdowns: the
 game's option rows are bound to its own settings object, and dropdowns open a
@@ -78,28 +83,79 @@ levels. Each frame picks one part of it.
 
 ## Grip toggle and aim smoothing
 
-- **Grip: Toggle** (`grip_toggle=1`): squeeze once to grab a magazine, the
-  gun's front (support hand) or the pistol from its holster, and squeeze again
-  to let go. The old `holster_pistol_grip_toggle` still works when
+- **Grip: Toggle** (`grip_toggle=1`): squeeze once to take a magazine or to
+  draw the pistol from its holster, and squeeze again to let go. The slide and
+  the support hand on the gun's front stay hold-to-grab. The old `holster_pistol_grip_toggle` still works when
   `grip_toggle` is not set.
 - **Aim smoothing**: takes out small shakes of the gun hand (under a few
   degrees). Fast swings and big moves (over 20 deg in a frame) are not slowed.
+
+## Teleport (src/vr/teleport.cpp, src/vr/teleport_math.cpp)
+
+Moving: Teleport (`locomotion=teleport`). Push the move stick forward: an arc
+of small balls comes out of that hand (a throw at 8.5 m/s, up to about 8 m on
+flat ground) and a flat disc shows where you land. The disc only shows on a
+floor you can stand on: not steeper than about 45 degrees, not more than
+1.5 m above your feet, not right at your feet. Let go of the stick to go
+there: the view blinks black for 0.2 s and the character is moved with the
+engine's own teleport (`K2_TeleportTo`, which refuses a spot the capsule
+does not fit). Pull the stick back to cancel. Turning stays on the other
+stick. The balls and disc are the engine's sphere mesh, made once per level
+on the player, with no collision and no shadow.
+
+## World size
+
+`world_scale` scales how far the tracking moves you in the game: the eye
+spacing, head movement and hands together. 1.2 makes the world look 20%
+bigger (you feel smaller). Done in the stereo view offset (stereo.cpp
+`WorldScale`), so the hands, holsters and wall checks all follow.
+
+## Which stick moves
+
+`move_stick=right` swaps the two sticks: the right stick moves (its click
+sprints) and the left stick turns, jumps and crouches. The gun stays in the
+right hand. Putting the gun in the left hand is a later change.
+
+## Body calibration
+
+Calibrate body on the VR tab. After the menu closes, stand straight with your
+arms straight out to the sides. At 2 s both controllers buzz and your eye
+height is measured for 2 s (the highest point), then saved as
+`standing_height_cm` (a strong buzz). At 5 s the body measures your arms as
+before (left stick click 2 s still works too). Real crouch uses the standing
+height from the start of every run instead of learning it.
+
+## Shot study (does the game shoot from the muzzle?)
+
+At the first shots of every run the log gets, per shot, where a line from the
+muzzle along the barrel lands and where a line from the game camera along the
+view lands, with the distance between them. At the first shot it also lists
+the gun's and player's functions and variables with fire, shot, trace,
+bullet, muzzle, aim, hit, projectile, spread, damage or camera in the name, and
+for 0.4 s around the first three shots the weapon lab trace logs the game's
+own gun and player events. With the owner's report of where the bullet hole
+appeared, this says whether shots need moving to the muzzle.
 
 ## Log lines to check after a test
 
 - `vr options: ready (a VR tab is added to Options)` at start.
 - `vr options: following clicks through ...` the first time Options opens.
 - `vr options: VR tab button added to ...` and `vr options: VR page added to
-  Options (18 rows ...)` each time Options opens.
+  Options (22 rows ...)` each time Options opens.
 - `vr options: VR tab opened` when the VR tab is clicked.
 - `vr options: <row> -> <choice> (key=value)` and `settings: saved key=value in
   hole-vr.ini` on each click, then `controls: settings changed (...)`.
 - `comfort: head inside a wall or object, view faded` / `head out of the wall
   again after N s`.
 - `controls: physical crouch (...)` / `physical stand (...)`.
+- `teleport: arc uses ...`, `teleport: moved N cm`, `teleport: no room ...`.
+- `controls: height measured: your eyes are N cm above the floor`.
+- `shot study 1: barrel line hits ... camera line hits ... N cm apart`, `shot
+  study: gun ... fire functions: ...`, `lab: [..s] gun.<event>`.
 
 ## Tests
 
 - `tests/test_comfort.cpp`: vignette texture, levels, smoothing, real crouch
   and jump, aim smoothing, grip toggle.
 - `tests/test_vr_options.cpp`: ini edit in place, menu rows, current choice.
+- `tests/test_teleport.cpp`: arc, stick gesture, landing check.

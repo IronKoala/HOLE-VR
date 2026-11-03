@@ -15,6 +15,7 @@
 #include "ue/process_event.h"
 #include "ue/reflection.h"
 #include "vr/body/body.h"
+#include "vr/controls.h"
 #include "vr/input.h"
 #include "vr/vr_menu_model.h"
 
@@ -278,7 +279,9 @@ void ClickRow(RowWidget& r) {
     const auto& row = vr_menu::Rows()[static_cast<size_t>(r.row)];
     if (row.kind == vr_menu::RowKind::kMeasureArms) {
         body::RequestMeasure();
-        log::Info("vr options: Measure arms clicked; the measure starts 5 s after the game runs again");
+        controls::RequestHeightMeasure();
+        log::Info("vr options: Calibrate body clicked; once the menu closes, stand straight with your arms out to "
+                  "the sides (height after 2 s, arms after 5 s)");
         input::Haptic(input::kLeft, 0.4f, 0.05f);
         return;
     }

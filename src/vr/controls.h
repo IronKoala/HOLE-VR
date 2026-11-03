@@ -11,5 +11,8 @@ void Init();
 // Registers the late tick that puts holstered items on the VR body. Call
 // after body::Init(), so it runs after the body is posed for the frame.
 void InitLate();
+// VR tab "Calibrate body": measures standing eye height once the menu closes
+// (stand straight for 4 s). Saved as standing_height_cm.
+void RequestHeightMeasure();
 
 }  // namespace holevr::vr::controls

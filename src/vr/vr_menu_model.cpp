@@ -9,6 +9,8 @@ namespace holevr::vr::vr_menu {
 const std::vector<Row>& Rows() {
     using K = RowKind;
     static const std::vector<Row> rows = {
+        {"Moving", K::kChoice,
+         {{"Smooth", {{"locomotion", "smooth"}}}, {"Teleport", {{"locomotion", "teleport"}}}}, 0},
         {"Turning", K::kChoice, {{"Smooth", {{"turn_mode", "1"}}}, {"Snap", {{"turn_mode", "0"}}}}, 0},
         {"Snap turn",
          K::kChoice,
@@ -26,9 +28,11 @@ const std::vector<Row>& Rows() {
           {"180 deg/s", {{"smooth_turn_speed", "180"}}},
           {"240 deg/s", {{"smooth_turn_speed", "240"}}}},
          1},
+        {"Move stick", K::kChoice,
+         {{"Left", {{"move_stick", "left"}}}, {"Right", {{"move_stick", "right"}}}}, 0},
         {"Move toward",
          K::kChoice,
-         {{"Where you look", {{"move_direction", "0"}}}, {"Left hand", {{"move_direction", "1"}}}},
+         {{"Where you look", {{"move_direction", "0"}}}, {"Stick hand", {{"move_direction", "1"}}}},
          0},
         {"Vignette moving",
          K::kChoice,
@@ -54,6 +58,14 @@ const std::vector<Row>& Rows() {
          0},
         {"Real crouch", K::kChoice, {{"On", {{"physical_crouch", "1"}}}, {"Off", {{"physical_crouch", "0"}}}}, 0},
         {"Hop to jump", K::kChoice, {{"Off", {{"physical_jump", "0"}}}, {"On", {{"physical_jump", "1"}}}}, 0},
+        {"World size",
+         K::kChoice,
+         {{"80%", {{"world_scale", "0.8"}}},
+          {"90%", {{"world_scale", "0.9"}}},
+          {"100%", {{"world_scale", "1"}}},
+          {"110%", {{"world_scale", "1.1"}}},
+          {"120%", {{"world_scale", "1.2"}}}},
+         2},
         {"Room walking", K::kChoice, {{"On", {{"room_scale_follow", "1"}}}, {"Off", {{"room_scale_follow", "0"}}}}, 0},
         {"Grip", K::kChoice, {{"Hold", {{"grip_toggle", "0"}}}, {"Toggle", {{"grip_toggle", "1"}}}}, 0},
         {"Aiming eye", K::kChoice,
@@ -76,7 +88,7 @@ const std::vector<Row>& Rows() {
           {"Normal", {{"gun_recoil_kick", "1"}}},
           {"Strong", {{"gun_recoil_kick", "1.5"}}}},
          2},
-        {"Measure arms", K::kMeasureArms, {{"click, then close menu", {}}}, 0},
+        {"Calibrate body", K::kMeasureArms, {{"click, then close menu", {}}}, 0},
     };
     return rows;
 }

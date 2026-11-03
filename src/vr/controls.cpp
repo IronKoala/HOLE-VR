@@ -2,6 +2,7 @@
 
 #include <windows.h>
 
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -9,6 +10,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <utility>
 
 #include "core/config.h"
 #include "core/log.h"
@@ -22,6 +24,7 @@
 #include "vr/body/body.h"
 #include "vr/comfort.h"
 #include "vr/comfort_math.h"
+#include "vr/teleport.h"
 #include "vr/hands.h"
 #include "vr/input.h"
 #include "vr/interact/holster.h"
@@ -121,6 +124,9 @@ struct Settings {
     bool room_scale = true;        // the character follows you around the room
     // VR tab settings (2026-11-03).
     bool grip_toggle = false;      // magazines: squeeze to take, squeeze again to let go
+    bool teleport = false;         // locomotion=teleport: the left stick aims a teleport arc
+    double standing_height_cm = 0; // measured standing head height (0 = learn it as you play)
+    bool swap_sticks = false;      // move_stick=right: the right stick moves, the left one turns
     double aim_smoothing = 0.0;    // 0 off .. 1 strongest
     bool real_height = false;      // fixed_height=0: the view follows your real head height
     bool seated = false;           // height_mode=seated
@@ -167,6 +173,9 @@ void LoadSettings() {
     // One grip toggle for everything held (the pistol's own key still works
     // when grip_toggle isn't in the ini yet).
     g_set.grip_toggle = config::GetBool("grip_toggle", false);
+    g_set.teleport = config::GetString("locomotion", "smooth") == "teleport";
+    g_set.standing_height_cm = config::GetFloat("standing_height_cm", 0.f);
+    g_set.swap_sticks = config::GetString("move_stick", "left") == "right";
     g_set.holster_toggle = config::GetBool("grip_toggle", config::GetBool("holster_pistol_grip_toggle", false));
     g_set.aim_smoothing = std::fmax(0.0, std::fmin(1.0, config::GetFloat("aim_smoothing", 0.f)));
     g_set.real_height = !config::GetBool("fixed_height", true);
@@ -360,10 +369,16 @@ void Locomotion(UObject player, const input::Snapshot& s, double dt) {
 
     double mx = left.stick_x, my = left.stick_y;
     double mag = std::sqrt(mx * mx + my * my);
-    if (mag > g_set.deadzone) {
+    // Teleport mode: the stick aims an arc instead of walking.
+    static bool s_teleport_on = false;
+    const bool teleport_now = g_set.teleport && !ui_panel::MenuOpen();
+    if (teleport_now) teleport::Update(player, left, g_set.swap_sticks ? input::kRight : input::kLeft);
+    else if (s_teleport_on) teleport::Hide();
+    s_teleport_on = teleport_now;
+    if (!g_set.teleport && mag > g_set.deadzone) {
         double scale = std::fmin(1.0, (mag - g_set.deadzone) / (1.0 - g_set.deadzone)) / mag;
         double yaw = 0;
-        hands::HandState lh = hands::Get(hands::kLeft);
+        hands::HandState lh = hands::Get(g_set.swap_sticks ? hands::kRight : hands::kLeft);
         hands::Pose head;
         if (g_set.move_with_hand && lh.valid) yaw = YawOf(lh.aim.rotation);
         else if (hands::Head(&head)) yaw = YawOf(head.rotation);
@@ -1585,15 +1600,64 @@ void RealHeightCrouchView(UObject player, bool crouched, bool known) {
     stereo::SetViewRaiseCm(g_cam.extra);
 }
 
+// Body calibration (VR tab: Calibrate body): after the menu closes, 2 s to
+// stand up straight, then the highest head height over 2 s is your standing
+// height. Saved as standing_height_cm, so real crouch knows it from the start.
+struct HeightMeasure {
+    std::atomic<bool> requested{false};
+    double start = -1;
+    double best = 0;
+    double applied_cm = -1;
+} g_height;
+
+void HeightCalibration(double head_m) {
+    if (g_height.requested.exchange(false)) {
+        g_height.start = g_clock;
+        g_height.best = 0;
+        log::Info("controls: height measure: stand up straight and look ahead");
+    }
+    if (g_height.start < 0) return;
+    const double t = g_clock - g_height.start;
+    if (t < 2.0) return;
+    if (g_height.best == 0) {
+        input::Haptic(input::kLeft, 0.3f, 0.08f);
+        input::Haptic(input::kRight, 0.3f, 0.08f);
+    }
+    g_height.best = std::fmax(g_height.best, head_m);
+    if (t < 4.0) return;
+    g_height.start = -1;
+    const double cm = std::round(g_height.best * 100.0);
+    if (cm < 100 || cm > 230) {
+        log::Warn("controls: height measure gave %.0f cm, which can't be right; not kept", cm);
+        return;
+    }
+    g_phys.SetStanding(cm / 100.0);
+    g_height.applied_cm = cm;
+    g_set.standing_height_cm = cm;
+    char v[32];
+    std::snprintf(v, sizeof(v), "%.0f", cm);
+    config::Set("standing_height_cm", v);
+    input::Haptic(input::kLeft, 0.6f, 0.15f);
+    input::Haptic(input::kRight, 0.6f, 0.15f);
+    log::Info("controls: height measured: your eyes are %.0f cm above the floor standing (real crouch uses this)",
+              cm);
+}
+
 void PhysicalCrouchAndJump(UObject player) {
     bool known = false;
     const bool crouched = GameCrouched(player, &known);
     RealHeightCrouchView(player, crouched, known);
     g_phys.Configure(g_set.physical_crouch, g_set.physical_crouch_cm, g_set.physical_jump);
-    if (!g_set.physical_crouch && !g_set.physical_jump) return;
+    if (g_set.standing_height_cm >= 100 && g_set.standing_height_cm != g_height.applied_cm) {
+        g_phys.SetStanding(g_set.standing_height_cm / 100.0);
+        g_height.applied_cm = g_set.standing_height_cm;
+        log::Info("controls: standing height %.0f cm (measured earlier)", g_set.standing_height_cm);
+    }
     xr::EyeView v[2];
     if (!xr::LatestViews(v)) return;
     const double head_m = (v[0].pose.position.y + v[1].pose.position.y) * 0.5;
+    HeightCalibration(head_m);
+    if (!g_set.physical_crouch && !g_set.physical_jump) return;
     const comfort::BodyEvent e = g_phys.Update(head_m, g_dt);
     using E = comfort::BodyEvent;
     if (e == E::kCrouch || e == E::kStand) {
@@ -1881,6 +1945,100 @@ void HookChargeTimeline() {
 // where the muzzle points against where the gun frame points, the player's
 // control rotation and the game camera, so the log shows which one the
 // game aims its bullets with. First 12 shots per launch.
+// ---- shot study (muzzle trace) ----
+// Does the game aim its shots from the gun's muzzle or from the camera? The
+// first shots of a run log where a line from the muzzle along the barrel
+// lands and where a line from the camera along the view lands, the game's
+// own gun/player events for a moment around the shot (weapon lab trace),
+// and once, the gun's and player's fire-related functions and variables.
+bool TraceFirstHit(UObject player, UObject gun, const FVector& a, const FVector& b, FVector* at, std::string* what) {
+    static UObject ksl = 0, gps = 0;
+    static int lookups = 0;
+    if ((!ksl || !gps) && lookups < 3) {
+        ++lookups;
+        if (!ksl) ksl = ue::FindObject("KismetSystemLibrary /Script/Engine.Default__KismetSystemLibrary");
+        if (!gps) gps = ue::FindObject("GameplayStatics /Script/Engine.Default__GameplayStatics");
+    }
+    if (!ksl || !gps) return false;
+    UObject ignore[2] = {player, gun};
+    TArrayRaw arr{ignore, gun ? 2 : 1, 2};
+    ue::Call t(ksl, "LineTraceSingle");
+    t.Set("WorldContextObject", player).Set("Start", a).Set("End", b).Set("TraceChannel", uint8_t{0})
+        .Set("bTraceComplex", false).Set("ActorsToIgnore", arr).Set("bIgnoreSelf", true);
+    if (!t.Invoke() || !t.Result<bool>()) return false;
+    int32_t hit_size = 0;
+    uint8_t* hit = t.Raw("OutHit", &hit_size);
+    if (!hit) return false;
+    ue::Call br(gps, "BreakHitResult");
+    int32_t in_size = 0;
+    uint8_t* in = br.Raw("Hit", &in_size);
+    if (!in || in_size != hit_size) return false;
+    std::memcpy(in, hit, static_cast<size_t>(hit_size));
+    if (!br.Invoke() || !br.Get<bool>("bBlockingHit")) return false;
+    *at = br.Get<FVector>("ImpactPoint");
+    UObject actor = br.Get<UObject>("HitActor");
+    *what = actor ? ue::GetName(actor) : "nothing";
+    return true;
+}
+
+bool FireWord(const std::string& name) {
+    static const char* words[] = {"fire", "shoot", "shot", "trace", "bullet", "muzzle", "aim", "hit",
+                                  "projectile", "spread", "damage", "camera"};
+    std::string n;
+    for (char c : name) n += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    for (const char* w : words)
+        if (n.find(w) != std::string::npos) return true;
+    return false;
+}
+
+void StudyFireClass(UObject obj, const char* who) {
+    for (UObject c = ue::GetClass(obj); c; c = ue::reflection::GetSuper(c)) {
+        std::string cn = ue::GetName(c);
+        if (cn.size() < 2 || cn.compare(cn.size() - 2, 2, "_C") != 0) break;
+        std::string fns, vars;
+        for (UObject f : ue::reflection::GetFunctions(c))
+            if (FireWord(ue::GetName(f))) fns += ue::GetName(f) + " ";
+        for (const auto& p : ue::reflection::GetProperties(c))
+            if (FireWord(p.name)) vars += p.name + ":" + p.type + " ";
+        log::Info("shot study: %s %s fire functions: %s", who, cn.c_str(), fns.empty() ? "none" : fns.c_str());
+        log::Info("shot study: %s %s fire variables: %s", who, cn.c_str(), vars.empty() ? "none" : vars.c_str());
+    }
+}
+
+double g_lab_trace_off_at = -1;
+
+void ShotStudy(UObject player, game::Gun& gun, int n, const FVector& muzzle, const FVector& barrel,
+               const FRotator& ctrl) {
+    if (n == 1) {
+        StudyFireClass(gun.Object(), "gun");
+        StudyFireClass(player, "player");
+    }
+    if (n <= 3 && g_lab_trace_off_at < 0 && !config::GetBool("lab_trace_on_start", false)) {
+        game::weapon_lab::SetTrace(true);
+        g_lab_trace_off_at = g_clock + 0.4;
+    }
+    if (n > 6) return;
+    FVector m_at, c_at, cam;
+    std::string m_what, c_what;
+    const bool m_hit = TraceFirstHit(player, gun.Object(), muzzle, muzzle + barrel * 5000.0, &m_at, &m_what);
+    FVector view = ToQuat(ctrl).Rotate(FVector{1, 0, 0});
+    const bool have_cam = stereo::GameCameraLocation(&cam);
+    const bool c_hit =
+        have_cam && TraceFirstHit(player, gun.Object(), cam, cam + view * 5000.0, &c_at, &c_what);
+    FVector apart = m_at - c_at;
+    log::Info("shot study %d: barrel line hits %s at (%.0f %.0f %.0f); camera line hits %s at (%.0f %.0f %.0f); %.0f cm "
+              "apart. If the bullet hole is at the barrel point, shots come from the muzzle.",
+              n, m_hit ? m_what.c_str() : "nothing", m_at.X, m_at.Y, m_at.Z, c_hit ? c_what.c_str() : "nothing",
+              c_at.X, c_at.Y, c_at.Z, m_hit && c_hit ? Len(apart) : -1.0);
+}
+
+void ShotStudyTick() {
+    if (g_lab_trace_off_at > 0 && g_clock >= g_lab_trace_off_at) {
+        g_lab_trace_off_at = -1;
+        game::weapon_lab::SetTrace(false);
+    }
+}
+
 void LogShot(UObject player, game::Gun& gun) {
     static int n = 0;
     if (++n > 12) return;
@@ -1908,6 +2066,7 @@ void LogShot(UObject player, game::Gun& gun) {
     ue::GetProp(gun.Object(), "AmmoObj_InChamber", round);
     log::Info("shot %d: magazine %s, chambered round %s", n, mag ? ue::GetName(mag).c_str() : "none",
               round ? ue::GetName(round).c_str() : "none");
+    ShotStudy(player, gun, n, muzzle ? mloc : W.grip_world + gfwd * W.muzzle_dist, gfwd, ctrl);
 }
 
 // ---- holsters ----
@@ -2150,6 +2309,15 @@ void OnTick(UObject player, float dt) {
         e.grip_value = e.trigger = 0.f;
         s.hand[input::kRight].trigger_button = input::Button{};
     }
+    if (g_set.swap_sticks) {
+        // Stick roles swapped (left-handed players): the right stick moves
+        // (and its click sprints), the left one turns, jumps and crouches.
+        input::HandInput& a = s.hand[input::kLeft];
+        input::HandInput& b = s.hand[input::kRight];
+        std::swap(a.stick_x, b.stick_x);
+        std::swap(a.stick_y, b.stick_y);
+        std::swap(a.stick_click, b.stick_click);
+    }
     Locomotion(player, s, dt);
     RoomScaleFollow(player);
     GameActions(player, s);
@@ -2185,6 +2353,7 @@ void OnTick(UObject player, float dt) {
     }
     HookChargeTimeline();
     HookPlayerRecoil(player);
+    ShotStudyTick();
     {
         // A round leaving the gun while the trigger is held = a shot (works
         // for full auto too). Racking also removes a round, but not with the
@@ -2327,15 +2496,21 @@ void ReloadSettings() {
         W.holster.Configure(g_spots[kPistolSpot].radius,
                             g_set.holster_toggle ? interact::DrawMode::kToggle : interact::DrawMode::kHold);
     g_aim_smoother.Reset();
-    log::Info("controls: settings changed (%s turn %.0f deg / %.0f deg/s, move by %s, grip %s, aim smoothing %.2f, "
+    log::Info("controls: settings changed (%s, %s turn %.0f deg / %.0f deg/s, move by %s, grip %s, aim smoothing %.2f, "
               "height %s, physical crouch %s, physical jump %s)",
-              g_set.smooth_turn ? "smooth" : "snap", g_set.snap_degrees, g_set.smooth_speed,
-              g_set.move_with_hand ? "hand" : "head", g_set.grip_toggle ? "toggle" : "hold", g_set.aim_smoothing,
+              g_set.teleport ? "teleport" : "smooth moving", g_set.smooth_turn ? "smooth" : "snap", g_set.snap_degrees,
+              g_set.smooth_speed, g_set.move_with_hand ? "hand" : "head", g_set.grip_toggle ? "toggle" : "hold",
+              g_set.aim_smoothing,
               g_set.real_height ? "real" : g_set.seated ? "seated" : "fixed", g_set.physical_crouch ? "on" : "off",
               g_set.physical_jump ? "on" : "off");
 }
 
 }  // namespace
+
+void RequestHeightMeasure() {
+    g_height.requested.store(true);
+    log::Info("controls: height measure asked for from the VR tab; it starts when the menu closes");
+}
 
 void Init() {
     LoadSettings();

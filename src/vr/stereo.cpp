@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <d3d12.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -226,7 +227,17 @@ void RunFrameCallback() {
     running = false;
 }
 
-void HookCalcOffset(void* self, int32_t view_index, FRotator* rotation, float world_to_meters, FVector* location) {
+// world_scale: how big the world looks. 1 = true size; 1.2 = the world looks
+// 20% bigger (you feel smaller). Done by scaling the tracking-to-world factor,
+// which scales the eye spacing, head movement and hands together.
+double WorldScale() {
+    double s = config::GetFloat("world_scale", 1.f);
+    if (!(s > 0)) s = 1.0;
+    return std::clamp(s, 0.5, 2.0);
+}
+
+void HookCalcOffset(void* self, int32_t view_index, FRotator* rotation, float engine_world_to_meters,
+                    FVector* location) {
     HOLEVR_FIRST_CALL("CalculateStereoViewOffset");
     struct AfterRightEye {
         int32_t i;
@@ -237,9 +248,10 @@ void HookCalcOffset(void* self, int32_t view_index, FRotator* rotation, float wo
     xr::EyeView views[2];
     // A left-eye request starts a new frame: take a fresh tracking sample.
     if (view_index < 0 || view_index > 1 || !FrameViews(view_index == 0, views)) {
-        o_calc_offset(self, view_index, rotation, world_to_meters, location);
+        o_calc_offset(self, view_index, rotation, engine_world_to_meters, location);
         return;
     }
+    const double world_to_meters = engine_world_to_meters / WorldScale();
     if (view_index == 1) xr::SetRenderedViews(views);
     if (view_index == 0) {
         std::lock_guard<std::mutex> lock(g_world_mutex);
