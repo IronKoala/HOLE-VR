@@ -221,8 +221,6 @@ void PushViews(const EyeView views[2]) {
     g_last_push_qpc = now.QuadPart;
 }
 
-// At Present: the views the picture being presented was drawn with. Falls
-// back to the newest views when nothing usable is queued.
 // ---- predicting ahead ----
 // The game takes a frame's head pose (g_latest, located at the headset frame
 // then current) and its picture reaches the headset about two frames later
@@ -249,6 +247,8 @@ void UpdateAhead(XrDuration period, bool pairing) {
     g_ahead_ns.store(period > 0 ? static_cast<long long>(frames * static_cast<double>(period)) : 0);
 }
 
+// At Present: the views the picture being presented was drawn with. Falls
+// back to the newest views when nothing usable is queued.
 void TakePresentedViews(EyeView out[2], bool* have, XrTime display_time, XrDuration period) {
     std::lock_guard<std::mutex> lock(g_view_mutex);
     LARGE_INTEGER now;
