@@ -122,6 +122,35 @@ private:
     FQuat place_q_;
 };
 
+// Keeping the view with the hands. The tick places the hands, the gun and
+// the body for the camera at `placed_for` (the previous view, plus room-scale
+// steps, plus the tick's lead). The game's camera for this frame ends up at
+// `game_cam`. Whatever moved the camera after the tick (the body animation
+// the camera rides on: a sprint start, a crouch, a fall) the lead could not
+// see, so drawing the views at game_cam leaves everything the mod placed off
+// by that miss for a frame, and off the other way the next frame, when the
+// lead counts the same move again (7-9 cm both ways in the owner's
+// 2026-11-03 14:02 run). Instead the views are drawn `follow` of the way from
+// placed_for to game_cam: what the mod placed is off from them by only
+// follow * miss, and the rest of the camera's move comes in over the next
+// frames (half of it in about 4 frames at 0.15). follow 1 draws the game's
+// camera exactly. Snaps to game_cam without a lead (no tick since the last
+// views: paused, loading) or when the miss is over snap_cm (a teleport).
+struct Settle {
+    FVector view;      // where this frame's views are drawn from
+    FVector mismatch;  // the mod's placements against those views: follow * miss
+    FVector held_off;  // view - game_cam
+    bool snapped = false;
+};
+Settle SettleView(const FVector& game_cam, const FVector& placed_for, double follow, bool have_lead, double snap_cm);
+
+struct SettleStats {
+    long long frames = 0, snaps = 0;
+    double mismatch_sum = 0, mismatch_max = 0;
+    double off_sum = 0, off_max = 0;
+    void Add(const Settle& s);
+};
+
 double AngleDeg(const FQuat& q);  // rotation angle of q, 0..180
 
 double Length(const FVector& v);

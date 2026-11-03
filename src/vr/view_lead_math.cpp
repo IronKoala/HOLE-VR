@@ -158,4 +158,32 @@ void GunShake::ResetTotals() {
     moved_max = 0;
 }
 
+Settle SettleView(const FVector& game_cam, const FVector& placed_for, double follow, bool have_lead, double snap_cm) {
+    Settle s;
+    const FVector miss = game_cam - placed_for;
+    if (!have_lead || !(follow < 1.0) || !(Length(miss) <= snap_cm)) {
+        s.view = game_cam;
+        s.snapped = true;
+        return s;
+    }
+    if (!(follow > 0.0)) follow = 0.0;
+    s.mismatch = miss * follow;
+    s.view = placed_for + s.mismatch;
+    s.held_off = s.view - game_cam;
+    return s;
+}
+
+void SettleStats::Add(const Settle& s) {
+    ++frames;
+    if (s.snapped) {
+        ++snaps;
+        return;
+    }
+    const double m = Length(s.mismatch), o = Length(s.held_off);
+    mismatch_sum += m;
+    off_sum += o;
+    if (m > mismatch_max) mismatch_max = m;
+    if (o > off_max) off_max = o;
+}
+
 }  // namespace holevr::vr::view_lead

@@ -159,7 +159,59 @@ static void TestGunShake() {
     EXPECT(p.place_n[0] == 0 && p.place_n[1] == 0 && p.place_cm_max[0] == 0);
 }
 
+// The camera moves v a frame, which the lead sees, and jumps j once at frame
+// `at` after the tick, which the lead only sees at the next tick (and then
+// counts again). Returns the largest |mismatch| between what the mod placed
+// and the drawn view, and the view's distance from the game camera at the end.
+static void RunSettle(double follow, double v, double j, int at, double* worst_mismatch, double* mismatch_at,
+                      double* mismatch_next, double* off_end) {
+    FVector game{0, 0, 0}, view{0, 0, 0};
+    *worst_mismatch = *mismatch_at = *mismatch_next = 0;
+    for (int n = 1; n <= 40; ++n) {
+        game = game + FVector{v + (n == at ? j : 0.0), 0, 0};
+        const FVector lead{v + (n == at + 1 ? j : 0.0), 0, 0};
+        const FVector placed = view + lead;
+        const Settle s = SettleView(game, placed, follow, true, 30.0);
+        const double m = Length(s.view - placed);
+        if (m > *worst_mismatch) *worst_mismatch = m;
+        if (n == at) *mismatch_at = m;
+        if (n == at + 1) *mismatch_next = m;
+        view = s.view;
+    }
+    *off_end = Length(view - game);
+}
+
+static void TestSettle() {
+    double worst, at, next, off;
+    // Walking, all seen by the lead: the view is the game camera, nothing off.
+    RunSettle(0.15, 4.0, 0.0, 10, &worst, &at, &next, &off);
+    EXPECT(worst < 1e-9 && off < 1e-9);
+    // As before (follow 1): a 9 cm jump after the tick puts the gun 9 cm off,
+    // then 9 cm off the other way the next frame.
+    RunSettle(1.0, 4.0, 9.0, 10, &worst, &at, &next, &off);
+    EXPECT(std::fabs(at - 9.0) < 1e-9 && std::fabs(next - 9.0) < 1e-9 && off < 1e-9);
+    // Settled: off by 0.15 of it, then much less, and the view catches up.
+    RunSettle(0.15, 4.0, 9.0, 10, &worst, &at, &next, &off);
+    EXPECT(std::fabs(at - 1.35) < 1e-9);
+    EXPECT(next < 0.25);
+    EXPECT(worst < 1.36);
+    EXPECT(off < 0.05);
+    // No lead (no tick since the last views) or a teleport: the game camera.
+    Settle s = SettleView({100, 0, 0}, {95, 0, 0}, 0.15, false, 30.0);
+    EXPECT(s.snapped && std::fabs(s.view.X - 100) < 1e-9);
+    s = SettleView({100, 0, 0}, {50, 0, 0}, 0.15, true, 30.0);
+    EXPECT(s.snapped && std::fabs(s.view.X - 100) < 1e-9);
+    s = SettleView({10, 0, 0}, {0, 0, 0}, 0.15, true, 30.0);
+    EXPECT(!s.snapped && std::fabs(s.view.X - 1.5) < 1e-9 && std::fabs(s.held_off.X + 8.5) < 1e-9);
+    SettleStats st;
+    st.Add(s);
+    st.Add(SettleView({100, 0, 0}, {95, 0, 0}, 0.15, false, 30.0));
+    EXPECT(st.frames == 2 && st.snaps == 1 && std::fabs(st.mismatch_sum - 1.5) < 1e-9 &&
+           std::fabs(st.off_max - 8.5) < 1e-9);
+}
+
 int main() {
+    TestSettle();
     TestGunShake();
     TestWalking();
     TestTurning();
