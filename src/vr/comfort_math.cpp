@@ -186,7 +186,7 @@ GripView ToggleGrip(bool toggle, bool holding, bool down, bool pressed, bool rel
     return GripView{true, false, false};
 }
 
-double CameraHeight::Update(double rel_cm, bool crouched, bool crouch_press, bool real_mode, double dt) {
+double CameraHeight::Update(double rel_cm, bool crouched, bool crouch_press, bool still, bool real_mode, double dt) {
     if (!(dt > 0) || dt > 0.5 || !std::isfinite(rel_cm)) return extra_;
     if (crouch_press) {
         ++presses_;
@@ -223,8 +223,13 @@ double CameraHeight::Update(double rel_cm, bool crouched, bool crouch_press, boo
         holding_ = false;
         low_t_ = 0;
     } else {
-        low_t_ = drop_ > 8.0 && !explained ? low_t_ + dt : 0.0;
-        holding_ = low_t_ >= 1.5;
+        // Starts only after 2 s standing still with the camera low and no
+        // crouch; once started it lasts while the camera stays low, moving
+        // or not. Sprinting dips (2026-11-03 run: 11-26 cm every sprint) never
+        // start it.
+        const bool low = drop_ > 8.0 && !explained;
+        low_t_ = low && still ? low_t_ + dt : 0.0;
+        holding_ = low && (holding_ || low_t_ >= 2.0);
         want = holding_ ? drop_ : 0.0;
     }
     want = std::min(want, 80.0);

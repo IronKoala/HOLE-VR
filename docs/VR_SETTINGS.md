@@ -87,6 +87,21 @@ levels. Each frame picks one part of it.
 - **Hop to jump** (off by default): the head rising faster than 1.1 m/s while
   above standing height presses jump. Then 1 s before it can fire again.
 
+### Stick crouch check and the camera hold (controls.cpp)
+
+- **Stick crouch** (right stick down) sends the game's own crouch input. 0.4 s
+  later the character must be in the stance the press asked for
+  (`bIsCrouched`); if not, `Crouch`/`UnCrouch` is called directly. Crouching
+  ends a sprint. For 3 s after, a stance change nobody asked for is logged.
+  (Owner, 2026-11-03: "i cant stay crouched"; the run showed 11 presses in
+  10 s and no stance readout.)
+- **Camera hold** (Character and Seated height): if the game camera sits more
+  than 8 cm below its standing height with no crouch for 2 s while the
+  character stands still, the view is held at standing height until the
+  camera comes back. Sprinting lowers the game camera 11 to 26 cm on purpose,
+  so moving or sprinting never starts the hold (the first version did, on
+  every sprint).
+
 ## Grip toggle and aim smoothing
 
 - **Grip: Toggle** (`grip_toggle=1`): squeeze once to take a magazine or to
@@ -154,6 +169,10 @@ appeared, this says whether shots need moving to the muzzle.
 - `comfort: head inside a wall or object, view faded` / `head out of the wall
   again after N s`.
 - `controls: physical crouch (...)` / `physical stand (...)`.
+- `controls: crouch (right stick down)` / `stand up (...)`, then `stick crouch:
+  the character is crouched (the game's own crouch input did it)` or `... left
+  the character standing; calling Crouch directly`, and `... by itself N s
+  after` if something else changes it.
 - `teleport: arc uses ...`, `teleport: moved N cm`, `teleport: no room ...`.
 - `controls: height measured: your eyes are N cm above the floor`.
 - `vr options: Edit hand grips clicked ...` then `controls: opening/closing the
