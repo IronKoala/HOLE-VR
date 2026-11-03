@@ -107,7 +107,7 @@ struct Settings {
     double belt_below_head = 60.0;  // belt height when the VR body is off, cm below the headset
     bool rack_trace = false;            // per-frame slide log while racking (debug)
     double slide_pinch_radius = 6.5;    // pinch zone around the rear sight...
-    double slide_pinch_back = 10.0;     // ...stretched this far back along the slide (cm): the controller's grip
+    double slide_pinch_back = 14.0;     // ...stretched this far back along the slide (cm): the controller's grip
                                         // point sits 5-12 cm behind fingertips that pinch the rear of the slide
     double slide_grab_forward = 16.0;   // pistol slide grab zone reaches this far forward of the rear grab point
     bool wall_collision = true;    // keep the gun out of walls
@@ -164,7 +164,7 @@ void LoadSettings() {
     g_set.slide_grab_forward = config::GetFloat("slide_grab_forward_cm", 16.f);
     g_set.rack_trace = config::GetBool("debug_rack_trace", false);
     g_set.slide_pinch_radius = config::GetFloat("slide_pinch_radius_cm", 6.5f);
-    g_set.slide_pinch_back = config::GetFloat("slide_pinch_back_cm", 10.f);
+    g_set.slide_pinch_back = config::GetFloat("slide_pinch_back_cm", 14.f);
     g_set.virtual_stock = config::GetBool("rifle_virtual_stock", true);
     g_set.stock_snap = config::GetFloat("rifle_stock_snap_cm", 12.f);
     g_set.stock_release = config::GetFloat("rifle_stock_release_cm", 20.f);

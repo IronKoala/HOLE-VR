@@ -47,7 +47,7 @@ struct SlideConfig {
     // sphere and the forward/back capsules are not used.
     bool use_span = false;
     FVector span_rear, span_front;    // parent space, cm
-    double span_radius = 7.0;
+    double span_radius = 8.5;
     double span_back_margin = 2.0;
     double span_front_margin = 2.0;
     // Pistol: pinch at the rear sight. Extra sphere, radius 0 = none.

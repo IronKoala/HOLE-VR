@@ -316,7 +316,7 @@ const Block kBlocks[] = {
      "slide_grab_forward_cm=16\n"
      "; Pinch at the rear sight: radius, and how far it stretches back along the slide (cm)\n"
      "slide_pinch_radius_cm=6.5\n"
-     "slide_pinch_back_cm=10\n"},
+     "slide_pinch_back_cm=14\n"},
     {"holster_pistol",
      "\n"
      "; --- Holsters on your VR body ---\n"

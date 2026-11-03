@@ -1150,8 +1150,14 @@ int PickSlideHold(const hands::HandState& h, const hands::Pose& gun, UObject gun
         to_sight = Length(at - (sight_at + FVector{along, 0, 0}));
     }
     int best;
+    // Rear half outside the pinch reach: owner 2026-11-03 10:47 kept getting
+    // the overhand pose when reaching for the pinch (fists 10-13 cm back and
+    // a little low, palm turned in). Overhand only when the palm faces down
+    // onto the top of the slide; any other rear grab is the pinch.
+    const bool palm_down_on_top = n.Z < -0.85 && (!shape || at.Z > sight_at.Z - 1.0);
     if (shape && to_sight < pinch_sight) best = kSlideRear;
     else if (at.X > split) best = kSlideFront;
+    else if (shape && !palm_down_on_top) best = kSlideRear;
     else best = kSlideOver;
     log::Info("body: slide grab: %s hold (fist (%.1f %.1f %.1f) from the grab point; %s; rear sight at (%.1f %.1f "
               "%.1f), %.1f cm from it, pinch within %.1f; front half from %.1f; palm in gun frame %.2f %.2f %.2f)",
