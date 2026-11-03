@@ -2185,6 +2185,12 @@ struct PressButton {
     PressPart parts[3];
     int n_parts = 0;
     bool inside[2] = {false, false};
+    // The button body (part 0 when it is the timer Mesh) sinks as a hand or
+    // the gun pushes down on its top: squashed from the top, bottom fixed.
+    bool body_rest = false;     // rest transform captured
+    UETransform rest{};         // world transform of the body at rest
+    double depth = 0.0;         // how far it is pushed in now, cm
+    bool armed = true;          // pushed back up since the last press
 };
 
 // The timer mesh's GetLocalBounds came back 0 x 0 x 0 in the owner's 10:56
@@ -2286,12 +2292,62 @@ void RefreshPressButtons(UObject player) {
     g_press.buttons.swap(found);
 }
 
+// Owner 2026-11-03 14:14: "as i push the button down i want the red part to
+// move down as i push it". The timer's red top is the Mesh part's top: how
+// far a hand or gun ball reaches below the top (over its footprint) sinks
+// it, up to kPressTravel; past kPressFire it presses. Side touches still
+// press at once (owner: any part of the hand or gun).
+constexpr double kPressTravel = 3.0;
+constexpr double kPressFire = 1.8;
+constexpr double kPressRearm = 0.6;
+
+void SetBodySquash(PressButton& b, double depth) {
+    if (!b.body_rest || b.n_parts == 0) return;
+    UObject comp = b.parts[0].comp;
+    const UETransform& t = b.rest;
+    const double sz = std::fabs(t.scale.Z);
+    const double h = (b.parts[0].mx.Z - b.parts[0].mn.Z) * sz;
+    if (h < 2.0) return;
+    const double k = std::fmax(0.5, (h - depth) / h);
+    // Keep the bottom where it was: bottom = loc + up * mn.Z * scale.
+    const FVector up = t.rotation.Rotate(FVector{0, 0, 1});
+    const FVector loc = t.translation + up * (b.parts[0].mn.Z * sz * (1.0 - k));
+    ue::Call sl(comp, "K2_SetWorldLocation");
+    sl.Set("NewLocation", ue::Vec3d{loc.X, loc.Y, loc.Z}).Set("bSweep", false).Set("bTeleport", true);
+    sl.Invoke();
+    ue::Call ss(comp, "SetWorldScale3D");
+    ss.Set("NewScale", ue::Vec3d{t.scale.X, t.scale.Y, t.scale.Z * k});
+    ss.Invoke();
+}
+
 void PhysicalButtons(UObject player) {
     RefreshPressButtons(player);
     for (PressButton& b : g_press.buttons) {
         if (!LiveObject(b.actor)) continue;
         UETransform tr[3];
         for (int i = 0; i < b.n_parts; ++i) tr[i] = ComponentToWorld(b.parts[i].comp);
+        // The body's rest pose: captured once, while it is not pushed in.
+        UObject body = 0;
+        ue::GetProp(b.actor, "Mesh", body);
+        const bool can_sink = b.n_parts > 0 && body && b.parts[0].comp == body;
+        if (can_sink && !b.body_rest) {
+            const FVector up = tr[0].rotation.Rotate(FVector{0, 0, 1});
+            if (up.Z > 0.95) {
+                ue::Call m(body, "SetMobility");
+                m.Set("NewMobility", uint8_t{2});   // Movable
+                m.Invoke();
+                b.rest = tr[0];
+                b.body_rest = true;
+                UObject sm = 0;
+                ue::GetProp(body, "StaticMesh", sm);
+                log::Info("controls: range timer button sinks when pushed (mesh %s, %.1f cm tall)",
+                          sm ? ue::GetName(sm).c_str() : "?",
+                          (b.parts[0].mx.Z - b.parts[0].mn.Z) * std::fabs(tr[0].scale.Z));
+            }
+        }
+        if (b.body_rest) tr[0] = b.rest;   // test against the button at rest
+        double push = 0.0;                 // deepest push from above, both hands
+        int push_hand = -1;
         for (int h = 0; h < 2; ++h) {
             const hands::HandState hs = hands::Get(h == 0 ? hands::kLeft : hands::kRight);
             if (!hs.valid) { b.inside[h] = false; continue; }
@@ -2312,23 +2368,34 @@ void PhysicalButtons(UObject player) {
                 for (double x = -4.0; x <= W.muzzle_dist + 0.1 && n < 16; x += 4.0)
                     pts[n++] = {W.grip_world + W.frame_rot.Rotate(FVector{x, 0, W.bore_height}), 2.5};
             }
-            auto ball_in = [&](const Ball& bl) {
+            // Side touch: a ball overlaps a part but is not over the body's top.
+            bool side = false;
+            double hand_push = 0.0;
+            for (int k = 0; k < n; ++k) {
+                const Ball& bl = pts[k];
                 for (int i = 0; i < b.n_parts; ++i) {
                     const UETransform& t = tr[i];
                     const FVector& mn = b.parts[i].mn;
                     const FVector& mx = b.parts[i].mx;
                     const FVector l = t.rotation.Inverse().Rotate(bl.p - t.translation);
-                    // Box in world cm (scaled), ball radius added on each side.
                     const double sx = std::fabs(t.scale.X), sy = std::fabs(t.scale.Y), sz = std::fabs(t.scale.Z);
+                    const bool over_xy = l.X > mn.X * sx && l.X < mx.X * sx && l.Y > mn.Y * sy && l.Y < mx.Y * sy;
+                    const double top = mx.Z * sz;
+                    if (i == 0 && b.body_rest && over_xy && l.Z > top - kPressTravel) {
+                        // Over the top: how far the ball's bottom is below it.
+                        hand_push = std::fmax(hand_push, top - (l.Z - bl.r));
+                        continue;
+                    }
                     if (l.X > mn.X * sx - bl.r && l.X < mx.X * sx + bl.r && l.Y > mn.Y * sy - bl.r &&
-                        l.Y < mx.Y * sy + bl.r && l.Z > mn.Z * sz - bl.r && l.Z < mx.Z * sz + bl.r)
-                        return true;
+                        l.Y < mx.Y * sy + bl.r && l.Z > mn.Z * sz - bl.r && l.Z < top + bl.r)
+                        side = true;
                 }
-                return false;
-            };
-            bool in = false;
-            for (int k = 0; k < n && !in; ++k) in = ball_in(pts[k]);
-            if (in && !b.inside[h] && g_clock >= g_press.ready_at) {
+            }
+            if (hand_push > push) {
+                push = hand_push;
+                push_hand = h;
+            }
+            if (side && !b.inside[h] && g_clock >= g_press.ready_at) {
                 g_press.ready_at = g_clock + 1.5;
                 bool on = false;
                 ue::GetProp(b.actor, "IsTimerON", on);
@@ -2336,10 +2403,33 @@ void PhysicalButtons(UObject player) {
                 c.Set("Actor", player).Set("SelectIndex", int32_t{0});
                 const bool ok = c.Invoke();
                 input::Haptic(h == 0 ? input::kLeft : input::kRight, 0.6f, 0.05f);
-                log::Info("controls: %s hand pressed the range timer button (timer was %s)%s",
+                log::Info("controls: %s hand touched the range timer (timer was %s)%s",
                           h == 0 ? "left" : "right", on ? "running" : "stopped", ok ? "" : ", call failed");
             }
-            b.inside[h] = in;
+            b.inside[h] = side;
+        }
+        if (!b.body_rest) continue;
+        // The red top follows the push, and springs back up when let go.
+        const double target = std::clamp(push, 0.0, kPressTravel);
+        const double back = 25.0 * g_dt;   // cm per tick going up
+        const double d = target >= b.depth ? target : std::fmax(target, b.depth - back);
+        if (std::fabs(d - b.depth) > 0.01) {
+            b.depth = d;
+            SetBodySquash(b, d);
+        }
+        if (b.depth < kPressRearm) b.armed = true;
+        if (b.armed && b.depth >= kPressFire && push_hand >= 0 && g_clock >= g_press.ready_at) {
+            b.armed = false;
+            g_press.ready_at = g_clock + 1.5;
+            bool on = false;
+            ue::GetProp(b.actor, "IsTimerON", on);
+            ue::Call c(b.actor, "Interact");
+            c.Set("Actor", player).Set("SelectIndex", int32_t{0});
+            const bool ok = c.Invoke();
+            input::Haptic(push_hand == 0 ? input::kLeft : input::kRight, 0.7f, 0.06f);
+            log::Info("controls: %s hand pushed the range timer button down %.1f cm (timer was %s)%s",
+                      push_hand == 0 ? "left" : "right", b.depth, on ? "running" : "stopped",
+                      ok ? "" : ", call failed");
         }
     }
 }
