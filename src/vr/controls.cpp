@@ -1582,39 +1582,85 @@ bool GameCrouched(UObject player, bool* known) {
     return (mem::ReadOr<uint8_t>(player + g_crouch_read.offset, 0) & g_crouch_read.mask) != 0;
 }
 
-// Real-height mode: the view follows your real head, so the game camera's
-// own crouch drop is given back (else crouching for real would lower the
-// view twice: once for your head, once for the character).
-struct CamHeight {
-    bool have_stand = false;
-    double stand_rel = 0;   // camera above the capsule's bottom while standing, cm
-    double extra = 0;       // what is given back to the view now, cm
-} g_cam;
+// The view's height against the game camera's. Real-height mode: the view
+// follows your real head, so the game camera's own drops (its crouch) are
+// given back, else crouching for real would lower the view twice. Character
+// and seated height: the game camera decides, except when it drops with no
+// crouch and stays down (2026-11-03: after two quick punches it sat 25 cm
+// low for the rest of the match); then the view is held at standing height.
+comfort::CameraHeight g_camh;
+UObject g_camh_player = 0;
+bool g_crouch_pressed = false;  // the stick crouch fired since the last check
+double g_camh_log_at = -1;
 
-void RealHeightCrouchView(UObject player, bool crouched, bool known) {
-    double want = 0;
+// Weapon lab trace (the game's own gun/player events) for a moment.
+double g_lab_trace_off_at = -1;
+void LabTraceFor(double seconds) {
+    if (config::GetBool("lab_trace_on_start", false)) return;
+    game::weapon_lab::SetTrace(true);
+    g_lab_trace_off_at = std::fmax(g_lab_trace_off_at, g_clock + seconds);
+}
+void LabTraceTick() {
+    if (g_lab_trace_off_at > 0 && g_clock >= g_lab_trace_off_at) {
+        g_lab_trace_off_at = -1;
+        game::weapon_lab::SetTrace(false);
+    }
+}
+
+// The game camera against the character's capsule: height above the feet
+// and distance from the capsule's middle line, cm.
+bool CameraOnCharacter(UObject player, double* rel, double* side) {
     FVector cam;
-    if (g_set.real_height && known && stereo::GameCameraLocation(&cam)) {
-        ue::Call loc(player, "K2_GetActorLocation");
-        UObject capsule = 0;
-        double half = 0;
-        if (ue::GetProp(player, "CapsuleComponent", capsule) && capsule) {
-            ue::Call h(capsule, "GetScaledCapsuleHalfHeight");
-            if (h.Invoke()) half = h.Result<float>();
+    if (!stereo::GameCameraLocation(&cam)) return false;
+    ue::Call loc(player, "K2_GetActorLocation");
+    UObject capsule = 0;
+    double half = 0;
+    if (ue::GetProp(player, "CapsuleComponent", capsule) && capsule) {
+        ue::Call h(capsule, "GetScaledCapsuleHalfHeight");
+        if (h.Invoke()) half = h.Result<float>();
+    }
+    if (!loc.Invoke() || half <= 10.0) return false;
+    const FVector at = loc.Result<FVector>();
+    *rel = cam.Z - (at.Z - half);
+    *side = std::sqrt((cam.X - at.X) * (cam.X - at.X) + (cam.Y - at.Y) * (cam.Y - at.Y));
+    return true;
+}
+
+void CameraHeightView(UObject player, bool crouched, bool known) {
+    if (player != g_camh_player) {
+        g_camh.Reset();
+        g_camh_player = player;
+    }
+    const bool pressed = g_crouch_pressed;
+    g_crouch_pressed = false;
+    double rel = 0, side = 0;
+    double raise = 0;
+    if (CameraOnCharacter(player, &rel, &side)) {
+        const bool had = g_camh.HaveStanding(), was = g_camh.Holding();
+        raise = g_camh.Update(rel, known && crouched, pressed, g_set.real_height, g_dt);
+        if (!had && g_camh.HaveStanding())
+            log::Info("controls: the game camera stands %.0f cm above the character's feet", g_camh.Standing());
+        if (g_camh.Holding() != was) {
+            if (g_camh.Holding())
+                log::Info("controls: the game camera has been %.0f cm below standing height for 1.5 s with no crouch "
+                          "(character %s, %d stick crouch presses, camera %.0f cm from the character's middle); "
+                          "your view is held at standing height",
+                          g_camh.Drop(), !known ? "stance unknown" : crouched ? "crouched" : "standing",
+                          g_camh.CrouchPresses(), side);
+            else
+                log::Info("controls: the game camera is back at standing height (or you crouched); view follows it "
+                          "again");
         }
-        if (loc.Invoke() && half > 10.0) {
-            double rel = cam.Z - (loc.Result<FVector>().Z - half);
-            if (!crouched) {
-                g_cam.stand_rel = g_cam.have_stand ? g_cam.stand_rel + (rel - g_cam.stand_rel) * 0.1 : rel;
-                g_cam.have_stand = true;
-            } else if (g_cam.have_stand) {
-                want = std::fmax(0.0, std::fmin(80.0, g_cam.stand_rel - rel));
-            }
+        // The camera far off the character's middle line is the other half
+        // of the same stuck state: logged so the next run shows it.
+        if (side > 30.0 && g_clock >= g_camh_log_at) {
+            g_camh_log_at = g_clock + 10.0;
+            log::Info("controls: the game camera is %.0f cm from the character's middle and %.0f cm above its feet "
+                      "(standing %.0f)",
+                      side, rel, g_camh.Standing());
         }
     }
-    g_cam.extra += (want - g_cam.extra) * (1.0 - std::exp(-12.0 * g_dt));
-    if (std::fabs(g_cam.extra) < 0.05 && want == 0) g_cam.extra = 0;
-    stereo::SetViewRaiseCm(g_cam.extra);
+    stereo::SetViewRaiseCm(raise);
 }
 
 // Body calibration (VR tab: Calibrate body): after the menu closes, 2 s to
@@ -1663,7 +1709,7 @@ void HeightCalibration(double head_m) {
 void PhysicalCrouchAndJump(UObject player) {
     bool known = false;
     const bool crouched = GameCrouched(player, &known);
-    RealHeightCrouchView(player, crouched, known);
+    CameraHeightView(player, crouched, known);
     g_phys.Configure(g_set.physical_crouch, g_set.physical_crouch_cm, g_set.physical_jump);
     if (g_set.standing_height_cm >= 100 && g_set.standing_height_cm != g_height.applied_cm) {
         g_phys.SetStanding(g_set.standing_height_cm / 100.0);
@@ -1706,6 +1752,7 @@ void PhysicalCrouchAndJump(UObject player) {
 //   Punch with the empty left hand   melee attack
 void GameActions(UObject player, const input::Snapshot& s) {
     if (!player) return;
+    LabTraceTick();
     const input::HandInput& l = s.hand[input::kLeft];
     const input::HandInput& r = s.hand[input::kRight];
     if (ui_panel::MenuOpen()) {
@@ -1732,6 +1779,7 @@ void GameActions(UObject player, const input::Snapshot& s) {
     if (down && GA.crouch_armed) {
         GA.crouch_armed = false;
         FireEvent(player, GA.crouch_down);
+        g_crouch_pressed = true;
         GA.crouch_release_at = g_clock + 0.1;
         log::Info("controls: crouch / stand");
     }
@@ -1812,6 +1860,13 @@ void GameActions(UObject player, const input::Snapshot& s) {
             GA.melee_ready_at = g_clock + 0.7;
             input::Haptic(input::kLeft, 0.8f, 0.06f);
             log::Info("controls: melee (left hand at %.1f m/s)", speed);
+            static int s_melee_traces = 0;
+            if (s_melee_traces++ < 3) {
+                double rel = 0, side = 0;
+                if (CameraOnCharacter(player, &rel, &side))
+                    log::Info("controls: melee: game camera %.0f cm above the feet, %.0f cm from the middle", rel, side);
+                LabTraceFor(2.0);
+            }
         }
     }
     if (GA.melee_release_at > 0 && g_clock >= GA.melee_release_at) {
@@ -2022,18 +2077,13 @@ void StudyFireClass(UObject obj, const char* who) {
     }
 }
 
-double g_lab_trace_off_at = -1;
-
 void ShotStudy(UObject player, game::Gun& gun, int n, const FVector& muzzle, const FVector& barrel,
                const FRotator& ctrl) {
     if (n == 1) {
         StudyFireClass(gun.Object(), "gun");
         StudyFireClass(player, "player");
     }
-    if (n <= 3 && g_lab_trace_off_at < 0 && !config::GetBool("lab_trace_on_start", false)) {
-        game::weapon_lab::SetTrace(true);
-        g_lab_trace_off_at = g_clock + 0.4;
-    }
+    if (n <= 3) LabTraceFor(0.4);
     if (n > 6) return;
     FVector m_at, c_at, cam;
     std::string m_what, c_what;
@@ -2049,12 +2099,7 @@ void ShotStudy(UObject player, game::Gun& gun, int n, const FVector& muzzle, con
               c_at.X, c_at.Y, c_at.Z, m_hit && c_hit ? Len(apart) : -1.0);
 }
 
-void ShotStudyTick() {
-    if (g_lab_trace_off_at > 0 && g_clock >= g_lab_trace_off_at) {
-        g_lab_trace_off_at = -1;
-        game::weapon_lab::SetTrace(false);
-    }
-}
+void ShotStudyTick() { LabTraceTick(); }
 
 void LogShot(UObject player, game::Gun& gun) {
     static int n = 0;
