@@ -239,6 +239,7 @@ struct Panel {
     std::vector<Picture> pictures;
     int text_phase = 0;        // kTextOff / kTextBaseline / kTextCheck
     int text_stale = 0;        // frames waited for the engine to lay out the new sizes
+    bool stale_off = false;    // the layout check never matched once: check as laid out from then on
     double recheck_at = -1;    // one more look a moment after the texts fit (TextStep)
     int rechecks = 0;
     int text_round = 0;
@@ -1504,6 +1505,14 @@ double Overlap(const Rect& a, const Rect& b) {
     return w > 0 && h > 0 ? w * h : 0.0;
 }
 
+// True if two boxes cross by more than `px` both ways (a real overlap, not
+// two edges touching).
+bool Crosses(const Rect& a, const Rect& b, double px = 3.0) {
+    double w = std::min(a.x1, b.x1) - std::max(a.x0, b.x0);
+    double h = std::min(a.y1, b.y1) - std::max(a.y0, b.y0);
+    return w > px && h > px;
+}
+
 // How big a text the game drew at `base` is made: everything
 // menu_text_scale times bigger, small print up to menu_text_min_px (the
 // death screen's 12-point lines were what the owner still couldn't read,
@@ -1549,6 +1558,11 @@ int AddTexts(Panel& p, const std::vector<UObject>& texts, bool* reset = nullptr)
 
 // The pictures a menu shows now, where the engine drew them. Whole-screen
 // layers are left out (everything is inside those).
+bool LooksLikeButton(UObject w) {
+    std::string cls = Lower(ue::GetName(ue::GetClass(w)));
+    return cls.find("button") != std::string::npos || cls.find("btn") != std::string::npos;
+}
+
 void CollectPictures(Panel& p) {
     p.pictures.clear();
     if (!L.image_class) return;
@@ -1569,6 +1583,23 @@ void CollectPictures(Panel& p) {
             if (!pl.ok || !Drawn(pl.r) || (pl.r.W() >= kDrawW * 0.9 && pl.r.H() >= kDrawH * 0.9)) continue;
             p.pictures.push_back({w, IndexOf(w), pl.r});
             continue;
+        }
+        // Drawn boxes count too: a filled border, and each button (a widget of
+        // its own named like one). A label inside one must stay inside it, and
+        // other text must not run into it (the level select's "Return Home"
+        // ran out of its button under the preview picture; the death screen's
+        // total ran into Retry, 2026-11-03).
+        const bool border = L.border_class && L.border_brush >= 0 && IsA(w, L.border_class);
+        const bool button = !border && IsA(w, L.user_widget_class) && LooksLikeButton(w);
+        if (border || button) {
+            bool drawn = true;
+            if (border) {
+                BrushLook b = ReadBrush(w, L.border_brush, L.border_color);
+                drawn = b.drawn && b.alpha >= 0.02f;
+            }
+            Placed pl = drawn ? PlaceOf(w, false) : Placed{};
+            if (pl.ok && Drawn(pl.r) && !(pl.r.W() >= kDrawW * 0.9 && pl.r.H() >= kDrawH * 0.9))
+                p.pictures.push_back({w, IndexOf(w), pl.r});
         }
         if (depth >= 24) continue;
         if (IsA(w, L.user_widget_class)) {
@@ -1622,9 +1653,10 @@ int GrowTexts(Panel& p) {
     for (auto& t : p.texts) {
         if (!t.measured || t.grown || t.scale > 1.01f || !Alive(t.obj, t.index)) continue;
         t.grown = true;
-        // The death screen's Back, Retry, Home and Next labels stay at the
-        // game's size (owner 2026-11-03: "they dont need to be bigger").
-        if (p.name == "UIM_Results_C" && ue::GetName(t.obj) == "ButtonText") continue;
+        // The death screen keeps the game's text sizes: the owner wants its
+        // buttons no bigger (2026-11-03, "they dont need to be bigger"; its
+        // trouble was brightness), and its grown total ran into Retry.
+        if (p.name == "UIM_Results_C") continue;
         float s = TargetScale(t.base);
         if (s <= 1.01f) continue;
         SetTextScale(t, s);
@@ -1639,7 +1671,7 @@ double Area(const Rect& r) { return std::max(0.0, r.W()) * std::max(0.0, r.H());
 // Returns how many texts were pulled back this round (0 = all fit), or -1
 // if the engine hasn't laid the new sizes out yet (look again next frame:
 // checking the old layout passed texts that then ran out of their buttons).
-int CheckTexts(Panel& p) {
+int CheckTexts(Panel& p, bool as_is) {
     std::unordered_map<UObject, Rect> boxes;
     auto box_rect = [&](UObject w) {
         auto it = boxes.find(w);
@@ -1673,7 +1705,7 @@ int CheckTexts(Panel& p) {
             if (std::fabs(pl.want_h - was) < std::fabs(pl.want_h - want)) ++stale;
         }
     }
-    if (stale > 0) return -1;
+    if (stale > 0 && !as_is) return -1;
     std::vector<Rect> pic_now(p.pictures.size());
     for (size_t j = 0; j < p.pictures.size(); ++j) {
         const Picture& pic = p.pictures[j];
@@ -1703,6 +1735,11 @@ int CheckTexts(Panel& p) {
                 break;
             }
         }
+        // Off the edge of the screen (the credits' line of names ran past it).
+        if (t.measured) {
+            const Rect screen{0, 0, static_cast<double>(kDrawW), static_cast<double>(kDrawH)};
+            if (RunsPast(pl.r, screen) > std::max(RunsPast(t.before, screen), 0.0) + 2.0) pull[i] = 1;
+        }
         for (size_t j = 0; j < p.pictures.size() && !pull[i] && t.measured; ++j) {
             const Rect& was_r = p.pictures[j].before;
             const Rect& is_r = pic_now[j];
@@ -1711,8 +1748,11 @@ int CheckTexts(Panel& p) {
                 if (RunsPast(pl.r, is_r) > 2.0) pull[i] = 1;
                 continue;
             }
+            if (!Crosses(t.before, was_r)) {  // clear of it at the game's size: stays clear
+                if (Crosses(pl.r, is_r)) pull[i] = 1;
+                continue;
+            }
             double share = Overlap(pl.r, is_r) / std::max(1.0, std::min(Area(pl.r), Area(is_r)));
-            if (share < 0.08) continue;
             double was = Overlap(t.before, was_r) / std::max(1.0, std::min(Area(t.before), Area(was_r)));
             if (share > was + 0.08) pull[i] = 1;
         }
@@ -1736,6 +1776,20 @@ int CheckTexts(Panel& p) {
             pull[i] = pull[j] = 1;
         }
     }
+    // Bigger texts pushed a picture or box into another one (the death
+    // screen's total line slid under Retry): every grown text steps back.
+    bool pushed = false;
+    for (size_t a = 0; a < p.pictures.size() && !pushed; ++a) {
+        if (!Drawn(pic_now[a])) continue;
+        for (size_t b = a + 1; b < p.pictures.size() && !pushed; ++b) {
+            if (!Drawn(pic_now[b])) continue;
+            if (Crosses(p.pictures[a].before, p.pictures[b].before)) continue;
+            if (Crosses(pic_now[a], pic_now[b])) pushed = true;
+        }
+    }
+    if (pushed)
+        for (size_t i = 0; i < p.texts.size(); ++i)
+            if (now[i].drawn && p.texts[i].scale > 1.01f) pull[i] = 1;
     for (size_t i = 0; i < p.texts.size() && !tight.empty(); ++i) {
         if (pull[i] || !now[i].drawn) continue;
         const TextItem& t = p.texts[i];
@@ -1796,12 +1850,16 @@ bool TextStep(Panel& p) {
     }
     double t0 = perf::NowMs();
     if (p.text_round < 8) {
-        int pulled = CheckTexts(p);
+        int pulled = CheckTexts(p, p.stale_off);
         if (pulled < 0) {
             if (++p.text_stale < 40) return false;  // laid out with the new sizes in a frame or two
-            log::Info("world menu: %s: the engine didn't lay out the new text sizes in 40 frames; checked as it is",
+            // This used to accept the texts unchecked, which is how the
+            // credits' names came out over the logo and past the screen edge.
+            log::Info("world menu: %s: the engine didn't lay out the new text sizes in 40 frames; checking them as "
+                      "they are laid out (and from now on)",
                       p.name.c_str());
-            pulled = 0;
+            p.stale_off = true;
+            pulled = CheckTexts(p, true);
         }
         p.text_stale = 0;
         p.text_pulled += pulled;

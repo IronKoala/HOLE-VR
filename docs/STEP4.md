@@ -89,14 +89,25 @@ dump of the shipping game (`hole-vr/dump/game_classes.txt`).
   pause menu, above the task giver's Get Reward buttons. A menu the game fills
   after it opens (the task cards) is fitted again in its first 3 s, and menus
   that fill the whole screen get at least `menu_fit_min_zoom` (1.3), except
-  the death screen, which keeps its fitted size; its button labels (`ButtonText`)
-  also stay at the game's size (owner: "they dont need to be bigger").
+  the death screen, which keeps its fitted size and the game's text sizes
+  (owner: "they dont need to be bigger"; its grown total ran into Retry).
 - **Text checks, second round.** Fully see-through texts are ignored (each
   game button has a large invisible "Lock" text that made the real label shrink).
   Every widget around a text is checked (from a list up, only across it), and
   every picture in the menu: a text mustn't newly cover one, or run out of one
   it sat inside. A check waits until the engine has laid out the new sizes
   (desired heights match), and one more check runs 0.6 s after the texts fit.
+- **Text checks, third round** (10:47 run). When the engine's layout never
+  matched the expected text heights (credits), the check gave up after 40
+  frames and kept every size unchecked: the names ran over the logo and past
+  the screen edge. Now it checks the layout as it is, and from then on for that
+  menu. Filled borders and buttons (widgets named like one) count as pictures:
+  a label inside one stays inside it ("Return Home" ran out of its button under
+  the level select's preview), and text clear of a picture at the game's size
+  must stay clear by 3 px (no share allowance). A text that runs further off
+  the screen is pulled back, and if growing pushed one picture or button into
+  another (the death screen's total line under Retry), every grown text steps
+  back.
 - **Menu button toggles** (`ui_panel.cpp`, `ClosePauseMenu`). With the pause
   menu on top, the menu button runs the pause menu's Return button.
 - **No menu blur on the death screen**: the blur smeared the kill shot (a
