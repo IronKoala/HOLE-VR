@@ -38,6 +38,7 @@ struct Lookups {
     UObject gps = 0;   // GameplayStatics (SpawnObject)
     UObject ktl = 0;   // KismetTextLibrary (Conv_StringToText)
     UObject scroll_class = 0, text_class = 0, rich_text_class = 0, panel_class = 0, user_widget_class = 0;
+    UObject hbox_class = 0, sizebox_class = 0;  // for the arrows beside each setting (optional)
 } L;
 
 // A widget we made, with its object index so a freed one is never touched.
@@ -49,11 +50,21 @@ int IndexOf(UObject obj) { return mem::ReadOr<int32_t>(obj + ue::off::kObjIndex,
 Made Track(UObject obj) { return Made{obj, obj ? IndexOf(obj) : -1}; }
 bool Alive(const Made& m) { return m.obj && m.index >= 0 && ue::objects::Get(m.index) == m.obj; }
 
+// Owner 2026-11-03: "left and right arrows to switch between options (right
+// arrow to make turning fast, left arrow to make turning slower)". A setting
+// row is  [<] [Setting: choice] [>]: the arrows step to the previous / next
+// choice and stop at the ends; clicking the middle still steps forward and
+// wraps. The setup rows (Calibrate body ...) are one button.
+constexpr float kArrowWidth = 64.f;
+const wchar_t* const kLeftArrow = L"<";
+const wchar_t* const kRightArrow = L">";
+
 struct RowWidget {
-    Made w;
-    int row = 0;      // index into vr_menu::Rows()
+    Made w;              // the middle button: "Setting: choice"
+    Made left, right;    // the arrow buttons (setting rows only)
+    int row = 0;         // index into vr_menu::Rows()
     int choice = 0;
-    std::vector<UObject> texts;  // its TextBlocks
+    std::vector<UObject> texts, left_texts, right_texts;  // their TextBlocks
 };
 
 struct Tab {
@@ -273,13 +284,20 @@ void LabelRow(RowWidget& r) {
 }
 
 void RelabelAll() {
-    for (auto& r : T.rows)
+    for (auto& r : T.rows) {
         if (Alive(r.w)) LabelRow(r);
+        if (Alive(r.left))
+            for (UObject t : r.left_texts) SetText(t, kLeftArrow);
+        if (Alive(r.right))
+            for (UObject t : r.right_texts) SetText(t, kRightArrow);
+    }
     if (Alive(T.vr_button))
         for (UObject t : T.vr_button_texts) SetText(t, L"VR");
 }
 
-void ClickRow(RowWidget& r) {
+// step: +1 right arrow, -1 left arrow (both stop at the ends), 0 the middle
+// button (next choice, wrapping round).
+void ClickRow(RowWidget& r, int step) {
     const auto& row = vr_menu::Rows()[static_cast<size_t>(r.row)];
     if (row.kind == vr_menu::RowKind::kMeasureArms) {
         body::RequestMeasure();
@@ -304,7 +322,15 @@ void ClickRow(RowWidget& r) {
         input::Haptic(input::kLeft, 0.4f, 0.05f);
         return;
     }
-    r.choice = (r.choice + 1) % static_cast<int>(row.choices.size());
+    const int n = static_cast<int>(row.choices.size());
+    const int next = step == 0 ? (r.choice + 1) % n : std::clamp(r.choice + step, 0, n - 1);
+    if (next == r.choice) {
+        input::Haptic(input::kRight, 0.1f, 0.01f);
+        log::Info("vr options: %s is already at its %s choice (%s)", row.label, step > 0 ? "last" : "first",
+                  row.choices[static_cast<size_t>(r.choice)].text);
+        return;
+    }
+    r.choice = next;
     const auto& c = row.choices[static_cast<size_t>(r.choice)];
     std::string what;
     bool saved = true;
@@ -314,7 +340,8 @@ void ClickRow(RowWidget& r) {
     }
     config::NotifyChanged();
     LabelRow(r);
-    log::Info("vr options: %s -> %s (%s)%s", row.label, c.text, what.c_str(),
+    log::Info("vr options: %s -> %s (%s, %s)%s", row.label, c.text, what.c_str(),
+              step > 0 ? "right arrow" : step < 0 ? "left arrow" : "row clicked",
               saved ? "" : "; NOT saved in hole-vr.ini, used for this run only");
 }
 
@@ -330,11 +357,74 @@ void AfterClick(UObject self, UObject, void*) {
         }
         return;
     }
-    for (auto& r : T.rows)
-        if (Alive(r.w) && r.w.obj == self) {
-            ClickRow(r);
+    for (auto& r : T.rows) {
+        const int step = Alive(r.w) && r.w.obj == self         ? 0
+                         : Alive(r.left) && r.left.obj == self   ? -1
+                         : Alive(r.right) && r.right.obj == self ? 1
+                                                                 : 2;
+        if (step != 2) {
+            ClickRow(r, step);
             return;
         }
+    }
+}
+
+UObject SpawnWidget(UObject cls, UObject outer) {
+    if (!cls) return 0;
+    ue::Call so(L.gps, "SpawnObject");
+    so.Set("ObjectClass", cls).Set("Outer", outer);
+    return so.Invoke() ? so.Result<UObject>() : 0;
+}
+
+template <typename T>
+bool SetStruct(UObject obj, const char* fn, const char* param, const T& v) {
+    if (!obj) return false;
+    ue::Call c(obj, fn);
+    int32_t size = 0;
+    uint8_t* p = c.Raw(param, &size);
+    if (!p || size != static_cast<int32_t>(sizeof(T))) return false;
+    std::memcpy(p, &v, sizeof(T));
+    return c.Invoke();
+}
+
+struct Margin {
+    float l, t, r, b;
+};
+
+// [<] [Setting: choice] [>] in a horizontal box; false (nothing added) if
+// any part could not be made, and the row is the middle button alone.
+bool AddArrows(RowWidget& r, UObject label, UObject outer, UObject owner_widget, UObject row_class, UObject owner,
+               UObject* holder) {
+    if (!L.hbox_class || !L.sizebox_class) return false;
+    UObject hb = SpawnWidget(L.hbox_class, outer);
+    UObject lbox = SpawnWidget(L.sizebox_class, outer), rbox = SpawnWidget(L.sizebox_class, outer);
+    UObject lb = CreateUserWidget(owner_widget, row_class, owner);
+    UObject rb = CreateUserWidget(owner_widget, row_class, owner);
+    if (!hb || !lbox || !rbox || !lb || !rb) return false;
+    ue::process_event::HookVtableOf(lb);
+    ue::process_event::HookVtableOf(rb);
+    SetBlueprintTexts(lb, kLeftArrow, nullptr);
+    SetBlueprintTexts(rb, kRightArrow, nullptr);
+    for (UObject b : {lbox, rbox}) {
+        ue::Call w(b, "SetWidthOverride");
+        w.Set("InWidthOverride", kArrowWidth);
+        w.Invoke();
+    }
+    if (!AddChild(lbox, lb) || !AddChild(rbox, rb)) return false;
+    AddChild(hb, lbox);
+    UObject mid = AddChild(hb, label);
+    AddChild(hb, rbox);
+    // The middle takes the rest of the width (ESlateSizeRule::Fill = 1).
+    struct ChildSize {
+        float value;
+        uint8_t rule, pad[3];
+    } fill{1.f, 1, {0, 0, 0}};
+    SetStruct(mid, "SetSize", "InSize", fill);
+    SetStruct(mid, "SetPadding", "InPadding", Margin{4.f, 0.f, 4.f, 0.f});
+    r.left = Track(lb);
+    r.right = Track(rb);
+    *holder = hb;
+    return true;
 }
 
 void Build(UObject option) {
@@ -416,6 +506,7 @@ void Build(UObject option) {
         return;
     }
     const auto& rows = vr_menu::Rows();
+    int with_arrows = 0;
     for (size_t i = 0; i < rows.size(); ++i) {
         UObject w = CreateUserWidget(option, row_class, owner);
         if (!w) continue;
@@ -425,31 +516,29 @@ void Build(UObject option) {
         r.row = static_cast<int>(i);
         r.choice = vr_menu::CurrentChoice(rows[i], &Current);
         SetBlueprintTexts(w, Widen(vr_menu::RowText(rows[i], r.choice)), nullptr);
-        UObject slot = AddChild(page, w);
-        if (slot) {
-            ue::Call pad(slot, "SetPadding");
-            struct Margin {
-                float l, t, r, b;
-            } m{0.f, 3.f, 0.f, 3.f};
-            int32_t size = 0;
-            if (uint8_t* p = pad.Raw("InPadding", &size); p && size == static_cast<int32_t>(sizeof(m))) {
-                std::memcpy(p, &m, sizeof(m));
-                pad.Invoke();
-            }
-        }
+        UObject holder = w;
+        if (rows[i].kind == vr_menu::RowKind::kChoice &&
+            AddArrows(r, w, tree ? tree : option, option, row_class, owner, &holder))
+            ++with_arrows;
+        if (UObject slot = AddChild(page, holder)) SetStruct(slot, "SetPadding", "InPadding", Margin{0.f, 3.f, 0.f, 3.f});
         T.rows.push_back(r);
     }
     UObject page_slot = AddChild(switcher, page);
     T.switcher = Track(switcher);
     T.page = Track(page);
     // Built now (the switcher is on screen): their texts exist.
-    for (auto& r : T.rows) r.texts = FindTexts(r.w.obj);
+    for (auto& r : T.rows) {
+        r.texts = FindTexts(r.w.obj);
+        if (Alive(r.left)) r.left_texts = FindTexts(r.left.obj);
+        if (Alive(r.right)) r.right_texts = FindTexts(r.right.obj);
+    }
     RelabelAll();
     T.relabel_frames = 30;
     size_t texts = 0;
     for (auto& r : T.rows) texts += r.texts.size();
-    log::Info("vr options: VR page added to Options (%zu rows from %s, %zu texts, slot %s)", T.rows.size(),
-              ue::GetName(row_class).c_str(), texts, page_slot ? "ok" : "MISSING");
+    log::Info("vr options: VR page added to Options (%zu rows from %s, %zu texts, %d rows with < > arrows%s, slot %s)",
+              T.rows.size(), ue::GetName(row_class).c_str(), texts, with_arrows,
+              L.hbox_class && L.sizebox_class ? "" : "; HorizontalBox/SizeBox class missing", page_slot ? "ok" : "MISSING");
 }
 
 }  // namespace
@@ -463,6 +552,8 @@ void InitGame() {
     L.rich_text_class = ue::FindObject("Class /Script/UMG.RichTextBlock");
     L.panel_class = ue::FindObject("Class /Script/UMG.PanelWidget");
     L.user_widget_class = ue::FindObject("Class /Script/UMG.UserWidget");
+    L.hbox_class = ue::FindObject("Class /Script/UMG.HorizontalBox");
+    L.sizebox_class = ue::FindObject("Class /Script/UMG.SizeBox");
     L.done = L.wbl && L.gps && L.ktl && L.scroll_class && L.text_class && L.panel_class && L.user_widget_class;
     if (L.done)
         log::Info("vr options: ready (a VR tab is added to Options)");

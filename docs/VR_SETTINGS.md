@@ -17,8 +17,16 @@ copy of the game's own tab button class, so it looks and clicks like the rest.
 Its page is a scroll box in the game's `WidgetSwitcher_OPTION`, holding one
 button per setting. The buttons are copies of the game's Back button class.
 
-Each row reads "Setting: choice". Clicking a row moves it to the next choice,
-writes the ini key(s) into `hole-vr.ini` in place (comments and layout kept,
+Each setting row is `[<] [Setting: choice] [>]` (owner, 2026-11-03: "left
+and right arrows to switch between options"). The right arrow steps to the
+next choice and the left arrow to the previous one; both stop at the ends
+(the choices are listed low to high, so right is faster, stronger or
+bigger). Clicking the middle still steps forward and wraps round. The arrows
+are copies of the same game button inside 64-unit-wide size boxes, in a
+horizontal box. The setup rows (Calibrate body, Edit hand grips, Move
+holsters) are one button. The right stick scrolls the page (the forearm
+menu's own stick scrolling, `world_menu.cpp`, which sends the mouse wheel to
+whatever the laser is on). A step writes the ini key(s) into `hole-vr.ini` in place (comments and layout kept,
 `config::Set`), and tells every part of the mod to re-read its settings
 (`config::NotifyChanged`). Nothing needs a restart.
 
@@ -164,8 +172,12 @@ appeared, this says whether shots need moving to the muzzle.
 - `vr options: VR tab button added to ...` and `vr options: VR page added to
   Options (24 rows ...)` each time Options opens.
 - `vr options: VR tab opened` when the VR tab is clicked.
-- `vr options: <row> -> <choice> (key=value)` and `settings: saved key=value in
-  hole-vr.ini` on each click, then `controls: settings changed (...)`.
+- `vr options: VR page added to Options (24 rows ..., 21 rows with < >
+  arrows, slot ok)`.
+- `vr options: <row> -> <choice> (key=value, right arrow | left arrow | row
+  clicked)` and `settings: saved key=value in hole-vr.ini` on each click, then
+  `controls: settings changed (...)`; `... is already at its last choice` at
+  an end.
 - `comfort: head inside a wall or object, view faded` / `head out of the wall
   again after N s`.
 - `controls: physical crouch (...)` / `physical stand (...)`.
