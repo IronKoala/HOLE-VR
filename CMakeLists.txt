@@ -22,6 +22,8 @@ add_library(hole_vr SHARED
     src/vr/menu_study.cpp
     src/vr/dxgi_hooks.cpp
     src/vr/stereo.cpp
+    src/vr/view_lead.cpp
+    src/vr/view_lead_math.cpp
     src/vr/spectator.cpp
     src/vr/spectator_math.cpp
     src/vr/input.cpp

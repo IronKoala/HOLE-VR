@@ -27,6 +27,10 @@ UObject Player();
 // Runs after the player's Blueprint tick, on the game thread, every frame.
 using TickFn = void (*)(UObject player, float delta_seconds);
 void AddTickListener(TickFn fn);
+// Runs `begin` right before the first tick listener and `end` right after
+// the last, every player tick, on the game thread. One pair; either may be
+// null.
+void SetTickBracket(TickFn begin, TickFn end);
 
 // Queue work for the next game-thread tick. Safe from any thread.
 void Post(std::function<void()> fn);

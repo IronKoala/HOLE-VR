@@ -29,6 +29,7 @@ std::vector<std::function<void()>> g_queue;
 constexpr int kMaxListeners = 16;
 TickFn g_listeners[kMaxListeners];
 std::atomic<int> g_listener_count{0};
+std::atomic<TickFn> g_tick_begin{nullptr}, g_tick_end{nullptr};
 const char* kListenerNames[kMaxListeners] = {"tick#0", "tick#1", "tick#2", "tick#3", "tick#4", "tick#5",
                                              "tick#6", "tick#7", "tick#8", "tick#9", "tick#10", "tick#11",
                                              "tick#12", "tick#13", "tick#14", "tick#15"};
@@ -72,11 +73,13 @@ void OnPlayerTick(UObject self, UObject, void* params) {
     for (auto& w : work) w();
     g_queue_perf.Add(perf::NowMs() - t0);
 
+    if (TickFn begin = g_tick_begin.load()) begin(self, dt);
     int n = g_listener_count.load(std::memory_order_acquire);
     for (int i = 0; i < n; ++i) {
         perf::Scope s(g_listener_perf[i]);
         g_listeners[i](self, dt);
     }
+    if (TickFn end = g_tick_end.load()) end(self, dt);
     perf::MaybeReport();
 }
 
@@ -177,6 +180,11 @@ void AddTickListener(TickFn fn) {
     perf::Register(&g_listener_perf[n]);
     log::Info("game: tick listener #%d registered (the next \"ready\" line names it)", n);
     g_listener_count.store(n + 1, std::memory_order_release);
+}
+
+void SetTickBracket(TickFn begin, TickFn end) {
+    g_tick_begin.store(begin);
+    g_tick_end.store(end);
 }
 
 void Post(std::function<void()> fn) {
