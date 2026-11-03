@@ -261,6 +261,19 @@ plane, with no extra traces. `hand_fingers_rest_on_walls=1` (on); off with
 the hand wall check too. Fingers on the gun and magazines keep their stored
 grips.
 
+Hands press flat on walls (owner 2026-11-03 14:14: the fingers "would
+close and make a fist, in real life people tend to press their hand
+against the wall"). With the curl search alone, a hand pushed fingers-first
+into a wall curled into a fist to clear it. Now, as the controller's fist
+centre comes within `hand_press_start_cm` (8) of the remembered surface,
+the palm turns to face it and moves onto it (palm middle 0.3 cm off, never
+in); from `hand_press_full_cm` (3) on it is flat, fingers open. The
+fingers follow the controller's curl less the flatness, and the plane
+search only matters while the hand is not yet flat. With the back of the
+hand toward the surface (more than 110 deg off) nothing turns: knuckles or
+a fist against a wall stay as they are. `hand_press_flat_on_walls=1`
+(on); it needs the hand wall check.
+
 ## Log lines to check after a test
 
 - `vr options: ready (a VR tab is added to Options)` at start.
@@ -294,6 +307,8 @@ grips.
 - `fingers: left/right hand's fingers rest on the surface it's against (curl
   wanted->used: thumb 0.60->0.20, ...)`, the first 10 times a wall changes a
   finger's curl noticeably (at most every 2 s per hand).
+- `body: left/right hand pressed flat on a surface (palm turned N deg to face
+  it)`, the first 10 times a hand goes flat.
 - `shot study 1: barrel line hits ... camera line hits ... N cm apart`, `shot
   study: gun ... fire functions: ...`, `lab: [..s] gun.<event>`.
 

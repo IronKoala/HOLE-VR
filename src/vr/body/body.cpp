@@ -82,6 +82,9 @@ struct Settings {
     bool fit_log = true;
     bool fixed_height = true;
     bool fingers_rest = true;  // fingers rest on walls an empty hand is against
+    bool press_flat = true;    // an empty hand pushed against a wall lies flat on it
+    double press_start = 8.0;  // cm from the surface (controller's fist centre) where it starts to turn flat
+    double press_full = 3.0;   // ...and is fully flat
 } S;
 
 void LoadSettings() {
@@ -123,6 +126,9 @@ void LoadSettings() {
     S.fit_log = config::GetBool("body_fit_log", true);
     S.fixed_height = config::GetBool("fixed_height", true);
     S.fingers_rest = config::GetBool("hand_fingers_rest_on_walls", true);
+    S.press_flat = config::GetBool("hand_press_flat_on_walls", true);
+    S.press_start = std::clamp<double>(config::GetFloat("hand_press_start_cm", 8.f), 1.0, 30.0);
+    S.press_full = std::clamp<double>(config::GetFloat("hand_press_full_cm", 3.f), -10.0, S.press_start - 0.5);
 }
 
 // ---- small files beside the ini ----
@@ -2476,6 +2482,54 @@ bool BuildSlidePreset(int side, const hands::HandState& h, const hands::Pose& ob
     return true;
 }
 
+// An empty hand pushed against a wall, table or door lies flat on it (owner
+// 2026-11-03 14:14: the fingers "would close and make a fist, in real life
+// people tend to press their hand against the wall"). As the controller's
+// fist centre comes within press_start of the surface the hand last touched
+// (vr/body/hand_walls), the palm turns to face the surface and moves onto
+// it; at press_full and beyond it is flat on it, fingers open. With the back
+// of the hand toward the surface (more than 110 deg off) it is left alone:
+// knuckles or a fist against a wall. Returns how flat, 0..1.
+bool g_was_flat[2] = {false, false};  // for the log: flat last frame
+double g_flat[2] = {0.0, 0.0};        // eased flatness: the wall check first sees a surface 4 cm off it
+
+double PressFlat(int side, FQuat* rot, FVector* pos, double dt) {
+    double& eased = g_flat[side];
+    const HandRig& rig = G.rig[side];
+    FVector at, out;
+    if (!S.press_flat || !rig.ok || !hand_walls::Contact(side, &at, &out)) return eased = 0.0;
+    const hands::HandState real = hands::Get(side == kL ? hands::kLeft : hands::kRight);
+    if (!real.valid) return eased = 0.0;
+    const double d = Dot(real.grip.location - at, out);  // the real fist centre's height above the surface
+    const FVector palm = Normalize(rot->Rotate(rig.palm_h));
+    const FVector into = out * -1.0;
+    double target = std::clamp((S.press_start - d) / (S.press_start - S.press_full), 0.0, 1.0);
+    if (Dot(palm, into) < std::cos(110.0 * kDegToRad)) target = 0.0;
+    // Ease in (about 0.07 s), so the hand turns rather than snaps when the
+    // wall is first found; let go at once.
+    eased = target < eased ? target : eased + (target - eased) * (1.0 - std::exp(-dt / 0.07));
+    const double w = eased;
+    if (w <= 0.001) return 0.0;
+    // Log the first 10 presses (flat after not being flat).
+    static int logged = 0;
+    const bool now_flat = w >= 0.99;
+    if (now_flat && !g_was_flat[side] && logged < 10) {
+        ++logged;
+        log::Info("body: %s hand pressed flat on a surface (palm turned %.0f deg to face it)",
+                  side == kL ? "left" : "right", std::acos(std::clamp(Dot(palm, into), -1.0, 1.0)) * kRadToDeg);
+    }
+    g_was_flat[side] = now_flat;
+    *rot = Normalized(Scale(Arc(palm, into), w) * *rot);
+    // The palm's middle onto the surface (0.3 cm off it), never into it.
+    constexpr double kSkin = 0.3;
+    const FVector c = *pos + rot->Rotate(rig.palm_centre);
+    const double dc = Dot(c - at, out);
+    double shift = (kSkin - dc) * w;
+    if (dc + shift < kSkin) shift = kSkin - dc;
+    *pos = *pos + out * shift;
+    return w;
+}
+
 // Log lines for fingers resting on a wall: the first 10 times in a run that
 // the wall changed a finger's curl noticeably, at most every 2 s per hand.
 struct FingerRestNote {
@@ -2562,6 +2616,7 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
     // Where the hand goes.
     FQuat hand_rot;
     FVector hand_pos;
+    double flat = 0.0;  // how flat an empty hand is pressed on a wall
     if (recorded) {
         hand_rot = Normalized(obj.rotation * g.hand_rot);
         hand_pos = obj.location + obj.rotation.Rotate(g.hand_pos);
@@ -2578,7 +2633,10 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
         const bool free_slide = grab.kind == hands::GrabKind::kSlideGrab && g_free_slide[side].on;
         FreeHand(side, hv, IsGrab(grab.kind) && !free_slide ? grab.target.location : hv.grip.location, &hand_rot,
                  &hand_pos);
+        if (grab.kind == hands::GrabKind::kNone) flat = PressFlat(side, &hand_rot, &hand_pos, dt);
+        else g_flat[side] = 0.0;
     }
+    if (flat < 0.99) g_was_flat[side] = false;
 
     FVector shoulder = WP(k.upperarm[side]);
     const Xf fore_local = G.pose.L(k.lowerarm[side]), hand_local = G.pose.L(k.hand[side]);
@@ -2719,12 +2777,15 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
                              hand_walls::Contact(side, &wall_at, &wall_out);
         for (int f = 0; f < hand_pose::kFingerCount; ++f) {
             const fingers::Limits lim = fingers::DefaultLimits(f == hand_pose::kThumb);
-            double curl = std::min(1.2, c.finger[f] * S.finger_scale);
+            // Pressed flat on a wall: the fingers open with it.
+            double curl = std::min(1.2, c.finger[f] * S.finger_scale) * (1.0 - flat);
             if (on_wall) {
                 const double rest =
                     fingers::CurlClearOfPlane(rig.chain[f], lim, hand, curl, 1.2, wall_at, wall_out, S.finger_radius);
                 NoteFingerRest(side, f, curl, rest);
-                curl = rest;
+                // Pressed flat, the fingers stay open on the surface rather
+                // than curling away from it (they made a fist before).
+                curl = rest + (curl - rest) * flat;
             }
             want[f] = fingers::Curl(rig.chain[f], curl, lim);
         }
