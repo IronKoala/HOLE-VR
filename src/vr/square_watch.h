@@ -35,13 +35,25 @@ void Submitted(ID3D12Fence* fence, UINT64 value);
 // Lone dots per eye over the whole picture, from strips read since
 // `since_ms` (perf::NowMs clock). True once every strip of the picture has
 // been read since then (a full sweep, about 15 frames).
+//
+// The whole-picture totals hide the dots: in the owner's 2026-11-03 15:2x
+// run they showed in one or two strips of one eye at a time (100 to 600
+// more dots there than in the other eye's same strip), while the rest of
+// the picture gave each eye a few hundred ordinary dots either way. So the
+// sweep also adds up, per eye, only strips where that eye has at least
+// kStripExcess more dots than the other (ordinary strips stay under 60 in
+// the base and most of a level).
+constexpr int kStripExcess = 60;
 struct Sweep {
     int dots[2] = {0, 0};
     float grid_share[2] = {0.f, 0.f};
-    int strips = 0;  // strips in the picture
-    int fresh = 0;   // of them read since since_ms
+    int excess[2] = {0, 0};      // sum of (this eye - other eye) over strips at kStripExcess or more
+    int best_strip[2] = {0, 0};  // the largest such difference in one strip
+    int strips = 0;              // strips in the picture
+    int fresh = 0;               // of them read since since_ms
     int Odd() const { return dots[0] > dots[1] ? dots[0] - dots[1] : dots[1] - dots[0]; }
     int Eye() const { return dots[1] > dots[0] ? 1 : 0; }
+    int BadEye() const { return excess[1] > excess[0] ? 1 : 0; }
 };
 bool LatestSweep(double since_ms, Sweep* out);
 

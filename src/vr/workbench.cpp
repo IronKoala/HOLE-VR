@@ -19,6 +19,7 @@
 #include "ue/call.h"
 #include "ue/names.h"
 #include "ue/objects.h"
+#include "ue/reflection.h"
 #include "vr/hands.h"
 #include "vr/input.h"
 #include "vr/math.h"
@@ -884,6 +885,143 @@ void CheckFacility() {
     }
 }
 
+// ---------------------------------------------------------------- light check
+// Owner 2026-11-03: after taking the light off at the bench and putting it
+// back, the weapon light "no longer worked" (in the next level too, where the
+// game builds the gun again from the same saved list). Logs what the pistol's
+// light really does: when it is first seen, whenever its part, mode, power or
+// beam changes, and just after each left-trigger press (controls sends the
+// light press on the left trigger at the gun; the game switches on release).
+struct LightState {
+    UObject gun = 0, part = 0, spot = 0;
+    int mode_index = -1;  // SelectedDeviceModeIndex
+    int mode = -1;        // DeviceMode[index]: 1 and 3 light, 0 and 2 dark
+    double power = -1;    // DevicePower: the beam is LightIntensity * power
+    float intensity = -1; // SpotLight's Intensity (0 while off)
+    int actor_hidden = -1, spot_visible = -1, spot_hidden = -1;
+    bool Same(const LightState& o) const {
+        return gun == o.gun && part == o.part && spot == o.spot && mode_index == o.mode_index && mode == o.mode &&
+               std::fabs(power - o.power) < 0.05 && std::fabs(intensity - o.intensity) < 1.0f &&
+               actor_hidden == o.actor_hidden && spot_visible == o.spot_visible && spot_hidden == o.spot_hidden;
+    }
+};
+struct LightCheck {
+    UObject player = 0;
+    double next_sample = 0, report_at = -1;
+    LightState last;
+    bool have = false;
+    int lines = 0;
+} g_light;
+
+// A bool property, bitfield or not (-1 when the class has none).
+int ReadBool(UObject obj, const char* name) {
+    static std::map<std::pair<UObject, std::string>, ue::reflection::PropertyInfo> cache;
+    const UObject cls = ue::GetClass(obj);
+    if (!cls) return -1;
+    auto key = std::make_pair(cls, std::string(name));
+    auto it = cache.find(key);
+    if (it == cache.end()) {
+        if (cache.size() > 256) cache.clear();
+        it = cache.emplace(key, ue::reflection::FindProperty(cls, name)).first;
+    }
+    const auto& pi = it->second;
+    uint8_t b = 0;
+    if (!pi.valid() || !mem::Read(obj + pi.offset, b)) return -1;
+    return (b & (pi.bool_mask ? pi.bool_mask : 0xFF)) ? 1 : 0;
+}
+
+UObject Pistol(UObject player) {
+    UObject wm = 0, gun = 0;
+    if (!ue::GetProp(player, "WeaponManager", wm) || !LiveObject(wm)) return 0;
+    if (!ue::GetProp(wm, "Obj_SecondaryWeapon", gun) || !LiveObject(gun)) return 0;
+    return gun;
+}
+
+LightState ReadLight(UObject gun) {
+    LightState st;
+    st.gun = gun;
+    for (const auto& in : custom::InstalledParts(gun)) {
+        if (!LiveObject(in.actor) || ue::PropertyOffset(in.actor, "SelectedDeviceModeIndex") < 0) continue;
+        st.part = in.actor;
+        uint8_t idx = 0xFF;
+        if (ue::GetProp(in.actor, "SelectedDeviceModeIndex", idx)) st.mode_index = idx;
+        const int32_t om = ue::PropertyOffset(in.actor, "DeviceMode");
+        Arr modes{};
+        if (om >= 0 && mem::Read(in.actor + om, modes) && modes.data && st.mode_index >= 0 &&
+            st.mode_index < modes.num && modes.num <= 16)
+            st.mode = mem::ReadOr<uint8_t>(modes.data + st.mode_index, 0xFF);
+        ue::GetProp(in.actor, "DevicePower", st.power);
+        st.actor_hidden = ReadBool(in.actor, "bHidden");
+        UObject spot = 0;
+        if (ue::GetProp(in.actor, "SpotLight", spot) && LiveObject(spot)) {
+            st.spot = spot;
+            ue::GetProp(spot, "Intensity", st.intensity);
+            st.spot_visible = ReadBool(spot, "bVisible");
+            st.spot_hidden = ReadBool(spot, "bHiddenInGame");
+        }
+        if (st.spot) break;  // a light; else keep looking (a laser has no SpotLight)
+    }
+    return st;
+}
+
+void LogLight(const char* why, const LightState& st) {
+    if (++g_light.lines > 60) {
+        if (g_light.lines == 61) log::Info("light check: more changes in this level are not logged");
+        return;
+    }
+    if (!st.part) {
+        log::Info("light check (%s): the pistol %s carries no light", why, ue::GetName(st.gun).c_str());
+        return;
+    }
+    const char* mode = st.mode == 1 || st.mode == 3 ? "ON" : st.mode == 0 || st.mode == 2 ? "off" : "unknown";
+    std::string beam = "no spot light";
+    if (st.spot) {
+        // Where the beam points, in the gun actor's own axes (compare before
+        // and after the bench).
+        const Xf sw = ComponentToWorld(st.spot);
+        const FQuat gq = ActorRotation(st.gun);
+        const FVector gl = ActorLocation(st.gun);
+        const FVector at = gq.Inverse().Rotate(sw.translation - gl);
+        const FVector dir = gq.Inverse().Rotate(sw.rotation.Rotate(FVector{1, 0, 0}));
+        UObject parent = 0;
+        ue::GetProp(st.spot, "AttachParent", parent);
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+                 "beam intensity %.0f, at (%.1f %.1f %.1f) pointing (%.2f %.2f %.2f) on the gun, spot visible %d, "
+                 "hidden in game %d, attached to %s",
+                 st.intensity, at.X, at.Y, at.Z, dir.X, dir.Y, dir.Z, st.spot_visible, st.spot_hidden,
+                 parent ? ue::GetName(parent).c_str() : "nothing");
+        beam = buf;
+    }
+    UObject cur = L.player ? game::Gun::Current(L.player).Object() : 0;
+    log::Info("light check (%s): %s on %s: mode %s (index %d), power %.2f, part hidden %d; %s; the game's current "
+              "weapon %s",
+              why, ue::GetName(st.part).c_str(), ue::GetName(st.gun).c_str(), mode, st.mode_index, st.power,
+              st.actor_hidden, beam.c_str(), cur == st.gun ? "is this pistol" : cur ? ue::GetName(cur).c_str() : "none");
+}
+
+void CheckLight(UObject player) {
+    if (player != g_light.player) g_light = LightCheck{}, g_light.player = player;
+    const input::Snapshot snap = input::LastConsumed();
+    if (snap.valid && snap.hand[0].trigger_button.released) g_light.report_at = L.age + 0.25;
+    const bool report = g_light.report_at >= 0 && L.age >= g_light.report_at;
+    if (!report && L.age < g_light.next_sample) return;
+    g_light.next_sample = L.age + 0.2;
+    UObject gun = Pistol(player);
+    if (!gun) return;
+    const LightState st = ReadLight(gun);
+    if (report) {
+        g_light.report_at = -1;
+        LogLight("left trigger let go 0.25 s ago", st);
+    } else if (!g_light.have) {
+        LogLight("first look in this level", st);
+    } else if (!st.Same(g_light.last)) {
+        LogLight(st.part != g_light.last.part ? "the light part changed" : "changed", st);
+    }
+    g_light.last = st;
+    g_light.have = true;
+}
+
 void OnTick(UObject player, float dt) {
     if (player != L.player) {
         EndSession("new level", true);
@@ -893,6 +1031,7 @@ void OnTick(UObject player, float dt) {
     }
     if (!player) return;
     L.age += dt;
+    CheckLight(player);
     SearchLevel(player);
     if (g_search_state.load() == 2) {
         g_search_state = 0;

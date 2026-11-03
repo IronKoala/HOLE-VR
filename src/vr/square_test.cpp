@@ -31,9 +31,12 @@ constexpr uint32_t kSkipFlags = 0x10 | 0x20 | 0x8000 | 0x10000;
 constexpr uint8_t kWidgetSpaceScreen = 1;  // EWidgetSpace::Screen
 
 bool g_on = false;
-int g_trigger = 250;  // lone dots more in one eye than the other, whole picture
+// Lone dots more in one eye than in the other eye's same strip, in one strip
+// (Sweep::best_strip). The owner's 15:2x run: up to about 90 in ordinary
+// strips and 147 at worst in the base, 150 to 600 where the dots were.
+int g_trigger = 200;
 constexpr double kSettleMs = 400;
-constexpr double kCheckEveryMs = 1000;
+constexpr double kCheckEveryMs = 500;
 constexpr int kStrongSweeps = 2;  // in a row before a test starts
 constexpr int kMaxTries = 3;
 
@@ -85,29 +88,37 @@ void AddCvar(const char* name, int value, bool keep, const char* group = "", con
 void AddRenderSuspects() {
     // Post-process materials (the game's own screen effects, e.g. its retro
     // look) work on the finished picture, per eye.
-    AddCvar("r.PostProcessing.DisableMaterials", 1, false);
-    // Lumen reflections draw garbage into the right eye of a side-by-side
-    // stereo picture on newer NVIDIA drivers (Epic's UE-220474, UE 5.5,
-    // reproduced with -emulatestereo, which is how this mod renders). A
-    // level's own post-process settings can turn them on even though the
-    // game's default (r.ReflectionMethod 2) is screen space reflections, so
-    // this kill switch goes first; it wins over any level setting.
-    AddCvar("r.Lumen.Reflections.Allow", 0, true);
+    // The dots seen at full size (15:2x run, capture-dots-2 and -3) repeat
+    // on an 8 x 8 pixel tile with a fixed pattern inside it (mostly its left
+    // four columns), the mark of a compute pass that works in 8 x 8 tiles
+    // and leaves some of each tile unwritten or wrong. Lumen's screen probe
+    // gather and the virtual shadow maps' one-pass projection both work that
+    // way, so they go first. Already ruled out in that run: the game's flat
+    // UI (none on the window) and post-process materials (no effect).
+    //
     // Lumen global illumination as a whole, then its parts.
     AddCvar("r.Lumen.DiffuseIndirect.Allow", 0, false, "lumen");
     AddCvar("r.Lumen.ScreenProbeGather.IntegrationTileClassification", 0, true, "", "lumen");
-    AddCvar("r.Lumen.ScreenProbeGather.ScreenTraces", 0, true, "", "lumen");
     AddCvar("r.Lumen.ScreenProbeGather.ShortRangeAO", 0, true, "", "lumen");
+    AddCvar("r.Lumen.ScreenProbeGather.ScreenTraces", 0, true, "", "lumen");
     AddCvar("r.Lumen.ScreenProbeGather.Temporal", 0, false, "", "lumen");
+    AddCvar("r.Lumen.ScreenProbeGather.SpatialFilterProbes", 0, false, "", "lumen");
     AddCvar("r.Shadow.Virtual.OnePassProjection", 0, true);
-    AddCvar("r.VolumetricFog", 0, false);
-    AddCvar("r.ReflectionMethod", 0, false);
-    AddCvar("r.Lumen.TranslucencyVolume.Enable", 0, false);
+    // Lumen reflections draw garbage into the right eye of a side-by-side
+    // stereo picture on newer NVIDIA drivers (Epic's UE-220474, UE 5.5,
+    // reproduced with -emulatestereo, which is how this mod renders). The
+    // levels ask for screen space reflections (render fixes log), so this is
+    // unlikely, but it is cheap to rule out.
+    AddCvar("r.Lumen.Reflections.Allow", 0, true);
     AddCvar("r.ContactShadows", 0, true);
+    AddCvar("r.VolumetricFog", 0, false);
     AddCvar("r.DistanceFieldAO", 0, false);
     AddCvar("r.AmbientOcclusionLevels", 0, false);
+    AddCvar("r.Lumen.TranslucencyVolume.Enable", 0, false);
+    AddCvar("r.ReflectionMethod", 0, false);
     AddCvar("r.BloomQuality", 0, false);
     AddCvar("r.PostProcessAAQuality", 0, false);
+    AddCvar("r.PostProcessing.DisableMaterials", 1, false);
 }
 
 // How close the picture came to starting the test, once every 30 s when it
@@ -118,15 +129,16 @@ float g_closest_share = 0.f;
 double g_closest_since = -1;
 void NoteClosest(const square_watch::Sweep& sw, double now) {
     if (g_closest_since < 0) g_closest_since = now;
-    if (sw.Odd() > g_closest) {
-        g_closest = sw.Odd();
-        g_closest_eye = sw.Eye();
-        g_closest_share = sw.grid_share[sw.Eye()];
+    const int eye = sw.best_strip[1] > sw.best_strip[0] ? 1 : 0;
+    if (sw.best_strip[eye] > g_closest) {
+        g_closest = sw.best_strip[eye];
+        g_closest_eye = eye;
+        g_closest_share = sw.grid_share[eye];
     }
     if (now - g_closest_since < 30000) return;
     if (g_closest >= g_trigger / 3)
-        log::Info("square test: most lone dots in one eye beyond the other in the last 30 s: %d (%s eye, %.0f%% on "
-                  "one cell of an 8x4 grid; the test starts at %d)",
+        log::Info("square test: most lone dots in one strip of one eye beyond the other eye's in the last 30 s: %d "
+                  "(%s eye, %.0f%% of that eye's dots on one cell of an 8x4 grid; the test starts at %d)",
                   g_closest, g_closest_eye ? "right" : "left", 100.f * g_closest_share, g_trigger);
     g_closest = 0;
     g_closest_since = now;
@@ -325,7 +337,8 @@ bool g_kept_any = false;
 
 const char* EyeName(int e) { return e ? "right" : "left"; }
 
-int BadEyeExcess(const square_watch::Sweep& s) { return s.dots[g_eye] - s.dots[1 - g_eye]; }
+// Dots more in the bad eye, added up over the strips where it has many more.
+int BadEyeExcess(const square_watch::Sweep& s) { return s.excess[g_eye]; }
 
 bool Ready(const Suspect& s) {
     if (s.needs.empty()) return true;
@@ -444,14 +457,17 @@ void Tick(UObject player, float) {
                 g_strong = 0;
                 return;
             }
-            g_strong = sw.Odd() >= g_trigger ? g_strong + 1 : 0;
+            {
+                const int eye = sw.best_strip[1] > sw.best_strip[0] ? 1 : 0;
+                // Both checks have to point at the same eye.
+                g_strong = sw.best_strip[eye] >= g_trigger && (g_strong == 0 || eye == g_eye) ? g_strong + 1 : 0;
+                if (g_strong > 0) g_eye = eye;
+            }
             NoteClosest(sw, now);
             if (g_strong < kStrongSweeps) return;
-            g_eye = sw.Eye();
-            log::Info("square test: %d lone dots in the %s eye, %d in the %s eye (%.0f%% on one cell of an 8x4 "
-                      "grid); looking for what draws them",
-                      sw.dots[g_eye], EyeName(g_eye), sw.dots[1 - g_eye], EyeName(1 - g_eye),
-                      100.f * sw.grid_share[g_eye]);
+            log::Info("square test: %d lone dots more in the %s eye than the other in its worst strip (%d over all "
+                      "such strips; whole picture %d vs %d); looking for what draws them",
+                      sw.best_strip[g_eye], EyeName(g_eye), sw.excess[g_eye], sw.dots[g_eye], sw.dots[1 - g_eye]);
             if (player != g_level_player) {
                 g_level_player = player;
                 StartScan();
@@ -547,7 +563,7 @@ void Tick(UObject player, float) {
 
 void Init() {
     g_on = config::GetBool("square_test", true);
-    g_trigger = std::max(20, config::GetInt("square_test_trigger", 250));
+    g_trigger = std::max(square_watch::kStripExcess, config::GetInt("square_test_trigger", 200));
     if (!g_on) {
         log::Info("square test: off (square_test=0)");
         return;
@@ -555,8 +571,8 @@ void Init() {
     AddRenderSuspects();
     for (int i = 0; i < static_cast<int>(g_suspects.size()); ++i) g_queue.push_back(i);
     game::AddTickListener(&Tick);
-    log::Info("square test: ready; when one eye has %d+ more lone dots than the other it lists the game's flat UI "
-              "and switches suspects off for about a second each (square_test=0 turns it off)",
+    log::Info("square test: ready; when one strip of one eye has %d+ more lone dots than the other eye's it lists "
+              "the game's flat UI and switches suspects off for about a second each (square_test=0 turns it off)",
               g_trigger);
 }
 
