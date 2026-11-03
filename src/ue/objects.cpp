@@ -1,6 +1,7 @@
 #include "ue/objects.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <vector>
 
@@ -177,6 +178,39 @@ UObject FindObject(const std::string& full_name) {
         if (match && GetFullName(o) == full_name) found = o;
     });
     return found;
+}
+
+bool IsLive(UObject obj) {
+    if (!obj) return false;
+    const int32_t idx = mem::ReadOr<int32_t>(obj + off::kObjIndex, -1);
+    return idx >= 0 && objects::Get(idx) == obj && GetClass(obj) != 0;
+}
+
+UObject ObjectRef::Get() {
+    using namespace std::chrono;
+    return Get(duration<double>(steady_clock::now().time_since_epoch()).count());
+}
+
+UObject ObjectRef::Get(double now_s) {
+    if (obj_) {
+        // Same slot, same name: still the object we found. A freed object's
+        // slot is cleared or holds another object; memory reused by a new
+        // object at the same address has that object's own name.
+        FName name;
+        if (IsLive(obj_) && mem::Read(obj_ + off::kObjName, name) &&
+            name.comparison_index == name_.comparison_index && name.number == name_.number)
+            return obj_;
+        ++lost_;
+        log::Info("objects: %s went away with its level; it is looked up again while needed",
+                  full_name_.c_str());
+        obj_ = 0;
+        next_find_ = now_s;
+    }
+    if (now_s < next_find_) return 0;
+    next_find_ = now_s + retry_s_;
+    UObject o = FindObject(full_name_);
+    if (o && mem::Read(o + off::kObjName, name_)) obj_ = o;
+    return obj_;
 }
 
 }  // namespace holevr::ue

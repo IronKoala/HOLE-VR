@@ -428,9 +428,12 @@ bool ApplyLoadout(UObject player, UObject gun, const std::vector<SavedPart>& par
 
     // The hub's weapon racks show the guns with their parts (the menu
     // refreshes them too).
-    static UObject rack_class = 0, statics = 0;
-    if (!rack_class)
-        rack_class = ue::FindObject("BlueprintGeneratedClass /Game/GamePlay/LevelComponents/LCBP_WeaponEquip.LCBP_WeaponEquip_C");
+    // The racks are a hub-level class, freed when you leave the hub; kept as
+    // an ObjectRef so a class from a level you left is never passed on.
+    static ue::ObjectRef s_rack_class(
+        "BlueprintGeneratedClass /Game/GamePlay/LevelComponents/LCBP_WeaponEquip.LCBP_WeaponEquip_C", 2.0);
+    static UObject statics = 0;
+    const UObject rack_class = s_rack_class.Get();
     if (!statics) statics = ue::FindObject("GameplayStatics /Script/Engine.Default__GameplayStatics");
     if (rack_class && statics) {
         ue::Call all(statics, "GetAllActorsOfClass");

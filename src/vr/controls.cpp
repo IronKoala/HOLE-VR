@@ -2050,13 +2050,17 @@ bool LeftHandNearGun() {
 // (doors, pickups, switches: actors with BPI_InteractSystem). Touching (hand
 // within 20 cm of its bounds) wins over pointing (aim ray up to 150 cm).
 UObject FindInteractTarget(UObject player, const hands::HandState& hs, std::string* how, double* score_out) {
-    static UObject iface = 0, gps = 0;
-    static int lookups = 0;
-    if ((!iface || !gps) && lookups < 3) {
-        ++lookups;
-        if (!iface) iface = ue::FindObject("BlueprintGeneratedClass /Game/GamePlay/InteractSystem/BPI_InteractSystem.BPI_InteractSystem_C");
-        if (!gps) gps = ue::FindObject("GameplayStatics /Script/Engine.Default__GameplayStatics");
-        if (!iface) log::Warn("controls: BPI_InteractSystem not found; hand interact uses the game's own target only");
+    // A Blueprint interface: it can be freed and loaded again (Return to
+    // Title, then a new game), so it is checked on every use.
+    static ue::ObjectRef s_iface(
+        "BlueprintGeneratedClass /Game/GamePlay/InteractSystem/BPI_InteractSystem.BPI_InteractSystem_C");
+    static UObject gps = 0;
+    if (!gps) gps = ue::FindObject("GameplayStatics /Script/Engine.Default__GameplayStatics");
+    const UObject iface = s_iface.Get();
+    static bool s_warned = false;
+    if (!iface && !s_warned) {
+        s_warned = true;
+        log::Warn("controls: BPI_InteractSystem not found; hand interact uses the game's own target only");
     }
     if (!iface || !gps || !hs.valid) return 0;
     ue::Call all(gps, "GetAllActorsWithInterface");
@@ -2257,8 +2261,12 @@ void BuildPressParts(PressButton& b) {
     }
 }
 struct {
-    UObject cls = 0;
-    double next_class_lookup = 0;
+    // The timer is a home-level prop: its class is freed when you leave home
+    // and comes back at a new address. Kept as an ObjectRef, which notices
+    // (the 2026-11-03 14:02 run crashed passing the freed class on).
+    ue::ObjectRef cls{
+        "BlueprintGeneratedClass /Game/Props/00_Home/ShootingTimer/BP_ShootingTimer.BP_ShootingTimer_C"};
+    UObject last_cls = 0;
     double next_refresh = 0;
     double ready_at = 0;
     std::vector<PressButton> buttons;
@@ -2267,19 +2275,20 @@ struct {
 void RefreshPressButtons(UObject player) {
     if (g_clock < g_press.next_refresh) return;
     g_press.next_refresh = g_clock + 2.0;
-    if (!g_press.cls) {
-        if (g_clock < g_press.next_class_lookup) return;
-        g_press.next_class_lookup = g_clock + 10.0;
-        g_press.cls = ue::FindObject(
-            "BlueprintGeneratedClass /Game/Props/00_Home/ShootingTimer/BP_ShootingTimer.BP_ShootingTimer_C");
-        if (!g_press.cls) return;
-        log::Info("controls: shooting range timer class found; its button can be pressed by hand");
+    const UObject cls = g_press.cls.Get();
+    if (cls != g_press.last_cls) {
+        g_press.last_cls = cls;
+        if (cls) log::Info("controls: shooting range timer class found; its button can be pressed by hand");
+    }
+    if (!cls) {
+        g_press.buttons.clear();
+        return;
     }
     static UObject gps = 0;
     if (!gps) gps = ue::FindObject("GameplayStatics /Script/Engine.Default__GameplayStatics");
     if (!gps) return;
     ue::Call all(gps, "GetAllActorsOfClass");
-    all.Set("WorldContextObject", player).Set("ActorClass", g_press.cls);
+    all.Set("WorldContextObject", player).Set("ActorClass", cls);
     std::vector<PressButton> found;
     if (all.Invoke()) {
         int32_t size = 0;
