@@ -7,6 +7,7 @@
 
 #include "core/config.h"
 #include "core/log.h"
+#include "core/perf.h"
 #include "hooks/hooks.h"
 #include "vr/openxr.h"
 
@@ -58,12 +59,34 @@ UINT BeforePresent(IDXGISwapChain* sc, UINT sync_interval) {
     return sync_interval;
 }
 
+// The game's own Present call after ours: long means DXGI made the render
+// thread wait (usually for the GPU to free a back buffer).
+perf::Counter g_perf_present{"game's Present call"};
+
+double TimePresentStart(IDXGISwapChain* sc) {
+    static bool registered = (perf::Register(&g_perf_present), true);
+    (void)registered;
+    return sc == g_game_swapchain.load() ? perf::NowMs() : -1.0;
+}
+
+void TimePresentEnd(double start) {
+    if (start >= 0.0) g_perf_present.Add(perf::NowMs() - start);
+}
+
 HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* sc, UINT sync, UINT flags) {
-    return o_present(sc, BeforePresent(sc, sync), flags);
+    UINT interval = BeforePresent(sc, sync);
+    double t = TimePresentStart(sc);
+    HRESULT hr = o_present(sc, interval, flags);
+    TimePresentEnd(t);
+    return hr;
 }
 
 HRESULT STDMETHODCALLTYPE HookPresent1(IDXGISwapChain1* sc, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* p) {
-    return o_present1(sc, BeforePresent(sc, sync), flags, p);
+    UINT interval = BeforePresent(sc, sync);
+    double t = TimePresentStart(sc);
+    HRESULT hr = o_present1(sc, interval, flags, p);
+    TimePresentEnd(t);
+    return hr;
 }
 
 void OnSwapChainCreated(IUnknown* device, IDXGISwapChain* sc) {

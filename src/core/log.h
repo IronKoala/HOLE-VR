@@ -8,4 +8,9 @@ void Init(const std::wstring& mod_dir);
 void Info(const char* fmt, ...) __attribute__((format(gnu_printf, 1, 2)));
 void Warn(const char* fmt, ...) __attribute__((format(gnu_printf, 1, 2)));
 void Error(const char* fmt, ...) __attribute__((format(gnu_printf, 1, 2)));
+// Lines are written by a background thread a few ms later (errors at once).
+// Flush writes everything queued so far.
+void Flush();
+// Lines logged since the start (for the performance report).
+long long LinesWritten();
 }  // namespace holevr::log

@@ -868,6 +868,7 @@ struct NotifyStudy {
     std::map<std::string, int> counts;
     int lines = 0;
 } g_ns;
+bool g_ns_on = false;
 
 void OnAnyNotify(UObject self, UObject function, void* params) {
     if (!self || !function) return;
@@ -894,7 +895,10 @@ void OnAnyNotify(UObject self, UObject function, void* params) {
 }
 
 void NotifyStudyInit() {
-    if (!config::GetBool("body_footstep_study", true)) return;
+    // Off unless asked for: footsteps work (owner, 2026-11-02), and the study
+    // put every animation update of every character through our event hook.
+    if (!config::GetBool("body_footstep_study", false)) return;
+    g_ns_on = true;
     const char* cdos[] = {"AnimNotify /Script/Engine.Default__AnimNotify",
                           "AnimNotifyState /Script/Engine.Default__AnimNotifyState",
                           "AnimInstance /Script/Engine.Default__AnimInstance"};
@@ -907,6 +911,7 @@ void NotifyStudyInit() {
 }
 
 void NotifyStudyReport(double dt) {
+    if (!g_ns_on) return;
     static double t = 0;
     static int reports = 0;
     t += dt;

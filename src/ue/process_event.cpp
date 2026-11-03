@@ -161,8 +161,15 @@ ProcessEventFn OriginalFor(uintptr_t vtable) {
 
 thread_local int t_depth = 0;
 thread_local int t_open = 0;  // calls at this depth still reach the callbacks (GameCodeScope)
-perf::Counter g_hook_perf{"ProcessEvent callbacks"};
-std::atomic<bool> g_hook_perf_registered{false};
+// Every game event on a hooked class (every Blueprint tick, every animation
+// update, every widget event) passes through Hook, 3,000-20,000 times a
+// second in a level. What we add to each one is measured here, apart from
+// the mod's own callbacks (the mod tick runs inside the player's tick event).
+perf::Counter g_listen_perf{"game events: our listeners"};
+perf::Counter g_cb_perf{"game events: our callbacks"};
+std::atomic<bool> g_perf_registered{false};
+std::atomic<DWORD> g_game_thread{0};
+std::atomic<long long> g_off_thread_events{0};
 
 void Hook(UObject self, UObject function, void* params) {
     uintptr_t vt = *reinterpret_cast<uintptr_t*>(self);
@@ -174,9 +181,14 @@ void Hook(UObject self, UObject function, void* params) {
         original(self, function, params);
         return;
     }
-    if (!g_hook_perf_registered.exchange(true)) perf::Register(&g_hook_perf);
-    double t_pre = perf::NowMs();
-    ++t_depth;
+    if (!g_perf_registered.exchange(true)) {
+        g_listen_perf.per_second_total = true;
+        g_cb_perf.per_second_total = true;
+        perf::Register(&g_listen_perf);
+        perf::Register(&g_cb_perf);
+    }
+    DWORD gt = g_game_thread.load(std::memory_order_relaxed);
+    if (gt && GetCurrentThreadId() != gt) g_off_thread_events.fetch_add(1, std::memory_order_relaxed);
     const Callback* match = nullptr;
     int n = g_callback_count.load(std::memory_order_acquire);
     for (int i = 0; i < n; ++i) {
@@ -186,9 +198,13 @@ void Hook(UObject self, UObject function, void* params) {
         }
     }
     bool run = true;
-    if (match && match->pre) run = match->pre(self, function, params);
-    --t_depth;
-    double t_mid = perf::NowMs();
+    if (match && match->pre) {
+        double t = perf::NowMs();
+        ++t_depth;
+        run = match->pre(self, function, params);
+        --t_depth;
+        g_cb_perf.Add(perf::NowMs() - t);
+    }
 
     if (run) original(self, function, params);
 
@@ -196,9 +212,11 @@ void Hook(UObject self, UObject function, void* params) {
     ++t_depth;
     for (int i = 0; i < kMaxAny; ++i)
         if (PostFn any = g_any[i].load(std::memory_order_acquire)) any(self, function, params);
+    double t_listeners = perf::NowMs();
     if (match && match->post) match->post(self, function, params);
     --t_depth;
-    g_hook_perf.Add((t_mid - t_pre) + (perf::NowMs() - t_post));
+    g_listen_perf.Add(t_listeners - t_post);
+    if (match && match->post) g_cb_perf.Add(perf::NowMs() - t_listeners);
 }
 
 }  // namespace
@@ -221,6 +239,9 @@ bool Init() {
 }
 
 bool Ready() { return g_ready; }
+
+void SetGameThread(DWORD id) { g_game_thread.store(id, std::memory_order_relaxed); }
+long long TakeOffThreadEvents() { return g_off_thread_events.exchange(0, std::memory_order_relaxed); }
 int VtableIndex() { return g_index; }
 uintptr_t FunctionFlagsOffset() { return g_flags_off; }
 

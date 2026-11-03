@@ -275,6 +275,9 @@ bool Init() {
 
 void Apply() {
     if (!g_ready) return;
+    // A pass over every object each second: remember memory regions for the
+    // pass, or most reads ask Windows again (2026-11-03 performance pass).
+    mem::ScopedRegionCache region_cache;
     Counts c;
     std::vector<Target> targets;
     ue::objects::ForEach([&](int, UObject obj) {

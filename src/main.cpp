@@ -6,6 +6,7 @@
 
 #include "core/config.h"
 #include "core/log.h"
+#include "core/perf.h"
 #include "core/memory.h"
 #include "game/game.h"
 #include "game/weapon_lab.h"
@@ -143,6 +144,16 @@ DWORD WINAPI InitThread(LPVOID) {
     // keypress (the start-up dump runs before any level and misses them).
     int game_classes_seen_at = -1;
     bool ingame_dumped = !config::GetBool("dump_in_game", true);
+    // Time spent on each job of this loop ("= N ms/s" in the perf lines is
+    // its share of one CPU core). It used to spend most of every second
+    // rescanning every game object (2026-11-03 performance pass).
+    static perf::Counter bg_maintain{"background: game classes"}, bg_render{"background: render fixes"},
+        bg_panel{"background: menu panel"}, bg_menu{"background: menu scan"}, bg_study{"background: menu study"},
+        bg_cvars{"background: cvars"};
+    for (perf::Counter* c : {&bg_maintain, &bg_render, &bg_panel, &bg_menu, &bg_study, &bg_cvars}) {
+        c->per_second_total = true;
+        perf::Register(c);
+    }
     for (int frame = 0;; ++frame) {
         if (hooks && !ingame_dumped && frame % 60 == 45 && game::GunBaseClass()) {
             if (game_classes_seen_at < 0) game_classes_seen_at = frame;
@@ -154,15 +165,15 @@ DWORD WINAPI InitThread(LPVOID) {
         }
         if (hooks) {
             game::weapon_lab::PollHotkeys();
-            if (frame % 60 == 0) game::Maintain();
-            if (frame % 60 == 30) vr::cvars::Maintain();
+            if (frame % 60 == 0) { perf::Scope t(bg_maintain); game::Maintain(); }
+            if (frame % 60 == 30) { perf::Scope t(bg_cvars); vr::cvars::Maintain(); }
         }
         // New cameras, volumes and captures appear on every level load, so
         // the render fixes are re-applied once a second.
-        if (render_fixes && frame % 60 == 0) vr::render_fixes::Apply();
-        if (frame % 60 == 15) vr::ui_panel::Maintain();
-        if (frame % 15 == 7) vr::world_menu::Scan();
-        if (hooks) vr::menu_study::Poll();
+        if (render_fixes && frame % 60 == 0) { perf::Scope t(bg_render); vr::render_fixes::Apply(); }
+        if (frame % 60 == 15) { perf::Scope t(bg_panel); vr::ui_panel::Maintain(); }
+        if (frame % 15 == 7) { perf::Scope t(bg_menu); vr::world_menu::Scan(); }
+        if (hooks) { perf::Scope t(bg_study); vr::menu_study::Poll(); }
         bool ctrl = GetAsyncKeyState(VK_CONTROL) & 0x8000;
         bool dump = ctrl && (GetAsyncKeyState(VK_F9) & 0x8000);
         bool recenter = ctrl && (GetAsyncKeyState(VK_F8) & 0x8000);

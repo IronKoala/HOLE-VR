@@ -46,6 +46,7 @@ unsigned long long g_hitches = 0, g_keepalive_frames = 0;
 std::atomic<bool> g_keepalive_started{false};
 
 uint32_t g_eye_w = 0, g_eye_h = 0;
+double g_present_ms = 0.0;  // perf::NowMs() when the game called Present for the frame being sent
 std::vector<Listener*>& Listeners() {
     static std::vector<Listener*> l;
     return l;
@@ -162,6 +163,130 @@ EyeView g_rendered[2]{};
 bool g_have_latest = false;
 bool g_have_rendered = false;
 
+// ---- pose pairing ----
+// The game thread works out a frame's eye views (and draws the hands with the
+// same tracking sample) well before the render side presents that frame, and
+// it can be one or two frames further on by the time the picture reaches
+// Present. Handing the headset "the latest views" therefore paired a picture
+// with a newer head pose, by a varying number of frames, which shakes the
+// world when the head turns. Each frame's views now wait in a queue in the
+// order they were drawn, and each Present takes the oldest one: the views
+// that picture was drawn with. All guarded by g_view_mutex.
+struct QueuedViews {
+    EyeView v[2];
+    long long qpc;
+};
+constexpr int kViewQueue = 8;
+QueuedViews g_vq[kViewQueue];
+int g_vq_head = 0, g_vq_size = 0;
+long long g_last_push_qpc = 0;
+EyeView g_paired[2]{};
+bool g_have_paired = false;
+struct PairStats {
+    long long pushes = 0, merged = 0, presents = 0, empty = 0, stale = 0, trimmed = 0;
+    long long newer[3] = {};  // frames already drawn after the presented one: 0, 1, 2+
+    double age_sum = 0, age_max = 0, age_min = 1e9;
+    long long age_n = 0;
+} g_pair;
+
+double QpcMs(long long ticks);  // below
+
+void PushViews(const EyeView views[2]) {
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    ++g_pair.pushes;
+    // A second set within 2 ms is the same frame asking again: replace it.
+    if (g_vq_size > 0 && QpcMs(now.QuadPart - g_last_push_qpc) < 2.0) {
+        QueuedViews& last = g_vq[(g_vq_head + g_vq_size - 1) % kViewQueue];
+        last.v[0] = views[0];
+        last.v[1] = views[1];
+        ++g_pair.merged;
+    } else {
+        if (g_vq_size == kViewQueue) {
+            g_vq_head = (g_vq_head + 1) % kViewQueue;
+            --g_vq_size;
+        }
+        QueuedViews& q = g_vq[(g_vq_head + g_vq_size) % kViewQueue];
+        q.v[0] = views[0];
+        q.v[1] = views[1];
+        q.qpc = now.QuadPart;
+        ++g_vq_size;
+    }
+    g_last_push_qpc = now.QuadPart;
+}
+
+// At Present: the views the picture being presented was drawn with. Falls
+// back to the newest views when nothing usable is queued.
+void TakePresentedViews(EyeView out[2], bool* have) {
+    std::lock_guard<std::mutex> lock(g_view_mutex);
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    ++g_pair.presents;
+    // Left over from before a load or a stall: not this picture's.
+    while (g_vq_size > 0 && QpcMs(now.QuadPart - g_vq[g_vq_head].qpc) > 1000.0) {
+        g_vq_head = (g_vq_head + 1) % kViewQueue;
+        --g_vq_size;
+        ++g_pair.stale;
+    }
+    if (g_vq_size > 0) {
+        const QueuedViews& q = g_vq[g_vq_head];
+        g_paired[0] = q.v[0];
+        g_paired[1] = q.v[1];
+        g_have_paired = true;
+        double age = QpcMs(now.QuadPart - q.qpc);
+        g_pair.age_sum += age;
+        g_pair.age_max = std::max(g_pair.age_max, age);
+        g_pair.age_min = std::min(g_pair.age_min, age);
+        ++g_pair.age_n;
+        g_vq_head = (g_vq_head + 1) % kViewQueue;
+        --g_vq_size;
+        // The old "latest views" would have been this many frames newer.
+        ++g_pair.newer[std::min(g_vq_size, 2)];
+        // The game thread can't be more than two drawn frames ahead of the
+        // picture being presented; more means a frame was drawn and never
+        // presented, so drop the extras to stay in step.
+        while (g_vq_size > 2) {
+            g_vq_head = (g_vq_head + 1) % kViewQueue;
+            --g_vq_size;
+            ++g_pair.trimmed;
+        }
+    } else {
+        ++g_pair.empty;  // keep the last pairing
+    }
+    const bool pairing = config::GetBool("pose_pairing", true);
+    if (pairing && g_have_paired) {
+        out[0] = g_paired[0];
+        out[1] = g_paired[1];
+        *have = true;
+    } else {
+        out[0] = g_rendered[0];
+        out[1] = g_rendered[1];
+        *have = g_have_rendered;
+    }
+}
+
+std::string PairReport(double) {
+    PairStats p;
+    {
+        std::lock_guard<std::mutex> lock(g_view_mutex);
+        p = g_pair;
+        g_pair = PairStats{};
+    }
+    if (!p.presents) return {};
+    long long n = p.newer[0] + p.newer[1] + p.newer[2];
+    auto pct = [&](long long v) { return n ? 100.0 * v / n : 0.0; };
+    char buf[600];
+    std::snprintf(buf, sizeof(buf),
+                  "frame timing: pose pairing %s; picture reached Present %.1f ms after its views were taken "
+                  "(%.1f-%.1f); at Present the game had already drawn 0/1/2+ newer frames %.0f%%/%.0f%%/%.0f%% "
+                  "(the old pairing used the newest, so it was off by that many frames); %lld presents, %lld view "
+                  "sets (%lld repeats merged), %lld presents with no new views, %lld stale and %lld extra views dropped",
+                  config::GetBool("pose_pairing", true) ? "on" : "off (newest views)",
+                  p.age_n ? p.age_sum / p.age_n : 0.0, p.age_n ? p.age_min : 0.0, p.age_max, pct(p.newer[0]),
+                  pct(p.newer[1]), pct(p.newer[2]), p.presents, p.pushes, p.merged, p.empty, p.stale, p.trimmed);
+    return buf;
+}
+
 std::atomic<ID3D12Resource*> g_eye_texture{nullptr};
 // The game window's current back buffer. While the engine draws both eyes
 // straight into the window (or before its eye texture is found) we copy from
@@ -195,6 +320,79 @@ HANDLE g_fence_event = nullptr;
 UINT64 g_fence_value = 0;
 int g_frame_slot = 0;
 
+// ---- GPU timing ----
+// A timestamp before and after our copy each frame. The first one is written
+// once the GPU has finished everything queued before it (the game's frame),
+// so "GPU done" minus the time Present was called says how far behind the
+// CPU the GPU runs; near a whole frame or more means the GPU is the limit.
+ID3D12QueryHeap* g_ts_heap = nullptr;
+ID3D12Resource* g_ts_readback = nullptr;
+UINT64 g_ts_freq = 0;
+UINT64 g_cal_gpu = 0, g_cal_cpu = 0;  // one moment on both clocks
+DWORD g_cal_at = 0;
+double g_slot_present_ms[kFramesInFlight] = {};  // perf::NowMs() when that slot's frame was presented
+bool g_slot_has_ts[kFramesInFlight] = {};
+perf::Counter g_perf_gpu_done{"GPU done with the game's picture, after Present"};
+perf::Counter g_perf_gpu_copy{"our copy on the GPU"};
+perf::Counter g_perf_fence{"copy waited for the GPU"};
+
+bool CreateTimestampResources() {
+    D3D12_QUERY_HEAP_DESC qd{};
+    qd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    qd.Count = 2 * kFramesInFlight;
+    if (FAILED(g_device->CreateQueryHeap(&qd, IID_PPV_ARGS(&g_ts_heap)))) return false;
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC bd{};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = 2 * kFramesInFlight * sizeof(UINT64);
+    bd.Height = 1;
+    bd.DepthOrArraySize = 1;
+    bd.MipLevels = 1;
+    bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (FAILED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                 nullptr, IID_PPV_ARGS(&g_ts_readback)))) {
+        g_ts_heap->Release();
+        g_ts_heap = nullptr;
+        return false;
+    }
+    if (FAILED(g_queue->GetTimestampFrequency(&g_ts_freq)) || !g_ts_freq) return false;
+    perf::Register(&g_perf_gpu_done);
+    perf::Register(&g_perf_gpu_copy);
+    return true;
+}
+
+// GPU timestamp -> perf::NowMs() time base.
+double GpuToCpuMs(UINT64 ts) {
+    double gpu_ms = (static_cast<double>(ts) - static_cast<double>(g_cal_gpu)) * 1000.0 / static_cast<double>(g_ts_freq);
+    LARGE_INTEGER f;
+    QueryPerformanceFrequency(&f);
+    return static_cast<double>(g_cal_cpu) * 1000.0 / static_cast<double>(f.QuadPart) + gpu_ms;
+}
+
+// Reads the timestamps a slot recorded last time round (the fence says done).
+void ReadSlotTimestamps(int slot) {
+    if (!g_ts_heap || !g_slot_has_ts[slot]) return;
+    g_slot_has_ts[slot] = false;
+    DWORD now = GetTickCount();
+    if (!g_cal_at || now - g_cal_at > 5000) {  // the two clocks drift apart slowly
+        if (SUCCEEDED(g_queue->GetClockCalibration(&g_cal_gpu, &g_cal_cpu))) g_cal_at = now;
+    }
+    if (!g_cal_at) return;
+    void* mapped = nullptr;
+    D3D12_RANGE range{slot * 2 * sizeof(UINT64), (slot * 2 + 2) * sizeof(UINT64)};
+    if (FAILED(g_ts_readback->Map(0, &range, &mapped)) || !mapped) return;
+    UINT64 ts[2];
+    std::memcpy(ts, static_cast<const uint8_t*>(mapped) + range.Begin, sizeof(ts));
+    D3D12_RANGE none{0, 0};
+    g_ts_readback->Unmap(0, &none);
+    if (!ts[0] || ts[1] < ts[0]) return;
+    double done = GpuToCpuMs(ts[0]) - g_slot_present_ms[slot];
+    if (done > -50.0 && done < 1000.0) g_perf_gpu_done.Add(std::max(done, 0.0));
+    g_perf_gpu_copy.Add((ts[1] - ts[0]) * 1000.0 / static_cast<double>(g_ts_freq));
+}
+
 bool CreateCopyResources() {
     if (g_cmd) return true;
     for (auto& a : g_allocators) {
@@ -206,6 +404,8 @@ bool CreateCopyResources() {
     g_cmd->Close();
     if (FAILED(g_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_fence)))) return false;
     g_fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!CreateTimestampResources()) log::Warn("OpenXR: GPU timing unavailable (timestamp queries)");
+    perf::Register(&g_perf_fence);
     return g_fence_event != nullptr;
 }
 
@@ -433,11 +633,14 @@ bool CopyEyes(ID3D12Resource* source, D3D12_RESOURCE_STATES src_state, const uin
     int slot = g_frame_slot;
     g_frame_slot = (g_frame_slot + 1) % kFramesInFlight;
     if (g_fence->GetCompletedValue() < g_allocator_fence_value[slot]) {
+        perf::Scope t(g_perf_fence);
         g_fence->SetEventOnCompletion(g_allocator_fence_value[slot], g_fence_event);
         WaitForSingleObject(g_fence_event, 100);
     }
+    if (g_fence->GetCompletedValue() >= g_allocator_fence_value[slot]) ReadSlotTimestamps(slot);
     g_allocators[slot]->Reset();
     g_cmd->Reset(g_allocators[slot], nullptr);
+    if (g_ts_heap) g_cmd->EndQuery(g_ts_heap, D3D12_QUERY_TYPE_TIMESTAMP, slot * 2);
 
     D3D12_RESOURCE_BARRIER before[3] = {
         Transition(source, src_state, D3D12_RESOURCE_STATE_COPY_SOURCE),
@@ -467,6 +670,13 @@ bool CopyEyes(ID3D12Resource* source, D3D12_RESOURCE_STATES src_state, const uin
         std::swap(after[i].Transition.StateBefore, after[i].Transition.StateAfter);
     }
     g_cmd->ResourceBarrier(3, after);
+    if (g_ts_heap) {
+        g_cmd->EndQuery(g_ts_heap, D3D12_QUERY_TYPE_TIMESTAMP, slot * 2 + 1);
+        g_cmd->ResolveQueryData(g_ts_heap, D3D12_QUERY_TYPE_TIMESTAMP, slot * 2, 2, g_ts_readback,
+                                slot * 2 * sizeof(UINT64));
+        g_slot_present_ms[slot] = g_present_ms;
+        g_slot_has_ts[slot] = true;
+    }
     if (FAILED(g_cmd->Close())) return false;
     ID3D12CommandList* lists[] = {g_cmd};
     g_queue->ExecuteCommandLists(1, lists);
@@ -568,6 +778,11 @@ void LocateViews(XrTime time) {
     g_have_latest = true;
 }
 
+double QpcMs(long long ticks) {
+    if (!g_qpc_freq.QuadPart) QueryPerformanceFrequency(&g_qpc_freq);
+    return ticks * 1000.0 / static_cast<double>(g_qpc_freq.QuadPart);
+}
+
 double MsSince(long long qpc) {
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
@@ -583,12 +798,60 @@ void MarkFrameDone() {
 perf::Counter g_perf_game{"game frame (between submits)"};
 perf::Counter g_perf_wait{"xrWaitFrame"};
 perf::Counter g_perf_submit{"copy+submit"};
+perf::Counter g_perf_begin{"  begin+input"};
+perf::Counter g_perf_images{"  swapchain wait"};
+perf::Counter g_perf_copy{"  copy"};
+perf::Counter g_perf_layers{"  wrist/laser layers"};
+perf::Counter g_perf_end{"  xrEndFrame"};
+
+// Headset frames the game missed: display times of consecutive frames we
+// sent that are more than one display period apart. Guarded by g_frame_mutex.
+XrTime g_last_display_time = 0;
+long long g_sent = 0, g_missed = 0, g_missed_runs = 0;
+XrDuration g_display_period = 0;
+
+void CountDisplaySlot(const XrFrameState& fs) {
+    if (fs.predictedDisplayPeriod > 0) g_display_period = fs.predictedDisplayPeriod;
+    if (g_last_display_time && g_display_period > 0 && fs.predictedDisplayTime > g_last_display_time) {
+        long long slots = (fs.predictedDisplayTime - g_last_display_time + g_display_period / 2) / g_display_period;
+        if (slots > 1 && slots < 1000) {
+            g_missed += slots - 1;
+            ++g_missed_runs;
+        }
+    }
+    g_last_display_time = fs.predictedDisplayTime;
+    ++g_sent;
+}
+
+std::string HeadsetReport(double span_s) {
+    long long sent, missed, runs;
+    double hz;
+    {
+        std::lock_guard<std::mutex> lock(g_frame_mutex);
+        sent = g_sent;
+        missed = g_missed;
+        runs = g_missed_runs;
+        hz = g_display_period > 0 ? 1e9 / static_cast<double>(g_display_period) : 0.0;
+        g_sent = g_missed = g_missed_runs = 0;
+    }
+    if (!sent) return {};
+    char buf[300];
+    std::snprintf(buf, sizeof(buf),
+                  "frame timing: headset %.0f Hz; %lld frames sent, %lld display slots missed (%.1f/s, in %lld runs)%s",
+                  hz, sent, missed, missed / span_s, runs,
+                  missed ? "; each missed slot shows the last picture again (a judder)" : "");
+    return buf;
+}
 
 void RunFrame() {
     static bool registered = [] {
         perf::Register(&g_perf_game);
         perf::Register(&g_perf_wait);
         perf::Register(&g_perf_submit);
+        for (perf::Counter* c : {&g_perf_begin, &g_perf_images, &g_perf_copy, &g_perf_layers, &g_perf_end})
+            perf::Register(c);
+        perf::AddReportLine(&HeadsetReport);
+        perf::AddReportLine(&PairReport);
         return true;
     }();
     (void)registered;
@@ -612,12 +875,20 @@ void RunFrame() {
     XrFrameWaitInfo wi{XR_TYPE_FRAME_WAIT_INFO};
     if (XR_FAILED(Proc<PFN_xrWaitFrame>("xrWaitFrame")(g_session, &wi, &fs))) return;
     g_perf_wait.Add(perf::NowMs() - t_wait);
+    CountDisplaySlot(fs);
     perf::Scope submit_scope(g_perf_submit);
+    double t_step = perf::NowMs();
+    auto step = [&t_step](perf::Counter& c) {
+        double now = perf::NowMs();
+        c.Add(now - t_step);
+        t_step = now;
+    };
     XrFrameBeginInfo bi{XR_TYPE_FRAME_BEGIN_INFO};
     if (XR_FAILED(Proc<PFN_xrBeginFrame>("xrBeginFrame")(g_session, &bi))) return;
 
     LocateViews(fs.predictedDisplayTime);
     for (Listener* l : Listeners()) l->OnFrame(g_session, g_space, fs.predictedDisplayTime);
+    step(g_perf_begin);
 
     XrCompositionLayerProjectionView proj_views[2] = {{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},
                                                       {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
@@ -635,12 +906,8 @@ void RunFrame() {
         src_state = D3D12_RESOURCE_STATE_PRESENT;
     }
     EyeView rendered[2];
-    bool have_rendered;
-    {
-        std::lock_guard<std::mutex> lock(g_view_mutex);
-        have_rendered = g_have_rendered;
-        std::memcpy(rendered, g_rendered, sizeof(rendered));
-    }
+    bool have_rendered = false;
+    TakePresentedViews(rendered, &have_rendered);
     if (fs.shouldRender && source && have_rendered) {
         D3D12_RESOURCE_DESC sd = source->GetDesc();
         bool ok = (sd.Width == g_source_width && sd.Height == g_source_height && sd.Format == g_source_format) ||
@@ -659,7 +926,9 @@ void RunFrame() {
             wti.timeout = 100000000;  // 100 ms
             ok = XR_SUCCEEDED(wait(g_swapchains[eye].handle, &wti));
         }
+        step(g_perf_images);
         if (ok) ok = CopyEyes(source, src_state, index);
+        step(g_perf_copy);
         for (int eye = 0; eye < acquired; ++eye) {
             XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
             release(g_swapchains[eye].handle, &ri);
@@ -694,14 +963,17 @@ void RunFrame() {
         g_max_gap_ms = 0.0;
         g_last_stats = now;
     }
+    t_step = perf::NowMs();
     if (fs.shouldRender)
         for (Listener* l : Listeners()) l->AddLayers(g_session, g_space, fs.predictedDisplayTime, layers);
+    step(g_perf_layers);
     XrFrameEndInfo ei{XR_TYPE_FRAME_END_INFO};
     ei.displayTime = fs.predictedDisplayTime;
     ei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
     ei.layerCount = static_cast<uint32_t>(layers.size());
     ei.layers = layers.data();
     Proc<PFN_xrEndFrame>("xrEndFrame")(g_session, &ei);
+    step(g_perf_end);
     MarkFrameDone();
     perf::MaybeReport();
 }
@@ -715,6 +987,7 @@ void KeepAliveFrame() {
     XrFrameState fs{XR_TYPE_FRAME_STATE};
     XrFrameWaitInfo wi{XR_TYPE_FRAME_WAIT_INFO};
     if (XR_FAILED(Proc<PFN_xrWaitFrame>("xrWaitFrame")(g_session, &wi, &fs))) return;
+    CountDisplaySlot(fs);
     XrFrameBeginInfo bi{XR_TYPE_FRAME_BEGIN_INFO};
     if (XR_FAILED(Proc<PFN_xrBeginFrame>("xrBeginFrame")(g_session, &bi))) return;
     XrCompositionLayerProjection layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
@@ -827,6 +1100,7 @@ void RecommendedEyeSize(uint32_t* width, uint32_t* height) {
 }
 
 void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* back_buffer) {
+    g_present_ms = perf::NowMs();
     g_fallback_texture = back_buffer;
     if (!g_instance_ready || g_session_failed || !queue) return;
     if (!g_session) {
@@ -860,6 +1134,7 @@ void SetRenderedViews(const EyeView views[2]) {
     g_rendered[0] = views[0];
     g_rendered[1] = views[1];
     g_have_rendered = true;
+    PushViews(views);
 }
 
 bool SessionRunning() { return g_running; }

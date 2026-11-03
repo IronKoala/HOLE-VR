@@ -12,6 +12,8 @@
 
 #include "core/config.h"
 #include "core/log.h"
+#include "ue/process_event.h"
+#include "core/perf.h"
 #include "core/memory.h"
 #include "hooks/hooks.h"
 #include "ue/objects.h"
@@ -189,18 +191,36 @@ FVector g_pending_world_cm;
 std::atomic<void (*)()> g_frame_callback{nullptr};
 std::atomic<DWORD> g_view_thread{0};
 
+// Game thread frames: time between one frame's eye views and the next's.
+perf::Counter g_perf_gt_frame{"game thread frame"};
+perf::Counter g_perf_after_eyes{"after-eyes callback (hands)"};
+
 // After the right eye: the frame's head pose and world mapping are final.
 void RunFrameCallback() {
-    auto fn = g_frame_callback.load();
-    if (!fn) return;
+    static double s_last = 0.0;
+    static bool s_registered = false;
+    double now = perf::NowMs();
     // Only the thread that set up the views (the game thread) runs it.
     DWORD me = GetCurrentThreadId();
     DWORD expected = 0;
     if (!g_view_thread.compare_exchange_strong(expected, me) && expected != me) return;
+    if (!s_registered) {
+        s_registered = true;
+        perf::Register(&g_perf_gt_frame);
+        perf::Register(&g_perf_after_eyes);
+        ue::process_event::SetGameThread(me);
+    }
+    if (s_last > 0.0 && now - s_last < 1000.0) g_perf_gt_frame.Add(now - s_last);
+    s_last = now;
+    auto fn = g_frame_callback.load();
+    if (!fn) return;
     static bool running = false;
     if (running) return;
     running = true;
-    fn();
+    {
+        perf::Scope t(g_perf_after_eyes);
+        fn();
+    }
     running = false;
 }
 

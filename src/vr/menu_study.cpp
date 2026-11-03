@@ -208,8 +208,13 @@ void DumpCounts(const char* why) {
 // ---------------------------------------------------------- vtables --
 
 std::unordered_set<UObject> g_hooked_classes;
+std::unordered_set<std::string> g_hooked_names;
 
+// A full pass over every object; runs until the class is found, then never
+// again for that name (it used to repeat 5 full passes every 2 s forever).
 void HookFirstInstanceNamed(const char* class_name) {
+    if (g_hooked_names.count(class_name)) return;
+    mem::ScopedRegionCache region_cache;
     UObject found = 0;
     ue::objects::ForEach([&](int, UObject o) {
         if (found) return;
@@ -221,6 +226,7 @@ void HookFirstInstanceNamed(const char* class_name) {
         found = o;
     });
     if (!found) return;
+    g_hooked_names.insert(class_name);
     g_hooked_classes.insert(ue::GetClass(found));
     bool ok = ue::process_event::HookVtableOf(found);
     log::Info("menu study: %s events %s", class_name, ok ? "followed" : "could not be followed");
@@ -229,8 +235,13 @@ void HookFirstInstanceNamed(const char* class_name) {
 }  // namespace
 
 void InitGame() {
-    g_on = config::GetBool("menu_study", true);
-    if (!g_on) return;
+    // Off unless asked for: the menus are done, and while on it sees every
+    // game event (2026-11-03 performance pass).
+    g_on = config::GetBool("menu_study", false);
+    if (!g_on) {
+        log::Info("menu study: off (menu_study=1 in hole-vr.ini turns the logging study on)");
+        return;
+    }
     const char* cdos[] = {"UserWidget /Script/UMG.Default__UserWidget",
                           "GameInstance /Script/Engine.Default__GameInstance"};
     for (const char* name : cdos) {
@@ -251,7 +262,7 @@ void Poll() {
     static bool s_play_done = false;
     const double now = Now();
 
-    if (now - s_last_hook > 2.0) {
+    if (now - s_last_hook > 10.0) {
         s_last_hook = now;
         HookFirstInstanceNamed("BP_GameInstance_C");
         HookFirstInstanceNamed("UIM_Pause_C");

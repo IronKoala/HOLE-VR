@@ -4,6 +4,7 @@
 #include <windows.h>
 
 #include <atomic>
+#include <string>
 
 namespace holevr::perf {
 
@@ -23,6 +24,9 @@ struct Counter {
     std::atomic<double> total{0.0};
     std::atomic<double> worst{0.0};
     std::atomic<long long> count{0};
+    // Also print the total time per second ("= 12.3 ms/s"): for counters hit
+    // thousands of times a frame, where the average alone hides the cost.
+    bool per_second_total = false;
     void Add(double ms) {
         total.store(total.load() + ms);
         if (ms > worst.load()) worst.store(ms);
@@ -35,6 +39,11 @@ void Register(Counter* c);
 // Logs every registered counter (average and worst per call, calls per second)
 // at most once per 10 s, then resets them. Call from any frequent place.
 void MaybeReport();
+
+// Extra lines for the same 10 s report (e.g. the frame summary). Called with
+// the report's span in seconds; return an empty string for nothing.
+using ReportFn = std::string (*)(double span_s);
+void AddReportLine(ReportFn fn);
 
 struct Scope {
     Counter& c;

@@ -11,7 +11,7 @@
 //   game is paused then, so this finds a safe place to run our own code).
 // - Asks the OpenXR thread for a picture of what the headset is shown.
 //
-// menu_study=0 in hole-vr.ini turns it off.
+// Off by default; menu_study=1 in hole-vr.ini turns it on.
 namespace holevr::vr::menu_study {
 
 // After game::Init(): hooks the widget and game-instance event paths.

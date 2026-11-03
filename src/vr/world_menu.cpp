@@ -1985,15 +1985,32 @@ void ExecRemoveFromParent(UObject context, void* stack, void* result) {
 // backup, so a menu built where we couldn't see it still leaves the flat
 // screen instead of sitting in front of the face; already hosted ones are
 // skipped by TakeNewMenus.
+// Name-pool entries of "Construct" and "OnAddedToFocusPath", found once.
+// This listener sees every game event (thousands a second in a level), so it
+// compares the function's name entry instead of taking a lock and a map
+// lookup per event (2026-11-03 performance pass).
+std::atomic<bool> g_fn_names_ok{false};
+uint32_t g_construct_entry = 0, g_focus_entry = 0;
+
 void OnAnyEvent(UObject self, UObject function, void*) {
     if (!S.enabled || !self || !function) return;
-    // Each widget class has its own function objects: remember which ones
-    // are a Construct (1) or an OnAddedToFocusPath (2).
     enum : uint8_t { kOther = 0, kConstruct = 1, kFocus = 2 };
-    static std::mutex s_mutex;
-    static std::unordered_map<UObject, uint8_t> s_kind;
     uint8_t kind;
-    {
+    if (g_fn_names_ok.load(std::memory_order_relaxed)) {
+        // The engine is calling this live function right now, so its name
+        // is safe to read directly.
+        ue::FName fn;
+        std::memcpy(&fn, reinterpret_cast<const void*>(function + ue::off::kObjName), sizeof(fn));
+        if (fn.number != 0) return;
+        kind = fn.comparison_index == g_construct_entry ? kConstruct
+               : fn.comparison_index == g_focus_entry   ? kFocus
+                                                        : kOther;
+        if (kind == kOther) return;
+    } else {
+        // Fallback: remember which function objects are a Construct (1) or an
+        // OnAddedToFocusPath (2).
+        static std::mutex s_mutex;
+        static std::unordered_map<UObject, uint8_t> s_kind;
         std::lock_guard<std::mutex> lock(s_mutex);
         auto it = s_kind.find(function);
         if (it == s_kind.end()) {
@@ -2020,6 +2037,16 @@ void OnAnyEvent(UObject self, UObject function, void*) {
 void InitGame() {
     if (!S.enabled) return;
     ResolveLookups();  // before any game-thread code can need them
+    {
+        ue::FName c, f;
+        if (ue::names::Find("Construct", &c) && ue::names::Find("OnAddedToFocusPath", &f)) {
+            g_construct_entry = c.comparison_index;
+            g_focus_entry = f.comparison_index;
+            g_fn_names_ok = true;
+        } else {
+            log::Warn("world menu: function names not found in the name pool; using the slower event check");
+        }
+    }
     game::AddTickListener(&OnPlayerTick);
     g_wbgc_class = ue::FindObject("Class /Script/UMG.WidgetBlueprintGeneratedClass");
     UObject uw = ue::FindObject("UserWidget /Script/UMG.Default__UserWidget");

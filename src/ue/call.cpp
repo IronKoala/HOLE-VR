@@ -1,5 +1,7 @@
 #include "ue/call.h"
 
+#include <windows.h>
+
 #include <map>
 #include <mutex>
 #include <utility>
@@ -146,7 +148,28 @@ uint8_t* Call::Raw(const char* param, int32_t* size) {
 
 bool Call::Invoke() {
     if (!Valid()) {
-        log::Warn("call: function '%s' not found on %s", name_.c_str(), GetName(obj_).c_str());
+        // At most one line per function every 5 s: a caller holding on to a
+        // destroyed object repeats this every frame (3 lines a frame for 52 s
+        // in the owner's 2026-11-02 21:08 run), and each line costs frame time.
+        static std::mutex s_mutex;
+        static std::map<std::string, std::pair<DWORD, int>> s_last;  // name -> (time, calls hidden)
+        DWORD now = GetTickCount();
+        int hidden = 0;
+        {
+            std::lock_guard<std::mutex> lock(s_mutex);
+            auto& e = s_last[name_];
+            if (e.first && now - e.first < 5000) {
+                ++e.second;
+                return false;
+            }
+            hidden = e.second;
+            e = {now, 0};
+        }
+        if (hidden)
+            log::Warn("call: function '%s' not found on %s (and %d more times in the last 5 s)", name_.c_str(),
+                      GetName(obj_).c_str(), hidden);
+        else
+            log::Warn("call: function '%s' not found on %s", name_.c_str(), GetName(obj_).c_str());
         return false;
     }
     process_event::Invoke(obj_, fn_, buf_.data());

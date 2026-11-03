@@ -15,6 +15,12 @@ namespace holevr::ue::process_event {
 bool Init();
 bool Ready();
 
+// The game thread's id, so the report can count events that reach our hook
+// from other threads (animation workers): callbacks take locks there.
+void SetGameThread(unsigned long id);
+// Events seen off the game thread since the last call.
+long long TakeOffThreadEvents();
+
 int VtableIndex();
 uintptr_t FunctionFlagsOffset();
 
