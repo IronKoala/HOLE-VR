@@ -153,6 +153,17 @@ const Block kBlocks[] = {
      "menu_laser_own_hit=1\n"
      "; 1 = the menu hand buzzes when the game puts a menu on your arm\n"
      "menu_arrive_buzz=1\n"},
+    {"menu_always_on_top",
+     "\n"
+     "; --- Seeing forearm menus wherever your arm is ---\n"
+     "; 1 = forearm menus are drawn on top of everything in the game, so walls,\n"
+     ";     your own body or a box around your head can't cover them\n"
+     "menu_always_on_top=1\n"
+     "; The black box the game puts around your head (the pit after the\n"
+     "; microwave fall) covered the menu once your arm left it. While a menu is\n"
+     "; on your arm: grow = make the box bigger than your arm's reach (still\n"
+     "; black), hide = hide the box, off = leave it alone\n"
+     "menu_black_box=grow\n"},
     {"menu_fit_content",
      "\n"
      "; 1 = zoom each forearm menu so the part holding its buttons fills the\n"

@@ -70,7 +70,10 @@ struct Settings {
     bool arrive_buzz = true;      // buzz the menu hand when the game puts a menu on the arm
     bool fit = true;              // zoom each menu so its buttons fill the space on the arm
     float fit_max_zoom = 3.f;
+    bool on_top = true;           // menus drawn over everything (no depth test)
+    int black_box = 1;            // kBoxGrow / kBoxHide / kBoxOff (KeepBoxesAway)
 } S;
+constexpr int kBoxOff = 0, kBoxGrow = 1, kBoxHide = 2;
 
 // The game's menus are laid out for a 1920x1080 screen.
 constexpr int32_t kDrawW = 1920, kDrawH = 1080;
@@ -246,6 +249,10 @@ struct Lookups {
     int32_t slot_offsets = -1, slot_anchor_min = -1, slot_anchor_max = -1, slot_alignment = -1;
     int32_t slot_autosize = -1;
     uint8_t slot_autosize_mask = 0;
+    // DrawOnTop: UMaterial.bDisableDepthTest, from the engine's property data.
+    UObject material_class = 0;
+    int32_t depth_off = -1;
+    uint8_t depth_off_mask = 0;
     // The widget tree, read straight from the engine's fields (TreeRoot,
     // Children, SlotOf, Visibility): Widget.Visibility and .Slot,
     // UserWidget.WidgetTree, WidgetTree.RootWidget, PanelWidget.Slots (an
@@ -406,6 +413,16 @@ void ResolveLookups() {
     ResolveTreeOffsets();
     ResolveBackdropOffsets();
     ResolveFitOffsets();
+    L.material_class = Lookup("Class /Script/Engine.Material");
+    if (L.material_class) {
+        auto dd = ue::reflection::FindProperty(L.material_class, "bDisableDepthTest");
+        if (dd.valid() && dd.type == "BoolProperty" && dd.element_size == 1) {
+            L.depth_off = dd.offset;
+            L.depth_off_mask = dd.bool_mask ? dd.bool_mask : 0xFF;
+        } else {
+            log::Warn("world menu: Material.bDisableDepthTest not found; menus can't be drawn on top");
+        }
+    }
     L.have_ui_profile = ue::names::Find("UI", &L.ui_profile);
     if (!ue::names::Find("LeftMouseButton", &L.left_mouse))
         log::Warn("world menu: name \"LeftMouseButton\" not found");
@@ -1036,6 +1053,272 @@ void FitContent(Panel& p) {
 
 // ------------------------------------------------------------ hosting --
 
+// ------------------------------------------------ menus drawn on top --
+// A forearm menu is a panel in the game world, so anything nearer the eye
+// covers it: a wall your arm goes into, your own body, or the black box the
+// game puts around your head in the pit after the microwave fall (owner,
+// 2026-11-03: "i need to be able to see the menu regardless of where my
+// forearm is"). The panel's material (the engine's widget material) gets
+// the engine's own "Disable Depth Test" switch while a menu is on the arm,
+// which draws it over everything, and it is switched back when the last menu
+// goes. Set before the panel starts, so the panel is made with it.
+struct OnTop {
+    UObject mat = 0;
+    int index = -1;
+    bool was = false;  // the switch before we touched it
+    bool set = false;
+    int lines = 0;
+} OT;
+
+UObject BaseMaterial(UObject mi) {
+    if (!mi || !L.material_class) return 0;
+    if (IsA(mi, L.material_class)) return mi;
+    ue::Call g(mi, "GetBaseMaterial");
+    UObject base = g.Invoke() ? g.Result<UObject>() : 0;
+    return base && IsA(base, L.material_class) ? base : 0;
+}
+
+void DrawOnTop(UObject comp) {
+    if (!S.on_top || L.depth_off < 0) return;
+    UObject mi = 0;
+    // Transparent and two-sided (Host) picks TranslucentMaterial.
+    ue::GetProp(comp, "TranslucentMaterial", mi);
+    UObject base = BaseMaterial(mi);
+    if (!base) {
+        if (OT.lines++ < 3) log::Warn("world menu: the panel's material wasn't found; menus can't be drawn on top");
+        return;
+    }
+    uintptr_t at = base + static_cast<uintptr_t>(L.depth_off);
+    if (!mem::IsReadable(at, 1)) return;
+    uint8_t v = mem::ReadOr<uint8_t>(at, 0);
+    if (!OT.set || OT.mat != base) {
+        OT.mat = base;
+        OT.index = IndexOf(base);
+        OT.was = (v & L.depth_off_mask) != 0;
+    }
+    if (!mem::Write<uint8_t>(at, static_cast<uint8_t>(v | L.depth_off_mask))) return;
+    // Drawn last among see-through things too (smoke, glass), or those would
+    // be drawn over it now that depth no longer decides.
+    ue::SetProp<int32_t>(comp, "TranslucencySortPriority", 1000);
+    bool took = (mem::ReadOr<uint8_t>(at, 0) & L.depth_off_mask) != 0;
+    if (!OT.set && OT.lines++ < 6)
+        log::Info("world menu: forearm menus drawn on top of the game (%s: depth test %s%s)",
+                  ue::GetName(base).c_str(), took ? "off" : "STILL ON", OT.was ? ", it was already off" : "");
+    OT.set = true;
+}
+
+void RestoreDepthTest() {
+    if (!OT.set) return;
+    OT.set = false;
+    if (OT.was || !Alive(OT.mat, OT.index)) return;
+    uintptr_t at = OT.mat + static_cast<uintptr_t>(L.depth_off);
+    if (!mem::IsReadable(at, 1)) return;
+    uint8_t v = mem::ReadOr<uint8_t>(at, 0);
+    mem::Write<uint8_t>(at, static_cast<uint8_t>(v & ~L.depth_off_mask));
+}
+
+// ------------------------------------------------- the game's black box --
+// In the pit after the microwave fall the game puts a black box around your
+// head (BlackCube_C; owner's 2026-11-02 21:05 run: the laser started inside
+// BlackCube_C_1.Cube). Your arm leaves it easily, and its wall then covers
+// the menu. While a menu is on the arm, a box like that which is around your
+// head is made bigger than your reach (it stays black), or hidden. Found by
+// the scan thread from its class name; only a box with your head inside it
+// is ever touched, and it is put back when the last menu goes.
+bool IsBlackBoxName(std::string n) {
+    for (auto& ch : n) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    return n.find("black") != std::string::npos && n.find("cube") != std::string::npos;
+}
+
+std::mutex g_box_mutex;
+std::vector<std::pair<UObject, int>> g_box_found;  // filled by the scan thread
+std::atomic<bool> g_box_wanted{false};             // a menu is on the arm, look
+std::unordered_map<UObject, bool> g_box_classes;   // scan thread only
+
+struct BlackBox {
+    UObject actor = 0;
+    int index = -1;
+    std::string name;
+    FVector scale0{1, 1, 1};
+    double grown = 1.0;  // total growth we applied
+    bool hidden = false;
+    bool said_away = false;
+    bool said_fine = false;
+};
+std::vector<BlackBox> g_boxes;  // game thread
+double g_box_check_at = 0;
+
+// Scan thread: every actor whose class name has "black" and "cube" in it.
+void FindBlackBoxes() {
+    static uint64_t s_last = 0;
+    if (!g_box_wanted.load() || !L.actor_class) return;
+    uint64_t now = GetTickCount64();
+    if (now - s_last < 2000) return;
+    s_last = now;
+    double t0 = perf::NowMs();
+    std::vector<std::pair<UObject, int>> found;
+    ue::objects::ForEach([&](int index, UObject o) {
+        UObject cls = ue::GetClass(o);
+        if (!cls) return;
+        auto it = g_box_classes.find(cls);
+        bool box;
+        if (it != g_box_classes.end()) {
+            box = it->second;
+        } else {
+            box = IsBlackBoxName(ue::GetName(cls)) && ue::reflection::IsChildOf(cls, L.actor_class);
+            g_box_classes.emplace(cls, box);
+        }
+        if (!box) return;
+        uint32_t flags = mem::ReadOr<uint32_t>(o + ue::off::kObjFlags, RF_ClassDefaultObject);
+        if (flags & (RF_ClassDefaultObject | RF_BeginDestroyed | RF_FinishDestroyed)) return;
+        found.emplace_back(o, index);
+    });
+    double ms = perf::NowMs() - t0;
+    std::lock_guard<std::mutex> lock(g_box_mutex);
+    static int s_lines = 0;
+    if (found.size() != g_box_found.size() && s_lines++ < 20)
+        log::Info("world menu: %zu black box actor(s) in the level (looked in %.1f ms)", found.size(), ms);
+    g_box_found = std::move(found);
+}
+
+struct Bounds {
+    FVector o, e;
+};
+bool ActorBounds(UObject actor, Bounds* b) {
+    ue::Call c(actor, "GetActorBounds");
+    c.Set("bOnlyCollidingComponents", false).Set("bIncludeFromChildActors", false);
+    if (!c.Invoke()) return false;
+    b->o = c.Get<FVector>("Origin");
+    b->e = c.Get<FVector>("BoxExtent");
+    return b->e.X > 0 && b->e.Y > 0 && b->e.Z > 0;
+}
+
+double Axis(const FVector& v, int i) { return i == 0 ? v.X : i == 1 ? v.Y : v.Z; }
+
+// Head inside the box, with `reach` to spare on every side. `room` < 1 asks
+// for more, for a box that is turned (its axis-aligned bounds are bigger
+// than the box itself).
+bool HeadFits(const Bounds& b, const FVector& head, double reach, double room) {
+    for (int i = 0; i < 3; ++i)
+        if (std::fabs(Axis(head, i) - Axis(b.o, i)) + reach > Axis(b.e, i) * room) return false;
+    return true;
+}
+
+void HideBox(BlackBox& bx, const char* why) {
+    if (bx.hidden) return;
+    ue::Call h(bx.actor, "SetActorHiddenInGame");
+    h.Set("bNewHidden", true);
+    h.Invoke();
+    bx.hidden = true;
+    log::Info("world menu: hid the black box %s while a menu is on the arm (%s)", bx.name.c_str(), why);
+}
+
+void KeepBoxesAway() {
+    if (S.black_box == kBoxOff || !S.forearm) return;
+    double now = Now();
+    if (now - g_box_check_at < 0.25) return;
+    g_box_check_at = now;
+    {
+        std::lock_guard<std::mutex> lock(g_box_mutex);
+        for (auto& f : g_box_found) {
+            bool known = false;
+            for (auto& bx : g_boxes) known = known || bx.actor == f.first;
+            if (known || !Alive(f.first, f.second)) continue;
+            BlackBox bx;
+            bx.actor = f.first;
+            bx.index = f.second;
+            bx.name = ue::GetName(f.first);
+            g_boxes.push_back(bx);
+        }
+    }
+    FVector head;
+    double yaw;
+    if (g_boxes.empty() || !HeadInWorld(&head, &yaw)) return;
+    const double reach = 1.5 * G.cm_per_m;  // arm's length and the menu, with room
+    for (auto& bx : g_boxes) {
+        if (bx.hidden || !Alive(bx.actor, bx.index)) continue;
+        Bounds b;
+        if (!ActorBounds(bx.actor, &b)) continue;
+        if (!HeadFits(b, head, 0, 1.0)) {
+            if (!bx.said_away) {
+                bx.said_away = true;
+                log::Info("world menu: black box %s isn't around your head; left alone", bx.name.c_str());
+            }
+            continue;
+        }
+        bx.said_away = false;
+        if (S.black_box == kBoxHide) {
+            HideBox(bx, "menu_black_box=hide");
+            continue;
+        }
+        if (HeadFits(b, head, reach, 0.7)) {
+            if (!bx.said_fine) {
+                bx.said_fine = true;
+                log::Info("world menu: black box %s is around your head and already bigger than your reach "
+                          "(%.0f x %.0f x %.0f cm)", bx.name.c_str(), b.e.X * 2, b.e.Y * 2, b.e.Z * 2);
+            }
+            continue;
+        }
+        // Grow it about its own pivot until the head has `reach` to spare.
+        ue::Call gl(bx.actor, "K2_GetActorLocation");
+        ue::Call gs(bx.actor, "GetActorScale3D");
+        if (!gl.Invoke() || !gs.Invoke()) continue;
+        FVector pivot = gl.Result<FVector>();
+        FVector scale = gs.Result<FVector>();
+        if (bx.grown == 1.0) bx.scale0 = scale;
+        double k = 0;
+        for (double f : {1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0, 32.0, 48.0, 64.0}) {
+            if (bx.grown * f > 64.0) break;
+            Bounds g{pivot + (b.o - pivot) * f, b.e * f};
+            if (HeadFits(g, head, reach, 0.7)) {
+                k = f;
+                break;
+            }
+        }
+        if (k == 0) {
+            HideBox(bx, "growing it enough would take more than 64 times its size");
+            continue;
+        }
+        ue::Call ss(bx.actor, "SetActorScale3D");
+        ss.Set("NewScale3D", scale * k);
+        ss.Invoke();
+        bx.grown *= k;
+        Bounds after;
+        if (!ActorBounds(bx.actor, &after) || !HeadFits(after, head, reach, 1.0)) {
+            log::Warn("world menu: growing the black box %s didn't take (was %.0f x %.0f x %.0f cm)",
+                      bx.name.c_str(), b.e.X * 2, b.e.Y * 2, b.e.Z * 2);
+            HideBox(bx, "growing it didn't work");
+            continue;
+        }
+        log::Info("world menu: black box %s was around your head (%.0f x %.0f x %.0f cm); grew it %.1fx to "
+                  "%.0f x %.0f x %.0f cm so your arm stays inside it",
+                  bx.name.c_str(), b.e.X * 2, b.e.Y * 2, b.e.Z * 2, bx.grown, after.e.X * 2, after.e.Y * 2,
+                  after.e.Z * 2);
+    }
+}
+
+// The last menu went: the boxes go back to how the game had them.
+void PutBoxesBack() {
+    g_box_wanted = false;
+    for (auto& bx : g_boxes) {
+        if (!Alive(bx.actor, bx.index)) continue;
+        if (bx.grown != 1.0) {
+            ue::Call ss(bx.actor, "SetActorScale3D");
+            ss.Set("NewScale3D", bx.scale0);
+            ss.Invoke();
+        }
+        if (bx.hidden) {
+            ue::Call h(bx.actor, "SetActorHiddenInGame");
+            h.Set("bNewHidden", false);
+            h.Invoke();
+        }
+        if (bx.grown != 1.0 || bx.hidden) log::Info("world menu: put the black box %s back", bx.name.c_str());
+    }
+    g_boxes.clear();
+    std::lock_guard<std::mutex> lock(g_box_mutex);
+    g_box_found.clear();
+}
+
 bool Host(const Candidate& c) {
     double t0 = perf::NowMs();
     bool holder_ready = G.actor && G.wic;  // made at level start (PrepareHolder)
@@ -1055,7 +1338,9 @@ bool Host(const Candidate& c) {
     ue::SetProp<uint8_t>(comp, "bIsTwoSided", 1);
     ue::SetProp<uint8_t>(comp, "TickWhenOffscreen", 1);
     ue::SetProp(comp, "BackgroundColor", LinearColor{0.f, 0.f, 0.f, S.backdrop});
+    DrawOnTop(comp);  // before it starts, so it is made with the switch on
     FinishComponent(G.actor, comp);
+    if (S.forearm && S.black_box != kBoxOff) g_box_wanted = true;
     TickWhenPaused(comp);
     if (L.have_ui_profile) {
         ue::Call cp(comp, "SetCollisionProfileName");
@@ -1547,6 +1832,8 @@ void OnGameFrame() {
     if (G.panels.empty()) {
         g_active = false;
         SendHit(nullptr, FVector{}, FVector{1, 0, 0});  // let go of the last menu's button
+        RestoreDepthTest();
+        if (!g_boxes.empty() || g_box_wanted.load()) PutBoxesBack();
         if (!LL.on.empty()) {
             LL.on.clear();
             LL.probe_said.clear();
@@ -1584,6 +1871,7 @@ void OnGameFrame() {
             if (diff > S.follow_deg) PlacePanels(head, yaw);
         }
     }
+    KeepBoxesAway();
     UpdatePointer();
     // A laser click can put up the next menu right now (Options, Task...).
     // Take it onto the arm before this frame is drawn: left for the next
@@ -1885,6 +2173,11 @@ void Init() {
     S.hide_backdrops = config::GetBool("menu_hide_backdrops", true);
     S.own_hit = config::GetBool("menu_laser_own_hit", true);
     S.arrive_buzz = config::GetBool("menu_arrive_buzz", true);
+    S.on_top = config::GetBool("menu_always_on_top", true);
+    {
+        std::string bb = config::GetString("menu_black_box", "grow");
+        S.black_box = bb == "off" || bb == "0" ? kBoxOff : bb == "hide" ? kBoxHide : kBoxGrow;
+    }
     S.fit = config::GetBool("menu_fit_content", true);
     S.fit_max_zoom = std::clamp(config::GetFloat("menu_fit_max_zoom", 3.f), 1.f, 6.f);
     if (!S.enabled) {
@@ -2078,6 +2371,7 @@ void FollowFrameEvent(const char* base_class, const char* fn_name, UObject* hook
 
 void Scan() {
     if (!S.enabled || !ue::objects::Ready() || !ue::process_event::Ready()) return;
+    FindBlackBoxes();  // only while a menu is on the arm, every 2 s at most
     static int s_calls = 0;
     if ((s_calls++ % 4) != 0) return;
     FollowFrameEvent("Class /Script/Engine.PlayerController", "ReceiveTick", &g_pc_cls);
