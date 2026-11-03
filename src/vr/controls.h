@@ -14,5 +14,11 @@ void InitLate();
 // VR tab "Calibrate body": measures standing eye height once the menu closes
 // (stand straight for 4 s). Saved as standing_height_cm.
 void RequestHeightMeasure();
+// VR tab "Edit hand grips": opens (or closes) the grip editor once the menu
+// closes. Inside the editor, left Y tap saves and left Y held 1 s closes it.
+void RequestGripEditor();
+// VR tab "Move holsters": 5 s after the menu closes, each holster moves to
+// where the hand holding its item is.
+void RequestHolsterMove();
 
 }  // namespace holevr::vr::controls

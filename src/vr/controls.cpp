@@ -317,6 +317,11 @@ bool ToWorld(const XrPosef& p, hands::Pose* out) {
     return stereo::TrackingToWorld(p, &out->location, &out->rotation);
 }
 
+// VR tab requests, served on the game thread once the menu has closed.
+std::atomic<bool> g_req_grip_editor{false};
+std::atomic<bool> g_req_holsters{false};
+double g_editor_y_until = -1;   // g_clock until which left Y is held for the grip editor
+
 void UpdateHands(const input::Snapshot& s) {
     hands::HandState h[2];
     for (int i = 0; i < 2; ++i) {
@@ -353,9 +358,15 @@ void UpdateHands(const input::Snapshot& s) {
         g_fingers[i].thumb_touch = in.primary.down || in.secondary.down || in.stick_click.down;
         g_edit_buttons.grip_down[i] = in.grip_value > 0.6f;
     }
-    g_edit_buttons.y_down = s.hand[input::kLeft].secondary.down;
-    g_edit_buttons.left_stick_pressed = s.hand[input::kLeft].stick_click.pressed;
-    g_edit_buttons.left_stick_down = s.hand[input::kLeft].stick_click.down;
+    // The grip editor's buttons (left Y, left stick click) only reach it
+    // while it is open; it is opened from the VR tab (RequestGripEditor),
+    // which holds Y for it for 1.1 s. Left stick hold no longer measures the
+    // arms (VR tab: Measure arms).
+    const bool editor_open = hands::EditorHand() >= 0;
+    const bool synth_y = g_clock < g_editor_y_until;
+    g_edit_buttons.y_down = synth_y || (editor_open && s.hand[input::kLeft].secondary.down);
+    g_edit_buttons.left_stick_pressed = editor_open && s.hand[input::kLeft].stick_click.pressed;
+    g_edit_buttons.left_stick_down = false;
     g_hands[0] = h[0];
     g_hands[1] = h[1];
     g_head = head;
@@ -460,6 +471,8 @@ struct WeaponState {
     UObject pouch_mag = 0;     // spare magazine shown at the pouch, ready to grab
     UObject mag_class = 0;     // class of this gun's magazines, for spawning spares
     double mag_wait_until = -1.0;  // when to stop waiting for the game to give the gun a magazine
+    int spawn_fail_logs = 0;
+    int wait_logs = 0;
     double refill_pouch_at = 0; // when to put a new magazine in the pouch
     bool trigger_down = false;
     bool have_frame = false;
@@ -1173,27 +1186,29 @@ UObject SpawnMagazine(UObject player, UObject cls, const FVector& loc, const FQu
 
 bool LiveObject(UObject obj);
 
-// Magazine class per gun class, kept across levels so a new match doesn't
-// have to wait for (or take) the game's own magazine.
-std::map<std::string, UObject> g_mag_class_by_gun;
-
+// The pouch magazine's class is read from the gun's own magazine in each
+// level. (A class remembered from an earlier level failed to spawn in the
+// next one, 2026-11-03: the pouch stayed empty all match.)
 void RefillPouch(game::Gun& gun, UObject player, const FVector& loc, const FQuat& rot) {
     if (!W.mag_class) {
         UObject m = 0;
         if (ue::GetProp(gun.Object(), "MagazineObj", m) && m) W.mag_class = ue::GetClass(m);
         else if (ue::GetProp(gun.Object(), "MagazineObj_Temp", m) && m) W.mag_class = ue::GetClass(m);
-        if (W.mag_class) {
-            g_mag_class_by_gun[gun.ClassName()] = W.mag_class;
-        } else {
-            auto known = g_mag_class_by_gun.find(gun.ClassName());
-            if (known != g_mag_class_by_gun.end() && LiveObject(known->second)) W.mag_class = known->second;
-        }
     }
     if (W.mag_wait_until < 0.0) W.mag_wait_until = g_clock + 5.0;
     UObject mag = 0;
     if (W.mag_class) {
         mag = SpawnMagazine(player, W.mag_class, loc, rot);
-        if (mag) log::Info("controls: spawned pouch magazine %s", ue::GetName(mag).c_str());
+        if (mag) {
+            log::Info("controls: spawned pouch magazine %s", ue::GetName(mag).c_str());
+        } else {
+            // Don't keep retrying a class that won't spawn: read it again from
+            // the gun's own magazine next time.
+            if (W.spawn_fail_logs++ < 5)
+                log::Warn("controls: could not spawn a pouch magazine of %s; reading the class from the gun again",
+                          ue::GetName(W.mag_class).c_str());
+            W.mag_class = 0;
+        }
     } else if (!gun.State().has_magazine && g_clock >= W.mag_wait_until) {
         // The game normally gives the gun its magazine just after the level
         // starts; only if it never does, borrow the game's own step. Taking
@@ -1203,6 +1218,8 @@ void RefillPouch(game::Gun& gun, UObject player, const FVector& loc, const FQuat
         ue::GetProp(gun.Object(), "MagazineObj_Temp", mag);
         if (mag) W.mag_class = ue::GetClass(mag);
         if (mag) log::Info("controls: took pouch magazine from the game (%s)", ue::GetName(mag).c_str());
+    } else if (W.wait_logs++ == 0) {
+        log::Info("controls: pouch magazine waits for the gun's own magazine (to learn its class)");
     }
     if (mag) {
         W.pouch_mag = mag;
@@ -1539,13 +1556,8 @@ struct GameActionState {
     ActionEvent walk_up{"InpActEvt_Walk_K2Node_InputActionEvent_16"};
     ActionEvent nav{"InpActEvt_CheckNavigationIcon_K2Node_InputActionEvent_0"};
     bool jump_armed = true, crouch_armed = true;
-    double jump_release_at = -1, crouch_release_at = -1, walk_release_at = -1;
+    double jump_release_at = -1, crouch_release_at = -1;
     bool sprinting = false;
-    double click_up_at = -1;    // left stick click released, waiting for a second click
-    double click_down_at = -1;
-    bool second_click = false;
-    double y_down_at = -1;
-    double rclick_down_at = -1;  // right stick click: tap = objective markers, hold 2 s = move holsters
     double melee_ready_at = 0;
     double melee_release_at = -1;
     bool light_down = false;     // left trigger is pressing the weapon light
@@ -1743,17 +1755,17 @@ void PhysicalCrouchAndJump(UObject player) {
     }
 }
 
-// Every other game action, on buttons the gun, menus, wrist and grip editor
-// don't use (lean is left out: lean for real).
+// Every other game action, one press of one button each; no gestures (no
+// flicks, taps, holds or punches). Lean is left out: lean for real.
+//   Left stick            move; click: sprint on/off (ends when you stop)
 //   Left trigger          weapon light with the left hand right next to the gun, else interact
-//   Right trigger         interact while the right hand is empty (fires with the gun in hand)
-//   Left stick click      tap: sprint on/off (ends when you stop); double tap: walk/run
-//   Right stick up        jump
-//   Right stick down      crouch / stand
-//   Left Y tap            switch weapon (holding Y for 1 s is the grip editor)
-//   Right stick click     fire selector on a rifle, otherwise objective markers (tap)
-//   Right stick click held 2 s   move the holsters to where the hands are
-//   Punch with the empty left hand   melee attack
+//   Left X                jump
+//   Left Y                crouch / stand
+//   Right stick           turn; click: kick (fire selector on a rifle)
+//   Right trigger         fire with the gun in hand, interact with the hand empty
+//   Right A / B           magazine release / slide release with the gun in hand;
+//                         switch weapon / objective markers with the hand empty
+//   VR tab buttons        grip editor, move holsters, measure arms, measure height
 // Is the left hand right next to the gun in the right hand? Distance from
 // the left grip to the gun's line, from just behind the grip to the muzzle.
 bool LeftHandNearGun() {
@@ -1766,6 +1778,111 @@ bool LeftHandNearGun() {
     const double dz = p.Z - std::clamp(p.Z, -12.0, W.bore_height);   // grip below the bore counts as the gun
     const double d = std::sqrt((p.X - x) * (p.X - x) + p.Y * p.Y + dz * dz);
     return d <= g_set.light_reach;
+}
+
+// What the hand is touching or pointing at that the game can interact with
+// (doors, pickups, switches: actors with BPI_InteractSystem). Touching (hand
+// within 20 cm of its bounds) wins over pointing (aim ray up to 150 cm).
+UObject FindInteractTarget(UObject player, const hands::HandState& hs, std::string* how, double* score_out) {
+    static UObject iface = 0, gps = 0;
+    static int lookups = 0;
+    if ((!iface || !gps) && lookups < 3) {
+        ++lookups;
+        if (!iface) iface = ue::FindObject("BlueprintGeneratedClass /Game/GamePlay/InteractSystem/BPI_InteractSystem.BPI_InteractSystem_C");
+        if (!gps) gps = ue::FindObject("GameplayStatics /Script/Engine.Default__GameplayStatics");
+        if (!iface) log::Warn("controls: BPI_InteractSystem not found; hand interact uses the game's own target only");
+    }
+    if (!iface || !gps || !hs.valid) return 0;
+    ue::Call all(gps, "GetAllActorsWithInterface");
+    all.Set("WorldContextObject", player).Set("Interface", iface);
+    if (!all.Invoke()) return 0;
+    int32_t size = 0;
+    const uint8_t* raw = all.Raw("OutActors", &size);
+    struct Arr { uintptr_t data; int32_t num, max; } arr{};
+    if (!raw || size < (int32_t)sizeof(Arr)) return 0;
+    std::memcpy(&arr, raw, sizeof(Arr));
+    const FVector hand = hs.grip.location;
+    const FVector o = hs.aim.location;
+    const FVector d = hs.aim.rotation.Rotate(FVector{1, 0, 0});
+    UObject best = 0;
+    double best_score = 1e9;
+    for (int i = 0; i < arr.num && i < 1024; ++i) {
+        UObject a = mem::ReadOr<uintptr_t>(arr.data + i * sizeof(uintptr_t), 0);
+        if (!a || a == player) continue;
+        ue::Call b(a, "GetActorBounds");
+        b.Set("bOnlyCollidingComponents", true).Set("bIncludeFromChildActors", false);
+        if (!b.Invoke()) continue;
+        const FVector c = b.Get<FVector>("Origin"), e = b.Get<FVector>("BoxExtent");
+        if (e.X > 800 || e.Y > 800 || e.Z > 800) continue;   // a whole room, not a thing
+        if (e.X <= 0 && e.Y <= 0 && e.Z <= 0) continue;
+        // Touch: distance from the hand to the box.
+        const double dx = std::fmax(0.0, std::fabs(hand.X - c.X) - e.X);
+        const double dy = std::fmax(0.0, std::fabs(hand.Y - c.Y) - e.Y);
+        const double dz = std::fmax(0.0, std::fabs(hand.Z - c.Z) - e.Z);
+        const double touch = std::sqrt(dx * dx + dy * dy + dz * dz);
+        double score = 1e9;
+        if (touch <= 20.0) {
+            // Inside or at several boxes: the smaller thing wins (a big
+            // InteractArea around a station shouldn't beat the door handle).
+            score = touch + 0.02 * std::fmax(e.X, std::fmax(e.Y, e.Z));
+        } else {
+            // Point: ray from the aim pose into the box (slab test).
+            double t0 = 0, t1 = 150.0;
+            const double oo[3] = {o.X, o.Y, o.Z}, dd[3] = {d.X, d.Y, d.Z};
+            const double cc[3] = {c.X, c.Y, c.Z}, ee[3] = {e.X, e.Y, e.Z};
+            bool hit = true;
+            for (int k = 0; k < 3 && hit; ++k) {
+                if (std::fabs(dd[k]) < 1e-6) {
+                    if (std::fabs(oo[k] - cc[k]) > ee[k]) hit = false;
+                    continue;
+                }
+                double ta = (cc[k] - ee[k] - oo[k]) / dd[k], tb = (cc[k] + ee[k] - oo[k]) / dd[k];
+                if (ta > tb) std::swap(ta, tb);
+                t0 = std::fmax(t0, ta);
+                t1 = std::fmin(t1, tb);
+                if (t0 > t1) hit = false;
+            }
+            if (hit) score = 40.0 + t0 * 0.5;
+        }
+        if (score < best_score) {
+            best_score = score;
+            best = a;
+        }
+    }
+    if (best && how) *how = best_score < 40.0 ? "touching" : "pointing at";
+    if (score_out) *score_out = best_score;
+    return best;
+}
+
+// Interact with the hand `hand`: the game's own target (what its view trace
+// found) if it has one, else what this hand touches or points at.
+void HandInteract(UObject player, int hand) {
+    UObject game_target = 0;
+    ue::GetProp(player, "InteractTarget", game_target);
+    if (game_target && !LiveObject(game_target)) game_target = 0;
+    std::string how;
+    double score = 1e9;
+    UObject pick = FindInteractTarget(player, hands::Get(hand == input::kLeft ? hands::kLeft : hands::kRight), &how,
+                                      &score);
+    // The game's own target (what you look at) wins unless the hand is
+    // clearly on something else: touching it, not just inside a big area.
+    if (game_target && score > 8.0) pick = 0;
+    const char* side = hand == input::kLeft ? "left" : "right";
+    input::Haptic(static_cast<input::Hand>(hand), 0.2f, 0.02f);
+    if (pick && pick != game_target) {
+        // The hand's target wins: call its Interact the way the game does.
+        ue::Call c(pick, "Interact");
+        c.Set("Actor", player).Set("SelectIndex", int32_t{0});
+        const bool ok = c.Invoke();
+        log::Info("controls: interact (%s hand %s %s%s; the game's view target: %s)", side, how.c_str(),
+                  ue::GetName(pick).c_str(), ok ? "" : ", call failed",
+                  game_target ? ue::GetName(game_target).c_str() : "none");
+        return;
+    }
+    ue::Call c(player, "PlayerInput_Interact");
+    c.Invoke();
+    log::Info("controls: interact (%s hand; game target %s)", side,
+              game_target ? ue::GetName(game_target).c_str() : "none, and nothing at the hand");
 }
 
 void GameActions(UObject player, const input::Snapshot& s) {
@@ -1796,10 +1913,7 @@ void GameActions(UObject player, const input::Snapshot& s) {
             input::Haptic(input::kLeft, 0.25f, 0.02f);
             log::Info("controls: weapon light (left trigger, hand at the gun)");
         } else {
-            ue::Call c(player, "PlayerInput_Interact");
-            c.Invoke();
-            input::Haptic(input::kLeft, 0.2f, 0.02f);
-            log::Info("controls: interact (left hand)");
+            HandInteract(player, input::kLeft);
         }
     }
     if (GA.light_down && !l.trigger_button.down) {
@@ -1810,112 +1924,73 @@ void GameActions(UObject player, const input::Snapshot& s) {
     }
     // Right trigger interacts too while the right hand is empty (pistol
     // holstered, or no gun); with the gun in hand it only fires.
-    if (r.trigger_button.pressed && !W.in_hand) {
-        ue::Call c(player, "PlayerInput_Interact");
-        c.Invoke();
-        input::Haptic(input::kRight, 0.2f, 0.02f);
-        log::Info("controls: interact (right hand)");
+    if (r.trigger_button.pressed && !W.in_hand) HandInteract(player, input::kRight);
+    if (g_req_grip_editor.exchange(false)) {
+        g_editor_y_until = g_clock + 1.1;   // the editor toggles on a 1 s hold of Y
+        log::Info("controls: opening/closing the grip editor (asked for from the VR tab)");
     }
-    // Jump / crouch: flick the right stick up or down (turning uses left/right).
-    const bool up = r.stick_y > 0.75f && std::fabs(r.stick_x) < 0.6f;
-    const bool down = r.stick_y < -0.75f && std::fabs(r.stick_x) < 0.6f;
-    if (up && GA.jump_armed) {
-        GA.jump_armed = false;
+    if (hands::EditorHand() >= 0) return;   // the grip editor owns the buttons
+    // No gestures (owner's rule): every action is one press of one button,
+    // and the combat ones never need the left thumb off the move stick.
+    const bool gun_in_hand = W.gun && W.in_hand;
+    // Left X: jump.
+    if (l.primary.pressed && GA.jump_release_at < 0) {
         FireEvent(player, GA.jump_down);
         GA.jump_release_at = g_clock + 0.15;
-        log::Info("controls: jump");
+        log::Info("controls: jump (left X)");
     }
-    if (down && GA.crouch_armed) {
-        GA.crouch_armed = false;
+    // Left Y: crouch / stand.
+    if (l.secondary.pressed && GA.crouch_release_at < 0) {
         FireEvent(player, GA.crouch_down);
         g_crouch_pressed = true;
         GA.crouch_release_at = g_clock + 0.1;
-        log::Info("controls: crouch / stand");
+        log::Info("controls: crouch / stand (left Y)");
     }
-    if (r.stick_y < 0.4f) GA.jump_armed = true;
-    if (r.stick_y > -0.4f) GA.crouch_armed = true;
     if (GA.jump_release_at > 0 && g_clock >= GA.jump_release_at) { FireEvent(player, GA.jump_up); GA.jump_release_at = -1; }
     if (GA.crouch_release_at > 0 && g_clock >= GA.crouch_release_at) { FireEvent(player, GA.crouch_up); GA.crouch_release_at = -1; }
 
-    // Left stick click: a short tap toggles sprint, a double tap toggles
-    // walk/run. Long holds are left alone (holding it 2 s measures your arms).
+    // Left stick click: sprint on/off; it ends by itself when you stop.
     if (l.stick_click.pressed) {
-        GA.click_down_at = g_clock;
-        GA.second_click = GA.click_up_at > 0 && g_clock - GA.click_up_at < 0.35;
-    }
-    if (l.stick_click.released && GA.click_down_at > 0) {
-        const bool tap = g_clock - GA.click_down_at < 0.4;
-        GA.click_down_at = -1;
-        if (tap && GA.second_click) {
-            GA.click_up_at = -1;
-            GA.second_click = false;
-            FireEvent(player, GA.walk_down);
-            GA.walk_release_at = g_clock + 0.1;
-            log::Info("controls: walk/run toggle");
-        } else if (tap) {
-            GA.click_up_at = g_clock;  // decide after the double-tap window
-        }
-    }
-    if (GA.click_up_at > 0 && g_clock - GA.click_up_at >= 0.35) {
-        GA.click_up_at = -1;
         GA.sprinting = !GA.sprinting;
         FireEvent(player, GA.sprinting ? GA.sprint_down : GA.sprint_up);
-        log::Info("controls: sprint %s", GA.sprinting ? "on" : "off");
+        log::Info("controls: sprint %s (left stick click)", GA.sprinting ? "on" : "off");
     }
-    if (GA.walk_release_at > 0 && g_clock >= GA.walk_release_at) { FireEvent(player, GA.walk_up); GA.walk_release_at = -1; }
-    // Sprint ends when you let go of the stick.
     if (GA.sprinting && std::sqrt(l.stick_x * l.stick_x + l.stick_y * l.stick_y) < g_set.deadzone) {
         GA.sprinting = false;
         FireEvent(player, GA.sprint_up);
         log::Info("controls: sprint off (stopped)");
     }
 
-    // Left Y tap: next weapon. Held for the grip editor instead.
-    if (l.secondary.pressed) GA.y_down_at = g_clock;
-    if (l.secondary.released && GA.y_down_at > 0) {
-        if (g_clock - GA.y_down_at < 0.4) {
-            ue::Call c(player, "PlayerInput_ScrollWeapon");
-            c.Set("IsUp", true);
-            c.Invoke();
-            log::Info("controls: switch weapon");
-        }
-        GA.y_down_at = -1;
+    // Right A / B with the right hand empty (pistol holstered): switch
+    // weapon / objective markers. With the gun in hand they are the
+    // magazine release and the slide release (MagazineHandling).
+    if (!gun_in_hand && r.primary.pressed) {
+        ue::Call c(player, "PlayerInput_ScrollWeapon");
+        c.Set("IsUp", true);
+        c.Invoke();
+        log::Info("controls: switch weapon (right A, hand empty)");
+    }
+    if (!gun_in_hand && r.secondary.pressed) {
+        FireEvent(player, GA.nav);
+        log::Info("controls: objective markers (right B, hand empty)");
     }
 
-    // Right stick click without a rifle: objective markers, on a short tap
-    // (holding it 2 s moves the holsters, see HolsterCalibration).
-    if (r.stick_click.pressed) GA.rclick_down_at = g_clock;
-    if (r.stick_click.released && GA.rclick_down_at > 0) {
-        if (g_clock - GA.rclick_down_at < 0.4 && !GunIsRifle(player)) {
-            FireEvent(player, GA.nav);
-            log::Info("controls: objective markers");
-        }
-        GA.rclick_down_at = -1;
-    }
-
-    // Melee: punch with the empty left hand (fast, arm reaching out).
-    hands::HandState lh = hands::Get(hands::kLeft);
-    hands::Pose head;
-    if (lh.valid && hands::Head(&head) && !W.held_mag && !W.slide.Held() && !W.two_hand &&
-        g_clock >= GA.melee_ready_at) {
-        const XrVector3f& v = l.linear_velocity;
-        double speed = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
-        FVector reach = lh.grip.location - head.location;
-        if (speed > 2.8 && Len(reach) > 40.0) {
-            ue::Call c(player, "PlayerInput_MeleeAttack");
-            c.Set("Press Released", false);
-            c.Invoke();
-            GA.melee_release_at = g_clock + 0.1;
-            GA.melee_ready_at = g_clock + 0.7;
-            input::Haptic(input::kLeft, 0.8f, 0.06f);
-            log::Info("controls: melee (left hand at %.1f m/s)", speed);
-            static int s_melee_traces = 0;
-            if (s_melee_traces++ < 3) {
-                double rel = 0, side = 0;
-                if (CameraOnCharacter(player, &rel, &side))
-                    log::Info("controls: melee: game camera %.0f cm above the feet, %.0f cm from the middle", rel, side);
-                LabTraceFor(2.0);
-            }
+    // Right stick click: kick (the game's melee). On a rifle it is the fire
+    // selector instead (FireSelector).
+    if (r.stick_click.pressed && !GunIsRifle(player) && g_clock >= GA.melee_ready_at) {
+        ue::Call c(player, "PlayerInput_MeleeAttack");
+        c.Set("Press Released", false);
+        c.Invoke();
+        GA.melee_release_at = g_clock + 0.1;
+        GA.melee_ready_at = g_clock + 0.7;
+        input::Haptic(input::kRight, 0.6f, 0.05f);
+        log::Info("controls: kick (right stick click)");
+        static int s_melee_traces = 0;
+        if (s_melee_traces++ < 3) {
+            double rel = 0, side = 0;
+            if (CameraOnCharacter(player, &rel, &side))
+                log::Info("controls: melee: game camera %.0f cm above the feet, %.0f cm from the middle", rel, side);
+            LabTraceFor(2.0);
         }
     }
     if (GA.melee_release_at > 0 && g_clock >= GA.melee_release_at) {
@@ -2352,14 +2427,15 @@ void UpdatePistolHolster(UObject player, const hands::HandState& rh, const input
     }
 }
 
-// Right stick click held 2 s: each holster moves to where the hand holding
+// VR tab "Move holsters" (5 s countdown): each holster moves to where the hand holding
 // its item is now (pistol in the right hand, magazine in the left), anywhere
 // on the body, and keeps the item at the angle it is held. It rides on the
 // nearest body part (belt, chest, a thigh) and is saved to
 // hole-vr/holsters.ini. Needs the VR body, since the spots ride on it.
 struct HolsterCalState {
-    double down_at = -1;
+    double down_at = -1;   // when the countdown started
     bool done = false;
+    int beat = 0;
 } g_cal;
 
 // Moves holster `spot` to the hand at `hand`, holding its item turned `item_rot`.
@@ -2381,15 +2457,28 @@ void PlaceHolsterAt(int spot, const FVector& hand, const FQuat* item_rot) {
               sp.turned ? "at the angle you held it" : "hanging the built-in way (angle not known)");
 }
 
-void HolsterCalibration(const input::HandInput& rin, const hands::HandState& rh, const hands::HandState& lh) {
-    if (rin.stick_click.pressed) {
+void HolsterCalibration(const input::HandInput&, const hands::HandState& rh, const hands::HandState& lh) {
+    // VR tab "Move holsters": 5 s after the menu closes (a buzz each second),
+    // each holster moves to where the hand holding its item is.
+    if (g_req_holsters.exchange(false)) {
         g_cal.down_at = g_clock;
         g_cal.done = false;
+        g_cal.beat = 5;
+        log::Info("holster: moving the holsters in 5 s: hold the pistol and the magazine where you want them");
     }
-    if (!rin.stick_click.down) g_cal.down_at = -1;
-    if (g_cal.down_at < 0 || g_cal.done || g_clock - g_cal.down_at < 2.0) return;
+    if (g_cal.down_at < 0 || g_cal.done) return;
+    const double left = 5.0 - (g_clock - g_cal.down_at);
+    if (left > 0) {
+        if (static_cast<int>(std::ceil(left)) < g_cal.beat) {
+            g_cal.beat = static_cast<int>(std::ceil(left));
+            input::Haptic(input::kLeft, 0.25f, 0.04f);
+            input::Haptic(input::kRight, 0.25f, 0.04f);
+        }
+        return;
+    }
     g_cal.done = true;
-    if (!W.is_pistol) return;   // the rifle's selector is on this click; rifle holsters come later
+    g_cal.down_at = -1;
+    if (!W.is_pistol) return;   // rifle holsters come later
     if (!g_hw.valid || !g_hw.on_body) {
         log::Info("holster: can't move the holsters while the VR body is off (F9)");
         input::Haptic(input::kRight, 0.2f, 0.1f);
@@ -2634,6 +2723,16 @@ void ReloadSettings() {
 }
 
 }  // namespace
+
+void RequestGripEditor() {
+    g_req_grip_editor.store(true);
+    log::Info("controls: grip editor asked for from the VR tab; it opens when the menu closes");
+}
+
+void RequestHolsterMove() {
+    g_req_holsters.store(true);
+    log::Info("controls: holster move asked for from the VR tab; 5 s countdown when the menu closes");
+}
 
 void RequestHeightMeasure() {
     g_height.requested.store(true);
