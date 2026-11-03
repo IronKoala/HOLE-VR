@@ -25,6 +25,7 @@
 #include "vr/hole_watch.h"
 #include "vr/controls.h"
 #include "vr/workbench.h"
+#include "vr/drinks.h"
 #include "vr/input.h"
 #include "vr/openxr.h"
 #include "vr/cvars.h"
@@ -109,14 +110,15 @@ void StartVr() {
 
 // Bytecode listings (dump/script/<Class>.txt) of the game's Blueprints whose
 // path contains one of the comma-separated dump_script_classes words: the
-// weapons, their parts, the workbench, the player and the save data. Empty
+// weapons, their parts, the workbench, the player, the save data and the
+// hub's drink machine. Empty
 // turns it off.
 void DumpScripts(const std::wstring& mod_dir) {
     using namespace holevr;
     const std::string list = config::GetString(
         "dump_script_classes",
         "/Game/Weapons/,BP_Player,BPC_WeaponManager,LCBP_Weapon,UIM_WeaponCustom,BPC_WeaponCustom,"
-        "BP_GameInstance,SGO_SaveData,UIP_WeaponModel,BPC_InventoryManager");
+        "BP_GameInstance,SGO_SaveData,UIP_WeaponModel,BPC_InventoryManager,LCBP_SkillUpgrade");
     std::vector<std::string> filters;
     size_t start = 0;
     while (start <= list.size()) {
@@ -170,6 +172,7 @@ DWORD WINAPI InitThread(LPVOID) {
         vr::body::Init();  // after controls: reads this frame's hand poses
         vr::controls::InitLate();  // after the body: holsters ride this frame's body pose
         vr::workbench::Init();     // after controls: reads this frame's hand poses
+        vr::drinks::Init();        // after controls: reads this frame's hand poses
         vr::cvars::Init();
         vr::wrist_hud::InitGame();
         vr::world_menu::InitGame();

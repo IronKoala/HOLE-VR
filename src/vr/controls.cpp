@@ -29,6 +29,7 @@
 #include "ue/names.h"
 #include "vr/hands.h"
 #include "vr/workbench.h"
+#include "vr/drinks.h"
 #include "vr/input.h"
 #include "vr/interact/holster.h"
 #include "vr/interact/rifle_carry.h"
@@ -2146,6 +2147,9 @@ UObject FindInteractTarget(UObject player, const hands::HandState& hs, std::stri
 // Interact with the hand `hand`: the game's own target (what its view trace
 // found) if it has one, else what this hand touches or points at.
 void HandInteract(UObject player, int hand) {
+    // A hand holding a can (vr/drinks): a fist round the can can pull the
+    // trigger too, and an interact then would drink it the flat way.
+    if (drinks::ClaimsGrip(hand)) return;
     // One interact per 0.5 s across both hands: some things (the hole's
     // countdown) toggle on each Interact, so a two-hand press cancelled itself.
     static double s_last = -10.0;
@@ -3995,9 +3999,10 @@ void OnTick(UObject player, float dt) {
     if (!s.valid || !g_set.enabled) return;
     UpdateHands(s);
     // The workbench (hub) owns a grip while that hand holds an attachment or
-    // is at one: no gun, slide or magazine grab with it.
+    // is at one: no gun, slide or magazine grab with it. The drink machine
+    // (vr/drinks) the same while the hand holds a can or is at one.
     for (int h = 0; h < 2; ++h)
-        if (workbench::ClaimsGrip(h)) s.hand[h].grip_button = input::Button{};
+        if (workbench::ClaimsGrip(h) || drinks::ClaimsGrip(h)) s.hand[h].grip_button = input::Button{};
     // The grip editor (vr/body) borrows one controller: none of its buttons
     // reach the game, and the gun does not fire while a grip is edited.
     if (int eh = g_editor_hand.load(); eh == 0 || eh == 1) {
