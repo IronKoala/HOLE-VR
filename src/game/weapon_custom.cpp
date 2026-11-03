@@ -105,17 +105,35 @@ int32_t Member(UObject ustruct, const char* name) {
     return found;
 }
 
+// A /Game/ object found by full name and kept: still that object (same
+// object-array slot, same name)? Blueprint classes and structs can be freed
+// with a level or by garbage collection, and their memory reused.
+struct Kept {
+    UObject obj = 0;
+    FName name{};
+};
+Kept Keep(UObject obj) {
+    Kept k;
+    if (obj && mem::Read(obj + ue::off::kObjName, k.name)) k.obj = obj;
+    return k;
+}
+bool StillThere(const Kept& k) {
+    FName now;
+    return k.obj && ue::IsLive(k.obj) && mem::Read(k.obj + ue::off::kObjName, now) &&
+           now.comparison_index == k.name.comparison_index && now.number == k.name.number;
+}
+
 UObject Struct(const char* full_name) {
     static std::mutex m;
-    static std::map<std::string, UObject> cache;
+    static std::map<std::string, Kept> cache;
     {
         std::lock_guard<std::mutex> lock(m);
         auto it = cache.find(full_name);
-        if (it != cache.end()) return it->second;
+        if (it != cache.end() && StillThere(it->second)) return it->second.obj;
     }
     UObject s = ue::FindObject(full_name);
     std::lock_guard<std::mutex> lock(m);
-    if (s) cache[full_name] = s;
+    if (s) cache[full_name] = Keep(s);
     return s;
 }
 
@@ -351,10 +369,12 @@ bool WriteSaved(UObject gi, const FName& weapon_row, const std::vector<SavedPart
 }
 
 UObject PartClass(const PartRow& part) {
-    static std::map<std::string, UObject> cache;
+    // A part's class is unloaded once nothing uses it (garbage collection after
+    // its actors are gone), so a kept one is checked before each use.
+    static std::map<std::string, Kept> cache;
     if (part.class_path.empty()) return 0;
     auto it = cache.find(part.class_path);
-    if (it != cache.end() && it->second) return it->second;
+    if (it != cache.end() && StillThere(it->second)) return it->second.obj;
     UObject cls = ue::FindObject("BlueprintGeneratedClass " + part.class_path);
     if (!cls && part.bp_soft) {
         // Not loaded yet (a part never fitted this session): the game's own
@@ -371,7 +391,7 @@ UObject PartClass(const PartRow& part) {
             log::Info("workbench: loaded the class of %s from disk: %s", part.name.c_str(), cls ? "ok" : "FAILED");
         }
     }
-    if (cls) cache[part.class_path] = cls;
+    if (cls) cache[part.class_path] = Keep(cls);
     return cls;
 }
 
