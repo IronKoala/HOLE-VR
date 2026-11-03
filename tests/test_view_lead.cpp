@@ -98,7 +98,33 @@ static void TestStats() {
     EXPECT(s.n[kCamera] == 1 && s.n[kMesh] == 0);
 }
 
+static void TestGunShake() {
+    GunShake g;
+    // Smooth motion (constant velocity, constant turn): no shake.
+    for (int i = 0; i < 10; ++i) g.Add(true, FVector{1.0 * i, 0, 0}, Yaw(2.0 * i), true);
+    EXPECT(g.n[1] == 8);
+    EXPECT(g.cm_sum[1] < 1e-9);
+    EXPECT(g.deg_sum[1] < 1e-6);
+    // A one-frame 1 cm jump: shake 1, then 2, then 1.
+    GunShake j;
+    const double xs[] = {0, 0, 0, 1, 0, 0};
+    for (double x : xs) j.Add(true, FVector{x, 0, 0}, FQuat{}, false);
+    EXPECT(j.n[0] == 4);
+    EXPECT(std::fabs(j.cm_sum[0] - 4.0) < 1e-9);
+    EXPECT(std::fabs(j.cm_max[0] - 2.0) < 1e-9);
+    // A gap restarts the history.
+    j.Add(false, {}, {}, false);
+    j.Add(true, FVector{50, 0, 0}, FQuat{}, false);
+    j.Add(true, FVector{51, 0, 0}, FQuat{}, false);
+    EXPECT(j.n[0] == 4);
+    j.AddMovedAfter(0.0);
+    j.AddMovedAfter(2.0);
+    EXPECT(j.checked_frames == 2 && j.moved_frames == 1 && std::fabs(j.moved_max - 2.0) < 1e-9);
+    EXPECT(std::fabs(AngleDeg(Yaw(30)) - 30.0) < 1e-6);
+}
+
 int main() {
+    TestGunShake();
     TestWalking();
     TestTurning();
     TestTeleportAndNewPlayer();

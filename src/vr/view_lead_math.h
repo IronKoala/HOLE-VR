@@ -24,6 +24,10 @@ struct Anchors {
     FQuat mesh_rot;
     bool capsule = false;
     FVector capsule_at;  // the collision capsule (actor location)
+    // The gun in the right hand, if any (for the log only).
+    uintptr_t held = 0;
+    FVector held_at;
+    FQuat held_rot;
 };
 
 enum Kind : int { kCamera = 0, kMesh = 1, kCapsule = 2, kKinds = 3 };
@@ -61,6 +65,29 @@ struct Stats {
     double turn_sum = 0, turn_max = 0;
     void AddTurn(double degrees);
 };
+
+// How much the held gun shakes as seen from the eyes: the frame-to-frame
+// change of its movement (second difference), in eye-yaw axes, so a steady
+// or smoothly moving gun scores near 0 and a jittering one does not. Split
+// by whether the character was moving. For the log.
+struct GunShake {
+    void Add(bool valid, const FVector& at, const FQuat& rot, bool moving);
+    long long n[2] = {};         // [still, moving]
+    double cm_sum[2] = {}, cm_max[2] = {};
+    double deg_sum[2] = {}, deg_max[2] = {};
+    // Moved by something else between the mod placing it and the next tick.
+    long long moved_frames = 0, checked_frames = 0;
+    double moved_max = 0;
+    void AddMovedAfter(double cm);
+    void ResetTotals();  // keeps the history
+
+private:
+    int have_ = 0;  // consecutive valid samples, up to 2
+    FVector p1_, p2_;
+    FQuat q1_, q2_;
+};
+
+double AngleDeg(const FQuat& q);  // rotation angle of q, 0..180
 
 double Length(const FVector& v);
 
