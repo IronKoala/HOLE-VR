@@ -52,18 +52,39 @@ dump of the shipping game (`hole-vr/dump/game_classes.txt`).
   player's scene capture runs again (`render_fixes::AllowPlayerCapture`) for
   its picture of the killer.
 - **Bigger menu text that still fits** (`world_menu.cpp`, `GrowText`).
-  Before a menu is zoomed, every TextBlock in it gets a bigger font
-  (`menu_text_scale`, 1.5x). Once the engine has laid the menu out again, each
-  text on screen is checked: letters that need more room than the text's slot
-  (desired size over its local size), a text running past a box around it (up
-  to the first ScrollBox, which may scroll) by more than it did at the game's
-  size, or two texts covering each other that didn't before. Those texts, and
-  every text in a box one ran out of, step back by 0.85 until all fit (up to 6
-  rounds). Hidden tabs are skipped (their cached geometry is stale). Texts on
-  pages that appear later get the same 0.8 s after the menu opens and 0.3 s
-  after each click. A narrow menu gets a taller panel of the same area
-  (`menu_fit_shape`). The head-in-wall fade never covers a forearm menu
-  (`comfort.cpp`).
+  Once a menu has been drawn on its panel, every text on screen is measured at
+  the game's size, then gets a bigger font: `menu_text_scale` (1.5x), small
+  print up to `menu_text_min_px` (32; the death screen's 12-point lines get
+  2.5x), titles no bigger than `menu_text_max_px` (64), never more than
+  `menu_text_max_scale` (2.5x). Once the engine has laid the menu out again,
+  each text on screen is checked: letters that need more room than the text's
+  slot (desired size over its local size), a text running past a box around
+  it (up to the first ScrollBox, which may scroll) by more than it did at the
+  game's size, two texts covering more of each other than they did (as a
+  share of the smaller, so stacked glow texts don't count), or a text running
+  over a picture beside it in the same box (an icon, a line) or out of one it
+  sat inside. Those texts, and every text in a box one ran out of, step back
+  by 0.85 until all fit (up to 8 rounds). A text that isn't on screen yet
+  (another tab, a line the death screen shows later) stays at the game's size:
+  twice a second `TextWatch` measures and grows texts that came into view, and
+  checks grown texts again when their words change (desired size moved).
+  Every 3 s the menu is searched for texts the game added. Growing texts that
+  were never measured left them unchecked, which is what overlapped in the
+  level menu and the death screen (2026-11-03). Each menu's texts are logged
+  once with their size and place. A narrow menu gets a taller panel of the
+  same area (`menu_fit_shape`). The head-in-wall fade never covers a forearm
+  menu (`comfort.cpp`).
+- **Panel pictures** (`SnapshotPanel`). A second after a menu is fitted (and
+  after texts came into view), the panel's own 1920x1080 picture is saved as
+  `hole-vr/panel-<menu>-<n>.png` through `KismetRenderingLibrary.ExportRenderTarget`;
+  the death screen saves one per page. Each costs a short hitch, so at most
+  `menu_snapshots` (2) per menu per run. The headset picture
+  (`capture-forearm-<menu>.bmp`) now waits until you look at the arm.
+- **Kill shot** (`WatchDeathScreen`). The death screen's WidgetSwitcher page is
+  watched; on each change the kill shot view (`UIP_DeadReview`) is described in
+  the log (what hides it, its pictures and where they come from, the
+  `LCBP_DeadReviewRoom` camera and its render target). While it shows, a camera
+  that only takes pictures when asked is asked four times a second.
 - **The hole** (`hole_watch.cpp`). The level menu and the extract results come
   from `LCBP_Hole_C`, which waits `WaitTimeLimit` seconds after you use it
   (`WaitTimeTemp`, `IsPlayerInside` against `AreaRadius`). Its state, countdown,

@@ -192,6 +192,18 @@ const Block kBlocks[] = {
      "; 1 = a tall narrow menu (the pause menu) gets a tall narrow panel of the\n"
      "; same area, so it can be zoomed further\n"
      "menu_fit_shape=1\n"},
+    {"menu_text_min_px",
+     "\n"
+     "; Small menu text on the arm is made at least this big (layout pixels; the\n"
+     "; game's smallest is 12), big titles no bigger than menu_text_max_px, and\n"
+     "; nothing more than menu_text_max_scale times the game's size. Texts that\n"
+     "; wouldn't fit are made smaller again\n"
+     "menu_text_min_px=32\n"
+     "menu_text_max_px=64\n"
+     "menu_text_max_scale=2.5\n"
+     "; Pictures of each menu's panel saved beside the log per run, to check its\n"
+     "; layout (each costs a short hitch when taken; 0 = off)\n"
+     "menu_snapshots=2\n"},
     {"hole_buzz",
      "\n"
      "; 1 = both hands tick softly each second while the hole in the floor counts\n"
