@@ -1096,7 +1096,7 @@ void DrawOnTop(UObject comp) {
         OT.index = IndexOf(base);
         OT.was = (v & L.depth_off_mask) != 0;
     }
-    *reinterpret_cast<volatile uint8_t*>(at) = static_cast<uint8_t>(v | L.depth_off_mask);
+    if (!mem::Write<uint8_t>(at, static_cast<uint8_t>(v | L.depth_off_mask))) return;
     // Drawn last among see-through things too (smoke, glass), or those would
     // be drawn over it now that depth no longer decides.
     ue::SetProp<int32_t>(comp, "TranslucencySortPriority", 1000);
@@ -1114,7 +1114,7 @@ void RestoreDepthTest() {
     uintptr_t at = OT.mat + static_cast<uintptr_t>(L.depth_off);
     if (!mem::IsReadable(at, 1)) return;
     uint8_t v = mem::ReadOr<uint8_t>(at, 0);
-    *reinterpret_cast<volatile uint8_t*>(at) = static_cast<uint8_t>(v & ~L.depth_off_mask);
+    mem::Write<uint8_t>(at, static_cast<uint8_t>(v & ~L.depth_off_mask));
 }
 
 // ------------------------------------------------- the game's black box --
