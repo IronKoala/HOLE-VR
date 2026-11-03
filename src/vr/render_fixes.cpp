@@ -61,28 +61,33 @@ std::vector<Fix> g_fixes = {
     {"vr_disable_film_grain", "bOverride_FilmGrainIntensity", "FilmGrainIntensity", 0.f},
 };
 
-// Console settings for the pause blur.
-// - Nothing nearer than the focus gets blurred: hands, arms, body, menu.
-// - No bokeh sprites ("scatter"): in the owner's 2026-11-03 run the left eye
-//   of a blurred menu frame (capture-forearm-UIM_Results_C.bmp, the game's
-//   own picture before it reaches the headset) was covered in white dots and
-//   bars in tile-sized blocks, the depth of field's sprite passes going wrong
-//   with both eyes in one frame. The gather blur alone gives the soft
-//   background. pause_blur_scatter=1 puts the sprites back.
+// Console settings for the pause blur: next to nothing nearer than the focus
+// gets blurred (hands, arms, body, menu).
+//
+// White dots and bars: in the owner's 2026-11-03 runs one eye of a blurred
+// menu frame (capture-forearm-UIM_Results_C.bmp, the game's own picture
+// before it reaches the headset) was covered in white dots and bars shaped
+// like menu text, in blocks, and the owner sees them "randomly in either
+// eye". Turning off the bokeh sprites (r.DOF.Scatter.*) changed nothing: this
+// game already has them off. The setting the blur adds is a foreground blur
+// limit of exactly 0, which can leave the depth of field's foreground pass
+// skipped while its output is still read, so that eye shows whatever was last
+// in that memory (menu text). The limit is now a hair above 0 (about one
+// pixel), so the pass always runs. pause_blur_foreground_radius sets it
+// (fraction of the picture width; the engine default is 0.025).
 std::vector<std::pair<std::string, std::string>> PauseBlurCvars() {
-    std::vector<std::pair<std::string, std::string>> v = {{"r.DOF.Kernel.MaxForegroundRadius", "0.0"}};
-    if (!config::GetBool("pause_blur_scatter", false)) {
-        v.push_back({"r.DOF.Scatter.ForegroundCompositing", "0"});
-        v.push_back({"r.DOF.Scatter.BackgroundCompositing", "0"});
-    }
-    return v;
+    float r = config::GetFloat("pause_blur_foreground_radius", 0.001f);
+    if (!(r >= 0.f)) r = 0.001f;
+    char value[32];
+    std::snprintf(value, sizeof(value), "%.4f", r);
+    return {{"r.DOF.Kernel.MaxForegroundRadius", value}};
 }
 
 // Pause blur: while a forearm menu is up, depth of field is switched on and
 // focused about arm's length away, so the world behind the menu goes soft
-// while the hands, arms and menu stay sharp. Foreground blur is turned off
-// (r.DOF.Kernel.MaxForegroundRadius 0), so nothing nearer than the focus is
-// blurred. It is written into the same cameras and post-process components
+// while the hands, arms and menu stay sharp. Foreground blur is limited to
+// about a pixel (PauseBlurCvars), so nothing nearer than the focus is
+// visibly blurred. It is written into the same cameras and post-process components
 // as the fixes above, so the forced "no depth of field" never fights it.
 struct PauseSetting {
     const char* override;

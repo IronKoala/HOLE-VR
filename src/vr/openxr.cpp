@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -187,9 +188,13 @@ bool g_pair_auto_off = false;   // pairing paused by the safety net below
 struct PairStats {
     long long pushes = 0, merged = 0, presents = 0, empty = 0, stale = 0, trimmed = 0;
     // Headset frames from the one the views were located at to the one the
-    // picture is shown in (what PredictAhead has to cover).
+    // picture is shown in (what the prediction has to cover).
     double lag_sum = 0, lag_max = 0, lag_min = 1e9;
     long long lag_n = 0;
+    // Each picture's head views were predicted for one headset frame: was
+    // it shown in that frame, a later one or an earlier one?
+    long long hit = 0, later = 0, earlier = 0;
+    double miss_ms_sum = 0;
     long long newer[3] = {};  // frames already drawn after the presented one: 0, 1, 2+
     double age_sum = 0, age_max = 0, age_min = 1e9;
     long long age_n = 0;
@@ -222,29 +227,50 @@ void PushViews(const EyeView views[2]) {
 }
 
 // ---- predicting ahead ----
-// The game takes a frame's head pose (g_latest, located at the headset frame
-// then current) and its picture reaches the headset about two frames later
-// (2026-11-03 log: 28-36 ms). Sent with the pose it was drawn with (pose
-// pairing), the headset then has to turn the picture by two frames of head
-// motion to show it, and the edges it uncovers are black (owner 2026-11-03:
-// "the image isn't keeping up with my headset so i see black on the edges a
-// lot when i move my head"). So the head (and hand) poses the game draws with
-// are predicted for the headset frame the picture will actually be shown in:
-// the measured lag in frames, smoothed. predict_ahead_frames in hole-vr.ini:
-// -1 = measured (default), 0 = off, or a fixed number of frames.
+// The game takes a frame's head pose and its picture reaches the headset two
+// or three headset frames later (2026-11-03 logs: 28-36 ms). Sent with the
+// pose it was drawn with (pose pairing), the headset then has to turn the
+// picture by that much head motion to show it, and the edges it uncovers are
+// black (owner 2026-11-03: "the image isn't keeping up with my headset so i
+// see black on the edges a lot when i move my head"). So the head views the
+// game draws with are predicted for the headset frame its picture will be
+// shown in.
+//
+// One smoothed lag for every picture (PR #72) was right on average but each
+// picture is shown either two or three frames on (owner: "keeps up better but
+// still needs work"), and measured in frames it doubled when SteamVR dropped
+// to half rate. Now each headset frame locates the views for the next few
+// frames, and when the game takes a new picture's views it picks the frame
+// that picture will be shown in: one frame past the pictures already queued
+// ahead of it (each Present shows the next queued picture). Hands (and the
+// LatestViews readers) use the smoothed lag, in time.
+// predict_ahead_frames in hole-vr.ini: -1 = per picture (default), 0 = off,
+// N = always N frames.
+constexpr int kMaxAhead = 5;
+EyeView g_cand[kMaxAhead + 1][2]{};  // [k]: views for k headset frames after the base frame (g_view_mutex)
+int g_cand_lo = 0, g_cand_hi = -1;   // the k located this frame (g_view_mutex)
+// Presents taken (TakePresentedViews calls), and the count the candidates
+// belong to: they are located just before their frame's Present is taken,
+// so a picture starting in between still counts the one about to go.
+long long g_takes = 0, g_cand_takes = 0;  // g_view_mutex
 std::atomic<long long> g_ahead_ns{0};
-double g_lag_frames = 0;  // smoothed, guarded by g_view_mutex
+std::atomic<bool> g_pairing_on{true};
+double g_lag_ns = 0;  // smoothed, guarded by g_view_mutex
 bool g_lag_known = false;
 
+int MaxAheadFrames() {
+    return std::clamp(static_cast<int>(config::GetFloat("predict_ahead_max_frames", 4.f)), 0, kMaxAhead);
+}
+
 void UpdateAhead(XrDuration period, bool pairing) {
-    double frames = 0;
+    double ns = 0;
     const double fixed = config::GetFloat("predict_ahead_frames", -1.f);
-    if (!pairing) frames = 0;  // newest views are sent: nothing to line up
-    else if (fixed >= 0) frames = fixed;
-    else if (g_lag_known) frames = g_lag_frames;
-    const double max_frames = std::max(0.0, static_cast<double>(config::GetFloat("predict_ahead_max_frames", 4.f)));
-    frames = std::clamp(frames, 0.0, max_frames);
-    g_ahead_ns.store(period > 0 ? static_cast<long long>(frames * static_cast<double>(period)) : 0);
+    if (!pairing || period <= 0) ns = 0;  // newest views are sent: nothing to line up
+    else if (fixed >= 0) ns = fixed * static_cast<double>(period);
+    else if (g_lag_known) ns = g_lag_ns;
+    ns = std::clamp(ns, 0.0, MaxAheadFrames() * static_cast<double>(period));
+    g_ahead_ns.store(static_cast<long long>(ns));
+    g_pairing_on.store(pairing);
 }
 
 // At Present: the views the picture being presented was drawn with. Falls
@@ -254,6 +280,7 @@ void TakePresentedViews(EyeView out[2], bool* have, XrTime display_time, XrDurat
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
     ++g_pair.presents;
+    ++g_takes;
     // Left over from before a load or a stall: not this picture's.
     while (g_vq_size > 0 && QpcMs(now.QuadPart - g_vq[g_vq_head].qpc) > 1000.0) {
         g_vq_head = (g_vq_head + 1) % kViewQueue;
@@ -266,14 +293,25 @@ void TakePresentedViews(EyeView out[2], bool* have, XrTime display_time, XrDurat
         g_paired[1] = q.v[1];
         g_have_paired = true;
         if (q.v[0].base_time > 0 && period > 0 && display_time >= q.v[0].base_time) {
-            const double lag = static_cast<double>(display_time - q.v[0].base_time) / static_cast<double>(period);
-            if (lag < 10.0) {
-                g_lag_frames = g_lag_known ? g_lag_frames + (lag - g_lag_frames) * 0.05 : lag;
+            // Smoothed in time, not frames: SteamVR sometimes runs the game at
+            // half rate, and a lag counted in frames then doubled the lead.
+            const double lag_ns = static_cast<double>(display_time - q.v[0].base_time);
+            const double lag = lag_ns / static_cast<double>(period);
+            if (lag_ns < 150e6) {
+                g_lag_ns = g_lag_known ? g_lag_ns + (lag_ns - g_lag_ns) * 0.05 : lag_ns;
                 g_lag_known = true;
                 g_pair.lag_sum += lag;
                 g_pair.lag_max = std::max(g_pair.lag_max, lag);
                 g_pair.lag_min = std::min(g_pair.lag_min, lag);
                 ++g_pair.lag_n;
+            }
+            if (q.v[0].shown_time > 0) {
+                const double miss_ns = static_cast<double>(display_time - q.v[0].shown_time);
+                const long long frames = std::llround(miss_ns / static_cast<double>(period));
+                if (frames == 0) ++g_pair.hit;
+                else if (frames > 0) ++g_pair.later;
+                else ++g_pair.earlier;
+                g_pair.miss_ms_sum += std::fabs(miss_ns) / 1e6;
             }
         }
         double age = QpcMs(now.QuadPart - q.qpc);
@@ -338,15 +376,19 @@ std::string PairReport(double) {
         auto_off = g_pair_auto_off;
     }
     if (!p.presents) return {};
-    char ahead[200] = "";
+    char ahead[400] = "";
+    const long long judged = p.hit + p.later + p.earlier;
     if (p.lag_n)
         std::snprintf(ahead, sizeof(ahead),
-                      "; pictures shown %.2f headset frames after their views' frame (%.1f-%.1f), poses predicted "
-                      "%.1f ms ahead to match",
-                      p.lag_sum / p.lag_n, p.lag_min, p.lag_max, g_ahead_ns.load() / 1e6);
+                      "; pictures shown %.2f headset frames after their views' frame (%.1f-%.1f); head predicted "
+                      "for the right frame %.0f%%, picture shown later %.0f%%, earlier %.0f%% (average miss %.1f "
+                      "ms); hands predicted %.1f ms ahead",
+                      p.lag_sum / p.lag_n, p.lag_min, p.lag_max, judged ? 100.0 * p.hit / judged : 0.0,
+                      judged ? 100.0 * p.later / judged : 0.0, judged ? 100.0 * p.earlier / judged : 0.0,
+                      judged ? p.miss_ms_sum / judged : 0.0, g_ahead_ns.load() / 1e6);
     long long n = p.newer[0] + p.newer[1] + p.newer[2];
     auto pct = [&](long long v) { return n ? 100.0 * v / n : 0.0; };
-    char buf[800];
+    char buf[1000];
     std::snprintf(buf, sizeof(buf),
                   "frame timing: pose pairing %s%s; picture reached Present %.1f ms after its views were taken "
                   "(%.1f-%.1f); at Present the game had already drawn 0/1/2+ newer frames %.0f%%/%.0f%%/%.0f%% "
@@ -837,19 +879,49 @@ void PollEvents() {
     }
 }
 
-// base: this headset frame's display time; time: when to predict for.
-void LocateViews(XrTime base, XrTime time) {
-    XrViewLocateInfo li{XR_TYPE_VIEW_LOCATE_INFO};
-    li.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
-    li.displayTime = time;
-    li.space = g_space;
-    XrViewState vs{XR_TYPE_VIEW_STATE};
-    XrView views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
-    uint32_t n = 0;
-    if (XR_FAILED(Proc<PFN_xrLocateViews>("xrLocateViews")(g_session, &li, &vs, 2, &n, views)) || n != 2) return;
-    if (!(vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)) return;
+// Locates the eye views for this headset frame (base, its display time) and
+// the next few, for the game to pick from (see ViewsForNewPicture).
+void LocateViews(XrTime base, XrDuration period) {
+    const bool pairing = g_pairing_on.load();
+    const double fixed = config::GetFloat("predict_ahead_frames", -1.f);
+    const int max_k = MaxAheadFrames();
+    int lo = 0, hi = 0;
+    if (pairing && period > 0) {
+        if (fixed >= 0) lo = hi = std::min(static_cast<int>(std::lround(fixed)), max_k);
+        else if (max_k > 0) lo = 1, hi = max_k;  // a new picture is always at least one frame away
+    }
+    EyeView cand[kMaxAhead + 1][2];
+    for (int k = lo; k <= hi; ++k) {
+        const XrTime t = base + static_cast<XrTime>(k) * period;
+        XrViewLocateInfo li{XR_TYPE_VIEW_LOCATE_INFO};
+        li.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+        li.displayTime = t;
+        li.space = g_space;
+        XrViewState vs{XR_TYPE_VIEW_STATE};
+        XrView views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+        uint32_t n = 0;
+        if (XR_FAILED(Proc<PFN_xrLocateViews>("xrLocateViews")(g_session, &li, &vs, 2, &n, views)) || n != 2 ||
+            !(vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)) {
+            if (k == lo) return;  // keep last frame's views
+            hi = k - 1;
+            break;
+        }
+        for (int i = 0; i < 2; ++i) cand[k][i] = {views[i].pose, views[i].fov, base, t};
+    }
+    // For LatestViews (hands' frame of reference, wrist display, menus): the
+    // frame nearest the smoothed lag.
+    int typical = period > 0 ? static_cast<int>(std::lround(static_cast<double>(g_ahead_ns.load()) / period)) : 0;
+    typical = std::clamp(typical, lo, hi);
     std::lock_guard<std::mutex> lock(g_view_mutex);
-    for (int i = 0; i < 2; ++i) g_latest[i] = {views[i].pose, views[i].fov, base};
+    for (int k = lo; k <= hi; ++k) {
+        g_cand[k][0] = cand[k][0];
+        g_cand[k][1] = cand[k][1];
+    }
+    g_cand_lo = lo;
+    g_cand_hi = hi;
+    g_cand_takes = g_takes + 1;  // this frame's Present is taken right after (RunFrame)
+    g_latest[0] = cand[typical][0];
+    g_latest[1] = cand[typical][1];
     g_have_latest = true;
 }
 
@@ -874,6 +946,7 @@ perf::Counter g_perf_game{"game frame (between submits)"};
 perf::Counter g_perf_wait{"xrWaitFrame"};
 perf::Counter g_perf_submit{"copy+submit"};
 perf::Counter g_perf_begin{"  begin+input"};
+perf::Counter g_perf_locate{"  head pose predictions"};
 perf::Counter g_perf_images{"  swapchain wait"};
 perf::Counter g_perf_copy{"  copy"};
 perf::Counter g_perf_layers{"  wrist/laser layers"};
@@ -962,11 +1035,12 @@ void RunFrame() {
     XrFrameBeginInfo bi{XR_TYPE_FRAME_BEGIN_INFO};
     if (XR_FAILED(Proc<PFN_xrBeginFrame>("xrBeginFrame")(g_session, &bi))) return;
 
-    // Head poses for the game, predicted for when its picture will be shown
-    // (see PredictAhead); controllers likewise (input::Consume).
-    LocateViews(fs.predictedDisplayTime, fs.predictedDisplayTime + g_ahead_ns.load());
     for (Listener* l : Listeners()) l->OnFrame(g_session, g_space, fs.predictedDisplayTime);
     step(g_perf_begin);
+    // Head poses for the game, predicted for when its pictures will be shown
+    // (see ViewsForNewPicture); controllers by the smoothed lag (input::Consume).
+    LocateViews(fs.predictedDisplayTime, fs.predictedDisplayPeriod);
+    step(g_perf_locate);
 
     XrCompositionLayerProjectionView proj_views[2] = {{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},
                                                       {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
@@ -1212,6 +1286,24 @@ bool LatestViews(EyeView out[2]) {
     if (!g_have_latest) return false;
     out[0] = g_latest[0];
     out[1] = g_latest[1];
+    return true;
+}
+
+bool ViewsForNewPicture(EyeView out[2]) {
+    std::lock_guard<std::mutex> lock(g_view_mutex);
+    if (!g_have_latest) return false;
+    int k;
+    if (config::GetFloat("predict_ahead_frames", -1.f) >= 0 || !g_pairing_on.load()) {
+        k = g_cand_lo;  // fixed (or off): the one frame located
+    } else {
+        // Each Present shows the oldest queued picture, so this one is shown
+        // one headset frame after the pictures still queued ahead of it,
+        // counted from the frame the candidates were located for.
+        k = g_vq_size + 1 + static_cast<int>(g_takes - g_cand_takes);
+    }
+    k = std::clamp(k, g_cand_lo, std::max(g_cand_lo, g_cand_hi));
+    out[0] = g_cand[k][0];
+    out[1] = g_cand[k][1];
     return true;
 }
 
