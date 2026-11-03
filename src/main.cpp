@@ -25,6 +25,7 @@
 #include "vr/hole_watch.h"
 #include "vr/controls.h"
 #include "vr/workbench.h"
+#include "vr/interact/touch.h"
 #include "vr/input.h"
 #include "vr/openxr.h"
 #include "vr/cvars.h"
@@ -170,6 +171,7 @@ DWORD WINAPI InitThread(LPVOID) {
         vr::body::Init();  // after controls: reads this frame's hand poses
         vr::controls::InitLate();  // after the body: holsters ride this frame's body pose
         vr::workbench::Init();     // after controls: reads this frame's hand poses
+        vr::touch::Init();         // after the body: reads this frame's drawn hands
         vr::cvars::Init();
         vr::wrist_hud::InitGame();
         vr::world_menu::InitGame();

@@ -529,6 +529,32 @@ const Block kBlocks[] = {
      "workbench_snap_cm=5\n"
      "; Walk this far from a pistol lying on a table and it goes back to the holster (m).\n"
      "workbench_walk_away_m=3\n"},
+    {"touch_interact",
+     "\n"
+     "; --- Touch interact: rest an empty hand on a thing ---\n"
+     "; Loot: touch it to take it. Loot boxes and fridges: touch to open. Doors:\n"
+     "; rest a hand on the handle to open or close. The game's own interact runs.\n"
+     "; The trigger still interacts too: what the hand touches or points at wins\n"
+     "; over where you look. 1 = on.\n"
+     "touch_interact=1\n"
+     "touch_interact_loot=1\n"
+     "touch_interact_containers=1\n"
+     "touch_interact_doors=1\n"
+     "; How close the hand must come (cm) and how long it rests there first (s).\n"
+     "touch_interact_reach_cm=1.5\n"
+     "touch_interact_hold_s=0.08\n"
+     "touch_interact_door_hold_s=0.2\n"
+     "; Door handle: height above the bottom of the door, and how far in from the\n"
+     "; door's edge the handle zone reaches (cm).\n"
+     "door_handle_height_cm=100\n"
+     "door_handle_from_edge_cm=22\n"
+     "; Class names (or parts of them, comma separated) that also count as loot\n"
+     "; containers, or that touch should leave alone.\n"
+     "touch_interact_extra_containers=\n"
+     "touch_interact_skip=\n"
+     "; 1 = log what each kind of thing is made of and save its game code in\n"
+     "; dump/script (once a run), to improve this feature.\n"
+     "touch_interact_study=1\n"},
 };
 
 std::string Trim(const std::string& s) {

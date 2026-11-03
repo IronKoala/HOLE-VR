@@ -33,6 +33,7 @@
 #include "vr/interact/holster.h"
 #include "vr/interact/rifle_carry.h"
 #include "vr/interact/slide.h"
+#include "vr/interact/touch.h"
 #include "vr/ui_panel.h"
 #include "vr/openxr.h"
 #include "vr/stereo.h"
@@ -2055,96 +2056,16 @@ bool LeftHandNearGun() {
     return d <= g_set.light_reach;
 }
 
-// What the hand is touching or pointing at that the game can interact with
-// (doors, pickups, switches: actors with BPI_InteractSystem). Touching (hand
-// within 20 cm of its bounds) wins over pointing (aim ray up to 150 cm).
-UObject FindInteractTarget(UObject player, const hands::HandState& hs, std::string* how, double* score_out) {
-    // A Blueprint interface: it can be freed and loaded again (Return to
-    // Title, then a new game), so it is checked on every use.
-    static ue::ObjectRef s_iface(
-        "BlueprintGeneratedClass /Game/GamePlay/InteractSystem/BPI_InteractSystem.BPI_InteractSystem_C");
-    static UObject gps = 0;
-    if (!gps) gps = ue::FindObject("GameplayStatics /Script/Engine.Default__GameplayStatics");
-    const UObject iface = s_iface.Get();
-    static bool s_warned = false;
-    if (!iface && !s_warned) {
-        s_warned = true;
-        log::Warn("controls: BPI_InteractSystem not found; hand interact uses the game's own target only");
-    }
-    if (!iface || !gps || !hs.valid) return 0;
-    ue::Call all(gps, "GetAllActorsWithInterface");
-    all.Set("WorldContextObject", player).Set("Interface", iface);
-    if (!all.Invoke()) return 0;
-    int32_t size = 0;
-    const uint8_t* raw = all.Raw("OutActors", &size);
-    struct Arr { uintptr_t data; int32_t num, max; } arr{};
-    if (!raw || size < (int32_t)sizeof(Arr)) return 0;
-    std::memcpy(&arr, raw, sizeof(Arr));
-    const FVector hand = hs.grip.location;
-    const FVector o = hs.aim.location;
-    const FVector d = hs.aim.rotation.Rotate(FVector{1, 0, 0});
-    UObject best = 0;
-    double best_score = 1e9;
-    UObject nearest = 0;
-    double nearest_touch = 1e9;
-    for (int i = 0; i < arr.num && i < 1024; ++i) {
-        UObject a = mem::ReadOr<uintptr_t>(arr.data + i * sizeof(uintptr_t), 0);
-        if (!a || a == player) continue;
-        ue::Call b(a, "GetActorBounds");
-        b.Set("bOnlyCollidingComponents", false).Set("bIncludeFromChildActors", false);
-        if (!b.Invoke()) continue;
-        const FVector c = b.Get<FVector>("Origin"), e = b.Get<FVector>("BoxExtent");
-        if (e.X > 800 || e.Y > 800 || e.Z > 800) continue;   // a whole room, not a thing
-        if (e.X <= 0 && e.Y <= 0 && e.Z <= 0) continue;
-        // Touch: distance from the hand to the box.
-        const double dx = std::fmax(0.0, std::fabs(hand.X - c.X) - e.X);
-        const double dy = std::fmax(0.0, std::fabs(hand.Y - c.Y) - e.Y);
-        const double dz = std::fmax(0.0, std::fabs(hand.Z - c.Z) - e.Z);
-        const double touch = std::sqrt(dx * dx + dy * dy + dz * dz);
-        if (touch < nearest_touch) {
-            nearest_touch = touch;
-            nearest = a;
-        }
-        double score = 1e9;
-        if (touch <= 20.0) {
-            // Inside or at several boxes: the smaller thing wins (a big
-            // InteractArea around a station shouldn't beat the door handle).
-            score = touch + 0.02 * std::fmax(e.X, std::fmax(e.Y, e.Z));
-        } else {
-            // Point: ray from the aim pose into the box (slab test).
-            double t0 = 0, t1 = 150.0;
-            const double oo[3] = {o.X, o.Y, o.Z}, dd[3] = {d.X, d.Y, d.Z};
-            const double cc[3] = {c.X, c.Y, c.Z}, ee[3] = {e.X, e.Y, e.Z};
-            bool hit = true;
-            for (int k = 0; k < 3 && hit; ++k) {
-                if (std::fabs(dd[k]) < 1e-6) {
-                    if (std::fabs(oo[k] - cc[k]) > ee[k]) hit = false;
-                    continue;
-                }
-                double ta = (cc[k] - ee[k] - oo[k]) / dd[k], tb = (cc[k] + ee[k] - oo[k]) / dd[k];
-                if (ta > tb) std::swap(ta, tb);
-                t0 = std::fmax(t0, ta);
-                t1 = std::fmin(t1, tb);
-                if (t0 > t1) hit = false;
-            }
-            if (hit) score = 40.0 + t0 * 0.5;
-        }
-        if (score < best_score) {
-            best_score = score;
-            best = a;
-        }
-    }
-    static int s_diag = 0;
-    if (!best && s_diag++ < 20)
-        log::Info("controls: hand interact: %d interactable things in the level; nearest %s, %.0f cm from the hand",
-                  arr.num, nearest ? ue::GetName(nearest).c_str() : "none", nearest_touch);
-    if (best && how) *how = best_score < 40.0 ? "touching" : "pointing at";
-    if (score_out) *score_out = best_score;
-    return best;
-}
-
-// Interact with the hand `hand`: the game's own target (what its view trace
-// found) if it has one, else what this hand touches or points at.
+// Interact with the hand `hand` (a trigger press with that hand empty).
+// Owner 2026-11-03 15:23: "opening up cardboard boxes is unreliable". In the
+// 14:54 run 20 presses at a box went to the HDD the owner was looking at:
+// what the head looked at (the game's own target) won unless the hand was
+// within ~8 cm of the box, and pointing with the hand never won. Now what
+// the hand touches, then what it points at (vr/interact/touch: the things'
+// own shapes, then the game's own interact trace from the hand) wins; where
+// you look is the fallback. Every interact goes through the game's own
+// steps (focus the thing, then its interact input), and the log says what
+// happened to the thing a second later ("touch: result of ...").
 void HandInteract(UObject player, int hand) {
     // One interact per 0.5 s across both hands: some things (the hole's
     // countdown) toggle on each Interact, so a two-hand press cancelled itself.
@@ -2158,38 +2079,25 @@ void HandInteract(UObject player, int hand) {
     UObject game_target = 0;
     ue::GetProp(player, "InteractTarget", game_target);
     if (game_target && !LiveObject(game_target)) game_target = 0;
-    std::string how;
-    double score = 1e9;
-    UObject pick = FindInteractTarget(player, hands::Get(hand == input::kLeft ? hands::kLeft : hands::kRight), &how,
-                                      &score);
-    // The game's own target (what you look at) wins unless the hand is
-    // clearly on something else: touching it, not just inside a big area.
-    if (game_target && score > 8.0) pick = 0;
+    std::vector<UObject> ignore;
+    for (UObject a : {W.gun, W.held_mag, W.pouch_mag})
+        if (a && LiveObject(a)) ignore.push_back(a);
+    const touch::Pick pick = touch::PickForHand(player, hand, ignore);
     const char* side = hand == input::kLeft ? "left" : "right";
     input::Haptic(static_cast<input::Hand>(hand), 0.2f, 0.02f);
-    if (pick && pick != game_target) {
-        // The hand's target wins. Owner 2026-11-03: "the game crashed (fatal
-        // Error!) when i tried to pick up a CD": calling the CD's Interact
-        // straight away skipped what the game does when you look at a thing
-        // (its InteractInOverlay, which sets up the item's prompt), and the
-        // CD's pickup needed that. So the hand now goes through the game's
-        // own steps: focus the thing as if looked at, then the game's own
-        // interact input. The game's view trace hands focus back next tick.
-        ue::Call focus(pick, "InteractInOverlay");
-        const bool focused = focus.Invoke();
-        ue::SetProp(player, "InteractTarget", pick);
-        ue::SetProp(player, "IsInteractReady", uint8_t{1});
-        ue::Call c(player, "PlayerInput_Interact");
-        const bool ok = c.Invoke();
-        log::Info("controls: interact (%s hand %s %s%s%s, through the game's interact; the game's view target: %s)",
-                  side, how.c_str(), ue::GetName(pick).c_str(), focused ? "" : ", no InteractInOverlay",
-                  ok ? "" : ", call failed", game_target ? ue::GetName(game_target).c_str() : "none");
+    const UObject target = pick.actor ? pick.actor : game_target;
+    if (!target) {
+        log::Info("controls: interact (%s hand): nothing touched, pointed at or looked at", side);
         return;
     }
-    ue::Call c(player, "PlayerInput_Interact");
-    c.Invoke();
-    log::Info("controls: interact (%s hand; game target %s)", side,
-              game_target ? ue::GetName(game_target).c_str() : "none, and nothing at the hand");
+    if (touch::RecentlyUsed(target, 0.8)) {
+        log::Info("controls: interact (%s hand) on %s skipped: a touch used it a moment ago", side,
+                  ue::GetName(target).c_str());
+        return;
+    }
+    char why[96];
+    std::snprintf(why, sizeof(why), "%s hand trigger, %s", side, pick.actor ? pick.how : "looking at");
+    touch::InteractThroughGame(player, target, why);
 }
 
 // ---- physical buttons ----
