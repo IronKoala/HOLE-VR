@@ -148,11 +148,63 @@ int main() {
         EXPECT(s.Update(FVector{-6, 0, 2}, true, 0.011) == SlideEvent::kNone);
     }
     {   // hand pulled off the axis slips
-        Slide s(Pistol());
+        Slide s(Pistol());   // (grabbed on the line, so it is also far from where it grabbed)
         s.Update(FVector{-6, 0, 2}, false, 0.011);
         s.Update(FVector{-6, 0, 2}, true, 0.011);
         EXPECT(s.Update(FVector{-7, 15, 2}, true, 0.011) == SlideEvent::kSlipped);
         EXPECT(!s.Held());
+    }
+    {   // a grab at the edge of the zone, 7 cm beside the slide, keeps hold
+        // through a few cm of sideways wobble while it pulls (before
+        // 2026-11-03 it slipped once it was 9 cm from the slide's line)
+        SlideConfig c = Pistol();
+        c.grab_radius = 8.0;
+        Slide s(c);
+        s.Update(FVector{-6, -7, 2}, false, 0.011);
+        EXPECT(s.Update(FVector{-6, -7, 2}, true, 0.011) == SlideEvent::kGrabbed);
+        EXPECT(s.Stats().start_off_axis > 6.9 && s.Stats().start_off_axis < 7.1);
+        bool back = false;
+        for (int i = 1; i <= 20; ++i) {
+            SlideEvent e = s.Update(FVector{-6 - 5.0 * i / 20, -7 - 3.0 * i / 20, 2}, true, 0.011);
+            EXPECT(e != SlideEvent::kSlipped);
+            if (e == SlideEvent::kReachedBack) back = true;
+        }
+        EXPECT(back);
+        EXPECT(s.Stats().max_pull > 4.9 && s.Stats().max_pull < 5.1);
+        EXPECT(s.Stats().max_drift > 2.9 && s.Stats().max_drift < 3.1);
+        EXPECT(!s.Stats().slipped);
+        EXPECT(s.Update(FVector{-11, -10, 2}, false, 0.011) == SlideEvent::kRacked);
+    }
+    {   // ...but a hand that really leaves (far from the slide and from where
+        // it grabbed) still slips, and the stats say so
+        Slide s(Pistol());
+        s.Update(FVector{-6, 0, 2}, false, 0.011);
+        s.Update(FVector{-6, 0, 2}, true, 0.011);
+        s.Update(FVector{-6.5, 0, 2}, true, 0.011);
+        EXPECT(s.Update(FVector{-7, 15, 2}, true, 0.011) == SlideEvent::kSlipped);
+        EXPECT(s.Stats().slipped);
+        EXPECT(s.Stats().max_pull > 0.9 && s.Stats().max_pull < 1.1);   // includes the frame it slipped on
+        EXPECT(s.Stats().frames == 2);
+    }
+    {   // hold stats: pushed forward, then pulled back a little, let go
+        Slide s(Pistol());
+        s.Update(FVector{-6, 0, 2}, false, 0.011);
+        s.Update(FVector{-6, 0, 2}, true, 0.011);
+        s.Update(FVector{-4, 0, 2}, true, 0.011);
+        s.Update(FVector{-7, 0, 2}, true, 0.011);
+        EXPECT(s.Update(FVector{-7, 0, 2}, false, 0.011) == SlideEvent::kPartialRelease);
+        EXPECT(s.Stats().min_pull < -1.9 && s.Stats().min_pull > -2.1);
+        EXPECT(s.Stats().max_pull > 0.9 && s.Stats().max_pull < 1.1);
+        EXPECT(!s.Stats().slipped);
+    }
+    {   // the caller's own zone (visible fingers at the rear sight) accepts a
+        // press that the slide's zone alone would not, for that press only
+        Slide s(Pistol());
+        s.Update(FVector{-20, 0, 2}, false, 0.011);
+        s.AcceptNextPress(true);
+        EXPECT(s.Update(FVector{-20, 0, 2}, true, 0.011) == SlideEvent::kGrabbed);
+        EXPECT(s.Update(FVector{-20, 0, 2}, false, 0.011) == SlideEvent::kPartialRelease);
+        EXPECT(s.Update(FVector{-20, 0, 2}, true, 0.011) == SlideEvent::kNone);
     }
     {   // pushing forward never goes past closed
         Slide s(Pistol());

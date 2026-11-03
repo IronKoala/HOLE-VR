@@ -1118,6 +1118,7 @@ enum SlideHold { kSlideOver, kSlideRear, kSlideFront, kSlideHoldCount };
 const char* kSlideHoldKey[] = {"rear-flat", "rear-pinch", "front-flat"};
 const char* kSlideHoldName[] = {"rear overhand", "rear pinch", "front"};
 int g_slide_hold[2] = {kSlideOver, kSlideOver};
+UObject g_slide_jump_logged[2] = {0, 0};  // slide grab whose drawn jump is logged
 
 bool PartBox(UObject comp, FVector* mn, FVector* mx, const char** how);
 
@@ -1682,6 +1683,21 @@ FVector g_handle_world[2];
 Xf g_joint_world[2][hand_pose::kFingerCount][3];  // posed finger joints, world
 Xf g_hand_world[2];
 bool g_tips_valid[2] = {false, false};
+
+// The visible EMPTY hand's pinch: the thumb tip and the index finger's
+// middle knuckle (the owner's pinch: "side of the index's first knuckle"
+// against the slide, thumb out), relative to the real controller's grip
+// pose, from the last frame that hand was empty. Controls tests it against
+// the slide's rear sight (2026-11-03: the controller's centre sits ~10 cm
+// behind these when the hand comes in from behind the slide).
+struct PinchNote {
+    bool valid = false;
+    FVector thumb, index;  // controller grip frame, cm
+    double ms = 0;         // perf::NowMs when taken
+};
+PinchNote g_pinch[2];
+hands::Pose g_raw_grip[2];  // controller grip before hand_walls moved the drawn hand
+std::mutex g_pinch_mutex;
 
 void HideMarkers();
 void StopEditor() {
@@ -2519,6 +2535,27 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
             g_free_slide[side] = {true, Normalized(inv * h.grip.rotation), inv.Rotate(h.grip.location - gun.location)};
         }
     }
+    // How far the drawn hand jumps from the controller onto the slide (2026-11-03:
+    // grabs from behind the slide caught 10-14 cm behind the grab point).
+    if (grab.kind == hands::GrabKind::kSlideGrab && grab.object != g_slide_jump_logged[side]) {
+        hands::Pose o;
+        if (g.have && rig.ok && rig.frame.valid && ObjectFrame(grab, right_grab, &o)) {
+            g_slide_jump_logged[side] = grab.object;
+            const FQuat drawn_rot = Normalized(o.rotation * g.hand_rot);
+            const FVector drawn_fist = o.location + o.rotation.Rotate(g.hand_pos) + drawn_rot.Rotate(rig.frame.fist);
+            FQuat free_rot;
+            FVector free_pos;
+            FreeHand(side, h, h.grip.location, &free_rot, &free_pos);
+            const double dq = std::fabs(free_rot.X * drawn_rot.X + free_rot.Y * drawn_rot.Y +
+                                        free_rot.Z * drawn_rot.Z + free_rot.W * drawn_rot.W);
+            log::Info("body: slide %s hold drawn: the hand jumps %.1f cm and turns %.0f deg from the controller onto "
+                      "the slide",
+                      kSlideHoldName[g_slide_hold[side]], Length(drawn_fist - h.grip.location),
+                      2.0 * std::acos(std::min(1.0, dq)) * kRadToDeg);
+        }
+    } else if (grab.kind != hands::GrabKind::kSlideGrab) {
+        g_slide_jump_logged[side] = 0;
+    }
     hands::Pose obj;
     const bool recorded = g.have && rig.ok && ObjectFrame(grab, right_grab, &obj);
 
@@ -2720,6 +2757,15 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
     g_handle_world[side] = skel::Apply(hw, rig.palm_centre - rig.palm_h * handle_out);
     g_hand_world[side] = hw;
     g_tips_valid[side] = true;
+    if (grab.kind == hands::GrabKind::kNone) {
+        const FQuat inv = g_raw_grip[side].rotation.Inverse();
+        std::lock_guard<std::mutex> lock(g_pinch_mutex);
+        PinchNote& p = g_pinch[side];
+        p.thumb = inv.Rotate(g_tip_world[side][gr::kThumb] - g_raw_grip[side].location);
+        p.index = inv.Rotate(g_joint_world[side][hand_pose::kIndex][1].translation - g_raw_grip[side].location);
+        p.ms = perf::NowMs();
+        p.valid = true;
+    }
 }
 
 bool g_toggle_down = false;
@@ -2950,6 +2996,7 @@ void OnTick(UObject player, float dt_f) {
     StepMeasure(hs, sc_target, body_right, dt);
     // Empty hands stop at walls (after the arm measure, which wants the real
     // hands; not while the grip editor holds the hands still).
+    for (int side = 0; side < 2; ++side) g_raw_grip[side] = hs[side].grip;
     if (!g_freeze.on) hand_walls::Apply(player, head, hs, grab, dt);
     for (int side = 0; side < 2; ++side)
         if (hs[side].valid) SolveArm(side, hs[side], grab[side], grab[kR], body_fwd, body_right, dt);
@@ -3061,6 +3108,16 @@ bool GetSlot(Slot slot, hands::Pose* out) {
     int i = static_cast<int>(slot);
     if (!g_slots_valid || i < 0 || i >= static_cast<int>(Slot::kCount)) return false;
     *out = g_slots[i];
+    return true;
+}
+
+bool PinchPoint(int side, FVector* thumb_in_grip, FVector* index_in_grip) {
+    if (side < 0 || side > 1) return false;
+    std::lock_guard<std::mutex> lock(g_pinch_mutex);
+    const PinchNote& p = g_pinch[side];
+    if (!p.valid || perf::NowMs() - p.ms > 500.0) return false;
+    *thumb_in_grip = p.thumb;
+    *index_in_grip = p.index;
     return true;
 }
 
