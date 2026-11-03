@@ -1566,6 +1566,7 @@ struct GameActionState {
     double melee_ready_at = 0;
     double melee_release_at = -1;
     bool light_down = false;     // left trigger is pressing the weapon light
+    double jump_block_until = 0; // no jump right after a crouch flick (stick spring-back)
 } GA;
 
 bool GunIsRifle(UObject player);
@@ -2001,7 +2002,9 @@ void GameActions(UObject player, const input::Snapshot& s) {
     // Right stick up: jump. Right stick down: crouch / stand.
     const bool up = r.stick_y > 0.75f && std::fabs(r.stick_x) < 0.6f;
     const bool down = r.stick_y < -0.75f && std::fabs(r.stick_x) < 0.6f;
-    if (up && GA.jump_armed && GA.jump_release_at < 0) {
+    // A crouch flick can spring the stick back past the top: no jump for
+    // 0.5 s after a crouch press.
+    if (up && GA.jump_armed && GA.jump_release_at < 0 && g_clock >= GA.jump_block_until) {
         GA.jump_armed = false;
         FireEvent(player, GA.jump_down);
         GA.jump_release_at = g_clock + 0.15;
@@ -2009,6 +2012,7 @@ void GameActions(UObject player, const input::Snapshot& s) {
     }
     if (down && GA.crouch_armed && GA.crouch_release_at < 0) {
         GA.crouch_armed = false;
+        GA.jump_block_until = g_clock + 0.5;
         bool known = false;
         const bool was = GameCrouched(player, &known);
         // Crouching ends a sprint, as it does in most games.
