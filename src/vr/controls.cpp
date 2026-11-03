@@ -1923,6 +1923,15 @@ UObject FindInteractTarget(UObject player, const hands::HandState& hs, std::stri
 // Interact with the hand `hand`: the game's own target (what its view trace
 // found) if it has one, else what this hand touches or points at.
 void HandInteract(UObject player, int hand) {
+    // One interact per 0.5 s across both hands: some things (the hole's
+    // countdown) toggle on each Interact, so a two-hand press cancelled itself.
+    static double s_last = -10.0;
+    if (g_clock - s_last < 0.5) {
+        log::Info("controls: interact (%s hand) ignored, %.2f s after the last one",
+                  hand == input::kLeft ? "left" : "right", g_clock - s_last);
+        return;
+    }
+    s_last = g_clock;
     UObject game_target = 0;
     ue::GetProp(player, "InteractTarget", game_target);
     if (game_target && !LiveObject(game_target)) game_target = 0;
