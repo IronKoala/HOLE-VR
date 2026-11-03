@@ -2152,8 +2152,33 @@ void PlaceGunInHolster(game::Gun& gun) {
     SetActorTransform(g, loc, rot);
 }
 
+// True while obj is still the object the engine holds at its own index. A
+// magazine the game destroys (dropped mags despawn, level streaming) frees
+// its slot, so this catches it before we call functions on freed memory.
+bool LiveObject(UObject obj) {
+    if (!obj) return false;
+    const int32_t idx = mem::ReadOr<int32_t>(obj + ue::off::kObjIndex, -1);
+    return idx >= 0 && ue::objects::Get(idx) == obj && ue::GetClass(obj) != 0;
+}
+
+// Forget magazines the game destroyed; RefillPouch spawns a new pouch mag.
+void DropDeadMagazines() {
+    if (W.pouch_mag && !LiveObject(W.pouch_mag)) {
+        log::Info("controls: the pouch magazine was destroyed by the game; a new one will be spawned");
+        W.pouch_mag = 0;
+        W.refill_pouch_at = g_clock + 0.5;
+    }
+    if (W.held_mag && !LiveObject(W.held_mag)) {
+        log::Info("controls: the held magazine was destroyed by the game; the left hand lets go");
+        W.held_mag = 0;
+        W.refill_pouch_at = g_clock + 0.5;
+    }
+    if (W.learn_mag && !LiveObject(W.learn_mag)) W.learn_mag = 0;
+}
+
 // The spare magazine sitting in its pouch.
 void PlacePouchMag(UObject gun) {
+    if (W.pouch_mag && !LiveObject(W.pouch_mag)) return;   // OnTick clears it
     if (!W.pouch_mag) return;
     DetachIfAttached(W.pouch_mag);
     { ue::Call v(W.pouch_mag, "SetVisibility"); v.Set("IsVisible", true); v.Invoke(); }
@@ -2351,6 +2376,7 @@ void OnTick(UObject player, float dt) {
         PublishGrabs(gun, none, none);
         return;
     }
+    DropDeadMagazines();
     HookChargeTimeline();
     HookPlayerRecoil(player);
     ShotStudyTick();
