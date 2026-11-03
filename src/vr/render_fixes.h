@@ -21,6 +21,8 @@ void Apply();
 // Returns how many cameras/post-process components were updated, or -1 if
 // the pause blur is off.
 int SetPauseBlur(bool on);
+// Any thread: whether the pause blur is on (a forearm menu is up).
+bool PauseBlurOn();
 // Console settings the pause blur needs, applied at once (context: any object
 // in the game world, for the console command).
 void ApplyPauseBlurCvars(uintptr_t context);

@@ -34,6 +34,7 @@
 #include "vr/launch.h"
 #include "vr/stereo.h"
 #include "vr/view_lead.h"
+#include "vr/square_watch.h"
 
 namespace {
 
@@ -86,6 +87,7 @@ void StartVr() {
     vr::world_menu::Init();
     vr::wrist_hud::Init();
     vr::comfort::Init();  // after the menus and wrist: its layer goes on top
+    vr::square_watch::Init();
     bool told = false;
     while (!vr::xr::InitInstance()) {
         if (!told) log::Info("Waiting for SteamVR and the headset...");
