@@ -738,8 +738,9 @@ bool IsA(UObject obj, UObject base) {
 struct WalkScope {
     mem::ScopedRegionCache regions;
     std::map<std::pair<UObject, UObject>, bool> isa;
+    std::map<std::pair<UObject, UObject>, bool>* outer = t_isa_cache;  // a scope inside another keeps it
     WalkScope() { t_isa_cache = &isa; }
-    ~WalkScope() { t_isa_cache = nullptr; }
+    ~WalkScope() { t_isa_cache = outer; }
     WalkScope(const WalkScope&) = delete;
     WalkScope& operator=(const WalkScope&) = delete;
 };
@@ -1823,6 +1824,7 @@ void FindHud(UObject player) {
     double now = Now();
     if (!S.enabled || !S.hud || !S.forearm || now < s_next) return;
     s_next = now + 0.5;
+    WalkScope walk;
     if (!G.actor || !Alive(G.actor, G.actor_index)) return;
     if (HP.widget) {
         if (Alive(HP.widget, HP.widget_index)) HideFlatOnlyParts();  // the game may show them again
@@ -1858,6 +1860,7 @@ bool LookingAtArm() {
 // it when the game takes it away or puts it back on the flat screen.
 void UpdateHud(double now) {
     if (!HP.widget) return;
+    WalkScope walk;
     if (std::find(g_removed_now.begin(), g_removed_now.end(), HP.widget) != g_removed_now.end())
         return UnhostHud("was taken away by the game");
     if (!Alive(HP.comp, HP.comp_index)) {
@@ -2304,6 +2307,8 @@ void OnGameFrame() {
     // New menus are measured once they have been drawn on their panel, then
     // zoomed and shown (FitContent); after a click the laser area may grow.
     for (auto& p : G.panels) {
+        if (!p.fit_pending && p.regrow_at < 0) continue;
+        WalkScope walk;
         if (p.fit_pending && FitContent(p)) {
             p.fit_pending = false;
             PosePanel(p);
