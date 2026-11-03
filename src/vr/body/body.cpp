@@ -1116,7 +1116,11 @@ int PickSlideHold(const hands::HandState& h, const hands::Pose& gun, UObject gun
     // the rear sight = pinch (owner: "only the rear iron sights"); the rest
     // of the rear = overhand. Unmeasured: 5 cm ahead of the grab point
     // splits front/rear and there is no pinch.
-    static const double pinch_sight = config::GetFloat("hand_slide_pinch_sight_cm", 6.f);
+    // Pinch zone: within this of the rear sight, stretched back along the
+    // slide (owner 2026-11-03: "a little bit longer and extended past the back
+    // of the slide by about .25 of an inch"). Same as the controls grab zone.
+    static const double pinch_sight = config::GetFloat("hand_slide_pinch_radius_cm", 6.5f);
+    static const double pinch_back = config::GetFloat("hand_slide_pinch_back_cm", 0.64f);
     FVector sight_w, rear_w, front_w;
     const bool shape = SlideMarksWorld(gun_actor, gun.rotation, &sight_w, &rear_w, &front_w);
     double split = 5.0, to_sight = -1;
@@ -1124,7 +1128,9 @@ int PickSlideHold(const hands::HandState& h, const hands::Pose& gun, UObject gun
     if (shape) {
         split = (inv.Rotate(rear_w - gun.location).X + inv.Rotate(front_w - gun.location).X) * 0.5;
         sight_at = inv.Rotate(sight_w - gun.location);
-        to_sight = Length(at - sight_at);
+        // Distance to the segment from the sight back along the barrel.
+        const double along = std::clamp(at.X - sight_at.X, -pinch_back, 0.0);
+        to_sight = Length(at - (sight_at + FVector{along, 0, 0}));
     }
     int best;
     if (shape && to_sight < pinch_sight) best = kSlideRear;
