@@ -182,6 +182,8 @@ int g_vq_head = 0, g_vq_size = 0;
 long long g_last_push_qpc = 0;
 EyeView g_paired[2]{};
 bool g_have_paired = false;
+long long g_win_trimmed = 0;    // extra view sets dropped in the current check window
+bool g_pair_auto_off = false;   // pairing paused by the safety net below
 struct PairStats {
     long long pushes = 0, merged = 0, presents = 0, empty = 0, stale = 0, trimmed = 0;
     long long newer[3] = {};  // frames already drawn after the presented one: 0, 1, 2+
@@ -249,11 +251,30 @@ void TakePresentedViews(EyeView out[2], bool* have) {
             g_vq_head = (g_vq_head + 1) % kViewQueue;
             --g_vq_size;
             ++g_pair.trimmed;
+            ++g_win_trimmed;
         }
     } else {
         ++g_pair.empty;  // keep the last pairing
     }
-    const bool pairing = config::GetBool("pose_pairing", true);
+    // Safety net: pairing assumes one view set per drawn frame. If the game
+    // asks for views more often than it presents (extra views keep being
+    // dropped), the oldest set would lag the picture, so fall back to the
+    // newest views until the counts agree again. Checked every 144 presents.
+    static long long win_presents = 0;
+    static bool auto_off = false;
+    if (++win_presents >= 144) {
+        bool bad = g_win_trimmed > win_presents / 8;
+        if (bad != auto_off) {
+            auto_off = bad;
+            log::Warn("pose pairing %s: %lld extra view sets in the last %lld presents",
+                      bad ? "paused (the game asks for views more often than it presents)" : "back on",
+                      g_win_trimmed, win_presents);
+        }
+        g_win_trimmed = 0;
+        win_presents = 0;
+    }
+    g_pair_auto_off = auto_off;
+    const bool pairing = config::GetBool("pose_pairing", true) && !auto_off;
     if (pairing && g_have_paired) {
         out[0] = g_paired[0];
         out[1] = g_paired[1];
@@ -267,10 +288,12 @@ void TakePresentedViews(EyeView out[2], bool* have) {
 
 std::string PairReport(double) {
     PairStats p;
+    bool auto_off;
     {
         std::lock_guard<std::mutex> lock(g_view_mutex);
         p = g_pair;
         g_pair = PairStats{};
+        auto_off = g_pair_auto_off;
     }
     if (!p.presents) return {};
     long long n = p.newer[0] + p.newer[1] + p.newer[2];
@@ -281,7 +304,9 @@ std::string PairReport(double) {
                   "(%.1f-%.1f); at Present the game had already drawn 0/1/2+ newer frames %.0f%%/%.0f%%/%.0f%% "
                   "(the old pairing used the newest, so it was off by that many frames); %lld presents, %lld view "
                   "sets (%lld repeats merged), %lld presents with no new views, %lld stale and %lld extra views dropped",
-                  config::GetBool("pose_pairing", true) ? "on" : "off (newest views)",
+                  !config::GetBool("pose_pairing", true) ? "off (newest views)"
+                  : auto_off                             ? "paused (too many view sets)"
+                                                         : "on",
                   p.age_n ? p.age_sum / p.age_n : 0.0, p.age_n ? p.age_min : 0.0, p.age_max, pct(p.newer[0]),
                   pct(p.newer[1]), pct(p.newer[2]), p.presents, p.pushes, p.merged, p.empty, p.stale, p.trimmed);
     return buf;
