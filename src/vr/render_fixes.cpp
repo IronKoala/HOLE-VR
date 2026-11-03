@@ -1,6 +1,7 @@
 #include "vr/render_fixes.h"
 
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <mutex>
@@ -110,6 +111,21 @@ struct Probe {
 };
 Probe g_probe_fstop{"bOverride_DepthOfFieldFstop", "DepthOfFieldFstop"};
 Probe g_probe_exposure{"bOverride_AutoExposureMethod", "AutoExposureMethod"};
+// Exposure settings, read for the forearm menus' brightness (ReadExposure).
+struct Field {
+    const char* override;  // bOverride_ flag, or nullptr
+    const char* value;
+    int32_t value_offset = -1;
+    int32_t flag_offset = -1;
+    uint8_t flag_mask = 0;
+    uint8_t value_mask = 0;  // BoolProperty values (bitfields)
+};
+Field g_exp_method{"bOverride_AutoExposureMethod", "AutoExposureMethod"};
+Field g_exp_bias{"bOverride_AutoExposureBias", "AutoExposureBias"};
+Field g_exp_physical{"bOverride_AutoExposureApplyPhysicalCameraExposure", "AutoExposureApplyPhysicalCameraExposure"};
+Field g_exp_fstop{"bOverride_DepthOfFieldFstop", "DepthOfFieldFstop"};
+Field g_exp_shutter{"bOverride_CameraShutterSpeed", "CameraShutterSpeed"};
+Field g_exp_iso{"bOverride_CameraISO", "CameraISO"};
 bool g_pause_ready = false;
 std::atomic<bool> g_pause_on{false};
 int32_t g_dof_focal_offset = -1;  // the "no depth of field" fix's value
@@ -227,6 +243,24 @@ bool Init() {
         g_capture_on_movement = refl::FindProperty(g_cls_capture2d, "bCaptureOnMovement");
     }
     g_disable_player_capture = config::GetBool("vr_disable_player_scene_capture", true);
+    {
+        int found = 0;
+        for (Field* f : {&g_exp_method, &g_exp_bias, &g_exp_physical, &g_exp_fstop, &g_exp_shutter, &g_exp_iso}) {
+            refl::PropertyInfo flag = refl::FindProperty(pp_struct, f->override);
+            refl::PropertyInfo val = refl::FindProperty(pp_struct, f->value);
+            if (!val.valid()) continue;
+            f->value_offset = val.offset;
+            f->value_mask = val.bool_mask;
+            if (flag.valid() && flag.bool_mask) {
+                f->flag_offset = flag.offset;
+                f->flag_mask = flag.bool_mask;
+            }
+            ++found;
+        }
+        log::Info("render fixes: %d of 6 exposure settings readable (method %s, bias %s, physical camera %s)", found,
+                  g_exp_method.value_offset >= 0 ? "yes" : "no", g_exp_bias.value_offset >= 0 ? "yes" : "no",
+                  g_exp_physical.value_offset >= 0 ? "yes" : "no");
+    }
 
     int enabled = 0;
     for (Fix& f : g_fixes) {
@@ -426,6 +460,69 @@ int AllowPlayerCapture(bool allow) {
         ++n;
     }
     return n;
+}
+
+namespace {
+bool FlagOn(uintptr_t settings, const Field& f) {
+    return f.flag_offset >= 0 && (mem::ReadOr<uint8_t>(settings + f.flag_offset) & f.flag_mask);
+}
+}  // namespace
+
+// The engine's manual exposure (PostProcessEyeAdaptation.cpp) draws the world
+// 2^AutoExposureBias times as bright, divided by the physical camera's
+// exposure (EV100 from aperture, shutter and ISO) when that is applied.
+Exposure ReadExposure(UObject obj) {
+    Exposure e;
+    if (!g_ready || !obj || g_exp_bias.value_offset < 0) return e;
+    UObject cls = ue::GetClass(obj);
+    if (!cls) return e;
+    Kind k = Classify(cls);
+    if (k.settings_offset < 0) return e;
+    uintptr_t s = obj + k.settings_offset;
+    float bias;
+    if (!mem::Read(s + g_exp_bias.value_offset, bias) || !(bias > -20.f && bias < 20.f)) return e;
+    e.bias = bias;
+    e.bias_set = FlagOn(s, g_exp_bias);
+    if (g_exp_method.value_offset >= 0) {
+        e.method = mem::ReadOr<uint8_t>(s + g_exp_method.value_offset, 255);
+        e.method_set = FlagOn(s, g_exp_method);
+    }
+    if (g_exp_physical.value_offset >= 0 && g_exp_physical.value_mask)
+        e.physical = mem::ReadOr<uint8_t>(s + g_exp_physical.value_offset) & g_exp_physical.value_mask;
+    auto read = [&](const Field& f, float fallback, float lo, float hi) {
+        float v = f.value_offset >= 0 ? mem::ReadOr<float>(s + f.value_offset, fallback) : fallback;
+        return v > lo && v < hi ? v : fallback;
+    };
+    float fstop = read(g_exp_fstop, 4.f, 0.5f, 64.f);
+    float shutter = read(g_exp_shutter, 60.f, 0.5f, 10000.f);
+    float iso = read(g_exp_iso, 100.f, 1.f, 100000.f);
+    e.camera_ev100 = static_cast<float>(std::log2(static_cast<double>(fstop) * fstop * shutter * 100.0 / iso));
+    e.stops = e.bias - (e.physical ? e.camera_ev100 : 0.f);
+    e.ok = true;
+    return e;
+}
+
+std::string ExposureReport() {
+    std::vector<Target> targets;
+    {
+        std::lock_guard<std::mutex> lock(g_targets_mutex);
+        targets = g_targets;
+    }
+    std::string out;
+    int n = 0;
+    for (const Target& t : targets) {
+        if (n >= 8) break;
+        if (t.index < 0 || ue::objects::Get(t.index) != t.obj) continue;
+        Exposure e = ReadExposure(t.obj);
+        if (!e.ok) continue;
+        char buf[160];
+        std::snprintf(buf, sizeof(buf), "%s%s exp %d%s bias %.2f%s%s", n ? " | " : "",
+                      ue::GetName(ue::GetClass(t.obj)).c_str(), e.method, e.method_set ? "*" : "", e.bias,
+                      e.bias_set ? "*" : "", e.physical ? " physical" : "");
+        out += buf;
+        ++n;
+    }
+    return out.empty() ? "none read" : out;
 }
 
 }  // namespace holevr::vr::render_fixes

@@ -1,5 +1,8 @@
 #pragma once
 #include <cstdint>
+#include <string>
+
+#include "ue/objects.h"
 
 namespace holevr::vr::render_fixes {
 // Turns off post-process effects that look wrong or cause discomfort in a
@@ -25,4 +28,25 @@ void ApplyPauseBlurCvars(uintptr_t context);
 // death screen is up, for its picture of who killed you. Returns how many
 // captures were switched.
 int AllowPlayerCapture(bool allow);
+
+// The exposure one object's post-process settings ask for (a camera,
+// post-process component or volume). The game raises it in dark areas
+// (BP_Player.Exposure_BaseBrightness, set by each area's
+// LCBP_LocalPostProcess), and the forearm menus are drawn in the world, so
+// they are brightened with it.
+struct Exposure {
+    bool ok = false;
+    int method = -1;            // EAutoExposureMethod: 0 histogram, 1 basic, 2 manual
+    bool method_set = false;    // bOverride_ on in this object
+    float bias = 0.f;           // AutoExposureBias, in stops
+    bool bias_set = false;
+    bool physical = false;      // AutoExposureApplyPhysicalCameraExposure
+    float camera_ev100 = 0.f;   // from aperture, shutter and ISO (used when physical)
+    // How many stops brighter than a plain 1:1 exposure the world is drawn.
+    float stops = 0.f;
+};
+// Game thread or background; reads only.
+Exposure ReadExposure(ue::UObject obj);
+// For the log: each post-process object's exposure settings (up to 8).
+std::string ExposureReport();
 }  // namespace holevr::vr::render_fixes

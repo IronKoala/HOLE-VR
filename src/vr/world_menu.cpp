@@ -79,6 +79,10 @@ struct Settings {
     int snapshots = 2;            // pictures of each menu's panel per run, to check its layout (0 = off)
     bool fit_shape = true;        // a tall narrow menu gets a tall panel of the same area (FitContent)
     float fit_min_zoom = 1.3f;    // menus filling the whole screen still get at least this zoom
+    bool follow_exposure = true;  // dim the menus as much as the game brightens dark areas
+    float exposure_ref = 0.f;     // game exposure (stops) at which menus are drawn as the game made them
+    float brightness = 1.f;       // all menus and the HUD, times this
+    float brightness_min = 0.1f;  // never dimmer than this
     bool hud = true;              // the in-level HUD on the forearm, shown when you look at it
     float hud_size = 1.f;         // its width, times the menu's
     float hud_look_deg = 50.f;    // shown when the arm faces you within this angle...
@@ -1185,7 +1189,9 @@ void ApplyFit(Panel& p, const Rect& box) {
     // Menus that fill the whole screen (death screen, Options, credits,
     // task cards) could hardly be zoomed at all and their print stayed tiny
     // (owner 2026-11-03): they get a panel at least this much bigger.
-    zoom = std::max(zoom, static_cast<double>(S.fit_min_zoom));
+    // Not the death screen: the owner wants its size as it was (2026-11-03,
+    // "they dont need to be bigger"; its trouble was brightness).
+    if (p.name != "UIM_Results_C") zoom = std::max(zoom, static_cast<double>(S.fit_min_zoom));
     zoom = std::clamp(zoom, 1.0, static_cast<double>(S.fit_max_zoom));
     p.zoom = zoom;
     p.cx = (box.x0 + box.x1) * 0.5;
@@ -1251,9 +1257,12 @@ void GrowHitArea(Panel& p) {
 
 // While a menu waits to be measured (a frame or two) it is drawn see-through,
 // so it never shows at the old size and then jumps.
+// The colour part of the tint is the menus' brightness (UpdateBrightness).
+float g_menu_gain = 1.f;  // game thread
+
 void SetPanelOpacity(UObject comp, float a) {
     ue::Call c(comp, "SetTintColorAndOpacity");
-    c.Set("NewTintColorAndOpacity", LinearColor{1.f, 1.f, 1.f, a});
+    c.Set("NewTintColorAndOpacity", LinearColor{g_menu_gain, g_menu_gain, g_menu_gain, a});
     c.Invoke();
 }
 
@@ -1613,6 +1622,9 @@ int GrowTexts(Panel& p) {
     for (auto& t : p.texts) {
         if (!t.measured || t.grown || t.scale > 1.01f || !Alive(t.obj, t.index)) continue;
         t.grown = true;
+        // The death screen's Back, Retry, Home and Next labels stay at the
+        // game's size (owner 2026-11-03: "they dont need to be bigger").
+        if (p.name == "UIM_Results_C" && ue::GetName(t.obj) == "ButtonText") continue;
         float s = TargetScale(t.base);
         if (s <= 1.01f) continue;
         SetTextScale(t, s);
@@ -2443,7 +2455,8 @@ bool Host(const Candidate& c) {
     // (a few frames from now, see OnGameFrame); see-through until then.
     if (L.slate_lib && AddTexts(G.panels.back(), texts) > 0) G.panels.back().text_phase = kTextBaseline;
     if (S.fit && L.slate_lib) G.panels.back().fit_pending = true;
-    if (G.panels.back().fit_pending) SetPanelOpacity(comp, 0.f);  // shown once grown and zoomed
+    // See-through until grown and zoomed; either way at the menus' brightness.
+    SetPanelOpacity(comp, G.panels.back().fit_pending ? 0.f : 1.f);
     // Lists the game fills a moment after the menu is built get the same.
     G.panels.back().regrow_at = Now() + 0.8;
     // Then texts that come into view later, and texts the game adds later.
@@ -3238,6 +3251,70 @@ void UpdatePointer() {
 
 // --------------------------------------------------------- frame pump --
 
+// ------------------------------------------------------ menu brightness --
+// The game brightens the picture in dark areas: each area's
+// LCBP_LocalPostProcess sets BP_Player.Exposure_BaseBrightness, which raises
+// the exposure of the player's post-process. A flat menu is drawn after that
+// and never sees it, but ours are in the world, so in a dark area the death
+// screen's kill shot came out pure white and its orange buttons pale yellow,
+// while the same menus looked right in lit rooms (owner 2026-11-03: the
+// buttons are "too bright"; headset picture of the 10:08 run). The menus are
+// dimmed by as many stops as the world is brightened past the brightest
+// place seen this run (and never past menu_exposure_ref), so they look the
+// same everywhere.
+UObject g_player = 0;  // game thread
+int g_player_index = -1;
+
+void ApplyBrightness() {
+    for (const auto& p : G.panels)
+        if (Alive(p.comp, p.comp_index)) SetPanelOpacity(p.comp, p.fit_pending ? 0.f : 1.f);
+    if (HP.comp && Alive(HP.comp, HP.comp_index)) SetPanelOpacity(HP.comp, HP.alpha);
+}
+
+void UpdateBrightness(double now) {
+    static double s_next = 0;
+    static size_t s_panels = 0;
+    static double s_low = 1e9;      // the brightest place seen this run (fewest stops)
+    static float s_logged = -1.f;   // the brightness last written to the log
+    const bool new_menu = G.panels.size() > s_panels;
+    s_panels = G.panels.size();
+    if (now < s_next && !new_menu) return;
+    s_next = now + 0.25;
+    render_fixes::Exposure e;
+    UObject pp = 0;
+    if (S.follow_exposure && g_player && Alive(g_player, g_player_index) && ue::GetProp(g_player, "PostProcess", pp) &&
+        pp)
+        e = render_fixes::ReadExposure(pp);
+    double ref = S.exposure_ref;
+    float gain = g_menu_gain;  // the player can't be read (e.g. between levels): keep what we had
+    if (!S.follow_exposure) {
+        gain = S.brightness;
+    } else if (e.ok && e.bias_set) {  // set by the game (not the engine's default before it does)
+        s_low = std::min(s_low, static_cast<double>(e.stops));
+        ref = std::max(ref, s_low);
+        gain = S.brightness * static_cast<float>(std::pow(2.0, -std::max(0.0, e.stops - ref)));
+    }
+    gain = std::clamp(gain, S.brightness_min, 2.f);
+    const bool changed = std::fabs(gain - g_menu_gain) > 0.02f * std::max(gain, g_menu_gain);
+    if (changed) {
+        g_menu_gain = gain;
+        ApplyBrightness();
+    }
+    const bool log_it = new_menu || (changed && std::fabs(gain - s_logged) > 0.1f * std::max(gain, s_logged));
+    if (!log_it || G.panels.empty()) return;
+    s_logged = gain;
+    double base = -1;
+    if (g_player && Alive(g_player, g_player_index)) ue::GetProp(g_player, "Exposure_BaseBrightness", base);
+    if (e.ok)
+        log::Info("world menu: menus drawn at %.2f brightness (game exposure %+.2f stops: bias %.2f%s, method %d%s%s, "
+                  "area brightness %.2f; brightest place this run %+.2f, reference %+.2f) [%s]",
+                  gain, e.stops, e.bias, e.bias_set ? "*" : "", e.method, e.method_set ? "*" : "",
+                  e.physical ? ", physical camera" : "", base, s_low, ref, render_fixes::ExposureReport().c_str());
+    else
+        log::Info("world menu: menus drawn at %.2f brightness (player's exposure not readable now%s) [%s]", gain,
+                  S.follow_exposure ? "" : "; menu_follow_exposure=0", render_fixes::ExposureReport().c_str());
+}
+
 void OnGameFrame() {
     if (!S.enabled || !ue::reflection::Ready() || !ue::process_event::Ready()) return;
     // Once per frame: the controller's tick and the player's tick can both call.
@@ -3259,6 +3336,7 @@ void OnGameFrame() {
         UpdateStack();
     }
     g_menu_up = !G.panels.empty();
+    UpdateBrightness(now);
     static UObject s_death = 0;
     {
         UObject death = 0;
@@ -3709,6 +3787,10 @@ void Init() {
     S.text_scale = std::clamp(config::GetFloat("menu_text_scale", 1.5f), 1.f, 3.f);
     S.fit_shape = config::GetBool("menu_fit_shape", true);
     S.fit_min_zoom = std::clamp(config::GetFloat("menu_fit_min_zoom", 1.3f), 1.f, 3.f);
+    S.follow_exposure = config::GetBool("menu_follow_exposure", true);
+    S.exposure_ref = std::clamp(config::GetFloat("menu_exposure_ref", 0.f), -15.f, 15.f);
+    S.brightness = std::clamp(config::GetFloat("menu_brightness", 1.f), 0.05f, 2.f);
+    S.brightness_min = std::clamp(config::GetFloat("menu_brightness_min", 0.1f), 0.01f, 1.f);
     S.text_min_px = std::clamp(config::GetFloat("menu_text_min_px", 32.f), 0.f, 120.f);
     S.text_max_px = std::clamp(config::GetFloat("menu_text_max_px", 64.f), 10.f, 200.f);
     S.text_max_scale = std::clamp(config::GetFloat("menu_text_max_scale", 2.5f), 1.f, 4.f);
@@ -3796,6 +3878,10 @@ void FollowFromPlayer(UObject player) {
 }
 
 void OnPlayerTick(UObject player, float) {
+    if (player && player != g_player) {
+        g_player = player;
+        g_player_index = IndexOf(player);
+    }
     if (S.enabled && ue::process_event::Ready()) FollowFromPlayer(player);
     if (S.enabled && player && G.panels.empty()) PrepareHolder(player);
     if (S.enabled && player && G.panels.empty()) FindHud(player);

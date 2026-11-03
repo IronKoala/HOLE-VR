@@ -210,6 +210,19 @@ const Block kBlocks[] = {
      "; cards) are made at least this much bigger on the arm than the whole\n"
      "; screen would be (1 = no bigger)\n"
      "menu_fit_min_zoom=1.3\n"},
+    {"menu_follow_exposure",
+     "\n"
+     "; The game brightens the picture in dark areas, and the arm menus are in the\n"
+     "; world, so they got brightened too (death screen washed out). 1 = dim the\n"
+     "; menus and HUD by the same amount so they look the same everywhere\n"
+     "menu_follow_exposure=1\n"
+     "; Game exposure (stops) below which the menus are never dimmed; the\n"
+     "; brightest place seen in a run counts too\n"
+     "menu_exposure_ref=0\n"
+     "; All arm menus and the HUD, times this (1 = as the game draws them)\n"
+     "menu_brightness=1\n"
+     "; Never dimmer than this\n"
+     "menu_brightness_min=0.1\n"},
     {"hole_buzz",
      "\n"
      "; 1 = both hands tick softly each second while the hole in the floor counts\n"

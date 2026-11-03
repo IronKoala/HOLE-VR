@@ -88,7 +88,9 @@ dump of the shipping game (`hole-vr/dump/game_classes.txt`).
   landed off by the box's distance from the screen centre: one item low in the
   pause menu, above the task giver's Get Reward buttons. A menu the game fills
   after it opens (the task cards) is fitted again in its first 3 s, and menus
-  that fill the whole screen get at least `menu_fit_min_zoom` (1.3).
+  that fill the whole screen get at least `menu_fit_min_zoom` (1.3), except
+  the death screen, which keeps its fitted size; its button labels (`ButtonText`)
+  also stay at the game's size (owner: "they dont need to be bigger").
 - **Text checks, second round.** Fully see-through texts are ignored (each
   game button has a large invisible "Lock" text that made the real label shrink).
   Every widget around a text is checked (from a list up, only across it), and
@@ -99,6 +101,19 @@ dump of the shipping game (`hole-vr/dump/game_classes.txt`).
   menu on top, the menu button runs the pause menu's Return button.
 - **No menu blur on the death screen**: the blur smeared the kill shot (a
   scene capture of your body a few metres away).
+- **Menu brightness follows the game's exposure** (`UpdateBrightness`,
+  `render_fixes::ReadExposure`). The game uses manual exposure on the player's
+  post-process (`BP_Player.PostProcess`) and raises its bias in dark areas
+  (`Exposure_BaseBrightness`, set per area by `LCBP_LocalPostProcess`). Flat
+  menus never see that, but the arm menus are in the world: in a dark area the
+  death screen's kill shot came out pure white and its orange buttons pale
+  yellow (headset picture, 2026-11-03 10:08 run), while the same menus looked
+  right in lit rooms. The menus and the HUD are tinted down by as many stops as
+  the exposure is above the brightest place seen in the run (never above
+  `menu_exposure_ref`, 0), at least `menu_brightness_min` (0.1), times
+  `menu_brightness` (1). `menu_follow_exposure=0` turns it off. Each menu that
+  opens logs a `menus drawn at ... brightness` line with the exposure settings
+  of every camera and post-process object.
 - **Kill shot** (`WatchDeathScreen`). The death screen's WidgetSwitcher page is
   watched; on each change the kill shot view (`UIP_DeadReview`) is described in
   the log (what hides it, its pictures and where they come from, the
