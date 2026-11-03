@@ -27,6 +27,7 @@
 #include "vr/comfort_math.h"
 #include "vr/teleport.h"
 #include "vr/hands.h"
+#include "vr/workbench.h"
 #include "vr/input.h"
 #include "vr/interact/holster.h"
 #include "vr/interact/rifle_carry.h"
@@ -3018,6 +3019,17 @@ void PlaceGunInHolster(game::Gun& gun) {
     const UETransform main_world = ComponentToWorld(main);
     const FVector rel = actor_rot.Inverse().Rotate(main_world.translation - actor_loc);
     if (!W.have_frame) LearnGunFrame(g, actor_loc, actor_rot, main_world.translation);
+    {
+        // Lying on a table at the workbench (vr/workbench): stays there.
+        FVector spot;
+        FQuat frame;
+        if (workbench::ParkedGun(g, &spot, &frame)) {
+            const FVector grip_w = spot + frame.Rotate(GunGripOffset());
+            const FQuat rot = W.have_frame ? frame * W.gun_frame.Inverse() : frame;
+            SetActorTransform(g, grip_w - rot.Rotate(rel), rot);
+            return;
+        }
+    }
     const interact::HolsterSpot& sp = g_spots[kPistolSpot];
     const FQuat frame = sp.turned ? g_hw.spot_anchor_rot[0] * sp.rot
                                   : interact::PistolHolsterFrame(g_hw.spot_anchor_rot[0], g_set.holster_cant);
@@ -3088,6 +3100,14 @@ void UpdatePistolHolster(UObject player, const hands::HandState& rh, const input
     in.hand_valid = rh.valid;
     in.spot = g_hw.spot[0];
     in.spot_valid = g_hw.valid;
+    // Lying on a table (vr/workbench): it is picked up from there.
+    FVector park_spot;
+    FQuat park_frame;
+    const bool parked = workbench::ParkedGun(W.gun, &park_spot, &park_frame);
+    if (parked) {
+        in.spot = park_spot;
+        in.spot_valid = true;
+    }
     in.grip_down = rin.grip_button.down;
     in.grip_pressed = rin.grip_button.pressed;
     in.freeze = hands::EditorHand() >= 0 || ui_panel::MenuOpen();
@@ -3102,13 +3122,20 @@ void UpdatePistolHolster(UObject player, const hands::HandState& rh, const input
             break;
         case E::kDrawn:
             input::Haptic(input::kRight, 0.5f, 0.04f);
-            log::Info("holster: pistol drawn (hand %.1f cm from the holster spot)", W.holster.LastDistance());
+            if (parked) workbench::GunTaken();
+            else log::Info("holster: pistol drawn (hand %.1f cm from the holster spot)", W.holster.LastDistance());
             break;
         case E::kStowed:
             input::Haptic(input::kRight, 0.6f, 0.05f);
-            log::Info("holster: pistol holstered (let go %.1f cm from the holster spot)", W.holster.LastDistance());
+            if (parked) log::Info("workbench: pistol put back down where it lay");
+            else log::Info("holster: pistol holstered (let go %.1f cm from the holster spot)", W.holster.LastDistance());
             break;
         case E::kReturnStarted:
+            // Over a table at the workbench it is laid down there instead.
+            if (W.have_pose && workbench::TryPark(W.gun, W.frame_rot, rh.grip.location)) {
+                W.holster.Reset(interact::HolsterState::kHolstered);
+                break;
+            }
             log::Info("holster: pistol let go %.0f cm from the holster, it goes back by itself",
                       W.holster.LastDistance());
             break;
@@ -3694,6 +3721,10 @@ void OnTick(UObject player, float dt) {
     input::Snapshot s = input::Consume();
     if (!s.valid || !g_set.enabled) return;
     UpdateHands(s);
+    // The workbench (hub) owns a grip while that hand holds an attachment or
+    // is at one: no gun, slide or magazine grab with it.
+    for (int h = 0; h < 2; ++h)
+        if (workbench::ClaimsGrip(h)) s.hand[h].grip_button = input::Button{};
     // The grip editor (vr/body) borrows one controller: none of its buttons
     // reach the game, and the gun does not fire while a grip is edited.
     if (int eh = g_editor_hand.load(); eh == 0 || eh == 1) {

@@ -151,6 +151,8 @@ std::string Short(const std::string& path) {
 
 }  // namespace
 
+std::string NameString(const FName& n) { return NameOf(n); }
+
 std::string PathString(const std::vector<uint8_t>& path) {
     std::string s = "[";
     for (size_t i = 0; i < path.size(); ++i) s += (i ? "," : "") + std::to_string(path[i]);
@@ -213,6 +215,7 @@ bool Database(UObject gi, std::vector<PartRow>* out) {
         r.attach_id = NameOf(mem::ReadOr<FName>(data + o_attach));
         if (o_sub >= 0) r.attach_sub_id = NameOf(mem::ReadOr<FName>(data + o_sub));
         r.class_path = SoftPath(data + o_bp);
+        r.bp_soft = data + o_bp;
         if (o_cost >= 0) r.unlock_cost = mem::ReadOr<int32_t>(data + o_cost);
         out->push_back(std::move(r));
     });
@@ -347,6 +350,106 @@ bool WriteSaved(UObject gi, const FName& weapon_row, const std::vector<SavedPart
     return c.Get<bool>("Success");
 }
 
+UObject PartClass(const PartRow& part) {
+    static std::map<std::string, UObject> cache;
+    if (part.class_path.empty()) return 0;
+    auto it = cache.find(part.class_path);
+    if (it != cache.end() && it->second) return it->second;
+    UObject cls = ue::FindObject("BlueprintGeneratedClass " + part.class_path);
+    if (!cls && part.bp_soft) {
+        // Not loaded yet (a part never fitted this session): the game's own
+        // LoadClassAsset_Blocking, given a copy of the row's soft pointer.
+        static UObject ksl = 0;
+        if (!ksl) ksl = ue::FindObject("KismetSystemLibrary /Script/Engine.Default__KismetSystemLibrary");
+        if (ksl) {
+            ue::Call c(ksl, "LoadClassAsset_Blocking");
+            int32_t size = 0;
+            uint8_t* raw = c.Raw("AssetClass", &size);
+            if (raw && size == 0x28 && mem::SafeCopy(raw, reinterpret_cast<const void*>(part.bp_soft), 0x28) &&
+                c.Invoke())
+                cls = c.Result<UObject>();
+            log::Info("workbench: loaded the class of %s from disk: %s", part.name.c_str(), cls ? "ok" : "FAILED");
+        }
+    }
+    if (cls) cache[part.class_path] = cls;
+    return cls;
+}
+
+bool ApplyLoadout(UObject player, UObject gun, const std::vector<SavedPart>& parts, std::string* why) {
+    auto fail = [&](const char* w) {
+        if (why) *why = w;
+        return false;
+    };
+    UObject gi = GameInstance(player);
+    FName row;
+    if (!gi || !gun || !WeaponRow(gun, &row)) return fail("no game instance or weapon row");
+    // Tube-fed guns empty and refill their magazine when they rebuild
+    // (ClearMagazine + Init_MagazineCreate): not for them.
+    uint8_t mag_type = 0;
+    if (ue::GetProp(gun, "MagazineType", mag_type) && mag_type == 1) return fail("tube magazine gun");
+    // A magazine the game is moving between hand and gun (MagazineObj_Temp)
+    // would be put in the gun by the rebuild (Gun_MagazineLoad).
+    UObject temp_mag = 0;
+    if (ue::GetProp(gun, "MagazineObj_Temp", temp_mag) && temp_mag) return fail("a magazine is on its way into the gun");
+    const int32_t o_meta = ue::PropertyOffset(gun, "WeaponCustomMetaData");
+    UObject meta_struct = Struct("UserDefinedStruct /Game/Weapons/Custom/Data/Str_WeaponCustomMetaData.Str_WeaponCustomMetaData");
+    const int32_t o_list = meta_struct ? Member(meta_struct, "WeaponCustomPartsAndPath") : -1;
+    if (o_meta < 0 || o_list < 0) return fail("gun metadata layout not found");
+
+    if (!WriteSaved(gi, row, parts)) return fail("the game did not take the new list");
+
+    ue::Call m(gi, "GetSaveData_WeaponCustomMetaData");
+    if (!m.Valid()) return fail("no GetSaveData_WeaponCustomMetaData");
+    m.Set("WeaponRowName", row);
+    if (!m.Invoke() || !m.Get<bool>("Success")) return fail("the game built no metadata from the saved list");
+    int32_t size = 0;
+    uint8_t* raw = m.Raw("WeaponCustomMetaData", &size);
+    struct Arr {
+        uintptr_t data;
+        int32_t num, max;
+    } fresh{}, old{};
+    if (!raw || size < o_list + 16) return fail("metadata parameter missing");
+    FName meta_row;
+    std::memcpy(&meta_row, raw, sizeof(FName));
+    std::memcpy(&fresh, raw + o_list, sizeof(Arr));
+    if (!SameName(meta_row, row) || fresh.num < 0 || fresh.num > 64 || fresh.num > fresh.max ||
+        (fresh.num > 0 && !fresh.data))
+        return fail("metadata from the game looks wrong");
+    // Hand the game-allocated list to the gun; its old list stays with us
+    // (a few hundred bytes, never freed: freeing needs the engine allocator).
+    if (!mem::Read(gun + o_meta + o_list, old) || !mem::Write(gun + o_meta + o_list, fresh))
+        return fail("could not write the gun's metadata");
+    std::memcpy(raw + o_list, &old, sizeof(Arr));
+
+    UObject wm = 0;
+    if (!ue::GetProp(player, "WeaponManager", wm) || !wm) return fail("no weapon manager");
+    ue::Call r(wm, "RefreshWeaponSpec");
+    if (!r.Invoke()) return fail("RefreshWeaponSpec did not run");
+
+    // The hub's weapon racks show the guns with their parts (the menu
+    // refreshes them too).
+    static UObject rack_class = 0, statics = 0;
+    if (!rack_class)
+        rack_class = ue::FindObject("BlueprintGeneratedClass /Game/GamePlay/LevelComponents/LCBP_WeaponEquip.LCBP_WeaponEquip_C");
+    if (!statics) statics = ue::FindObject("GameplayStatics /Script/Engine.Default__GameplayStatics");
+    if (rack_class && statics) {
+        ue::Call all(statics, "GetAllActorsOfClass");
+        all.Set("WorldContextObject", player).Set("ActorClass", rack_class);
+        int32_t asz = 0;
+        const uint8_t* araw = all.Invoke() ? all.Raw("OutActors", &asz) : nullptr;
+        Arr racks{};
+        if (araw && asz >= 16) std::memcpy(&racks, araw, sizeof(Arr));
+        for (int32_t i = 0; i < racks.num && i < 16; ++i) {
+            UObject a = mem::ReadOr<uintptr_t>(racks.data + i * 8ull);
+            if (!a) continue;
+            ue::Call rf(a, "Refresh");
+            rf.Set("IsNewWeapon", false);
+            rf.Invoke();
+        }
+    }
+    return true;
+}
+
 void Study(UObject player, UObject bench) {
     UObject gi = GameInstance(player);
     log::Info("workbench study: game instance %s, save data %s", ue::GetName(gi).c_str(),
@@ -454,7 +557,7 @@ void Study(UObject player, UObject bench) {
             log::Info("workbench study:   no saved attachments for %s", NameOf(row).c_str());
         }
         // Which owned parts the game lists for this gun, per category.
-        for (int cat = 0; cat < 12; ++cat) {
+        for (int cat = 0; cat < 16; ++cat) {
             ue::Call c(gi, "GetGunPartsDataByCategoryFromDB");
             if (!c.Valid()) break;
             c.Set("WeaponRowName", row).Set("PartsCategory", static_cast<uint8_t>(cat));

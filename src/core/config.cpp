@@ -506,6 +506,23 @@ const Block kBlocks[] = {
      "monitor_view=right\n"
      "; Shape of the one-eye view, width / height (1.778 = 16:9).\n"
      "monitor_view_aspect=1.778\n"},
+    {"workbench_hands",
+     "\n"
+     "; --- Workbench: swap gun attachments by hand (hub) ---\n"
+     "; Let go of the pistol over a table and it lies there. Grab an attachment off\n"
+     "; it (light, sight, muzzle) with either hand; the attachments you own lie\n"
+     "; beside it; bring one to its place on the gun until it snaps, let go and it\n"
+     "; is fitted for real (saved like the game's workbench menu). 1 = on.\n"
+     "workbench_hands=1\n"
+     "; 1 = until the hub's workbench is unlocked, any table in the hub works.\n"
+     "; Once it is unlocked only the workbench does.\n"
+     "workbench_tables_before_unlock=1\n"
+     "; Grab reach around an attachment, and how close it must come to its place\n"
+     "; on the gun to snap there (cm).\n"
+     "workbench_grab_cm=3\n"
+     "workbench_snap_cm=5\n"
+     "; Walk this far from a pistol lying on a table and it goes back to the holster (m).\n"
+     "workbench_walk_away_m=3\n"},
 };
 
 std::string Trim(const std::string& s) {
