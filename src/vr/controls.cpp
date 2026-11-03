@@ -1990,10 +1990,11 @@ void HandInteract(UObject player, int hand) {
 
 // ---- physical buttons ----
 // Owner 2026-11-03: "the ready button for the shooting range? i want to be
-// able to physically press it to start the timer". A fingertip of either
-// hand (about 8 cm ahead of the fist along the pointing ray) pushing into the
-// timer's mesh presses it: the timer's own Interact, as the game's interact
-// key does. A press needs the fingertip to come from outside; 1.5 s apart.
+// able to physically press it to start the timer"; then "not just the finger
+// tip, any part of the hand or the gun im holding". Either hand, or the gun in
+// it, touching the timer's mesh presses it: the timer's own Interact, as the
+// game's interact key does. A press needs the hand to come from outside;
+// presses 1.5 s apart.
 struct PressButton {
     UObject actor = 0;
     UObject mesh = 0;
@@ -2062,13 +2063,33 @@ void PhysicalButtons(UObject player) {
         for (int h = 0; h < 2; ++h) {
             const hands::HandState hs = hands::Get(h == 0 ? hands::kLeft : hands::kRight);
             if (!hs.valid) { b.inside[h] = false; continue; }
-            const FVector tip = hs.grip.location + hs.aim.rotation.Rotate(FVector{8, 0, 0});
-            FVector l = t.rotation.Inverse().Rotate(tip - t.translation);
-            l = FVector{l.X / std::fmax(1e-3, t.scale.X), l.Y / std::fmax(1e-3, t.scale.Y),
-                        l.Z / std::fmax(1e-3, t.scale.Z)};
-            const double m = 1.0;   // cm of slack around the mesh
-            const bool in = l.X > mn.x - m && l.X < mx.x + m && l.Y > mn.y - m && l.Y < mx.y + m &&
-                            l.Z > mn.z - m && l.Z < mx.z + m;
+            // Any part of the hand (owner: "not just the finger tip, any part
+            // of the hand or the gun im holding"): wrist, palm, knuckles and
+            // fingertip as 4.5 cm balls; the gun in this hand along its bore
+            // and slide as 2.5 cm balls.
+            struct Ball { FVector p; double r; };
+            Ball pts[16];
+            int n = 0;
+            const FQuat ar = hs.aim.rotation;
+            pts[n++] = {hs.wrist.location, 4.5};
+            pts[n++] = {hs.grip.location, 4.5};
+            pts[n++] = {hs.grip.location + ar.Rotate(FVector{5, 0, 0}), 4.5};
+            pts[n++] = {hs.grip.location + ar.Rotate(FVector{9, 0, 0}), 3.0};
+            const bool gun_here = h == 1 && W.gun && W.in_hand && W.have_pose;
+            if (gun_here) {
+                for (double x = -4.0; x <= W.muzzle_dist + 0.1 && n < 16; x += 4.0)
+                    pts[n++] = {W.grip_world + W.frame_rot.Rotate(FVector{x, 0, W.bore_height}), 2.5};
+            }
+            auto ball_in = [&](const Ball& bl) {
+                FVector l = t.rotation.Inverse().Rotate(bl.p - t.translation);
+                // Box half-extents in world cm, ball radius added on each side.
+                const double sx = std::fmax(1e-3, t.scale.X), sy = std::fmax(1e-3, t.scale.Y),
+                             sz = std::fmax(1e-3, t.scale.Z);
+                return l.X > mn.x * sx - bl.r && l.X < mx.x * sx + bl.r && l.Y > mn.y * sy - bl.r &&
+                       l.Y < mx.y * sy + bl.r && l.Z > mn.z * sz - bl.r && l.Z < mx.z * sz + bl.r;
+            };
+            bool in = false;
+            for (int k = 0; k < n && !in; ++k) in = ball_in(pts[k]);
             if (in && !b.inside[h] && g_clock >= g_press.ready_at) {
                 g_press.ready_at = g_clock + 1.5;
                 bool on = false;
