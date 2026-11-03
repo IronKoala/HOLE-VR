@@ -9,7 +9,10 @@ double Dot(const FVector& a, const FVector& b) { return a.X * b.X + a.Y * b.Y + 
 double Length(const FVector& a) { return std::sqrt(Dot(a, a)); }
 
 bool Slide::InZone(const FVector& hand) const {
-    if (cfg_.sight_radius > 0.0 && Length(hand - cfg_.sight_center) <= cfg_.sight_radius) return true;
+    if (cfg_.sight_radius > 0.0) {
+        const double t = std::clamp(Dot(hand - cfg_.sight_center, cfg_.axis), 0.0, std::max(0.0, cfg_.sight_back));
+        if (Length(hand - (cfg_.sight_center + cfg_.axis * t)) <= cfg_.sight_radius) return true;
+    }
     if (cfg_.use_span) {
         const FVector d = cfg_.span_front - cfg_.span_rear;
         const double len = Length(d);

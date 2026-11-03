@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <atomic>
+#include <map>
 #include <mutex>
 #include <string>
 
@@ -97,6 +98,8 @@ struct Settings {
     bool holster_toggle = false;    // squeeze to draw, squeeze at the holster to put away
     double holster_cant = 10.0;     // grip tilted forward, degrees
     double belt_below_head = 60.0;  // belt height when the VR body is off, cm below the headset
+    double slide_pinch_radius = 6.5;    // pinch zone around the rear sight...
+    double slide_pinch_back = 0.64;     // ...stretched this far back along the slide (cm)
     double slide_grab_forward = 16.0;   // pistol slide grab zone reaches this far forward of the rear grab point
     bool wall_collision = true;    // keep the gun out of walls
     double recoil_kick = 1.0;      // scale of the in-hand recoil kick, 0 = off
@@ -138,6 +141,8 @@ void LoadSettings() {
     g_set.holster_cant = config::GetFloat("holster_pistol_cant_deg", 10.f);
     g_set.belt_below_head = config::GetFloat("holster_belt_below_head_cm", 60.f);
     g_set.slide_grab_forward = config::GetFloat("slide_grab_forward_cm", 16.f);
+    g_set.slide_pinch_radius = config::GetFloat("slide_pinch_radius_cm", 6.5f);
+    g_set.slide_pinch_back = config::GetFloat("slide_pinch_back_cm", 0.64f);
     g_set.virtual_stock = config::GetBool("rifle_virtual_stock", true);
     g_set.stock_snap = config::GetFloat("rifle_stock_snap_cm", 12.f);
     g_set.stock_release = config::GetFloat("rifle_stock_release_cm", 20.f);
@@ -160,6 +165,47 @@ interact::HolsterSpot g_spots[static_cast<int>(HolsterId::kCount)];
 bool g_spot_moved[static_cast<int>(HolsterId::kCount)] = {};  // placed in the headset (holsters.ini)
 
 std::wstring HolsterFile() { return config::Dir() + L"\\holsters.ini"; }
+
+// Where a seated magazine sits in each gun (actor space), learned from a
+// magazine in the gun and kept across levels and launches in mag-seats.ini.
+// Without it the first reload of a gun aimed at the magwell's top point, so
+// the magazine had to be pushed up through the gun before it seated.
+struct MagSeat {
+    FVector offset;
+    FQuat rot;
+};
+std::map<std::string, MagSeat> g_mag_seats;
+std::wstring MagSeatFile() { return config::Dir() + L"\\mag-seats.ini"; }
+
+void LoadMagSeats() {
+    FILE* f = _wfopen(MagSeatFile().c_str(), L"r");
+    if (!f) return;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        char name[128] = {};
+        double v[7];
+        if (line[0] == ';' || std::sscanf(line, "%127[^=]=%lf %lf %lf %lf %lf %lf %lf", name, &v[0], &v[1], &v[2],
+                                          &v[3], &v[4], &v[5], &v[6]) != 8)
+            continue;
+        MagSeat m;
+        m.offset = FVector{v[0], v[1], v[2]};
+        m.rot.X = v[3]; m.rot.Y = v[4]; m.rot.Z = v[5]; m.rot.W = v[6];
+        if (std::sqrt(m.offset.X * m.offset.X + m.offset.Y * m.offset.Y + m.offset.Z * m.offset.Z) > 15.0) continue;
+        g_mag_seats[name] = m;
+        log::Info("controls: magazine seat for %s from mag-seats.ini (%.1f %.1f %.1f)", name, v[0], v[1], v[2]);
+    }
+    fclose(f);
+}
+
+void SaveMagSeats() {
+    FILE* f = _wfopen(MagSeatFile().c_str(), L"w");
+    if (!f) return;
+    std::fputs("; Where a seated magazine sits in each gun, learned in game. Delete to relearn.\n", f);
+    for (const auto& [name, m] : g_mag_seats)
+        std::fprintf(f, "%s=%.3f %.3f %.3f %.6f %.6f %.6f %.6f\n", name.c_str(), m.offset.X, m.offset.Y, m.offset.Z,
+                     m.rot.X, m.rot.Y, m.rot.Z, m.rot.W);
+    fclose(f);
+}
 
 void LoadHolsterSpots() {
     for (int i = 0; i < static_cast<int>(HolsterId::kCount); ++i) {
@@ -895,7 +941,8 @@ void SlideHandling(game::Gun& gun, const hands::HandState& lh, const input::Hand
             cfg.span_rear = ToLocal(pt, rear_w);
             cfg.span_front = ToLocal(pt, front_w);
             cfg.sight_center = ToLocal(pt, sight_w);
-            cfg.sight_radius = 6.5;
+            cfg.sight_radius = g_set.slide_pinch_radius;
+            cfg.sight_back = g_set.slide_pinch_back;   // owner: about 1/4 inch further back than the sight
             static UObject logged_gun = 0;
             if (logged_gun != gun.Object()) {
                 logged_gun = gun.Object();
@@ -1306,7 +1353,7 @@ void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState& lh
             return;
         }
         if (!W.mag_engaged) {
-            if (along > 2.0 && along < 14.0 && lateral < 4.5 && aim_off_deg < 35.0) {
+            if (along > -4.0 && along < 14.0 && lateral < 5.5 && aim_off_deg < 40.0) {
                 W.mag_engaged = true;
                 input::Haptic(input::kLeft, 0.25f, 0.02f);
                 log::Info("controls: magazine lined up with the magwell (%.1f cm below, %.1f off axis, %.0f deg)",
@@ -1981,6 +2028,12 @@ void OnTick(UObject player, float dt) {
             W.holster.Reset(interact::HolsterState::kHolstered);
             W.in_hand = !W.uses_holster;
             log::Info("controls: holding %s (%s)", gun.ClassName().c_str(), W.is_pistol ? "pistol" : "rifle");
+            auto seat = g_mag_seats.find(gun.ClassName());
+            if (seat != g_mag_seats.end()) {
+                W.seat_offset = seat->second.offset;
+                W.seat_rot = seat->second.rot;
+                W.seat_learned = true;
+            }
             if (W.uses_holster)
                 log::Info("holster: the pistol starts in its holster (on %s)",
                           interact::AnchorPlace(g_spots[kPistolSpot].anchor));
@@ -2021,6 +2074,15 @@ void OnTick(UObject player, float dt) {
         }
         W.timeline_fast = true;
     }
+    if (!W.seat_learned && W.learn_at < 0 && W.have_pose && W.in_hand && !W.mag_seating) {
+        // The gun came with a magazine in it: learn where it sits now, so the
+        // first reload already lines up with the real seat.
+        UObject mag = 0;
+        if (gun.State().has_magazine && ue::GetProp(gun.Object(), "MagazineObj", mag) && mag) {
+            W.learn_mag = mag;
+            W.learn_at = g_clock;
+        }
+    }
     if (W.learn_at > 0 && g_clock >= W.learn_at && W.have_pose) {
         W.learn_at = -1;
         UObject well = 0;
@@ -2034,6 +2096,8 @@ void OnTick(UObject player, float dt) {
                 W.seat_offset = inv.Rotate(off);
                 W.seat_rot = inv * ActorRotation(mag);
                 W.seat_learned = true;
+                g_mag_seats[gun.ClassName()] = MagSeat{W.seat_offset, W.seat_rot};
+                SaveMagSeats();
                 // How far the seated magazine is turned from the magwell
                 // point (what the pouch and hand used before this insert).
                 const FQuat wq = inv * ComponentToWorld(well).rotation;
@@ -2106,6 +2170,7 @@ void OnTick(UObject player, float dt) {
 
 void Init() {
     LoadSettings();
+    LoadMagSeats();
     game::AddTickListener(&OnTick);
     log::Info("controls: ready (%s turn, move by %s)", g_set.smooth_turn ? "smooth" : "snap",
               g_set.move_with_hand ? "hand" : "head");
