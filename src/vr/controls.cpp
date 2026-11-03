@@ -98,6 +98,7 @@ struct Settings {
     bool holster_toggle = false;    // squeeze to draw, squeeze at the holster to put away
     double holster_cant = 10.0;     // grip tilted forward, degrees
     double belt_below_head = 60.0;  // belt height when the VR body is off, cm below the headset
+    bool rack_trace = false;            // per-frame slide log while racking (debug)
     double slide_pinch_radius = 6.5;    // pinch zone around the rear sight...
     double slide_pinch_back = 0.64;     // ...stretched this far back along the slide (cm)
     double slide_grab_forward = 16.0;   // pistol slide grab zone reaches this far forward of the rear grab point
@@ -141,6 +142,7 @@ void LoadSettings() {
     g_set.holster_cant = config::GetFloat("holster_pistol_cant_deg", 10.f);
     g_set.belt_below_head = config::GetFloat("holster_belt_below_head_cm", 60.f);
     g_set.slide_grab_forward = config::GetFloat("slide_grab_forward_cm", 16.f);
+    g_set.rack_trace = config::GetBool("debug_rack_trace", false);
     g_set.slide_pinch_radius = config::GetFloat("slide_pinch_radius_cm", 6.5f);
     g_set.slide_pinch_back = config::GetFloat("slide_pinch_back_cm", 0.64f);
     g_set.virtual_stock = config::GetBool("rifle_virtual_stock", true);
@@ -1654,6 +1656,10 @@ void PublishGrabs(game::Gun& gun, const hands::HandState& rh, const hands::HandS
 // far the gun actor sits from where HoldGun put it. Diagnoses the chamber hitch.
 void RackTrace(game::Gun& gun, float dt) {
     if (W.trace_until < 0) return;
+    if (!g_set.rack_trace) {   // per-frame slide diagnostics: off unless debug_rack_trace=1
+        W.trace_until = -1;
+        return;
+    }
     if (g_clock > W.trace_until) {
         W.trace_until = -1;
         game::weapon_lab::SetTrace(false);
