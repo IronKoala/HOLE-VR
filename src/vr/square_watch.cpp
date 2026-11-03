@@ -554,6 +554,11 @@ bool LatestSweep(double since_ms, Sweep* out) {
         for (int e = 0; e < 2; ++e) {
             out->dots[e] += sd.dots[e];
             for (int c = 0; c < 32; ++c) grid[e][c] += sd.grid[e][c];
+            const int more = sd.dots[e] - sd.dots[1 - e];
+            if (more >= kStripExcess) {
+                out->excess[e] += more;
+                out->best_strip[e] = std::max(out->best_strip[e], more);
+            }
         }
     }
     for (int e = 0; e < 2; ++e) out->grid_share[e] = GridShare(grid[e]);

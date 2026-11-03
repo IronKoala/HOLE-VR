@@ -10,8 +10,8 @@
 //    exactly one eye), or
 //  - a render pass of the game reading a picture it never finished drawing.
 //
-// When the square watch (square_watch.h) sees many more lone dots in one eye
-// than the other, this first lists the game's flat UI (every widget on the
+// When the square watch (square_watch.h) sees many more lone dots in one
+// strip of one eye than in the other eye's same strip, this first lists the game's flat UI (every widget on the
 // window and every widget component drawn flat) in the log, then switches
 // suspects off one at a time for about a second each: each flat widget
 // (made see-through), then render features (console variables), comparing
