@@ -1106,56 +1106,34 @@ int g_slide_hold[2] = {kSlideOver, kSlideOver};
 
 bool PartBox(UObject comp, FVector* mn, FVector* mx, const char** how);
 
-// The slide's length along the barrel, in the frame of `gun` (x only).
-bool SlideSpan(UObject gun_actor, const hands::Pose& gun, double* back, double* front) {
-    UObject slide = 0;
-    if (!gun_actor || !ue::GetProp(gun_actor, "GunParts_Bolt(Slide)", slide) || !slide) return false;
-    FVector mn, mx;
-    const char* how = "";
-    if (!PartBox(slide, &mn, &mx, &how)) return false;
-    const Xf cw = ComponentToWorld(slide);
-    const FQuat inv = gun.rotation.Inverse();
-    for (int k = 0; k < 8; ++k) {
-        FVector corner{k & 1 ? mx.X : mn.X, k & 2 ? mx.Y : mn.Y, k & 4 ? mx.Z : mn.Z};
-        double x = inv.Rotate(skel::Apply(cw, corner) - gun.location).X;
-        if (k == 0) *back = *front = x;
-        *back = std::min(*back, x);
-        *front = std::max(*front, x);
-    }
-    return *front - *back > 3.0 && *front - *back < 60.0;
-}
+bool SlideMarksWorld(UObject gun, const FQuat& gun_rot, FVector* sight, FVector* rear, FVector* front);
 
 int PickSlideHold(const hands::HandState& h, const hands::Pose& gun, UObject gun_actor) {
     const FQuat inv = gun.rotation.Inverse();
     const FVector n = inv.Rotate(h.palm_normal);                    // palm direction, gun frame
     const FVector at = inv.Rotate(h.grip.location - gun.location);  // fist from the grab point, gun frame
-    double back = 0, front = 0;
-    const bool span = SlideSpan(gun_actor, gun, &back, &front);
-    // Front half of the slide (unknown length: well ahead of the grab point).
-    const double split = span ? (back + front) * 0.5 : 5.0;
-    int best;
-    // The pinch is taken at the rear sight (owner: "the pinch grab zone
-    // should be the rear iron sights"): fist within reach of the gun's sight
-    // point. Without a sight point: behind the slide.
+    // From the measured slide: front half = front hold; within reach of
+    // the rear sight = pinch (owner: "only the rear iron sights"); the rest
+    // of the rear = overhand. Unmeasured: 5 cm ahead of the grab point
+    // splits front/rear and there is no pinch.
     static const double pinch_sight = config::GetFloat("hand_slide_pinch_sight_cm", 6.f);
-    static const double pinch_behind = config::GetFloat("hand_slide_pinch_behind_cm", 7.f);
-    UObject sight = 0;
+    FVector sight_w, rear_w, front_w;
+    const bool shape = SlideMarksWorld(gun_actor, gun.rotation, &sight_w, &rear_w, &front_w);
+    double split = 5.0, to_sight = -1;
     FVector sight_at{};
-    double to_sight = -1;
-    if (gun_actor && ue::GetProp(gun_actor, "DefaultADSPoint", sight) && sight) {
-        sight_at = inv.Rotate(ComponentToWorld(sight).translation - gun.location);
+    if (shape) {
+        split = (inv.Rotate(rear_w - gun.location).X + inv.Rotate(front_w - gun.location).X) * 0.5;
+        sight_at = inv.Rotate(sight_w - gun.location);
         to_sight = Length(at - sight_at);
     }
-    const bool pinch = to_sight >= 0 ? to_sight < pinch_sight : at.X < -pinch_behind;
-    if (pinch) best = kSlideRear;
+    int best;
+    if (shape && to_sight < pinch_sight) best = kSlideRear;
     else if (at.X > split) best = kSlideFront;
     else best = kSlideOver;
-    log::Info("body: slide grab: %s hold (fist (%.1f %.1f %.1f) from the grab point, rear sight at (%.1f %.1f %.1f), "
-              "%.1f cm from it, pinch within %.1f; slide %s; front half from %.1f; palm in gun frame %.2f %.2f %.2f)",
-              kSlideHoldName[best], at.X, at.Y, at.Z, sight_at.X, sight_at.Y, sight_at.Z, to_sight, pinch_sight,
-              span ? (std::to_string(int(back * 10) / 10.0) + ".." + std::to_string(int(front * 10) / 10.0)).c_str()
-                   : "size unknown",
-              split, n.X, n.Y, n.Z);
+    log::Info("body: slide grab: %s hold (fist (%.1f %.1f %.1f) from the grab point; %s; rear sight at (%.1f %.1f "
+              "%.1f), %.1f cm from it, pinch within %.1f; front half from %.1f; palm in gun frame %.2f %.2f %.2f)",
+              kSlideHoldName[best], at.X, at.Y, at.Z, shape ? "slide measured" : "slide NOT measured", sight_at.X,
+              sight_at.Y, sight_at.Z, to_sight, pinch_sight, split, n.X, n.Y, n.Z);
     return best;
 }
 
@@ -1513,6 +1491,11 @@ int g_edit_side = -1;      // hand whose grip is edited
 int g_edit_ctrl = -1;      // controller doing the editing
 FVector g_tip_world[2][gr::kTipCount];
 FVector g_palm_world[2];
+// The "move the whole hand" handle: a ball off the back of the hand, clear
+// of the finger joints (owner: "i need the ability to position the whole
+// hand in relation to the gun"; the old palm ball sat among the joints and
+// was never picked).
+FVector g_handle_world[2];
 Xf g_joint_world[2][hand_pose::kFingerCount][3];  // posed finger joints, world
 Xf g_hand_world[2];
 bool g_tips_valid[2] = {false, false};
@@ -1665,7 +1648,7 @@ void ShowMarkers(UObject player, int side, int hover, const FVector& pointer, co
     }
     // The palm ball (move the hand) or, holding a magazine, the magazine ball.
     if (object) PlaceMarker(kMkObject, *object, hover == grip_editor::kObjectItem ? 4.5 : 2.5);
-    else PlaceMarker(kMkPalm, g_palm_world[side], hover == grip_editor::kHandItem ? 4.0 : 2.0);
+    else PlaceMarker(kMkPalm, g_handle_world[side], hover == grip_editor::kHandItem ? 5.0 : 3.5);
     if (g_mk.object_shown != (object != nullptr)) {
         g_mk.object_shown = object != nullptr;
         SetVisible(g_mk.comp[kMkObject], g_mk.object_shown);
@@ -1735,7 +1718,7 @@ void UpdateEditor(const hands::HandGrab grab[2], const hands::HandState hs[2], c
     in.pointer_rot = Normalized(inv * live[ctrl].grip.rotation);
     grip_editor::Scene sc;
     for (int m = 0; m < grip_editor::kJointItems; ++m) sc.joint[m] = local(g_joint_world[side][m / 3][m % 3].translation);
-    sc.palm = local(g_palm_world[side]);
+    sc.palm = local(g_handle_world[side]);
     ActiveGrip& g = G.grip[side];
     FVector object_w = obj.location;
     if (is_mag && !g.rec.outline.empty()) object_w = obj.location + obj.rotation.Rotate(g.rec.outline[0].centre);
@@ -2027,30 +2010,124 @@ void FreeHand(int side, const hands::HandState& h, const FVector& fist_at, FQuat
 // controller had when it grabbed; it is only moved so the contact point
 // touches the slide's surface, found with a line trace against the slide part.
 // Unsaved: the grip editor fine-tunes it and Y saves it as usual.
-bool TraceSlide(UObject slide, const FVector& a, const FVector& b, FVector* hit) {
-    // The game's gun parts have no collision; a line trace against one
-    // component needs query collision. Query-only and ignoring every channel:
-    // nothing in the game can hit it.
-    static UObject made = 0;
-    if (made != slide) {
-        made = slide;
-        uint8_t coll = 0;
-        ue::Call ce(slide, "GetCollisionEnabled");
-        if (ce.Invoke()) coll = ce.Result<uint8_t>();
-        if (coll == 0) {
-            ue::Call r(slide, "SetCollisionResponseToAllChannels");
-            r.Set("NewResponse", static_cast<uint8_t>(0));  // ECR_Ignore
-            ue::Call e(slide, "SetCollisionEnabled");
-            e.Set("NewType", static_cast<uint8_t>(1));  // QueryOnly
-            const bool ok = r.Invoke() && e.Invoke();
-            log::Info("body: slide part made traceable (query only, ignores every channel): %s", ok ? "ok" : "FAILED");
+// The slide's own parts. GunParts_Bolt(Slide) itself is a plain scene
+// component (log: making it traceable failed); its meshes are its children.
+// They get query-only collision that ignores every channel, so nothing in
+// the game can hit them but K2_LineTraceComponent (which tests one component
+// and never the world) can.
+std::vector<UObject> SlideParts(UObject slide) {
+    static UObject prim = ue::FindObject("Class /Script/Engine.PrimitiveComponent");
+    std::vector<UObject> out;
+    if (!prim || !slide) return out;
+    std::vector<UObject> all{slide};
+    ue::Call ch(slide, "GetChildrenComponents");
+    ch.Set("bIncludeAllDescendants", true);
+    if (ch.Invoke()) {
+        int32_t size = 0;
+        const uint8_t* raw = ch.Raw("Children", &size);
+        TArrayRaw arr{};
+        if (raw && size >= (int32_t)sizeof(TArrayRaw)) std::memcpy(&arr, raw, sizeof(arr));
+        for (int k = 0; k < arr.num && k < 32; ++k) {
+            UObject c = mem::ReadOr<uintptr_t>(arr.data + k * sizeof(uintptr_t), 0);
+            if (c) all.push_back(c);
         }
     }
-    ue::Call c(slide, "K2_LineTraceComponent");
-    if (!c.Valid()) return false;
-    c.Set("TraceStart", a).Set("TraceEnd", b).Set("bTraceComplex", true);
-    if (!c.Invoke() || !c.Result<bool>()) return false;
-    *hit = c.Get<FVector>("HitLocation");
+    for (UObject c : all) {
+        if (!ue::reflection::IsA(c, prim)) continue;
+        uint8_t coll = 0;
+        ue::Call ce(c, "GetCollisionEnabled");
+        if (ce.Invoke()) coll = ce.Result<uint8_t>();
+        if (coll == 0) {
+            ue::Call rr(c, "SetCollisionResponseToAllChannels");
+            rr.Set("NewResponse", static_cast<uint8_t>(0));  // ECR_Ignore
+            ue::Call e(c, "SetCollisionEnabled");
+            e.Set("NewType", static_cast<uint8_t>(1));  // QueryOnly
+            rr.Invoke();
+            e.Invoke();
+        }
+        out.push_back(c);
+    }
+    return out;
+}
+
+bool TraceParts(const std::vector<UObject>& parts, const FVector& a, const FVector& b, FVector* hit) {
+    double best = 1e30;
+    for (UObject c : parts) {
+        ue::Call t(c, "K2_LineTraceComponent");
+        if (!t.Valid()) continue;
+        t.Set("TraceStart", a).Set("TraceEnd", b).Set("bTraceComplex", true);
+        if (!t.Invoke() || !t.Result<bool>()) continue;
+        FVector h = t.Get<FVector>("HitLocation");
+        double d = Length(h - a);
+        if (d < best) best = d, *hit = h;
+    }
+    return best < 1e29;
+}
+
+// The slide measured once per gun with rays down onto its top along the
+// centre line: rear and front end and the rear sight (the highest point of
+// the rear 3.5 cm). Stored in the slide component's space, so it follows
+// the slide as it moves.
+struct SlideShape {
+    UObject gun = 0, slide = 0;
+    bool tried = false, ok = false;
+    std::vector<UObject> parts;
+    FVector sight, rear, front;  // slide component space
+} g_shape;
+
+bool MeasureSlide(UObject gun, const FQuat& gun_rot) {
+    if (g_shape.gun == gun && g_shape.tried) return g_shape.ok;
+    g_shape = SlideShape{};
+    g_shape.gun = gun;
+    g_shape.tried = true;
+    if (!gun || !ue::GetProp(gun, "GunParts_Bolt(Slide)", g_shape.slide) || !g_shape.slide) return false;
+    g_shape.parts = SlideParts(g_shape.slide);
+    if (g_shape.parts.empty()) {
+        log::Warn("body: slide measure: the slide has no mesh parts to trace");
+        return false;
+    }
+    const Xf sw = ComponentToWorld(g_shape.slide);
+    const FVector X = gun_rot.Rotate(FVector{1, 0, 0}), Z = gun_rot.Rotate(FVector{0, 0, 1});
+    double rear = 1e9, front = -1e9;
+    std::vector<std::pair<double, double>> top;  // x along the barrel from the slide origin, z
+    for (double x = -30; x <= 30; x += 0.5) {
+        FVector a = sw.translation + X * x + Z * 15.0, b = sw.translation + X * x - Z * 15.0, h;
+        if (!TraceParts(g_shape.parts, a, b, &h)) continue;
+        double z = Dot(h - sw.translation, Z);
+        top.push_back({x, z});
+        rear = std::min(rear, x);
+        front = std::max(front, x);
+    }
+    if (top.size() < 6 || front - rear < 5.0 || front - rear > 50.0) {
+        log::Warn("body: slide measure: %zu of 121 rays hit %zu part(s); no slide shape", top.size(),
+                  g_shape.parts.size());
+        return false;
+    }
+    double sx = rear, sz = -1e9;
+    for (auto& [x, z] : top)
+        if (x <= rear + 3.5 && z > sz) sx = x, sz = z;
+    double rz = top.front().second, fz = top.back().second;
+    auto to_local = [&](double x, double z) {
+        Xf pt;
+        pt.translation = sw.translation + X * x + Z * z;
+        return skel::Relative(pt, sw).translation;
+    };
+    g_shape.sight = to_local(sx, sz);
+    g_shape.rear = to_local(rear, rz);
+    g_shape.front = to_local(front, fz);
+    g_shape.ok = true;
+    log::Info("body: slide measured (%zu parts): %.1f cm long, rear end %.1f / front end %.1f cm along the barrel "
+              "from the slide origin, rear sight at %.1f, %.1f cm above the origin",
+              g_shape.parts.size(), front - rear, rear, front, sx, sz);
+    return true;
+}
+
+bool SlideMarksWorld(UObject gun, const FQuat& gun_rot, FVector* sight, FVector* rear, FVector* front) {
+    if (!MeasureSlide(gun, gun_rot)) return false;
+    const Xf sw = ComponentToWorld(g_shape.slide);
+    if (sight) *sight = skel::Apply(sw, g_shape.sight);
+    if (rear) *rear = skel::Apply(sw, g_shape.rear);
+    if (front) *front = skel::Apply(sw, g_shape.front);
     return true;
 }
 
@@ -2058,8 +2135,9 @@ bool BuildSlidePreset(int side, const hands::HandState& h, const hands::Pose& ob
     static const bool enabled = config::GetBool("hand_slide_builtin_holds", true);
     const HandRig& rig = G.rig[side];
     if (!enabled || !rig.ok || !grab.object) return false;
-    UObject slide = 0;
-    if (!ue::GetProp(grab.object, "GunParts_Bolt(Slide)", slide) || !slide) return false;
+    MeasureSlide(grab.object, obj.rotation);
+    const UObject slide = g_shape.slide;
+    if (!slide || g_shape.parts.empty()) return false;
     const int hold = g_slide_hold[side];
     const bool pinch = hold == kSlideRear;
     // Hand where the controller grabbed, in the object frame.
@@ -2100,7 +2178,7 @@ bool BuildSlidePreset(int side, const hands::HandState& h, const hands::Pose& ob
     FVector hit{};
     if (dist > 0.1) {
         d = d * (1.0 / dist);
-        snapped = TraceSlide(slide, cw - d * 8.0, on_line, &hit);
+        snapped = TraceParts(g_shape.parts, cw - d * 8.0, on_line, &hit);
         if (snapped) {
             static const double pad = config::GetFloat("hand_slide_contact_skin_cm", 0.6f);
             pos_o = pos_o + inv.Rotate(hit - d * pad - cw);
@@ -2327,6 +2405,8 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
         for (int n = 0; n < 3; ++n) g_joint_world[side][f][n] = skel::Compose(j[n], hw);
     }
     g_palm_world[side] = skel::Apply(hw, rig.palm_centre);
+    static const double handle_out = config::GetFloat("hand_editor_handle_cm", 7.f);
+    g_handle_world[side] = skel::Apply(hw, rig.palm_centre - rig.palm_h * handle_out);
     g_hand_world[side] = hw;
     g_tips_valid[side] = true;
 }
@@ -2667,6 +2747,17 @@ bool GetSlot(Slot slot, hands::Pose* out) {
     if (!g_slots_valid || i < 0 || i >= static_cast<int>(Slot::kCount)) return false;
     *out = g_slots[i];
     return true;
+}
+
+bool SlideMarks(uintptr_t gun, FVector* rear_sight, FVector* rear_end, FVector* front_end) {
+    const hands::HandGrab r = hands::GetGrab(hands::kRight);
+    if (!gun) return false;
+    if (g_shape.gun != gun || !g_shape.tried) {
+        // Measure only with the gun frame from the hand that holds it.
+        if (r.kind != hands::GrabKind::kGunGrip || r.object != gun) return false;
+        return SlideMarksWorld(gun, r.target.rotation, rear_sight, rear_end, front_end);
+    }
+    return SlideMarksWorld(gun, r.target.rotation, rear_sight, rear_end, front_end);
 }
 
 bool GetAnchor(Anchor anchor, hands::Pose* out) {

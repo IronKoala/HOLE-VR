@@ -882,21 +882,27 @@ void SlideHandling(game::Gun& gun, const hands::HandState& lh, const input::Hand
     cfg.length = gun.SlideBackLength() > 0.5 ? gun.SlideBackLength() : (W.is_pistol ? 4.7 : 8.0);
     ue::Vec3d o = gun.SlideOrigin();
     cfg.grab_center = FVector{o.x, o.y, o.z} + cfg.axis * 4.0;
-    cfg.grab_radius = 8.0;
+    cfg.grab_radius = 10.0;  // until the slide is measured: the rear of the slide (owner grabs at -11..-13)
     cfg.grab_forward = g_set.slide_grab_forward;   // whole slide, front serrations included
-    // No zone behind the slide: the pinch is grabbed at the rear sight only.
     if (W.is_pistol) {
-        // Pinch at the rear sight (the body picks its pinch pose there too).
-        UObject sight = 0;
-        ue::GetProp(gun.Object(), "DefaultADSPoint", sight);
-        if (sight) {
-            cfg.sight_center = ToLocal(pt, ComponentToWorld(sight).translation);
-            cfg.sight_radius = 7.0;
-            static bool logged = false;
-            if (!logged) {
-                logged = true;
-                log::Info("controls: rear sight pinch zone at slide-space (%.1f %.1f %.1f), 7 cm", cfg.sight_center.X,
-                          cfg.sight_center.Y, cfg.sight_center.Z);
+        // Zones from the slide the body measured (traces on its mesh): the
+        // whole slide top from the front end to 2 cm past the rear end, and
+        // the pinch at the rear sight. Until measured, the rear sphere and
+        // front capsule above.
+        FVector sight_w, rear_w, front_w;
+        if (body::SlideMarks(gun.Object(), &sight_w, &rear_w, &front_w)) {
+            cfg.use_span = true;
+            cfg.span_rear = ToLocal(pt, rear_w);
+            cfg.span_front = ToLocal(pt, front_w);
+            cfg.sight_center = ToLocal(pt, sight_w);
+            cfg.sight_radius = 6.5;
+            static UObject logged_gun = 0;
+            if (logged_gun != gun.Object()) {
+                logged_gun = gun.Object();
+                log::Info("controls: slide zones from the measured slide: rear end (%.1f %.1f %.1f), front end "
+                          "(%.1f %.1f %.1f), rear sight (%.1f %.1f %.1f) in slide space",
+                          cfg.span_rear.X, cfg.span_rear.Y, cfg.span_rear.Z, cfg.span_front.X, cfg.span_front.Y,
+                          cfg.span_front.Z, cfg.sight_center.X, cfg.sight_center.Y, cfg.sight_center.Z);
             }
         }
     }

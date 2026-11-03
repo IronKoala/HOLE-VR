@@ -70,9 +70,13 @@ states from trigger touch and the analog trigger.
 - Slide: three holds, like Half-Life: Alyx, each posed and saved on its
   own (`<Class>.slide-rear-flat|rear-pinch|front-flat.ini`). The hold is picked once, when
   the hand closes on the slide: fist over the FRONT half of the slide
-  (measured from the slide part's mesh) = **front**; fist within 6 cm of
-  the rear sight (the gun's `DefaultADSPoint`, `hand_slide_pinch_sight_cm`)
-  = **rear pinch**; else **rear overhand**.
+  = **front**; fist within 6 cm of the rear sight (`hand_slide_pinch_sight_cm`)
+  = **rear pinch**; else **rear overhand**. The slide is measured once per
+  gun with line traces down onto the slide's own mesh parts (children of
+  `GunParts_Bolt(Slide)`, made query-only traceable): rear end, front end
+  and rear sight (highest point of the rear 3.5 cm). `DefaultADSPoint` is
+  NOT the rear sight: it is the aiming eye point, 22 cm behind the slide.
+  `body::SlideMarks()` gives these to controls for its grab zones.
   Until a hold is saved it uses a built-in pose (`hand_slide_builtin_holds`):
   front and rear overhand = flat hand with the thumb's pad on the slide;
   pinch = fist with the thumb straight out and the side of the index
@@ -110,7 +114,9 @@ and grabs on its side while `hands::EditorHand() >= 0`).
 - **Magazine**: a big ball sits on the magazine. Squeeze it and move/turn
   the controller: the magazine moves and turns in the hand (the hand stays
   where it is on its controller while editing).
-- **Pistol**: the palm ball moves and turns the whole hand on the gun.
+- **Whole hand** (gun grip and slide holds): the ball 7 cm off the back of
+  the hand (`hand_editor_handle_cm`) moves and turns the whole hand on the
+  gun.
 - The editing hand's grab point is a small ball just ahead of the
   controller; when that hand holds a gun it sits in front of the barrel
   (`hand_editor_gun_hand_reach_cm`, default 22). Joint balls are 2.6 cm
