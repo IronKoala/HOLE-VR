@@ -183,6 +183,20 @@ const Block kBlocks[] = {
      "; Black outline around the text of menus on the arm, so it reads over a\n"
      "; bright scene (layout pixels; 0 = off)\n"
      "menu_text_outline=2\n"},
+    {"menu_text_scale",
+     "\n"
+     "; Menu text on the arm this many times the game's size (1 = the game's).\n"
+     "; A text that wouldn't fit its box or would cover another is made\n"
+     "; smaller again, just enough to fit\n"
+     "menu_text_scale=1.5\n"
+     "; 1 = a tall narrow menu (the pause menu) gets a tall narrow panel of the\n"
+     "; same area, so it can be zoomed further\n"
+     "menu_fit_shape=1\n"},
+    {"hole_buzz",
+     "\n"
+     "; 1 = both hands tick softly each second while the hole in the floor counts\n"
+     "; down (stay in it), and buzz once as you drop in\n"
+     "hole_buzz=1\n"},
     {"hud_on_forearm",
      "\n"
      "; 1 = the game's in-level HUD (kill feed, objectives, money, prompts) sits\n"

@@ -25,6 +25,7 @@ add_library(hole_vr SHARED
     src/vr/input.cpp
     src/vr/controls.cpp
     src/vr/comfort.cpp
+    src/vr/hole_watch.cpp
     src/vr/comfort_math.cpp
     src/vr/vr_menu_model.cpp
     src/vr/vr_options.cpp

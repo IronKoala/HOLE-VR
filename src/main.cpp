@@ -20,6 +20,7 @@
 #include "vr/dxgi_hooks.h"
 #include "vr/body/body.h"
 #include "vr/comfort.h"
+#include "vr/hole_watch.h"
 #include "vr/controls.h"
 #include "vr/input.h"
 #include "vr/openxr.h"
@@ -138,6 +139,7 @@ DWORD WINAPI InitThread(LPVOID) {
         vr::world_menu::InitGame();
         vr::vr_options::InitGame();
         vr::comfort::InitGame();
+        vr::hole_watch::InitGame();
         vr::menu_study::InitGame();
         vr::ui_panel::InitGame();
     }
