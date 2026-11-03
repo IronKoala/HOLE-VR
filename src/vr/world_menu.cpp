@@ -1805,9 +1805,13 @@ void UpdatePointer() {
 void OnGameFrame() {
     if (!S.enabled || !ue::reflection::Ready() || !ue::process_event::Ready()) return;
     // Once per frame: the controller's tick and the player's tick can both call.
-    static uint64_t s_last_ms = 0;
-    uint64_t ms = GetTickCount64();
-    if (ms - s_last_ms < 4) return;
+    // Timed with the high-resolution clock: GetTickCount64 only moves every
+    // 15.6 ms, which held the menu to 64 updates a second on the 72 Hz
+    // headset, so 8 frames a second showed it where the arm had been (owner,
+    // 2026-11-03: the area select was "really choppy and jittery").
+    static double s_last_ms = 0;
+    double ms = perf::NowMs();
+    if (ms - s_last_ms < 4.0) return;
     s_last_ms = ms;
     double now = Now();
     TakeNewMenus();

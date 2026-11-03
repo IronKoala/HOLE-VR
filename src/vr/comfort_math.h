@@ -106,4 +106,37 @@ struct GripView {
 // holding: an item is in the hand after last frame's handling.
 GripView ToggleGrip(bool toggle, bool holding, bool down, bool pressed, bool released);
 
+// ---- the game camera's height ----
+// Keeps the view at the character's standing eye height when the game's own
+// camera drops without a crouch and stays down (seen 2026-11-03: after two
+// quick melee punches the camera sat 25 cm low for the rest of the match
+// while the character ran normally). Short dips (vaults, hits) still play.
+// In real-height mode every drop below standing is given back, crouches
+// included, since your own head already does the crouching.
+class CameraHeight {
+public:
+    // rel_cm: the game camera's height above the character's feet this
+    // frame. crouched: the character's crouch flag. crouch_press: the stick
+    // crouch was pressed this frame (a crouch the flag may not show).
+    // Returns how far to raise the view, cm.
+    double Update(double rel_cm, bool crouched, bool crouch_press, bool real_mode, double dt);
+    bool HaveStanding() const { return have_; }
+    double Standing() const { return stand_; }
+    double Drop() const { return drop_; }
+    bool Holding() const { return holding_; }
+    int CrouchPresses() const { return presses_; }
+    void Reset() { *this = CameraHeight{}; }
+
+private:
+    bool have_ = false;
+    double stand_ = 0;
+    double stable_ref_ = 0, stable_t_ = 0;
+    int presses_ = 0;          // stick crouches since the camera was last at standing height (0.6 s)
+    double standing_t_ = 0;
+    double low_t_ = 0;         // how long an unexplained drop has lasted
+    bool holding_ = false;
+    double drop_ = 0;
+    double extra_ = 0;
+};
+
 }  // namespace holevr::vr::comfort

@@ -164,6 +164,58 @@ static void TestToggleGrip() {
     EXPECT(!v.down && !v.pressed && v.released);
 }
 
+static void TestCameraHeight() {
+    const double dt = 1.0 / 72;
+    auto run = [&](CameraHeight& c, double rel, double seconds, bool crouched = false, bool real = false) {
+        double r = 0;
+        for (double t = 0; t < seconds; t += dt) r = c.Update(rel, crouched, false, real, dt);
+        return r;
+    };
+    // Learns standing height once the camera holds still.
+    CameraHeight c;
+    run(c, 152, 1.5);
+    EXPECT(c.HaveStanding() && std::fabs(c.Standing() - 152) < 0.01);
+    // A short dip (a vault, a hit) is left alone.
+    EXPECT(run(c, 130, 0.8) == 0.0);
+    EXPECT(run(c, 152, 0.5) == 0.0);
+    // A drop with no crouch that stays: after 1.5 s the view is held up.
+    run(c, 127, 1.4);
+    EXPECT(!c.Holding());
+    double r = run(c, 127, 1.5);
+    EXPECT(c.Holding() && std::fabs(r - 25) < 1.0);
+    // Back to normal: the raise goes away.
+    EXPECT(run(c, 152, 2.0) < 0.1);
+    // A stick crouch is a real crouch: never undone in character height.
+    CameraHeight k;
+    run(k, 152, 1.5);
+    k.Update(152, false, true, false, dt);  // crouch pressed
+    EXPECT(run(k, 112, 3.0) == 0.0);
+    // Standing up again (second press), back at standing: presses forgotten.
+    k.Update(112, false, true, false, dt);
+    run(k, 152, 1.0);
+    EXPECT(k.CrouchPresses() == 0);
+    // Crouch then stand pressed but the camera stays down: held up.
+    k.Update(152, false, true, false, dt);
+    run(k, 120, 0.2);
+    k.Update(120, false, true, false, dt);
+    EXPECT(run(k, 120, 2.0) > 25.0);
+    // The character's crouch flag: no raise in character height...
+    CameraHeight f;
+    run(f, 152, 1.5);
+    EXPECT(run(f, 112, 3.0, true) == 0.0);
+    // ...but in real height every drop is given back (your head crouches).
+    CameraHeight g;
+    run(g, 152, 1.5, false, true);
+    EXPECT(std::fabs(run(g, 112, 2.0, true, true) - 40) < 1.0);
+    // The standing height never learns a low camera.
+    EXPECT(std::fabs(c.Standing() - 152) < 0.01);
+    // A brief lift (an animation) is not learned as standing.
+    CameraHeight h;
+    run(h, 152, 1.5);
+    run(h, 175, 0.5);
+    EXPECT(std::fabs(h.Standing() - 152) < 0.01);
+}
+
 int main() {
     TestTexture();
     TestLevels();
@@ -171,6 +223,7 @@ int main() {
     TestPhysicalBody();
     TestAimSmoother();
     TestToggleGrip();
+    TestCameraHeight();
     if (failures) {
         std::printf("%d failure(s)\n", failures);
         return 1;

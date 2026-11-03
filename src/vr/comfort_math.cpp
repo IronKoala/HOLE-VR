@@ -186,4 +186,51 @@ GripView ToggleGrip(bool toggle, bool holding, bool down, bool pressed, bool rel
     return GripView{true, false, false};
 }
 
+double CameraHeight::Update(double rel_cm, bool crouched, bool crouch_press, bool real_mode, double dt) {
+    if (!(dt > 0) || dt > 0.5 || !std::isfinite(rel_cm)) return extra_;
+    if (crouch_press) {
+        ++presses_;
+        standing_t_ = 0;  // the camera takes a moment to start moving
+    }
+    // Standing height: the highest value the camera holds still at for 1 s
+    // while not crouched. Animations that lift it for a moment never count.
+    if (!crouched && rel_cm > 60.0 && rel_cm < 260.0) {
+        if (std::fabs(rel_cm - stable_ref_) < 1.0) {
+            stable_t_ += dt;
+        } else {
+            stable_ref_ = rel_cm;
+            stable_t_ = 0;
+        }
+        if (stable_t_ >= 1.0 && (!have_ || stable_ref_ > stand_)) {
+            stand_ = stable_ref_;
+            have_ = true;
+        }
+    } else {
+        stable_t_ = 0;
+    }
+    drop_ = have_ ? std::max(0.0, stand_ - rel_cm) : 0.0;
+    // Back at standing height for a moment: earlier crouch presses are done with.
+    if (drop_ < 5.0) {
+        standing_t_ += dt;
+        if (standing_t_ >= 0.6) presses_ = 0;
+    } else {
+        standing_t_ = 0;
+    }
+    const bool explained = crouched || (presses_ % 2) == 1;
+    double want = 0;
+    if (real_mode) {
+        want = drop_;
+        holding_ = false;
+        low_t_ = 0;
+    } else {
+        low_t_ = drop_ > 8.0 && !explained ? low_t_ + dt : 0.0;
+        holding_ = low_t_ >= 1.5;
+        want = holding_ ? drop_ : 0.0;
+    }
+    want = std::min(want, 80.0);
+    extra_ += (want - extra_) * (1.0 - std::exp(-6.0 * dt));
+    if (want == 0 && extra_ < 0.05) extra_ = 0;
+    return extra_;
+}
+
 }  // namespace holevr::vr::comfort

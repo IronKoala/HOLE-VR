@@ -93,6 +93,7 @@ struct Settings {
     double smooth_speed = 180.0;   // degrees per second at full stick
     bool move_with_hand = false;   // false: head direction
     double deadzone = 0.15;
+    double light_reach = 12.0;     // left hand this close to the gun: left trigger = weapon light, cm
     double gun_pitch = 0.0;        // extra pitch on the held gun, degrees
     double gun_yaw = 0.0;
     double gun_roll = 0.0;
@@ -145,6 +146,7 @@ void LoadSettings() {
     g_set.smooth_speed = config::GetFloat("smooth_turn_speed", 90.f);
     g_set.move_with_hand = config::GetInt("move_direction", 0) == 1;
     g_set.deadzone = config::GetFloat("stick_deadzone", 0.15f);
+    g_set.light_reach = config::GetFloat("light_hand_reach_cm", 12.f);
     g_set.gun_pitch = config::GetFloat("gun_pitch_offset", 0.f);
     g_set.gun_yaw = config::GetFloat("gun_yaw_offset", 0.f);
     g_set.gun_roll = config::GetFloat("gun_roll_offset", 0.f);
@@ -457,6 +459,7 @@ struct WeaponState {
     UObject held_mag = 0;      // magazine in the left hand, not yet inserted
     UObject pouch_mag = 0;     // spare magazine shown at the pouch, ready to grab
     UObject mag_class = 0;     // class of this gun's magazines, for spawning spares
+    double mag_wait_until = -1.0;  // when to stop waiting for the game to give the gun a magazine
     double refill_pouch_at = 0; // when to put a new magazine in the pouch
     bool trigger_down = false;
     bool have_frame = false;
@@ -1168,18 +1171,34 @@ UObject SpawnMagazine(UObject player, UObject cls, const FVector& loc, const FQu
     return done ? done : actor;
 }
 
+bool LiveObject(UObject obj);
+
+// Magazine class per gun class, kept across levels so a new match doesn't
+// have to wait for (or take) the game's own magazine.
+std::map<std::string, UObject> g_mag_class_by_gun;
+
 void RefillPouch(game::Gun& gun, UObject player, const FVector& loc, const FQuat& rot) {
     if (!W.mag_class) {
         UObject m = 0;
         if (ue::GetProp(gun.Object(), "MagazineObj", m) && m) W.mag_class = ue::GetClass(m);
         else if (ue::GetProp(gun.Object(), "MagazineObj_Temp", m) && m) W.mag_class = ue::GetClass(m);
+        if (W.mag_class) {
+            g_mag_class_by_gun[gun.ClassName()] = W.mag_class;
+        } else {
+            auto known = g_mag_class_by_gun.find(gun.ClassName());
+            if (known != g_mag_class_by_gun.end() && LiveObject(known->second)) W.mag_class = known->second;
+        }
     }
+    if (W.mag_wait_until < 0.0) W.mag_wait_until = g_clock + 5.0;
     UObject mag = 0;
     if (W.mag_class) {
         mag = SpawnMagazine(player, W.mag_class, loc, rot);
         if (mag) log::Info("controls: spawned pouch magazine %s", ue::GetName(mag).c_str());
-    } else if (!gun.State().has_magazine) {
-        // Empty gun and no class known yet: the game's own step is safe here.
+    } else if (!gun.State().has_magazine && g_clock >= W.mag_wait_until) {
+        // The game normally gives the gun its magazine just after the level
+        // starts; only if it never does, borrow the game's own step. Taking
+        // it earlier races the game's own load-in, and the game later moves
+        // or destroys that magazine (pouch looks empty for seconds).
         gun.TakeNewMagazine();
         ue::GetProp(gun.Object(), "MagazineObj_Temp", mag);
         if (mag) W.mag_class = ue::GetClass(mag);
@@ -1188,7 +1207,7 @@ void RefillPouch(game::Gun& gun, UObject player, const FVector& loc, const FQuat
     if (mag) {
         W.pouch_mag = mag;
     } else {
-        W.refill_pouch_at = g_clock + 2.0;   // try again later
+        W.refill_pouch_at = g_clock + 0.25;   // try again shortly
     }
 }
 
@@ -1529,6 +1548,7 @@ struct GameActionState {
     double rclick_down_at = -1;  // right stick click: tap = objective markers, hold 2 s = move holsters
     double melee_ready_at = 0;
     double melee_release_at = -1;
+    bool light_down = false;     // left trigger is pressing the weapon light
 } GA;
 
 bool GunIsRifle(UObject player);
@@ -1565,39 +1585,85 @@ bool GameCrouched(UObject player, bool* known) {
     return (mem::ReadOr<uint8_t>(player + g_crouch_read.offset, 0) & g_crouch_read.mask) != 0;
 }
 
-// Real-height mode: the view follows your real head, so the game camera's
-// own crouch drop is given back (else crouching for real would lower the
-// view twice: once for your head, once for the character).
-struct CamHeight {
-    bool have_stand = false;
-    double stand_rel = 0;   // camera above the capsule's bottom while standing, cm
-    double extra = 0;       // what is given back to the view now, cm
-} g_cam;
+// The view's height against the game camera's. Real-height mode: the view
+// follows your real head, so the game camera's own drops (its crouch) are
+// given back, else crouching for real would lower the view twice. Character
+// and seated height: the game camera decides, except when it drops with no
+// crouch and stays down (2026-11-03: after two quick punches it sat 25 cm
+// low for the rest of the match); then the view is held at standing height.
+comfort::CameraHeight g_camh;
+UObject g_camh_player = 0;
+bool g_crouch_pressed = false;  // the stick crouch fired since the last check
+double g_camh_log_at = -1;
 
-void RealHeightCrouchView(UObject player, bool crouched, bool known) {
-    double want = 0;
+// Weapon lab trace (the game's own gun/player events) for a moment.
+double g_lab_trace_off_at = -1;
+void LabTraceFor(double seconds) {
+    if (config::GetBool("lab_trace_on_start", false)) return;
+    game::weapon_lab::SetTrace(true);
+    g_lab_trace_off_at = std::fmax(g_lab_trace_off_at, g_clock + seconds);
+}
+void LabTraceTick() {
+    if (g_lab_trace_off_at > 0 && g_clock >= g_lab_trace_off_at) {
+        g_lab_trace_off_at = -1;
+        game::weapon_lab::SetTrace(false);
+    }
+}
+
+// The game camera against the character's capsule: height above the feet
+// and distance from the capsule's middle line, cm.
+bool CameraOnCharacter(UObject player, double* rel, double* side) {
     FVector cam;
-    if (g_set.real_height && known && stereo::GameCameraLocation(&cam)) {
-        ue::Call loc(player, "K2_GetActorLocation");
-        UObject capsule = 0;
-        double half = 0;
-        if (ue::GetProp(player, "CapsuleComponent", capsule) && capsule) {
-            ue::Call h(capsule, "GetScaledCapsuleHalfHeight");
-            if (h.Invoke()) half = h.Result<float>();
+    if (!stereo::GameCameraLocation(&cam)) return false;
+    ue::Call loc(player, "K2_GetActorLocation");
+    UObject capsule = 0;
+    double half = 0;
+    if (ue::GetProp(player, "CapsuleComponent", capsule) && capsule) {
+        ue::Call h(capsule, "GetScaledCapsuleHalfHeight");
+        if (h.Invoke()) half = h.Result<float>();
+    }
+    if (!loc.Invoke() || half <= 10.0) return false;
+    const FVector at = loc.Result<FVector>();
+    *rel = cam.Z - (at.Z - half);
+    *side = std::sqrt((cam.X - at.X) * (cam.X - at.X) + (cam.Y - at.Y) * (cam.Y - at.Y));
+    return true;
+}
+
+void CameraHeightView(UObject player, bool crouched, bool known) {
+    if (player != g_camh_player) {
+        g_camh.Reset();
+        g_camh_player = player;
+    }
+    const bool pressed = g_crouch_pressed;
+    g_crouch_pressed = false;
+    double rel = 0, side = 0;
+    double raise = 0;
+    if (CameraOnCharacter(player, &rel, &side)) {
+        const bool had = g_camh.HaveStanding(), was = g_camh.Holding();
+        raise = g_camh.Update(rel, known && crouched, pressed, g_set.real_height, g_dt);
+        if (!had && g_camh.HaveStanding())
+            log::Info("controls: the game camera stands %.0f cm above the character's feet", g_camh.Standing());
+        if (g_camh.Holding() != was) {
+            if (g_camh.Holding())
+                log::Info("controls: the game camera has been %.0f cm below standing height for 1.5 s with no crouch "
+                          "(character %s, %d stick crouch presses, camera %.0f cm from the character's middle); "
+                          "your view is held at standing height",
+                          g_camh.Drop(), !known ? "stance unknown" : crouched ? "crouched" : "standing",
+                          g_camh.CrouchPresses(), side);
+            else
+                log::Info("controls: the game camera is back at standing height (or you crouched); view follows it "
+                          "again");
         }
-        if (loc.Invoke() && half > 10.0) {
-            double rel = cam.Z - (loc.Result<FVector>().Z - half);
-            if (!crouched) {
-                g_cam.stand_rel = g_cam.have_stand ? g_cam.stand_rel + (rel - g_cam.stand_rel) * 0.1 : rel;
-                g_cam.have_stand = true;
-            } else if (g_cam.have_stand) {
-                want = std::fmax(0.0, std::fmin(80.0, g_cam.stand_rel - rel));
-            }
+        // The camera far off the character's middle line is the other half
+        // of the same stuck state: logged so the next run shows it.
+        if (side > 30.0 && g_clock >= g_camh_log_at) {
+            g_camh_log_at = g_clock + 10.0;
+            log::Info("controls: the game camera is %.0f cm from the character's middle and %.0f cm above its feet "
+                      "(standing %.0f)",
+                      side, rel, g_camh.Standing());
         }
     }
-    g_cam.extra += (want - g_cam.extra) * (1.0 - std::exp(-12.0 * g_dt));
-    if (std::fabs(g_cam.extra) < 0.05 && want == 0) g_cam.extra = 0;
-    stereo::SetViewRaiseCm(g_cam.extra);
+    stereo::SetViewRaiseCm(raise);
 }
 
 // Body calibration (VR tab: Calibrate body): after the menu closes, 2 s to
@@ -1646,7 +1712,7 @@ void HeightCalibration(double head_m) {
 void PhysicalCrouchAndJump(UObject player) {
     bool known = false;
     const bool crouched = GameCrouched(player, &known);
-    RealHeightCrouchView(player, crouched, known);
+    CameraHeightView(player, crouched, known);
     g_phys.Configure(g_set.physical_crouch, g_set.physical_crouch_cm, g_set.physical_jump);
     if (g_set.standing_height_cm >= 100 && g_set.standing_height_cm != g_height.applied_cm) {
         g_phys.SetStanding(g_set.standing_height_cm / 100.0);
@@ -1679,7 +1745,8 @@ void PhysicalCrouchAndJump(UObject player) {
 
 // Every other game action, on buttons the gun, menus, wrist and grip editor
 // don't use (lean is left out: lean for real).
-//   Left trigger          interact (doors, pickups)
+//   Left trigger          weapon light with the left hand right next to the gun, else interact
+//   Right trigger         interact while the right hand is empty (fires with the gun in hand)
 //   Left stick click      tap: sprint on/off (ends when you stop); double tap: walk/run
 //   Right stick up        jump
 //   Right stick down      crouch / stand
@@ -1687,21 +1754,67 @@ void PhysicalCrouchAndJump(UObject player) {
 //   Right stick click     fire selector on a rifle, otherwise objective markers (tap)
 //   Right stick click held 2 s   move the holsters to where the hands are
 //   Punch with the empty left hand   melee attack
+// Is the left hand right next to the gun in the right hand? Distance from
+// the left grip to the gun's line, from just behind the grip to the muzzle.
+bool LeftHandNearGun() {
+    if (!W.gun || !W.in_hand || !W.have_pose) return false;
+    if (W.two_hand) return true;
+    hands::HandState lh = hands::Get(hands::kLeft);
+    if (!lh.valid) return false;
+    FVector p = W.frame_rot.Inverse().Rotate(lh.grip.location - W.grip_world);
+    const double x = std::clamp(p.X, -8.0, W.muzzle_dist + 2.0);
+    const double dz = p.Z - std::clamp(p.Z, -12.0, W.bore_height);   // grip below the bore counts as the gun
+    const double d = std::sqrt((p.X - x) * (p.X - x) + p.Y * p.Y + dz * dz);
+    return d <= g_set.light_reach;
+}
+
 void GameActions(UObject player, const input::Snapshot& s) {
     if (!player) return;
+    LabTraceTick();
     const input::HandInput& l = s.hand[input::kLeft];
     const input::HandInput& r = s.hand[input::kRight];
     if (ui_panel::MenuOpen()) {
         if (GA.sprinting) { FireEvent(player, GA.sprint_up); GA.sprinting = false; }
+        if (GA.light_down) {
+            ue::Call c(player, "PlayerInput_SwitchLight");
+            c.Set("IsPressed", false);
+            c.Invoke();
+            GA.light_down = false;
+        }
         return;
     }
     PhysicalCrouchAndJump(player);
-    // Interact.
+    // Left trigger: the weapon light when the left hand is right next to the
+    // gun in your hand, otherwise interact. The light press lasts as long as
+    // the trigger is held (the game toggles on the press).
     if (l.trigger_button.pressed && !W.held_mag && !W.slide.Held()) {
+        if (LeftHandNearGun()) {
+            ue::Call c(player, "PlayerInput_SwitchLight");
+            c.Set("IsPressed", true);
+            c.Invoke();
+            GA.light_down = true;
+            input::Haptic(input::kLeft, 0.25f, 0.02f);
+            log::Info("controls: weapon light (left trigger, hand at the gun)");
+        } else {
+            ue::Call c(player, "PlayerInput_Interact");
+            c.Invoke();
+            input::Haptic(input::kLeft, 0.2f, 0.02f);
+            log::Info("controls: interact (left hand)");
+        }
+    }
+    if (GA.light_down && !l.trigger_button.down) {
+        ue::Call c(player, "PlayerInput_SwitchLight");
+        c.Set("IsPressed", false);
+        c.Invoke();
+        GA.light_down = false;
+    }
+    // Right trigger interacts too while the right hand is empty (pistol
+    // holstered, or no gun); with the gun in hand it only fires.
+    if (r.trigger_button.pressed && !W.in_hand) {
         ue::Call c(player, "PlayerInput_Interact");
         c.Invoke();
-        input::Haptic(input::kLeft, 0.2f, 0.02f);
-        log::Info("controls: interact");
+        input::Haptic(input::kRight, 0.2f, 0.02f);
+        log::Info("controls: interact (right hand)");
     }
     // Jump / crouch: flick the right stick up or down (turning uses left/right).
     const bool up = r.stick_y > 0.75f && std::fabs(r.stick_x) < 0.6f;
@@ -1715,6 +1828,7 @@ void GameActions(UObject player, const input::Snapshot& s) {
     if (down && GA.crouch_armed) {
         GA.crouch_armed = false;
         FireEvent(player, GA.crouch_down);
+        g_crouch_pressed = true;
         GA.crouch_release_at = g_clock + 0.1;
         log::Info("controls: crouch / stand");
     }
@@ -1795,6 +1909,13 @@ void GameActions(UObject player, const input::Snapshot& s) {
             GA.melee_ready_at = g_clock + 0.7;
             input::Haptic(input::kLeft, 0.8f, 0.06f);
             log::Info("controls: melee (left hand at %.1f m/s)", speed);
+            static int s_melee_traces = 0;
+            if (s_melee_traces++ < 3) {
+                double rel = 0, side = 0;
+                if (CameraOnCharacter(player, &rel, &side))
+                    log::Info("controls: melee: game camera %.0f cm above the feet, %.0f cm from the middle", rel, side);
+                LabTraceFor(2.0);
+            }
         }
     }
     if (GA.melee_release_at > 0 && g_clock >= GA.melee_release_at) {
@@ -2005,18 +2126,13 @@ void StudyFireClass(UObject obj, const char* who) {
     }
 }
 
-double g_lab_trace_off_at = -1;
-
 void ShotStudy(UObject player, game::Gun& gun, int n, const FVector& muzzle, const FVector& barrel,
                const FRotator& ctrl) {
     if (n == 1) {
         StudyFireClass(gun.Object(), "gun");
         StudyFireClass(player, "player");
     }
-    if (n <= 3 && g_lab_trace_off_at < 0 && !config::GetBool("lab_trace_on_start", false)) {
-        game::weapon_lab::SetTrace(true);
-        g_lab_trace_off_at = g_clock + 0.4;
-    }
+    if (n <= 3) LabTraceFor(0.4);
     if (n > 6) return;
     FVector m_at, c_at, cam;
     std::string m_what, c_what;
@@ -2032,12 +2148,7 @@ void ShotStudy(UObject player, game::Gun& gun, int n, const FVector& muzzle, con
               c_at.X, c_at.Y, c_at.Z, m_hit && c_hit ? Len(apart) : -1.0);
 }
 
-void ShotStudyTick() {
-    if (g_lab_trace_off_at > 0 && g_clock >= g_lab_trace_off_at) {
-        g_lab_trace_off_at = -1;
-        game::weapon_lab::SetTrace(false);
-    }
-}
+void ShotStudyTick() { LabTraceTick(); }
 
 void LogShot(UObject player, game::Gun& gun) {
     static int n = 0;
@@ -2441,15 +2552,6 @@ void OnTick(UObject player, float dt) {
                           W.seat_offset.X, W.seat_offset.Y, W.seat_offset.Z,
                           2.0 * std::acos(std::fmin(1.0, dq)) * 180.0 / 3.14159265358979);
             }
-        }
-    }
-    {
-        // Left X: weapon light.
-        const input::HandInput& l = s.hand[input::kLeft];
-        if ((l.primary.pressed || l.primary.released) && !ui_panel::MenuOpen()) {
-            ue::Call c(player, "PlayerInput_SwitchLight");
-            c.Set("IsPressed", l.primary.down);
-            c.Invoke();
         }
     }
     hands::HandState rh = hands::Get(hands::kRight), lh = hands::Get(hands::kLeft);
