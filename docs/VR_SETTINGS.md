@@ -60,6 +60,12 @@ Move holsters is here because the right stick click (which used to be held
 for it) is now the kick. The grip editor (left Y hold) and the arm measure
 (left stick click hold) still open on their buttons too.
 
+The tab button and an empty page are added when Options opens; the rows
+are then made a few per frame (up to 3 ms of each frame, at least one row)
+while the page is still hidden. Making all 23 rows at once took 71 ms, a
+hitch the owner felt when Options opened (pause-menu thread's timing,
+2026-11-03 02:49 run).
+
 Why cycle buttons and not the game's sliders, checkboxes and dropdowns: the
 game's option rows are bound to its own settings object, and dropdowns open a
 popup that would land outside the forearm panel. A button that cycles is one
@@ -184,7 +190,7 @@ appeared, this says whether shots need moving to the muzzle.
   Options (23 rows ...)` each time Options opens.
 - `vr options: VR tab opened` when the VR tab is clicked.
 - `vr options: VR page added to Options (23 rows ..., 20 rows with < >
-  arrows, slot ok)`.
+  arrows; made over N frames, X ms in all, Y ms at most in one frame)`.
 - `vr options: <row> -> <choice> (key=value, right arrow | left arrow | row
   clicked)` and `settings: saved key=value in hole-vr.ini` on each click, then
   `controls: settings changed (...)`; `... is already at its last choice` at

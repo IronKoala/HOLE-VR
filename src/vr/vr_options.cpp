@@ -10,6 +10,7 @@
 #include "core/config.h"
 #include "core/log.h"
 #include "core/memory.h"
+#include "core/perf.h"
 #include "ue/call.h"
 #include "ue/objects.h"
 #include "ue/process_event.h"
@@ -76,6 +77,15 @@ struct Tab {
     std::vector<RowWidget> rows;
     int relabel_frames = 0;   // labels set again for the first frames (the game's own PreConstruct)
     bool study_logged = false;
+    // The rows are made a few per frame after Options opens (each is up to
+    // five widgets with their Blueprint construction; all 23 in one frame
+    // took 71 ms, a hitch the owner felt, 2026-11-03 02:49 run). The page is
+    // hidden until the VR tab is clicked, so nobody sees it fill.
+    UObject row_class = 0, owner = 0, outer = 0;
+    size_t next_row = 0;
+    bool building = false;
+    int build_frames = 0, with_arrows = 0;
+    double build_ms = 0, build_worst_ms = 0;
 } T;
 
 UObject g_click_fn = 0;  // the game buttons' "clicked" event
@@ -428,6 +438,7 @@ bool AddArrows(RowWidget& r, UObject label, UObject outer, UObject owner_widget,
 }
 
 void Build(UObject option) {
+    mem::ScopedRegionCache rc;
     if (!L.done) {
         log::Warn("vr options: engine lookups missing; no VR tab");
         return;
@@ -505,40 +516,65 @@ void Build(UObject option) {
         log::Warn("vr options: could not make the VR page (ScrollBox)");
         return;
     }
-    const auto& rows = vr_menu::Rows();
-    int with_arrows = 0;
-    for (size_t i = 0; i < rows.size(); ++i) {
-        UObject w = CreateUserWidget(option, row_class, owner);
-        if (!w) continue;
-        ue::process_event::HookVtableOf(w);
-        RowWidget r;
-        r.w = Track(w);
-        r.row = static_cast<int>(i);
-        r.choice = vr_menu::CurrentChoice(rows[i], &Current);
-        SetBlueprintTexts(w, Widen(vr_menu::RowText(rows[i], r.choice)), nullptr);
-        UObject holder = w;
-        if (rows[i].kind == vr_menu::RowKind::kChoice &&
-            AddArrows(r, w, tree ? tree : option, option, row_class, owner, &holder))
-            ++with_arrows;
-        if (UObject slot = AddChild(page, holder)) SetStruct(slot, "SetPadding", "InPadding", Margin{0.f, 3.f, 0.f, 3.f});
-        T.rows.push_back(r);
-    }
     UObject page_slot = AddChild(switcher, page);
     T.switcher = Track(switcher);
     T.page = Track(page);
-    // Built now (the switcher is on screen): their texts exist.
-    for (auto& r : T.rows) {
-        r.texts = FindTexts(r.w.obj);
-        if (Alive(r.left)) r.left_texts = FindTexts(r.left.obj);
-        if (Alive(r.right)) r.right_texts = FindTexts(r.right.obj);
-    }
+    T.row_class = row_class;
+    T.owner = owner;
+    T.outer = tree ? tree : option;
+    T.building = page_slot != 0;
+    T.rows.reserve(vr_menu::Rows().size());
+    if (!page_slot) log::Warn("vr options: the VR page could not be added to the Options switcher");
+}
+
+// One row: the middle button, and for a setting its < > arrows.
+void BuildRow(size_t i) {
+    const auto& rows = vr_menu::Rows();
+    UObject option = T.option.obj;
+    UObject w = CreateUserWidget(option, T.row_class, T.owner);
+    if (!w) return;
+    ue::process_event::HookVtableOf(w);
+    RowWidget r;
+    r.w = Track(w);
+    r.row = static_cast<int>(i);
+    r.choice = vr_menu::CurrentChoice(rows[i], &Current);
+    SetBlueprintTexts(w, Widen(vr_menu::RowText(rows[i], r.choice)), nullptr);
+    UObject holder = w;
+    if (rows[i].kind == vr_menu::RowKind::kChoice && AddArrows(r, w, T.outer, option, T.row_class, T.owner, &holder))
+        ++T.with_arrows;
+    if (UObject slot = AddChild(T.page.obj, holder)) SetStruct(slot, "SetPadding", "InPadding", Margin{0.f, 3.f, 0.f, 3.f});
+    r.texts = FindTexts(r.w.obj);
+    if (Alive(r.left)) r.left_texts = FindTexts(r.left.obj);
+    if (Alive(r.right)) r.right_texts = FindTexts(r.right.obj);
+    T.rows.push_back(r);
+    LabelRow(T.rows.back());
+}
+
+// From Tick while Options is open: rows until 3 ms of this frame are spent
+// (at least one), then the next frame.
+void BuildSomeRows() {
+    if (!T.building || !Alive(T.page) || !Alive(T.option)) return;
+    mem::ScopedRegionCache rc;
+    const double t0 = perf::NowMs();
+    const auto& rows = vr_menu::Rows();
+    do {
+        BuildRow(T.next_row++);
+    } while (T.next_row < rows.size() && perf::NowMs() - t0 < 3.0);
+    const double ms = perf::NowMs() - t0;
+    ++T.build_frames;
+    T.build_ms += ms;
+    T.build_worst_ms = std::max(T.build_worst_ms, ms);
+    if (T.next_row < rows.size()) return;
+    T.building = false;
     RelabelAll();
     T.relabel_frames = 30;
     size_t texts = 0;
     for (auto& r : T.rows) texts += r.texts.size();
-    log::Info("vr options: VR page added to Options (%zu rows from %s, %zu texts, %d rows with < > arrows%s, slot %s)",
-              T.rows.size(), ue::GetName(row_class).c_str(), texts, with_arrows,
-              L.hbox_class && L.sizebox_class ? "" : "; HorizontalBox/SizeBox class missing", page_slot ? "ok" : "MISSING");
+    log::Info("vr options: VR page added to Options (%zu rows from %s, %zu texts, %d rows with < > arrows%s; made over "
+              "%d frames, %.1f ms in all, %.1f ms at most in one frame)",
+              T.rows.size(), ue::GetName(T.row_class).c_str(), texts, T.with_arrows,
+              L.hbox_class && L.sizebox_class ? "" : "; HorizontalBox/SizeBox class missing", T.build_frames, T.build_ms,
+              T.build_worst_ms);
 }
 
 }  // namespace
@@ -573,6 +609,7 @@ void Tick() {
         if (T.option.obj) T = Tab{};
         return;
     }
+    if (T.building) BuildSomeRows();
     if (T.relabel_frames > 0) {
         --T.relabel_frames;
         RelabelAll();
