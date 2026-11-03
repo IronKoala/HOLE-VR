@@ -308,7 +308,9 @@ struct Level {
 
 std::atomic<int> g_search_state{0};  // 0 idle, 1 running, 2 done
 std::atomic<UObject> g_found_bench{0}, g_found_facility{0}, g_search_for{0};
-UObject g_bench_class = 0, g_facility_class = 0;
+// Hub classes: freed when you leave the hub and loaded again at a new address
+// when you come back, so kept as ObjectRefs (only the search thread uses them).
+ue::ObjectRef g_bench_class(kBenchClass, 2.0), g_facility_class(kFacilityClass, 2.0);
 
 // ---------------------------------------------------------------- workbench state
 struct Park {
@@ -851,10 +853,9 @@ void SearchLevel(UObject player) {
     g_search_for = player;
     g_search_state = 1;
     if (HANDLE t = CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
-            if (!g_bench_class) g_bench_class = ue::FindObject(kBenchClass);
-            if (!g_facility_class) g_facility_class = ue::FindObject(kFacilityClass);
-            g_found_bench = g_bench_class ? ue::FindFirstInstance(g_bench_class) : 0;
-            g_found_facility = g_facility_class ? ue::FindFirstInstance(g_facility_class) : 0;
+            const UObject bench_cls = g_bench_class.Get(), facility_cls = g_facility_class.Get();
+            g_found_bench = bench_cls ? ue::FindFirstInstance(bench_cls) : 0;
+            g_found_facility = facility_cls ? ue::FindFirstInstance(facility_cls) : 0;
             g_search_state = 2;
             return 0;
         }, nullptr, 0, nullptr))
