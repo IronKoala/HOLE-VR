@@ -9,10 +9,12 @@
 #include <cmath>
 #include <cstring>
 #include <initializer_list>
+#include <map>
 #include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "core/config.h"
@@ -251,6 +253,14 @@ struct Lookups {
     UObject material_class = 0;
     int32_t depth_off = -1;
     uint8_t depth_off_mask = 0;
+    // The widget tree, read straight from the engine's fields (TreeRoot,
+    // Children, SlotOf, Visibility): Widget.Visibility and .Slot,
+    // UserWidget.WidgetTree, WidgetTree.RootWidget, PanelWidget.Slots (an
+    // array of slots) and PanelSlot.Content (the child widget in a slot).
+    UObject panel_slot_class = 0;
+    int32_t widget_visibility = -1, widget_slot = -1, uw_tree = -1, tree_root = -1;
+    int32_t panel_slots = -1, slot_content = -1;
+    bool children_checked = false;  // Children() compared once with GetChildAt
     FName ui_profile;           // collision profile "UI"
     bool have_ui_profile = false;
     FName left_mouse;           // key name "LeftMouseButton", for the laser
@@ -357,6 +367,37 @@ void ResolveFitOffsets() {
     L.slot_autosize_mask = autosize.bool_mask ? autosize.bool_mask : 0xFF;
 }
 
+// Offsets for walking a menu's widget tree without calling into the engine
+// for every widget. Calling GetChildAt and friends through the engine, and
+// looking properties up by name for each new widget class, made the Options
+// menu (775 widgets) take about 110 ms to walk (2026-11-02), a hitch the
+// owner felt. Each offset is checked against the size the field must have;
+// a missing one falls back to the engine calls.
+void ResolveTreeOffsets() {
+    namespace rf = ue::reflection;
+    UObject widget = Lookup("Class /Script/UMG.Widget");
+    UObject tree = Lookup("Class /Script/UMG.WidgetTree");
+    L.panel_slot_class = Lookup("Class /Script/UMG.PanelSlot");
+    auto offset = [](UObject cls, const char* name, int32_t size) -> int32_t {
+        if (!cls) return -1;
+        rf::PropertyInfo p = rf::FindProperty(cls, name);
+        if (!p.valid() || p.element_size != size || p.offset <= 0) {
+            log::Warn("world menu: %s.%s not found as a %d-byte field; using engine calls for it",
+                      ue::GetName(cls).c_str(), name, size);
+            return -1;
+        }
+        return p.offset;
+    };
+    L.widget_visibility = offset(widget, "Visibility", 1);
+    L.widget_slot = offset(widget, "Slot", 8);
+    L.uw_tree = offset(L.user_widget_class, "WidgetTree", 8);
+    L.tree_root = offset(tree, "RootWidget", 8);
+    L.panel_slots = offset(L.panel_class, "Slots", 16);  // TArray: data, count, capacity
+    L.slot_content = offset(L.panel_slot_class, "Content", 8);
+    if (L.panel_slots < 0 || L.slot_content < 0) L.panel_slots = L.slot_content = -1;
+    if (L.uw_tree < 0 || L.tree_root < 0) L.uw_tree = L.tree_root = -1;
+}
+
 void ResolveLookups() {
     ResolveCustomSource();
     L.ksl = Lookup("KismetSystemLibrary /Script/Engine.Default__KismetSystemLibrary");
@@ -369,6 +410,7 @@ void ResolveLookups() {
     L.blur_class = Lookup("Class /Script/UMG.BackgroundBlur");
     L.image_class = Lookup("Class /Script/UMG.Image");
     L.border_class = Lookup("Class /Script/UMG.Border");
+    ResolveTreeOffsets();
     ResolveBackdropOffsets();
     ResolveFitOffsets();
     L.material_class = Lookup("Class /Script/Engine.Material");
@@ -413,6 +455,7 @@ void CallVoid(UObject obj, const char* fn) {
 }
 
 uint8_t Visibility(UObject widget) {
+    if (L.widget_visibility >= 0) return mem::ReadOr<uint8_t>(widget + L.widget_visibility, kVisible);
     uint8_t v = kVisible;
     ue::GetProp(widget, "Visibility", v);
     return v;
@@ -658,9 +701,99 @@ void PlacePanels(const FVector& head, double yaw) {
 
 // ---------------------------------------------------- widget tree walk --
 
+// While a menu is being put on the arm (WalkScope in Host), each widget
+// class's answer is remembered, so an 800-widget menu doesn't climb the same
+// class chains thousands of times. Only for that one call, since a class can
+// be unloaded between menus.
+thread_local std::map<std::pair<UObject, UObject>, bool>* t_isa_cache = nullptr;
+
 bool IsA(UObject obj, UObject base) {
     UObject cls = ue::GetClass(obj);
-    return cls && base && ue::reflection::IsChildOf(cls, base);
+    if (!cls || !base) return false;
+    if (!t_isa_cache) return ue::reflection::IsChildOf(cls, base);
+    auto key = std::make_pair(cls, base);
+    auto it = t_isa_cache->find(key);
+    if (it != t_isa_cache->end()) return it->second;
+    bool r = ue::reflection::IsChildOf(cls, base);
+    t_isa_cache->emplace(key, r);
+    return r;
+}
+
+// Everything a menu walk needs to be quick, for the length of one Host call:
+// memory checks remember every block of memory they looked at (the widgets
+// of one menu are spread over a hundred or so), and class answers are kept.
+struct WalkScope {
+    mem::ScopedRegionCache regions;
+    std::map<std::pair<UObject, UObject>, bool> isa;
+    WalkScope() { t_isa_cache = &isa; }
+    ~WalkScope() { t_isa_cache = nullptr; }
+    WalkScope(const WalkScope&) = delete;
+    WalkScope& operator=(const WalkScope&) = delete;
+};
+
+// A user widget's top widget (the root of its own tree), or 0.
+UObject TreeRoot(UObject user_widget) {
+    if (L.uw_tree >= 0) {
+        UObject tree = mem::ReadOr<UObject>(user_widget + L.uw_tree, 0);
+        return tree ? mem::ReadOr<UObject>(tree + L.tree_root, 0) : 0;
+    }
+    UObject tree = 0, root = 0;
+    if (ue::GetProp(user_widget, "WidgetTree", tree) && tree && ue::GetProp(tree, "RootWidget", root)) return root;
+    return 0;
+}
+
+// The layout slot a widget sits in inside its parent panel, or 0.
+UObject SlotOf(UObject widget) {
+    if (L.widget_slot >= 0) return mem::ReadOr<UObject>(widget + L.widget_slot, 0);
+    UObject slot = 0;
+    ue::GetProp(widget, "Slot", slot);
+    return slot;
+}
+
+void ChildrenByCall(UObject panel, int max, std::vector<UObject>* out) {
+    ue::Call count(panel, "GetChildrenCount");
+    int n = count.Invoke() ? count.Result<int32_t>() : 0;
+    for (int i = 0; i < n && i < max; ++i) {
+        ue::Call child(panel, "GetChildAt");
+        child.Set("Index", static_cast<int32_t>(i));
+        if (child.Invoke() && child.Result<UObject>()) out->push_back(child.Result<UObject>());
+    }
+}
+
+// A panel's child widgets in order (what GetChildAt gives), read from its
+// slots array. The first panel with children is also asked through the
+// engine, and if the two disagree the engine calls are used from then on.
+void Children(UObject panel, int max, std::vector<UObject>* out) {
+    out->clear();
+    if (L.panel_slots < 0) return ChildrenByCall(panel, max, out);
+    struct PtrArray {
+        uintptr_t data;
+        int32_t num, max;
+    } a{};
+    if (!mem::Read(panel + L.panel_slots, a) || a.num < 0 || a.num > 4096 || a.max < a.num) return;
+    int n = std::min(a.num, max);
+    if (n == 0) return;
+    std::vector<uintptr_t> slots(static_cast<size_t>(n));
+    if (!mem::IsReadable(a.data, slots.size() * sizeof(uintptr_t))) return;
+    std::memcpy(slots.data(), reinterpret_cast<const void*>(a.data), slots.size() * sizeof(uintptr_t));
+    for (uintptr_t slot : slots) {
+        UObject child = slot ? mem::ReadOr<UObject>(slot + L.slot_content, 0) : 0;
+        if (child) out->push_back(child);
+    }
+    if (!L.children_checked) {
+        L.children_checked = true;
+        std::vector<UObject> engine;
+        ChildrenByCall(panel, max, &engine);
+        if (engine != *out) {
+            log::Warn("world menu: reading %s's children directly gave %zu, the engine says %zu; using engine calls",
+                      ue::GetName(panel).c_str(), out->size(), engine.size());
+            L.panel_slots = -1;
+            *out = engine;
+        } else {
+            log::Info("world menu: menu layout read directly (checked on %s: %zu children)", ue::GetName(panel).c_str(),
+                      out->size());
+        }
+    }
 }
 
 // Walks a menu's widget tree (and the trees of the user widgets inside it,
@@ -671,10 +804,9 @@ int FindBlurs(UObject menu, std::vector<UObject>* blurs) {
     if (!L.panel_class || !L.user_widget_class) return 0;
     int seen = 0;
     std::vector<std::pair<UObject, int>> todo;  // widget, depth
+    std::vector<UObject> kids;
     auto push_tree = [&](UObject user_widget, int depth) {
-        UObject tree = 0, root = 0;
-        if (ue::GetProp(user_widget, "WidgetTree", tree) && tree && ue::GetProp(tree, "RootWidget", root) && root)
-            todo.push_back({root, depth});
+        if (UObject root = TreeRoot(user_widget)) todo.push_back({root, depth});
     };
     push_tree(menu, 0);
     while (!todo.empty() && seen < 2000) {
@@ -686,13 +818,8 @@ int FindBlurs(UObject menu, std::vector<UObject>* blurs) {
         if (IsA(w, L.user_widget_class)) {
             push_tree(w, depth + 1);
         } else if (IsA(w, L.panel_class)) {
-            ue::Call count(w, "GetChildrenCount");
-            int n = count.Invoke() ? count.Result<int32_t>() : 0;
-            for (int i = 0; i < n && i < 256; ++i) {
-                ue::Call child(w, "GetChildAt");
-                child.Set("Index", static_cast<int32_t>(i));
-                if (child.Invoke() && child.Result<UObject>()) todo.push_back({child.Result<UObject>(), depth + 1});
-            }
+            Children(w, 256, &kids);
+            for (UObject k : kids) todo.push_back({k, depth + 1});
         }
     }
     return seen;
@@ -742,10 +869,9 @@ int HideBackdrops(UObject menu, const std::string& menu_name) {
     if (!S.hide_backdrops || L.image_brush < 0 || !L.panel_class || !L.user_widget_class) return 0;
     int hidden = 0, logged = 0, seen = 0;
     std::vector<std::pair<UObject, int>> todo;  // widget, user-widget depth
+    std::vector<UObject> kids;
     auto push_tree = [&](UObject user_widget, int depth) {
-        UObject tree = 0, root = 0;
-        if (ue::GetProp(user_widget, "WidgetTree", tree) && tree && ue::GetProp(tree, "RootWidget", root) && root)
-            todo.push_back({root, depth});
+        if (UObject root = TreeRoot(user_widget)) todo.push_back({root, depth});
     };
     push_tree(menu, 0);
     while (!todo.empty() && seen < 1000) {
@@ -790,13 +916,8 @@ int HideBackdrops(UObject menu, const std::string& menu_name) {
                 continue;
             push_tree(w, depth + 1);
         } else if (IsA(w, L.panel_class)) {  // Border is a panel too (one child)
-            ue::Call count(w, "GetChildrenCount");
-            int n = count.Invoke() ? count.Result<int32_t>() : 0;
-            for (int i = 0; i < n && i < 256; ++i) {
-                ue::Call child(w, "GetChildAt");
-                child.Set("Index", static_cast<int32_t>(i));
-                if (child.Invoke() && child.Result<UObject>()) todo.push_back({child.Result<UObject>(), depth});
-            }
+            Children(w, 256, &kids);
+            for (UObject k : kids) todo.push_back({k, depth});
         }
     }
     return hidden;
@@ -864,21 +985,17 @@ void Measure(UObject w, const Rect& r, const Rect& screen, int depth, Rect* box,
     if (vis == kCollapsed || vis == kHidden) return;
     if (IsA(w, L.user_widget_class)) {
         // A user widget that fills its spot with its own canvas: look inside.
-        UObject tree = 0, root = 0;
-        if (ue::GetProp(w, "WidgetTree", tree) && tree && ue::GetProp(tree, "RootWidget", root) && root &&
-            IsA(root, L.canvas_class)) {
+        UObject root = TreeRoot(w);
+        if (root && IsA(root, L.canvas_class)) {
             Measure(root, r, screen, depth + 1, box, any, seen);
             return;
         }
     } else if (IsA(w, L.canvas_class)) {
-        ue::Call count(w, "GetChildrenCount");
-        int n = count.Invoke() ? count.Result<int32_t>() : 0;
-        for (int i = 0; i < n && i < 128; ++i) {
-            ue::Call at(w, "GetChildAt");
-            at.Set("Index", static_cast<int32_t>(i));
-            UObject child = at.Invoke() ? at.Result<UObject>() : 0;
-            UObject slot = 0;
-            if (!child || !ue::GetProp(child, "Slot", slot) || !slot || !IsA(slot, L.canvas_slot_class)) continue;
+        std::vector<UObject> kids;
+        Children(w, 128, &kids);
+        for (UObject child : kids) {
+            UObject slot = SlotOf(child);
+            if (!slot || !IsA(slot, L.canvas_slot_class)) continue;
             Rect cr;
             if (SlotRect(child, slot, r, &cr)) Measure(child, cr, screen, depth + 1, box, any, seen);
         }
@@ -1274,20 +1391,28 @@ bool Host(const Candidate& c) {
     // the screen) would read as a box on the arm, so any background blur is
     // hidden. Found by walking the menu's own widget tree (a few dozen
     // widgets), never by scanning every object in the game.
+    WalkScope walk;
+    double t_walk = perf::NowMs();
     std::vector<UObject> blurs;
     int widgets = FindBlurs(c.obj, &blurs);
+    double t_blurs = perf::NowMs();
     for (UObject b : blurs) {
         ue::Call v(b, "SetVisibility");
         v.Set("InVisibility", kCollapsed);
         v.Invoke();
         log::Info("world menu: hid %s (a background blur)", ue::GetName(b).c_str());
     }
+    double t_hid = perf::NowMs();
     int boxes = HideBackdrops(c.obj, p.name);
-    if (boxes > 0) log::Info("world menu: hid %d see-through backdrop box(es) in %s", boxes, p.name.c_str());
+    if (boxes > 0) log::Info("world menu: %s: hid %d see-through backdrop box(es)", p.name.c_str(), boxes);
+    double t_boxes = perf::NowMs();
     FitContent(G.panels.back());
     if (G.placed) PosePanel(G.panels.back());  // zoomed, before this frame is drawn
-    log::Info("world menu: %s on the arm in %.1f ms (%d widgets looked at; holder %s)", p.name.c_str(),
-              perf::NowMs() - t0, widgets, holder_ready ? "made at level start" : "made just now");
+    double t_end = perf::NowMs();
+    log::Info("world menu: %s on the arm in %.1f ms (%d widgets; blurs %.1f ms, backdrops %.1f ms, fit %.1f ms, "
+              "%u memory lookups; holder %s)",
+              p.name.c_str(), t_end - t0, widgets, t_blurs - t_walk, t_boxes - t_hid, t_end - t_boxes,
+              mem::ScopedRegionCache::Lookups(), holder_ready ? "made at level start" : "made just now");
     // A menu the game put up by itself (the area select after the microwave
     // fall comes up in a dark pit) is easy to miss on the arm: buzz that hand
     // so you look. Only for the first menu; sub-menus come from your clicks.

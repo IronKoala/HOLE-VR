@@ -70,7 +70,7 @@ states from trigger touch and the analog trigger.
 - Slide: three holds, like Half-Life: Alyx, each posed and saved on its
   own (`<Class>.slide-rear-flat|rear-pinch|front-flat.ini`). The hold is picked once, when
   the hand closes on the slide: fist over the FRONT half of the slide
-  = **front**; fist within 6 cm of the rear sight (`hand_slide_pinch_sight_cm`)
+  = **front**; fist within 6.5 cm of the rear sight, or of the line from it 0.64 cm back along the slide (`hand_slide_pinch_radius_cm`, `hand_slide_pinch_back_cm`; same as the controls grab zone)
   = **rear pinch**; else **rear overhand**. The slide is measured once per
   gun with line traces down onto the slide's own mesh parts (children of
   `GunParts_Bolt(Slide)`, made query-only traceable): rear end, front end

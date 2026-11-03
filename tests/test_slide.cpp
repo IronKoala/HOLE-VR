@@ -81,6 +81,19 @@ int main() {
             EXPECT(!z.InZone(FVector{11, 0, 4}));          // past the muzzle
             EXPECT(z.InZone(FVector{-14, 0, 8}));          // pinch at the rear sight
         }
+        {   // pinch capsule from the owner's 20:58 run: sight (-3.1 -0.8 3.7), 6.5 cm, 0.64 cm back
+            SlideConfig m = Pistol();
+            m.use_span = true;
+            m.span_rear = FVector{-6.8, -1.3, 2.4};
+            m.span_front = FVector{8.2, 1.2, 3.3};
+            m.sight_center = FVector{-3.1, -0.8, 3.7};
+            m.sight_radius = 6.5;
+            m.sight_back = 0.64;
+            Slide z(m);
+            EXPECT(z.InZone(FVector{-10.0, 0.5, 4.1}));    // missed in that run, now inside
+            EXPECT(z.InZone(FVector{-9.7, -1.7, 1.6}));
+            EXPECT(!z.InZone(FVector{-13.4, -0.1, 0.5}));  // well behind: still outside
+        }
         SlideConfig r = Pistol();   // rear sphere only (default)
         EXPECT(!Slide(r).InZone(FVector{-20, 0, 2}));
         {   // pinch from behind (owner's log: hands 10-15 cm behind the rear point)

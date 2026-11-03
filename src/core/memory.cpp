@@ -2,6 +2,7 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <cstdlib>
 
 namespace holevr::mem {
@@ -43,6 +44,29 @@ struct RegionCache {
 thread_local RegionCache t_cache[4];
 thread_local unsigned t_next = 0;
 
+// ScopedRegionCache: every region looked up while one is alive, sorted by
+// start address. Regions VirtualQuery reports never overlap.
+constexpr size_t kMaxScopedRegions = 4096;
+thread_local int t_scope_depth = 0;
+thread_local std::vector<RegionCache>* t_scoped = nullptr;
+thread_local unsigned t_scoped_queries = 0;
+
+const RegionCache* FindScoped(uintptr_t p) {
+    if (!t_scoped || t_scoped->empty()) return nullptr;
+    auto it = std::upper_bound(t_scoped->begin(), t_scoped->end(), p,
+                               [](uintptr_t v, const RegionCache& c) { return v < c.start; });
+    if (it == t_scoped->begin()) return nullptr;
+    --it;
+    return p < it->end ? &*it : nullptr;
+}
+
+void RememberScoped(const RegionCache& c) {
+    if (!t_scoped || t_scoped->size() >= kMaxScopedRegions) return;
+    auto it = std::upper_bound(t_scoped->begin(), t_scoped->end(), c.start,
+                               [](uintptr_t v, const RegionCache& r) { return v < r.start; });
+    t_scoped->insert(it, c);
+}
+
 bool ProtectReadable(DWORD protect) {
     if (protect & (PAGE_GUARD | PAGE_NOACCESS)) return false;
     return (protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
@@ -56,7 +80,13 @@ bool RegionReadable(uintptr_t p, uintptr_t* region_end) {
             return c.readable;
         }
     }
+    if (const RegionCache* s = FindScoped(p)) {
+        t_cache[t_next++ & 3] = *s;
+        *region_end = s->end;
+        return s->readable;
+    }
     MEMORY_BASIC_INFORMATION mbi;
+    if (t_scope_depth > 0) ++t_scoped_queries;
     if (!VirtualQuery(reinterpret_cast<void*>(p), &mbi, sizeof(mbi))) {
         *region_end = p + 1;
         return false;
@@ -65,10 +95,28 @@ bool RegionReadable(uintptr_t p, uintptr_t* region_end) {
     c.start = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
     c.end = c.start + mbi.RegionSize;
     c.readable = mbi.State == MEM_COMMIT && ProtectReadable(mbi.Protect);
+    if (t_scope_depth > 0 && c.end > c.start) RememberScoped(c);
     *region_end = c.end;
     return c.readable;
 }
 }  // namespace
+
+ScopedRegionCache::ScopedRegionCache() {
+    if (t_scope_depth++ == 0) {
+        t_scoped = new std::vector<RegionCache>();
+        t_scoped->reserve(256);
+        t_scoped_queries = 0;
+    }
+}
+
+ScopedRegionCache::~ScopedRegionCache() {
+    if (--t_scope_depth == 0) {
+        delete t_scoped;
+        t_scoped = nullptr;
+    }
+}
+
+unsigned ScopedRegionCache::Lookups() { return t_scoped_queries; }
 
 bool IsReadable(uintptr_t p, size_t len) {
     if (p < 0x10000 || p >= 0x00007FFFFFFFFFFFull) return false;
