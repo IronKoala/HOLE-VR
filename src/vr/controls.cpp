@@ -1995,18 +1995,76 @@ void HandInteract(UObject player, int hand) {
 // it, touching the timer's mesh presses it: the timer's own Interact, as the
 // game's interact key does. A press needs the hand to come from outside;
 // presses 1.5 s apart.
+struct PressPart {
+    UObject comp = 0;
+    FVector mn, mx;   // box in the component's own (unscaled) space
+};
 struct PressButton {
     UObject actor = 0;
-    UObject mesh = 0;
+    PressPart parts[3];
+    int n_parts = 0;
     bool inside[2] = {false, false};
 };
+
+// The timer mesh's GetLocalBounds came back 0 x 0 x 0 in the owner's 10:56
+// run, so the shape comes from the static mesh asset's own bounding box
+// (StaticMesh.GetBoundingBox), for the timer body and its display; the
+// interact Box (BoxExtent) only if neither has one.
+bool StaticMeshBox(UObject comp, FVector* mn, FVector* mx) {
+    UObject sm = 0;
+    if (!comp || !ue::GetProp(comp, "StaticMesh", sm) || !sm) return false;
+    ue::Call c(sm, "GetBoundingBox");
+    if (!c.Invoke()) return false;
+    int32_t size = 0;
+    const uint8_t* raw = c.Raw("ReturnValue", &size);
+    if (!raw || size < 48) return false;
+    double v[6];
+    std::memcpy(v, raw, sizeof(v));
+    *mn = FVector{v[0], v[1], v[2]};
+    *mx = FVector{v[3], v[4], v[5]};
+    return v[3] - v[0] > 0.5 || v[4] - v[1] > 0.5 || v[5] - v[2] > 0.5;
+}
+
+void BuildPressParts(PressButton& b) {
+    b.n_parts = 0;
+    for (const char* name : {"Mesh", "timerDisplay"}) {
+        UObject comp = 0;
+        ue::GetProp(b.actor, name, comp);
+        PressPart part;
+        if (comp && StaticMeshBox(comp, &part.mn, &part.mx)) {
+            part.comp = comp;
+            b.parts[b.n_parts++] = part;
+        }
+    }
+    if (b.n_parts == 0) {
+        UObject box = 0;
+        ue::Vec3d e{};
+        if (ue::GetProp(b.actor, "Box", box) && box && ue::GetProp(box, "BoxExtent", e) && e.x > 0) {
+            PressPart part;
+            part.comp = box;
+            part.mn = FVector{-e.x, -e.y, -e.z};
+            part.mx = FVector{e.x, e.y, e.z};
+            b.parts[b.n_parts++] = part;
+        }
+    }
+    static int logs = 0;
+    if (logs++ < 4) {
+        for (int i = 0; i < b.n_parts; ++i) {
+            const UETransform t = ComponentToWorld(b.parts[i].comp);
+            const PressPart& q = b.parts[i];
+            log::Info("controls: range timer part %s: %.1f x %.1f x %.1f cm at (%.0f %.0f %.0f)",
+                      ue::GetName(q.comp).c_str(), (q.mx.X - q.mn.X) * t.scale.X, (q.mx.Y - q.mn.Y) * t.scale.Y,
+                      (q.mx.Z - q.mn.Z) * t.scale.Z, t.translation.X, t.translation.Y, t.translation.Z);
+        }
+        if (b.n_parts == 0) log::Warn("controls: range timer has no shape to press");
+    }
+}
 struct {
     UObject cls = 0;
     double next_class_lookup = 0;
     double next_refresh = 0;
     double ready_at = 0;
     std::vector<PressButton> buttons;
-    bool logged_bounds = false;
 } g_press;
 
 void RefreshPressButtons(UObject player) {
@@ -2036,10 +2094,11 @@ void RefreshPressButtons(UObject player) {
             if (!a) continue;
             PressButton b;
             b.actor = a;
-            ue::GetProp(a, "Mesh", b.mesh);
-            if (!b.mesh) continue;
+            bool known = false;
             for (const PressButton& old : g_press.buttons)
-                if (old.actor == a) { b.inside[0] = old.inside[0]; b.inside[1] = old.inside[1]; }
+                if (old.actor == a) { b = old; known = true; }
+            if (!known) BuildPressParts(b);
+            if (b.n_parts == 0) continue;
             found.push_back(b);
         }
     }
@@ -2049,17 +2108,9 @@ void RefreshPressButtons(UObject player) {
 void PhysicalButtons(UObject player) {
     RefreshPressButtons(player);
     for (PressButton& b : g_press.buttons) {
-        if (!LiveObject(b.actor) || !LiveObject(b.mesh)) continue;
-        ue::Call lb(b.mesh, "GetLocalBounds");
-        if (!lb.Invoke()) continue;
-        const ue::Vec3d mn = lb.Get<ue::Vec3d>("Min"), mx = lb.Get<ue::Vec3d>("Max");
-        const UETransform t = ComponentToWorld(b.mesh);
-        if (!g_press.logged_bounds) {
-            g_press.logged_bounds = true;
-            log::Info("controls: range timer mesh %.1f x %.1f x %.1f cm (scale %.2f %.2f %.2f) at (%.0f %.0f %.0f)",
-                      (mx.x - mn.x) * t.scale.X, (mx.y - mn.y) * t.scale.Y, (mx.z - mn.z) * t.scale.Z, t.scale.X,
-                      t.scale.Y, t.scale.Z, t.translation.X, t.translation.Y, t.translation.Z);
-        }
+        if (!LiveObject(b.actor)) continue;
+        UETransform tr[3];
+        for (int i = 0; i < b.n_parts; ++i) tr[i] = ComponentToWorld(b.parts[i].comp);
         for (int h = 0; h < 2; ++h) {
             const hands::HandState hs = hands::Get(h == 0 ? hands::kLeft : hands::kRight);
             if (!hs.valid) { b.inside[h] = false; continue; }
@@ -2081,12 +2132,18 @@ void PhysicalButtons(UObject player) {
                     pts[n++] = {W.grip_world + W.frame_rot.Rotate(FVector{x, 0, W.bore_height}), 2.5};
             }
             auto ball_in = [&](const Ball& bl) {
-                FVector l = t.rotation.Inverse().Rotate(bl.p - t.translation);
-                // Box half-extents in world cm, ball radius added on each side.
-                const double sx = std::fmax(1e-3, t.scale.X), sy = std::fmax(1e-3, t.scale.Y),
-                             sz = std::fmax(1e-3, t.scale.Z);
-                return l.X > mn.x * sx - bl.r && l.X < mx.x * sx + bl.r && l.Y > mn.y * sy - bl.r &&
-                       l.Y < mx.y * sy + bl.r && l.Z > mn.z * sz - bl.r && l.Z < mx.z * sz + bl.r;
+                for (int i = 0; i < b.n_parts; ++i) {
+                    const UETransform& t = tr[i];
+                    const FVector& mn = b.parts[i].mn;
+                    const FVector& mx = b.parts[i].mx;
+                    const FVector l = t.rotation.Inverse().Rotate(bl.p - t.translation);
+                    // Box in world cm (scaled), ball radius added on each side.
+                    const double sx = std::fabs(t.scale.X), sy = std::fabs(t.scale.Y), sz = std::fabs(t.scale.Z);
+                    if (l.X > mn.X * sx - bl.r && l.X < mx.X * sx + bl.r && l.Y > mn.Y * sy - bl.r &&
+                        l.Y < mx.Y * sy + bl.r && l.Z > mn.Z * sz - bl.r && l.Z < mx.Z * sz + bl.r)
+                        return true;
+                }
+                return false;
             };
             bool in = false;
             for (int k = 0; k < n && !in; ++k) in = ball_in(pts[k]);
