@@ -134,4 +134,53 @@ Odd FindOdd(const Band& band, const Settings& s, Scratch* scratch) {
     return odd;
 }
 
+Dots CountDots(const Band& band, int y0, const DotSettings& s) {
+    Dots d;
+    const int eye_w = band.width / 2, h = band.height, W = band.width;
+    if (eye_w < 5 || h < 5 || band.luma.size() < static_cast<size_t>(band.width) * band.height) return d;
+    const float* L = band.luma.data();
+    for (int eye = 0; eye < 2; ++eye) {
+        const int base = eye * eye_w;
+        for (int y = 2; y < h - 2; ++y) {
+            const float* row = L + static_cast<size_t>(y) * W + base;
+            for (int x = 2; x < eye_w - 2; ++x) {
+                const float v = row[x];
+                if (v < s.min_luma) continue;
+                // At least as bright as its four neighbours (one pixel of a
+                // pair still counts, a smooth patch's pixels mostly don't).
+                if (v < row[x - 1] || v < row[x + 1] || v < row[x - W] || v < row[x + W]) continue;
+                // At most two of its eight neighbours anywhere near as bright:
+                // a dot, a pair or a one-pixel line, not the corner of a patch.
+                const float half = 0.5f * v;
+                int near = 0;
+                for (int dy = -1; dy <= 1; ++dy)
+                    for (int dx = -1; dx <= 1; ++dx)
+                        if ((dx || dy) && row[x + dx + dy * W] >= half) ++near;
+                if (near > 2) continue;
+                // The 16 pixels two steps out.
+                const float* up2 = row - 2 * W;
+                const float* dn2 = row + 2 * W;
+                float ring = 0.f;
+                for (int dx = -2; dx <= 2; ++dx) ring += up2[x + dx] + dn2[x + dx];
+                for (int dy = -1; dy <= 1; ++dy) ring += row[x - 2 + dy * W] + row[x + 2 + dy * W];
+                ring *= 1.f / 16.f;
+                if (v - ring < s.min_jump || v < s.min_ratio * ring) continue;
+                ++d.count[eye];
+                ++d.grid[eye][(x & 7) + 8 * ((y0 + y) & 3)];
+            }
+        }
+    }
+    return d;
+}
+
+float GridShare(const int grid[32]) {
+    long long total = 0;
+    int most = 0;
+    for (int i = 0; i < 32; ++i) {
+        total += grid[i];
+        most = std::max(most, grid[i]);
+    }
+    return total > 0 ? static_cast<float>(most) / static_cast<float>(total) : 0.f;
+}
+
 }  // namespace holevr::vr::square_watch
