@@ -20,8 +20,10 @@ using ik::Length;
 
 struct Settings {
     bool on = true;
-    double radius = 4.0;  // cm: about half a fist
+    double radius = 4.0;    // cm: about half a fist
+    double probe = 14.0;    // cm: how far past the fist the fingertip probe reaches (0 = off)
 } S;
+constexpr double kProbeRadius = 2.0;  // cm: about a finger's width
 
 struct TArrayRaw {
     const UObject* data;
@@ -46,7 +48,9 @@ struct Side {
     std::string what;         // what the hand touched
     // A clear sweep is reused while the eyes and the hand stay put.
     bool last_clear = false;
-    FVector last_from, last_to;
+    FVector last_from, last_to, last_fwd;
+    // The fingertip probe found a surface ahead of the fingers.
+    bool ahead = false;
     // The surface the hand last touched (fingers rest on it), kept while
     // the hand stays near it.
     bool have_plane = false;
@@ -62,6 +66,7 @@ int32_t g_radius_size = -1;  // SphereTraceSingle's Radius: float (4) or double 
 std::vector<Kept> g_attached;  // actors hanging on the player (holstered gun, mags)
 double g_attached_age = 1e9;
 bool g_announced = false;  // the on/off state last logged
+int g_ahead_logged = 0;    // fingertip probe hits logged this run
 int g_logged = 0;          // touches logged one by one this run
 int g_touches = 0;         // touches since the last summary
 double g_summary_age = 0;  // s since the last summary
@@ -100,8 +105,8 @@ void RefreshAttached(UObject player, double dt) {
 // where it first touches something; false when the way is clear (or the
 // sweep starts inside something: the eyes are in a wall, so there is no
 // sensible place to stop the hand).
-bool Sweep(UObject player, const FVector& from, const FVector& to, const std::vector<UObject>& ignore, FVector* at,
-           FVector* surface, FVector* normal, std::string* what) {
+bool Sweep(UObject player, const FVector& from, const FVector& to, double radius, const std::vector<UObject>& ignore,
+           FVector* at, FVector* surface, FVector* normal, std::string* what) {
     ue::Call t(g_ksl, "SphereTraceSingle");
     if (!t.Valid()) return false;
     if (g_radius_size < 0) {
@@ -111,9 +116,9 @@ bool Sweep(UObject player, const FVector& from, const FVector& to, const std::ve
         if (sz != 4 && sz != 8) log::Warn("hand walls: sphere trace radius is %d bytes; hands won't stop at walls", sz);
     }
     if (g_radius_size == 4)
-        t.Set("Radius", static_cast<float>(S.radius));
+        t.Set("Radius", static_cast<float>(radius));
     else if (g_radius_size == 8)
-        t.Set("Radius", S.radius);
+        t.Set("Radius", radius);
     else
         return false;
     TArrayRaw arr{ignore.data(), static_cast<int32_t>(ignore.size()), static_cast<int32_t>(ignore.size())};
@@ -139,6 +144,32 @@ bool Sweep(UObject player, const FVector& from, const FVector& to, const std::ve
 
 bool Near(const FVector& a, const FVector& b) { return Length(a - b) < 0.3; }
 
+// The fingers reach well past the fist the hand's ball is centred on. A
+// thin ball swept from the fist along the fingers finds a wall or table
+// ahead of them, so the fingers and palm react when the fingertips get
+// there, not only once the fist does (a real hand, and the owner's
+// reference, SentientArt/TheBasement, collide with the whole hand). It only
+// remembers the surface; the hand isn't moved for it.
+void Probe(UObject player, int side, const FVector& fist, const FVector& fwd, const std::vector<UObject>& ignore) {
+    Side& s = g_side[side];
+    FVector at, surface, normal;
+    std::string what;
+    const bool hit = S.probe > 0.0 && Sweep(player, fist, fist + fwd * S.probe, kProbeRadius, ignore, &at, &surface,
+                                            &normal, &what) &&
+                     ik::Length(normal) > 0.5;
+    if (hit) {
+        s.have_plane = true;
+        s.plane_point = surface;
+        s.plane_normal = normal * (1.0 / ik::Length(normal));
+        if (!s.ahead && g_ahead_logged < 8) {
+            ++g_ahead_logged;
+            log::Info("hand walls: %s fingertips found %s %.1f cm past the fist", side == 0 ? "left" : "right",
+                      what.c_str(), ik::Length(at - fist));
+        }
+    }
+    s.ahead = hit;
+}
+
 void EndTouch(int side) {
     Side& s = g_side[side];
     if (!s.touching) return;
@@ -157,6 +188,7 @@ void EndTouch(int side) {
 void LoadSettings() {
     S.on = config::GetBool("hand_wall_collision", true);
     S.radius = std::clamp<double>(config::GetFloat("hand_wall_radius_cm", 4.f), 1.0, 10.0);
+    S.probe = std::clamp<double>(config::GetFloat("hand_wall_probe_cm", 14.f), 0.0, 30.0);
 }
 
 void Apply(UObject player, const hands::Pose& head, hands::HandState hs[2], const hands::HandGrab grab[2],
@@ -169,8 +201,9 @@ void Apply(UObject player, const hands::Pose& head, hands::HandState hs[2], cons
     if (g_announced != S.on) {
         g_announced = S.on;
         if (S.on)
-            log::Info("hand walls: on (a %.1f cm ball from the eyes to each empty hand stops at what it touches)",
-                      S.radius);
+            log::Info("hand walls: on (a %.1f cm ball from the eyes to each empty hand stops at what it touches; "
+                      "the fingertips feel %.0f cm past the fist)",
+                      S.radius, S.probe);
         else
             log::Info("hand walls: off (hands pass through walls)");
     }
@@ -178,6 +211,7 @@ void Apply(UObject player, const hands::Pose& head, hands::HandState hs[2], cons
         EndTouch(0);
         EndTouch(1);
         g_side[0].have_plane = g_side[1].have_plane = false;
+        g_side[0].ahead = g_side[1].ahead = false;
         return;
     }
     perf::Scope timer(g_perf);
@@ -206,21 +240,28 @@ void Apply(UObject player, const hands::Pose& head, hands::HandState hs[2], cons
             EndTouch(side);
             s.last_clear = false;
             s.have_plane = false;
+            s.ahead = false;
             continue;
         }
         const FVector from = head.location, to = h.grip.location;
+        const FVector fwd = ik::Normalize(h.grip.rotation.Rotate(FVector{1, 0, 0}));
         s.drawn = to;
-        if (s.last_clear && Near(from, s.last_from) && Near(to, s.last_to)) continue;
+        // Reused while the eyes, the hand and its pointing stay put (2 deg).
+        if (s.last_clear && Near(from, s.last_from) && Near(to, s.last_to) && ik::Dot(fwd, s.last_fwd) > 0.9994)
+            continue;
         FVector at, surface, normal;
         std::string what;
-        if (!Sweep(player, from, to, ignore, &at, &surface, &normal, &what)) {
+        if (!Sweep(player, from, to, S.radius, ignore, &at, &surface, &normal, &what)) {
             EndTouch(side);
             s.last_clear = true;
             s.last_from = from;
             s.last_to = to;
+            s.last_fwd = fwd;
+            Probe(player, side, to, fwd, ignore);
             continue;
         }
         s.last_clear = false;
+        s.ahead = false;
         const FVector shift = at - to;
         const double depth = Length(shift);
         if (!s.touching) {
@@ -249,6 +290,13 @@ void Apply(UObject player, const hands::Pose& head, hands::HandState hs[2], cons
         g_touches = 0;
         g_summary_age = 0;
     }
+}
+
+double Radius() { return S.radius; }
+
+bool Touching(int side) {
+    if (side < 0 || side > 1 || !S.on) return false;
+    return g_side[side].touching || g_side[side].ahead;
 }
 
 bool Contact(int side, FVector* point, FVector* normal) {

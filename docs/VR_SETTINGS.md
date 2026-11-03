@@ -7,7 +7,7 @@ Build 1 (PR #68): the VR tab, vignette, head-in-wall fade, height modes,
 real crouch and jump, grip toggle, aim smoothing. Build 2: teleport, world
 size, which stick moves, body calibration (height and arms) and the shot
 study (does the game shoot from the muzzle?). Then: empty hands stop at
-walls, and their fingers rest on the surface. Still to come: the gun in the
+walls, and their fingers give way on the surface like physics hands. Still to come: the gun in the
 left hand (full left-handed mode).
 
 ## The VR tab (src/vr/vr_options.cpp, src/vr/vr_menu_model.cpp)
@@ -248,31 +248,58 @@ hand.
   perf report as "body hands stop at walls".
 - Runs after the arm measure (Calibrate body wants the real hands) and not
   while the grip editor holds the hands still.
+- The fingers reach well past the fist the ball is centred on, so when the
+  ball's way is clear a thin ball (2 cm) is also swept from the fist along
+  the controller's pointing direction, `hand_wall_probe_cm` (14) past it. A
+  surface it meets is remembered for the fingers and the palm (below) before
+  the fist gets there; the hand itself isn't moved for it.
 
-Fingers rest on the surface (owner's list, item 13, "physical fingers";
-`src/vr/body/finger_rest.cpp`): the wall check keeps the surface the hand
-last stopped against (its impact point and normal) while the hand stays
-within 20 cm of that point and on its open side. Each finger of that empty
-hand then takes the curl nearest to what the controller asks for that keeps
-its joints and tip out of the surface's plane (steps of 0.05 between straight
-and the fullest curl): an open hand pressed on a wall lies flat on it, and
-fingers pointed into a wall bend back against it. It is plain math on the
-plane, with no extra traces. `hand_fingers_rest_on_walls=1` (on); off with
-the hand wall check too. Fingers on the gun and magazines keep their stored
-grips.
+Physics-style fingers (owner's list, item 13, "physical fingers";
+`src/vr/body/finger_rest.cpp`). Reworked 2026-11-03 after the owner's
+hand-physics reference, SentientArt/TheBasement (an Unreal 5.3 VR demo):
+there each hand is a ragdoll, a box for the palm and a capsule for every
+finger bone, and Unreal's Physics Control pulls every piece toward the
+controller's pose like a spring with a capped force, so a wall simply wins
+and fingers bend back where they touch. Our hands are drawn, not simulated,
+so this copies the result:
 
-Hands press flat on walls (owner 2026-11-03 14:14: the fingers "would
+- The wall check keeps the surface the hand last met (its impact point and
+  normal) while the hand stays within 20 cm of that point and on its open
+  side.
+- Each finger of that empty hand has one bend number: 0 straight, up to 1.2
+  curled as the controller asks, and below 0 bent back past straight (to the
+  joints' backward limits at -1: the knuckle 25 deg, the outer joints 5 deg;
+  the thumb half that).
+- Each frame a finger moves from where it was toward the controller's bend
+  and stops where it touches the surface (a sprung finger can't jump
+  through a wall). If the hand moved it into the surface, the surface pushes
+  it out the way it presses on it: pressed on its pad it bends back, pressed
+  on its nails it curls, straight on a straight finger bends back and a
+  curled one buckles further. When one way can't get it out, the other is
+  tried. Last frame's side wins a near tie, so it doesn't flicker.
+- Fingertip drag: a fingertip on the surface (within 1 cm) trails where the
+  hand was 0.05 s before as the hand slides along it, as far as small bends
+  (0.3) and spreads (12 deg) allow, eased over 0.06 s and never into the
+  surface. `hand_finger_drag` (1; 0 = off, 2 = twice as much).
+- Plain math on the plane, no extra traces. `hand_fingers_rest_on_walls=1`
+  (on); off with the hand wall check too. Fingers on the gun and magazines
+  keep their stored grips.
+
+Hands settle flat on walls (owner 2026-11-03 14:14: the fingers "would
 close and make a fist, in real life people tend to press their hand
-against the wall"). With the curl search alone, a hand pushed fingers-first
-into a wall curled into a fist to clear it. Now, as the controller's fist
-centre comes within `hand_press_start_cm` (8) of the remembered surface,
-the palm turns to face it and moves onto it (palm middle 0.3 cm off, never
-in); from `hand_press_full_cm` (3) on it is flat, fingers open. The
-fingers follow the controller's curl less the flatness, and the plane
-search only matters while the hand is not yet flat. With the back of the
-hand toward the surface (more than 110 deg off) nothing turns: knuckles or
-a fist against a wall stay as they are. `hand_press_flat_on_walls=1`
-(on); it needs the hand wall check.
+against the wall"). The first version (1694d3d) turned the palm toward a
+remembered surface from 8 cm before touching it; since the reference study
+it behaves like a physics hand: the hand keeps the controller's angle until
+it really touches (its ball is stopped, or the fingertip probe reaches the
+surface), then turns to face the surface as the real hand goes on toward
+it, flat once the real fist is `hand_press_flat_push_cm` (4) past where the
+ball stops. The palm is set on the surface (middle 0.3 cm off, never in) but
+never pulled toward it from further than the wall check held the hand back.
+Only a palm or fingertips-first touch turns it: the back of the hand (palm
+100-115 deg or more off the surface, faded) and its side (a karate chop:
+the line across the knuckles pointing into the surface) keep their angle.
+The fingers follow the controller's curl less the flatness.
+`hand_press_flat_on_walls=1` (on); it needs the hand wall check.
 
 ## Log lines to check after a test
 
@@ -300,15 +327,20 @@ a fist against a wall stay as they are. `hand_press_flat_on_walls=1`
 - `vr options: Edit hand grips clicked ...` then `controls: opening/closing the
   grip editor (asked for from the VR tab)`.
 - `vr options: Move holsters clicked ...` then the holster countdown lines.
-- `hand walls: on (a 4.0 cm ball from the eyes to each empty hand ...)` once,
-  then `hand walls: left/right hand stopped at <thing> for N s; the real hand
+- `hand walls: on (a 4.0 cm ball from the eyes to each empty hand ...; the
+  fingertips feel 14 cm past the fist)` once, `hand walls: left/right
+  fingertips found <thing> N cm past the fist` the first 8 times, then `hand walls: left/right hand stopped at <thing> for N s; the real hand
   went up to N cm past the surface` for the first 12 touches, then a count
   each minute.
-- `fingers: left/right hand's fingers rest on the surface it's against (curl
-  wanted->used: thumb 0.60->0.20, ...)`, the first 10 times a wall changes a
-  finger's curl noticeably (at most every 2 s per hand).
+- `fingers: left/right hand's fingers give way against the surface (bend
+  wanted->used, below 0 = bent back past straight: thumb 0.60->0.20, index
+  0.12->-0.35, ...)`, the first 10 times a wall changes a finger's bend
+  noticeably (at most every 2 s per hand).
+- `fingers: left/right fingertips drag along the surface (hand sliding N
+  cm/s, a tip trails N cm)`, the first 6 times a tip trails 1 cm or more.
 - `body: left/right hand pressed flat on a surface (palm turned N deg to face
-  it)`, the first 10 times a hand goes flat.
+  it; it touched with the real fist N cm off the surface, now N cm)`, the
+  first 10 times a hand goes flat.
 - `shot study 1: barrel line hits ... camera line hits ... N cm apart`, `shot
   study: gun ... fire functions: ...`, `lab: [..s] gun.<event>`.
 
@@ -316,9 +348,11 @@ a fist against a wall stay as they are. `hand_press_flat_on_walls=1`
 
 - `tests/test_comfort.cpp`: vignette texture, levels, smoothing, real crouch
   and jump, aim smoothing, grip toggle.
-- `tests/test_finger_rest.cpp`: fingers against a plane (palm on a wall
-  opens the hand just enough, fingers pointed into a wall curl back, the
-  least-bad curl when nothing clears, same result anywhere in the world).
+- `tests/test_finger_rest.cpp`: fingers against a plane (the bend path, a
+  curling finger stops where it touches, pressed on pads bends back past
+  straight, pressed on nails curls, tip first: straight bends back and
+  curled buckles, the other way when one can't clear, last frame's side
+  wins a tie, same result anywhere in the world, fingertip drag).
 - `tests/test_vr_options.cpp`: ini edit in place, menu rows, current choice,
   teleport and hop to jump off by default, action rows.
 - `tests/test_teleport.cpp`: arc, stick gesture, landing check.

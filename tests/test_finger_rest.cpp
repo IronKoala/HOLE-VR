@@ -1,4 +1,4 @@
-// Native unit tests for fingers resting on a surface (vr/body/finger_rest).
+// Native unit tests for fingers giving way against a surface (vr/body/finger_rest).
 //   g++ -std=c++20 -Isrc tests/test_finger_rest.cpp src/vr/body/finger_rest.cpp src/vr/body/finger_solve.cpp
 //       src/vr/body/skeleton.cpp src/vr/body/ik_math.cpp -o /tmp/test_finger_rest && /tmp/test_finger_rest
 #include <cmath>
@@ -44,48 +44,133 @@ int main() {
     EXPECT(c.valid);
     const fingers::Limits lim = fingers::DefaultLimits(false);
     const Xf hand = X(FVector{0, 0, 0});
-    double depth = -1;
+    auto depth_at = [&](double b, const FVector& p, const FVector& n) {
+        return fingers::PlaneDepth(c, fingers::Bend(c, b, lim), hand, p, n, 0.5);
+    };
 
-    // Nothing near: the wanted curl stands.
-    double curl = fingers::CurlClearOfPlane(c, lim, hand, 0.4, 1.2, FVector{0, 50, 0}, FVector{0, -1, 0}, 0.5, &depth);
-    EXPECT(std::fabs(curl - 0.4) < 1e-9);
-    EXPECT(depth == 0.0);
+    // The bend path: 0 is straight, positive is Curl, negative bends back
+    // (mostly at the knuckle) and moves the fingertip to the back of the hand.
+    {
+        const fingers::Angles s = fingers::Bend(c, 0.0, lim);
+        EXPECT(s.flex[0] == 0.0 && s.flex[1] == 0.0 && s.flex[2] == 0.0);
+        const fingers::Angles b = fingers::Bend(c, -1.0, lim);
+        EXPECT(b.flex[0] < 0.0 && b.flex[0] < b.flex[1] && b.flex[0] < b.flex[2]);
+        EXPECT(std::fabs(b.flex[0] - lim.flex_min[0] * kDegToRad) < 1e-9);
+        const fingers::Angles k = fingers::Bend(c, 0.4, lim), want = fingers::Curl(c, 0.4, lim);
+        EXPECT(std::fabs(k.flex[1] - want.flex[1]) < 1e-12);
+        const FVector tip0 = fingers::TipWorld(c, s, hand), tipb = fingers::TipWorld(c, b, hand);
+        EXPECT(tipb.Y < tip0.Y - 2.0);  // the palm faces +Y: bent back goes -Y
+    }
 
-    // Palm flat on a wall 2 cm in front of it (wall normal points back at the
-    // palm, -Y): curling would push the fingers into it, so the hand opens.
+    // Nothing near: the finger goes all the way to the wanted bend.
+    {
+        const fingers::Push p =
+            fingers::PushFromPlane(c, lim, hand, 0.1, 0.4, 1.2, FVector{0, 50, 0}, FVector{0, -1, 0}, 0.5);
+        EXPECT(std::fabs(p.bend - 0.4) < 1e-9 && p.depth == 0.0 && p.dir == 0 && !p.pushed);
+    }
+
+    // Palm 2 cm from a wall: an open finger asked to curl (pad toward the
+    // wall) curls until it touches the wall and rests there.
     const FVector wall{0, 3.3, 0}, out{0, -1, 0};
-    EXPECT(fingers::PlaneDepth(c, fingers::Curl(c, 0.6, lim), hand, wall, out, 0.5) > 0.0);
-    curl = fingers::CurlClearOfPlane(c, lim, hand, 0.6, 1.2, wall, out, 0.5, &depth);
-    EXPECT(curl < 0.6);
-    EXPECT(depth == 0.0);
-    EXPECT(fingers::PlaneDepth(c, fingers::Curl(c, curl, lim), hand, wall, out, 0.5) == 0.0);
-    // ...and opens no further than it has to: a little more curl goes in.
-    EXPECT(fingers::PlaneDepth(c, fingers::Curl(c, curl + 0.05, lim), hand, wall, out, 0.5) > 0.0);
+    {
+        EXPECT(depth_at(0.0, wall, out) == 0.0 && depth_at(0.6, wall, out) > 0.0);
+        const fingers::Push p = fingers::PushFromPlane(c, lim, hand, 0.0, 0.6, 1.2, wall, out, 0.5);
+        EXPECT(!p.pushed && p.dir == -1);
+        EXPECT(p.bend > 0.0 && p.bend < 0.15);
+        EXPECT(p.depth == 0.0 && depth_at(p.bend, wall, out) == 0.0);
+        EXPECT(depth_at(p.bend + 0.02, wall, out) > 0.0);
+        // Asked to open again, it follows at once.
+        const fingers::Push q = fingers::PushFromPlane(c, lim, hand, p.bend, 0.0, 1.2, wall, out, 0.5);
+        EXPECT(q.bend == 0.0 && q.dir == 0);
+    }
 
-    // Fingers pointed straight into a wall 6 cm past the knuckles (wall
-    // across -X, normal +X): an open hand goes in, so the fingers curl back.
-    const FVector front{-18.2, 0, 0}, back{1, 0, 0};
-    EXPECT(fingers::PlaneDepth(c, fingers::Curl(c, 0.0, lim), hand, front, back, 0.5) > 0.0);
-    curl = fingers::CurlClearOfPlane(c, lim, hand, 0.0, 1.2, front, back, 0.5, &depth);
-    EXPECT(curl > 0.0);
-    EXPECT(depth == 0.0);
+    // The hand pushed onto the wall: the relaxed fingers are in it on their
+    // pads, so they bend back past straight (a real hand pushed flat), not
+    // into a fist.
+    const FVector flat{0, 1.5, 0};
+    {
+        EXPECT(depth_at(0.15, flat, out) > 0.0 && depth_at(0.0, flat, out) > 0.0);
+        const fingers::Push p = fingers::PushFromPlane(c, lim, hand, 0.15, 0.15, 1.2, flat, out, 0.5);
+        EXPECT(p.pushed && p.dir == -1);
+        EXPECT(p.bend < 0.0);
+        EXPECT(p.depth == 0.0);
+    }
 
-    // A wall the finger can never clear (just past the knuckle): the curl
-    // that goes in least is used, and the depth says how far.
-    const FVector close{-12.4, 0, 0};
-    curl = fingers::CurlClearOfPlane(c, lim, hand, 0.0, 1.2, close, back, 0.5, &depth);
-    EXPECT(depth > 0.0);
-    EXPECT(curl >= 0.0 && curl <= 1.2);
-    for (double other = 0.0; other <= 1.2; other += 0.05)
-        EXPECT(fingers::PlaneDepth(c, fingers::Curl(c, other, lim), hand, close, back, 0.5) >= depth - 1e-9);
+    // A wall on the back of the fingers (pressed on the nails): they curl.
+    const FVector behind{0, 1.0, 0}, back_out{0, 1, 0};
+    {
+        EXPECT(depth_at(0.0, behind, back_out) > 0.0);
+        const fingers::Push p = fingers::PushFromPlane(c, lim, hand, 0.0, 0.0, 1.2, behind, back_out, 0.5);
+        EXPECT(p.pushed && p.dir == +1);
+        EXPECT(p.bend > 0.0);
+        EXPECT(p.depth == 0.0);
+    }
 
-    // The hand's own world transform is used: the same palm-on-wall case
-    // moved and turned in the world gives the same curl.
-    Xf moved = X(FVector{100, -40, 90}, ToQuat(FRotator{10, 70, -20}));
-    const double here = fingers::CurlClearOfPlane(c, lim, hand, 0.6, 1.2, wall, out, 0.5);
-    const double there = fingers::CurlClearOfPlane(c, lim, moved, 0.6, 1.2, skel::Apply(moved, wall),
-                                                   moved.rotation.Rotate(out), 0.5);
-    EXPECT(std::fabs(here - there) < 1e-6);
+    // A finger bent back to its limit with the wall on its nails: it can't
+    // go further back, so it is pushed the other way, out of the wall.
+    {
+        EXPECT(depth_at(-1.0, behind, back_out) > 0.0);
+        const fingers::Push p = fingers::PushFromPlane(c, lim, hand, -1.0, 0.0, 1.2, behind, back_out, 0.5);
+        EXPECT(p.pushed && p.dir == +1 && p.depth == 0.0 && p.bend > -1.0);
+    }
+
+    // Fingertips straight into a wall 6 cm past the knuckle. A straight
+    // finger bends back; it can't clear a wall that close, so it takes the
+    // bend that goes in least on that side.
+    const FVector front{-18.2, 0, 0}, front_out{1, 0, 0};
+    {
+        const double before = depth_at(0.0, front, front_out);
+        EXPECT(before > 0.0);
+        const fingers::Push p = fingers::PushFromPlane(c, lim, hand, 0.0, 0.0, 1.2, front, front_out, 0.5);
+        EXPECT(p.pushed && p.dir == -1);
+        EXPECT(p.depth > 0.0 && p.depth <= before);
+        for (double b = -1.0; b <= 1e-9; b += 0.05) EXPECT(depth_at(b, front, front_out) >= p.depth - 1e-9);
+        // Last frame's side wins a near tie: told it was curling, it curls.
+        const fingers::Push q = fingers::PushFromPlane(c, lim, hand, 0.0, 0.0, 1.2, front, front_out, 0.5, +1);
+        EXPECT(q.dir == +1);
+    }
+
+    // A relaxed (slightly curled) finger pushed tip first buckles further
+    // until it clears, as a sprung finger would.
+    {
+        EXPECT(depth_at(0.12, front, front_out) > 0.0);
+        const fingers::Push p = fingers::PushFromPlane(c, lim, hand, 0.12, 0.12, 1.2, front, front_out, 0.5);
+        EXPECT(p.pushed && p.dir == +1 && p.bend > 0.12 && p.depth == 0.0);
+        // Pushed toward a curl the controller asks for anyway, it carries on
+        // to it.
+        const fingers::Push q = fingers::PushFromPlane(c, lim, hand, 0.12, 0.9, 1.2, front, front_out, 0.5);
+        EXPECT(q.depth == 0.0 && std::fabs(q.bend - 0.9) < 1e-9);
+    }
+
+    // The hand's own world transform is used: the same cases moved and
+    // turned in the world give the same bends.
+    {
+        const Xf moved = X(FVector{100, -40, 90}, ToQuat(FRotator{10, 70, -20}));
+        for (const FVector* w : {&wall, &flat}) {
+            const fingers::Push here = fingers::PushFromPlane(c, lim, hand, 0.15, 0.6, 1.2, *w, out, 0.5);
+            const fingers::Push there = fingers::PushFromPlane(c, lim, moved, 0.15, 0.6, 1.2, skel::Apply(moved, *w),
+                                                               moved.rotation.Rotate(out), 0.5);
+            EXPECT(std::fabs(here.bend - there.bend) < 1e-6 && here.dir == there.dir);
+        }
+    }
+
+    // Drag: asked to move the fingertip toward the palm, the finger curls;
+    // sideways, it spreads; the tip ends up moved the asked way; big asks are
+    // clamped.
+    {
+        double db = 0, ds = 0;
+        fingers::DragTip(c, lim, hand, 0.1, FVector{0, 0.5, 0}, &db, &ds);
+        EXPECT(db > 0.0);
+        const FVector side = Normalize(Cross(FVector{-1, 0, 0}, FVector{0, 1, 0}));  // across the finger
+        fingers::DragTip(c, lim, hand, 0.1, side * 0.8, &db, &ds);
+        EXPECT(std::fabs(ds) > 0.01);
+        fingers::Angles a = fingers::Bend(c, 0.1 + db, lim);
+        a.spread = ds;
+        const FVector t0 = fingers::TipWorld(c, fingers::Bend(c, 0.1, lim), hand), t1 = fingers::TipWorld(c, a, hand);
+        EXPECT(Dot(t1 - t0, side) > 0.4);
+        fingers::DragTip(c, lim, hand, 0.1, FVector{0, 50, 0}, &db, &ds);
+        EXPECT(std::fabs(db) <= 0.3 + 1e-12);
+    }
 
     if (failures) {
         std::printf("finger rest: %d failure(s)\n", failures);

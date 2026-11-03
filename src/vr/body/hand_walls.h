@@ -10,7 +10,12 @@
 // something follows that object instead (the gun keeps itself out of walls on
 // its own: controls WallPushback).
 //
-// Settings: hand_wall_collision (1 = on), hand_wall_radius_cm (ball radius).
+// The fingers reach past that ball, so a thin ball is also swept from the
+// fist along the fingers: a surface ahead of the fingertips is remembered
+// for them (and the palm) before the fist gets there.
+//
+// Settings: hand_wall_collision (1 = on), hand_wall_radius_cm (ball radius),
+// hand_wall_probe_cm (fingertip probe length past the fist, 0 = off).
 #include "ue/objects.h"
 #include "vr/hands.h"
 
@@ -31,5 +36,13 @@ void Apply(UObject player, const hands::Pose& head, hands::HandState hs[2], cons
 // hand stays within 20 cm of that point and on its open side, so fingers
 // can rest on a wall the ball itself isn't touching. False otherwise.
 bool Contact(int side, FVector* point, FVector* normal);
+
+// Radius of the hand's ball, cm: the real fist centre is this far off a
+// surface when the drawn hand first stops at it.
+double Radius();
+
+// The hand is touching something this frame: its ball is stopped, or its
+// fingertips have reached a surface.
+bool Touching(int side);
 
 }  // namespace holevr::vr::body::hand_walls
