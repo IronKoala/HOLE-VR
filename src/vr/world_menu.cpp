@@ -80,9 +80,10 @@ struct Settings {
     bool fit_shape = true;        // a tall narrow menu gets a tall panel of the same area (FitContent)
     float fit_min_zoom = 1.3f;    // menus filling the whole screen still get at least this zoom
     bool follow_exposure = true;  // dim the menus as much as the game brightens dark areas
-    float exposure_ref = 0.f;     // game exposure (stops) at which menus are drawn as the game made them
+    float exposure_ref = -1.f;    // game exposure (stops) at which menus are drawn at full brightness
     float brightness = 1.f;       // all menus and the HUD, times this
-    float brightness_min = 0.1f;  // never dimmer than this
+    float brightness_min = 0.03f; // never dimmer than this
+    bool separate = true;         // a column or row running into a picture is moved clear (SeparateParts)
     bool hud = true;              // the in-level HUD on the forearm, shown when you look at it
     float hud_size = 1.f;         // its width, times the menu's
     float hud_look_deg = 50.f;    // shown when the arm faces you within this angle...
@@ -240,6 +241,8 @@ struct Panel {
     int text_phase = 0;        // kTextOff / kTextBaseline / kTextCheck
     int text_stale = 0;        // frames waited for the engine to lay out the new sizes
     bool stale_off = false;    // the layout check never matched once: check as laid out from then on
+    bool separated = false;    // parts running into pictures moved apart (SeparateParts)
+    int fit_wait = 0;          // frames to wait after moving parts, before measuring the menu
     double recheck_at = -1;    // one more look a moment after the texts fit (TextStep)
     int rechecks = 0;
     int text_round = 0;
@@ -1833,6 +1836,262 @@ void LogTexts(const Panel& p) {
     }
 }
 
+// ------------------------------------------------------ parts moved apart --
+// A few menus run into their own pictures in the game's layout: the level
+// select's left column runs past its divider line toward the preview, and
+// the credits' row of names sits on the logo's bottom edge. On the flat
+// screen that passed; on the arm the owner reads it as clipped and
+// overlapping (2026-11-03, both still there after the text checks). For a
+// text and a picture or box it isn't in (a big one, or a long divider line:
+// small icons beside their text are left alone), the widget holding the text
+// just below the one they share is moved if it runs into the picture: by its
+// render translation, the shortest way clear (left, right, up or down, at
+// most 120 layout pixels), if that spot is on the screen and clear of
+// everything else. Parts lined up on one edge move together.
+// Rows of three or more texts and nothing else get their gaps widened to
+// twice the text height (the credits' names ran together).
+
+// Boxes that cross (more than 3 px both ways, or half of a thin line's width).
+bool Touches(const Rect& a, const Rect& b) {
+    double w = std::min(a.x1, b.x1) - std::max(a.x0, b.x0);
+    double h = std::min(a.y1, b.y1) - std::max(a.y0, b.y0);
+    double tw = std::min(3.0, 0.5 * std::min(a.W(), b.W())), th = std::min(3.0, 0.5 * std::min(a.H(), b.H()));
+    return w > tw && h > th;
+}
+
+bool WidenRowGaps(Panel& p) {
+    if (!L.text_class || L.widget_slot < 0) return false;
+    std::unordered_map<UObject, std::vector<std::pair<Rect, UObject>>> rows;
+    std::unordered_map<UObject, UObject> active;
+    for (auto& t : p.texts) {
+        if (!Alive(t.obj, t.index) || !ShownNow(t, active)) continue;
+        UObject parent = ParentOf(t.obj);
+        if (!parent || ue::GetName(ue::GetClass(parent)) != "HorizontalBox") continue;
+        Placed pl = PlaceOf(t.obj, false);
+        if (pl.ok && Drawn(pl.r)) rows[parent].push_back({pl.r, t.obj});
+    }
+    struct Margin {
+        float left, top, right, bottom;
+    };
+    bool any = false;
+    for (auto& [row, items] : rows) {
+        std::vector<UObject> kids;
+        Children(row, 64, &kids);
+        if (items.size() < 3 || kids.size() != items.size()) continue;  // only texts in it
+        std::sort(items.begin(), items.end(), [](const auto& a, const auto& b) { return a.first.x0 < b.first.x0; });
+        int widened = 0;
+        double added = 0;
+        for (size_t i = 1; i < items.size(); ++i) {
+            const Rect &a = items[i - 1].first, &b = items[i].first;
+            double gap = b.x0 - a.x1, want = 2.0 * std::max(a.H(), b.H());
+            if (gap <= 4 || gap >= want) continue;  // touching on purpose (a role and its name), or wide enough
+            UObject slot = mem::ReadOr<UObject>(items[i].second + L.widget_slot, 0);
+            Margin m{};
+            if (!slot || !ue::GetProp(slot, "Padding", m)) continue;
+            m.left += static_cast<float>(want - gap);
+            ue::Call c(slot, "SetPadding");
+            c.Set("InPadding", m);
+            if (!c.Invoke()) continue;
+            ++widened;
+            added += want - gap;
+        }
+        if (widened)
+            log::Info("world menu: %s: %d gap(s) in a row of %zu texts widened to twice the text height (+%.0f px)",
+                      p.name.c_str(), widened, items.size(), added);
+        any = any || widened > 0;
+    }
+    return any;
+}
+
+// Returns true if anything was changed (the menu is laid out again before
+// it is measured for its zoom).
+bool SeparateParts(Panel& p) {
+    if (!S.separate || p.separated || p.name == "UIM_Results_C" || !L.slate_lib) return false;
+    p.separated = true;
+    bool changed = WidenRowGaps(p);
+    auto up_of = [&](UObject w) {
+        std::vector<UObject> up;
+        for (UObject x = w; x && x != p.widget && up.size() < 40; x = ParentOf(x)) up.push_back(x);
+        return up;
+    };
+    struct Thing {
+        UObject w;
+        std::vector<UObject> up;  // itself first, then each widget around it
+        Rect r;
+    };
+    std::vector<Thing> texts, pics;
+    std::unordered_map<UObject, UObject> active;
+    for (auto& t : p.texts) {
+        if (!Alive(t.obj, t.index) || !ShownNow(t, active)) continue;
+        Placed pl = PlaceOf(t.obj, false);
+        if (pl.ok && Drawn(pl.r)) texts.push_back({t.obj, up_of(t.obj), pl.r});
+    }
+    for (auto& pic : p.pictures) {
+        if (!Alive(pic.obj, pic.index)) continue;
+        Placed pl = PlaceOf(pic.obj, false);
+        if (pl.ok && Drawn(pl.r)) pics.push_back({pic.obj, up_of(pic.obj), pl.r});
+    }
+    auto nested = [](const Rect& a, const Rect& b) { return RunsPast(a, b) <= 0.5 || RunsPast(b, a) <= 0.5; };
+    auto inside = [](const Thing& th, UObject item) {
+        return std::find(th.up.begin(), th.up.end(), item) != th.up.end();
+    };
+    // What to move: for a text and a picture, the widget holding the text
+    // just below the one they share. It moves if it runs into the picture.
+    struct Item {
+        UObject w;
+        Rect r;
+        double factor;
+        UObject hit;
+        UObject leader = 0;  // moved along with this one (same column or row)
+    };
+    std::vector<Item> items;
+    std::unordered_set<UObject> seen;
+    auto big = [](const Rect& r) {
+        return (r.W() >= 40 && r.H() >= 40) || (std::min(r.W(), r.H()) <= 6 && std::max(r.W(), r.H()) >= 100);
+    };
+    for (const Thing& t : texts) {
+        for (const Thing& pic : pics) {
+            if (inside(t, pic.w) || !big(pic.r)) continue;  // the text sits in this box, or it's an icon
+            UObject item = t.up.back();
+            for (size_t k = 1; k < t.up.size(); ++k)
+                if (std::find(pic.up.begin(), pic.up.end(), t.up[k]) != pic.up.end()) {
+                    item = t.up[k - 1];
+                    break;
+                }
+            if (seen.count(item)) continue;
+            Placed pl = PlaceOf(item, false);
+            if (!pl.ok || !Drawn(pl.r) || (pl.r.W() >= kDrawW * 0.9 && pl.r.H() >= kDrawH * 0.9)) continue;
+            if (nested(pl.r, pic.r) || !Touches(pl.r, pic.r)) continue;
+            seen.insert(item);
+            items.push_back({item, pl.r, pl.local_w > 1 ? pl.r.W() / pl.local_w : 1.0, pic.w});
+        }
+    }
+    const Rect screen{0, 0, static_cast<double>(kDrawW), static_cast<double>(kDrawH)};
+    struct Move {
+        size_t item;
+        double dx, dy;
+    };
+    std::vector<Move> moves;
+    for (size_t i = 0; i < items.size(); ++i) {
+        const Item& u = items[i];
+        // Everything not inside the moving widget must stay clear of it.
+        std::vector<Rect> others;
+        for (const Thing& th : pics)
+            if (!inside(th, u.w) && !nested(u.r, th.r)) others.push_back(th.r);
+        for (const Thing& th : texts)
+            if (!inside(th, u.w) && !nested(u.r, th.r)) others.push_back(th.r);
+        auto blocked = [&](const Rect& r, Rect* hit) {
+            for (const Rect& o : others)
+                if (Touches(r, o)) {
+                    *hit = o;
+                    return true;
+                }
+            return false;
+        };
+        constexpr double kGap = 16, kMax = 120;
+        double best_dx = 0, best_dy = 0, best = 1e9;
+        for (int dir = 0; dir < 4; ++dir) {
+            double dx = 0, dy = 0;
+            for (int step = 0; step < 6; ++step) {
+                Rect r{u.r.x0 + dx, u.r.y0 + dy, u.r.x1 + dx, u.r.y1 + dy};
+                Rect o;
+                if (!blocked(r, &o)) {
+                    double d = std::fabs(dx) + std::fabs(dy);
+                    if (step > 0 && d < best && d <= kMax && RunsPast(r, screen) <= 0) {
+                        best = d;
+                        best_dx = dx;
+                        best_dy = dy;
+                    }
+                    break;
+                }
+                // Past what it ran into, never back the other way.
+                const double was = dir < 2 ? dx : dy;
+                if (dir == 0) dx = std::min(dx, o.x0 - u.r.x1 - kGap);
+                if (dir == 1) dx = std::max(dx, o.x1 - u.r.x0 + kGap);
+                if (dir == 2) dy = std::min(dy, o.y0 - u.r.y1 - kGap);
+                if (dir == 3) dy = std::max(dy, o.y1 - u.r.y0 + kGap);
+                if ((dir < 2 ? dx : dy) == was) break;
+            }
+        }
+        if (best > 1e8) {
+            log::Info("world menu: %s: %s runs into %s, but there's no clear spot within %.0f px to move it to",
+                      p.name.c_str(), ue::GetName(u.w).c_str(), ue::GetName(u.hit).c_str(), kMax);
+            continue;
+        }
+        moves.push_back({i, best_dx, best_dy});
+    }
+    // Parts lined up on the same edge move together (a column stays a column).
+    for (auto& m : moves) {
+        for (const auto& o : moves) {
+            const Rect &a = items[m.item].r, &b = items[o.item].r;
+            if (m.dx != 0 && o.dx != 0 && (m.dx < 0) == (o.dx < 0) && std::fabs(a.x0 - b.x0) <= 2 &&
+                std::fabs(o.dx) > std::fabs(m.dx))
+                m.dx = o.dx;
+            if (m.dy != 0 && o.dy != 0 && (m.dy < 0) == (o.dy < 0) && std::fabs(a.y0 - b.y0) <= 2 &&
+                std::fabs(o.dy) > std::fabs(m.dy))
+                m.dy = o.dy;
+        }
+    }
+    // The rest of a column (or row) goes with it: widgets beside a moved one,
+    // in the same box and lined up on the same edge, if their new spot is
+    // clear too (the level select's OFFICE and Return Home buttons under its
+    // LEVEL title, which is what ran into the divider line).
+    const size_t n_moves = moves.size();
+    for (size_t k = 0; k < n_moves; ++k) {
+        const Move m = moves[k];
+        const Item u = items[m.item];
+        UObject parent = ParentOf(u.w);
+        if (!parent || !L.panel_class || !IsA(parent, L.panel_class)) continue;
+        std::vector<UObject> kids;
+        Children(parent, 64, &kids);
+        for (UObject kid : kids) {
+            if (kid == u.w || seen.count(kid)) continue;
+            Placed pl = PlaceOf(kid, false);
+            if (!pl.ok || !Drawn(pl.r)) continue;
+            const bool col = m.dx != 0 && std::fabs(pl.r.x0 - u.r.x0) <= 2;
+            const bool row = m.dy != 0 && std::fabs(pl.r.y0 - u.r.y0) <= 2;
+            if (!col && !row) continue;
+            const double dx = col ? m.dx : 0, dy = row ? m.dy : 0;
+            const Rect to{pl.r.x0 + dx, pl.r.y0 + dy, pl.r.x1 + dx, pl.r.y1 + dy};
+            if (RunsPast(to, screen) > 0) continue;
+            auto stays = [&](const Thing& th) {  // not part of anything that moves
+                if (inside(th, kid)) return false;
+                for (const auto& mm : moves)
+                    if (inside(th, items[mm.item].w)) return false;
+                return !nested(pl.r, th.r);
+            };
+            bool clear = true;
+            for (const Thing& th : pics)
+                if (stays(th) && Touches(to, th.r)) clear = false;
+            for (const Thing& th : texts)
+                if (stays(th) && Touches(to, th.r)) clear = false;
+            if (!clear) continue;
+            seen.insert(kid);
+            items.push_back({kid, pl.r, pl.local_w > 1 ? pl.r.W() / pl.local_w : 1.0, u.hit, u.w});
+            moves.push_back({items.size() - 1, dx, dy});
+        }
+    }
+    struct WidgetTransform {
+        Vector2D translation, scale, shear;
+        float angle;
+    };
+    for (const auto& m : moves) {
+        const Item& u = items[m.item];
+        WidgetTransform wt{};
+        Vector2D now{0, 0};
+        if (ue::GetProp(u.w, "RenderTransform", wt)) now = wt.translation;
+        Vector2D to{now.x + m.dx / u.factor, now.y + m.dy / u.factor};
+        ue::Call c(u.w, "SetRenderTranslation");
+        c.Set("Translation", to);
+        bool ok = c.Invoke();
+        changed = changed || ok;
+        log::Info("world menu: %s: %s (at %.0f,%.0f %.0fx%.0f) %s %s: moved %+.0f,%+.0f px%s", p.name.c_str(),
+                  ue::GetName(u.w).c_str(), u.r.x0, u.r.y0, u.r.W(), u.r.H(), u.leader ? "lined up with" : "ran into",
+                  ue::GetName(u.leader ? u.leader : u.hit).c_str(), m.dx, m.dy, ok ? "" : " (the engine refused)");
+    }
+    return changed;
+}
+
 // Runs each frame while texts are being grown. Returns true once they fit
 // (or there is nothing to grow), so the menu can be zoomed.
 bool TextStep(Panel& p) {
@@ -3315,11 +3574,16 @@ void UpdatePointer() {
 // the exposure of the player's post-process. A flat menu is drawn after that
 // and never sees it, but ours are in the world, so in a dark area the death
 // screen's kill shot came out pure white and its orange buttons pale yellow,
-// while the same menus looked right in lit rooms (owner 2026-11-03: the
-// buttons are "too bright"; headset picture of the 10:08 run). The menus are
-// dimmed by as many stops as the world is brightened past the brightest
-// place seen this run (and never past menu_exposure_ref), so they look the
-// same everywhere.
+// (owner 2026-11-03: the buttons are "too bright"; headset picture of the
+// 10:08 run). The game's exposure is about +1.1 stops in lit rooms (manual
+// bias 11 with the physical camera's EV100 9.9) and +2.6 in the dark area of
+// the 11:00 run. Dimming only past the lit rooms' level (the first try) left
+// the death screen's kill shot near white and its orange buttons yellow, and
+// the level select's brown Enter button came out yellow in a lit room too:
+// the headset picture matches the panel's own colours at about 0.4 of a 1:1
+// exposure (raw value 0.55 showed as 0.94 at 1.76). So the menus are drawn
+// at 2^-(exposure - menu_full_brightness_at) with the reference at -1 stops,
+// wherever you are.
 UObject g_player = 0;  // game thread
 int g_player_index = -1;
 
@@ -3332,7 +3596,6 @@ void ApplyBrightness() {
 void UpdateBrightness(double now) {
     static double s_next = 0;
     static size_t s_panels = 0;
-    static double s_low = 1e9;      // the brightest place seen this run (fewest stops)
     static float s_logged = -1.f;   // the brightness last written to the log
     const bool new_menu = G.panels.size() > s_panels;
     s_panels = G.panels.size();
@@ -3343,16 +3606,14 @@ void UpdateBrightness(double now) {
     if (S.follow_exposure && g_player && Alive(g_player, g_player_index) && ue::GetProp(g_player, "PostProcess", pp) &&
         pp)
         e = render_fixes::ReadExposure(pp);
-    double ref = S.exposure_ref;
+    const double ref = S.exposure_ref;
     float gain = g_menu_gain;  // the player can't be read (e.g. between levels): keep what we had
     if (!S.follow_exposure) {
         gain = S.brightness;
     } else if (e.ok && e.bias_set) {  // set by the game (not the engine's default before it does)
-        s_low = std::min(s_low, static_cast<double>(e.stops));
-        ref = std::max(ref, s_low);
-        gain = S.brightness * static_cast<float>(std::pow(2.0, -std::max(0.0, e.stops - ref)));
+        gain = S.brightness * static_cast<float>(std::pow(2.0, -(e.stops - ref)));
     }
-    gain = std::clamp(gain, S.brightness_min, 2.f);
+    gain = std::clamp(gain, S.brightness_min, 4.f);
     const bool changed = std::fabs(gain - g_menu_gain) > 0.02f * std::max(gain, g_menu_gain);
     if (changed) {
         g_menu_gain = gain;
@@ -3365,9 +3626,9 @@ void UpdateBrightness(double now) {
     if (g_player && Alive(g_player, g_player_index)) ue::GetProp(g_player, "Exposure_BaseBrightness", base);
     if (e.ok)
         log::Info("world menu: menus drawn at %.2f brightness (game exposure %+.2f stops: bias %.2f%s, method %d%s%s, "
-                  "area brightness %.2f; brightest place this run %+.2f, reference %+.2f) [%s]",
+                  "area brightness %.2f; reference %+.2f) [%s]",
                   gain, e.stops, e.bias, e.bias_set ? "*" : "", e.method, e.method_set ? "*" : "",
-                  e.physical ? ", physical camera" : "", base, s_low, ref, render_fixes::ExposureReport().c_str());
+                  e.physical ? ", physical camera" : "", base, ref, render_fixes::ExposureReport().c_str());
     else
         log::Info("world menu: menus drawn at %.2f brightness (player's exposure not readable now%s) [%s]", gain,
                   S.follow_exposure ? "" : "; menu_follow_exposure=0", render_fixes::ExposureReport().c_str());
@@ -3511,7 +3772,10 @@ void OnGameFrame() {
             if (on_panel || now - p.hosted_at >= 1.0) {
                 const bool was_growing = p.text_phase != kTextOff;
                 if (TextStep(p)) {
-                    if (p.fit_pending && FitContent(p)) {
+                    if (SeparateParts(p)) p.fit_wait = 3;  // laid out at the new spots first
+                    if (p.fit_wait > 0) {
+                        --p.fit_wait;
+                    } else if (p.fit_pending && FitContent(p)) {
                         p.fit_pending = false;
                         PosePanel(p);
                         SetPanelOpacity(p.comp, 1.f);
@@ -3846,9 +4110,13 @@ void Init() {
     S.fit_shape = config::GetBool("menu_fit_shape", true);
     S.fit_min_zoom = std::clamp(config::GetFloat("menu_fit_min_zoom", 1.3f), 1.f, 3.f);
     S.follow_exposure = config::GetBool("menu_follow_exposure", true);
-    S.exposure_ref = std::clamp(config::GetFloat("menu_exposure_ref", 0.f), -15.f, 15.f);
-    S.brightness = std::clamp(config::GetFloat("menu_brightness", 1.f), 0.05f, 2.f);
-    S.brightness_min = std::clamp(config::GetFloat("menu_brightness_min", 0.1f), 0.01f, 1.f);
+    // New names (2026-11-03): the first version's menu_exposure_ref=0 and
+    // menu_brightness_min=0.1 are already in players' hole-vr.ini and meant
+    // something else, so they are left there unread.
+    S.exposure_ref = std::clamp(config::GetFloat("menu_full_brightness_at", -1.f), -15.f, 15.f);
+    S.brightness = std::clamp(config::GetFloat("menu_brightness", 1.f), 0.05f, 4.f);
+    S.brightness_min = std::clamp(config::GetFloat("menu_dimmest", 0.03f), 0.005f, 1.f);
+    S.separate = config::GetBool("menu_move_parts_apart", true);
     S.text_min_px = std::clamp(config::GetFloat("menu_text_min_px", 32.f), 0.f, 120.f);
     S.text_max_px = std::clamp(config::GetFloat("menu_text_max_px", 64.f), 10.f, 200.f);
     S.text_max_scale = std::clamp(config::GetFloat("menu_text_max_scale", 2.5f), 1.f, 4.f);
