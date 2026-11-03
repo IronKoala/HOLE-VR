@@ -52,6 +52,7 @@ whatever the laser is on). A step writes the ini key(s) into `hole-vr.ini` in pl
 | Rifle stock | On, Off | `rifle_virtual_stock` |
 | Gun stops at walls | On, Off | `gun_wall_collision` |
 | Gun kick | Off, Light, Normal, Strong | `gun_recoil_kick` |
+| Monitor shows | Right eye, Left eye, Both eyes | `monitor_view` (right, left, both) |
 | Calibrate body | (action) | after the menu closes: height at 2 to 4 s (`standing_height_cm`), arms at 5 s (`body-measure.ini`) |
 | Edit hand grips | (action) | opens the grip editor once the menu closes; while it is open the row reads "open, click to close" and closes it |
 | Move holsters | (action) | 5 s after the menu closes (a buzz each second), each holster moves to where the hand holding its item is |
@@ -172,6 +173,32 @@ for 0.4 s around the first three shots the weapon lab trace logs the game's
 own gun and player events. With the owner's report of where the bullet hole
 appeared, this says whether shots need moving to the muzzle.
 
+## Monitor view (src/vr/spectator.cpp, src/vr/spectator_math.cpp)
+
+What the game window on the monitor shows, so OBS or the NVIDIA app can record
+a normal-looking game picture. Steam's own Game Recording can't be used: it
+refuses to record while SteamVR runs over Steam Link (the Steam Frame), with
+"VRLink driver in use; can't start recording" in Steam's
+`logs/streaming_log.txt`.
+
+- The engine draws both eyes side by side into the window, and the headset
+  picture is copied from there first (openxr.cpp `CopyEyes`). Only then, on
+  the same GPU queue and right before the window is shown, the window is
+  redrawn: the chosen eye's half is cropped to `monitor_view_aspect` (16:9),
+  centred on straight ahead for that eye (its field of view is off-centre),
+  scaled to fill the window's height or width and centred on black.
+- On the 3440x1440 ultrawide: the right eye's 1720x968 middle is shown as
+  2560x1440 with black bars left and right. On a 16:9 monitor it fills the
+  screen.
+- `monitor_view=both` keeps the old side-by-side picture. The headset picture
+  is the same either way.
+- Needs `d3dcompiler_47.dll` (part of Windows 10 and 11) for its one small
+  shader; without it, or if any step fails, the log says so once and the
+  monitor keeps showing both eyes.
+- Log: `monitor view: right eye, 16:9`, then `monitor view: showing right eye
+  WxH from (x,y) as WxH at (x,y) in the WxH window`. Cost shows in the perf
+  report as "monitor view (one eye on the monitor)".
+
 ## Log lines to check after a test
 
 - `vr options: ready (a VR tab is added to Options)` at start.
@@ -207,3 +234,5 @@ appeared, this says whether shots need moving to the muzzle.
 - `tests/test_vr_options.cpp`: ini edit in place, menu rows, current choice,
   teleport and hop to jump off by default, action rows.
 - `tests/test_teleport.cpp`: arc, stick gesture, landing check.
+- `tests/test_spectator.cpp`: monitor view crop and placement, straight ahead
+  from the field of view, ini value parsing.

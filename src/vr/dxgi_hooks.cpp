@@ -10,6 +10,7 @@
 #include "core/perf.h"
 #include "hooks/hooks.h"
 #include "vr/openxr.h"
+#include "vr/spectator.h"
 
 namespace holevr::vr::dxgi_hooks {
 namespace {
@@ -50,6 +51,9 @@ UINT BeforePresent(IDXGISwapChain* sc, UINT sync_interval) {
         sc3->Release();
     }
     xr::OnPresent(g_queue.load(), back_buffer);
+    // After the headset copy (queued above on the same queue): the monitor
+    // shows one eye instead of both side by side.
+    spectator::Draw(g_queue.load(), back_buffer);
     // The swap chain keeps its buffers alive; we only borrow this one for the frame.
     if (back_buffer) back_buffer->Release();
     t_in_present = false;
