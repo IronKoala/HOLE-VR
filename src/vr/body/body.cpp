@@ -1137,7 +1137,7 @@ int PickSlideHold(const hands::HandState& h, const hands::Pose& gun, UObject gun
     // slide (owner 2026-11-03: "a little bit longer and extended past the back
     // of the slide by about .25 of an inch"). Same as the controls grab zone.
     static const double pinch_sight = config::GetFloat("hand_slide_pinch_radius_cm", 6.5f);
-    static const double pinch_back = config::GetFloat("hand_slide_pinch_back_cm", 0.64f);
+    static const double pinch_back = config::GetFloat("hand_slide_pinch_back_cm", 10.f);
     FVector sight_w, rear_w, front_w;
     const bool shape = SlideMarksWorld(gun_actor, gun.rotation, &sight_w, &rear_w, &front_w);
     double split = 5.0, to_sight = -1;
