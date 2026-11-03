@@ -16,6 +16,7 @@
 #include "ue/reflection.h"
 #include "vr/body/body.h"
 #include "vr/controls.h"
+#include "vr/hands.h"
 #include "vr/input.h"
 #include "vr/vr_menu_model.h"
 
@@ -264,6 +265,9 @@ std::string Current(const char* key) { return config::GetString(key, ""); }
 
 void LabelRow(RowWidget& r) {
     const auto& row = vr_menu::Rows()[static_cast<size_t>(r.row)];
+    // The grip editor row says whether the editor is open (the menu can be
+    // opened while it is, and the same row closes it).
+    if (row.kind == vr_menu::RowKind::kGripEditor) r.choice = hands::EditorHand() >= 0 ? 1 : 0;
     std::wstring w = Widen(vr_menu::RowText(row, r.choice));
     for (UObject t : r.texts) SetText(t, w);
 }
@@ -282,6 +286,21 @@ void ClickRow(RowWidget& r) {
         controls::RequestHeightMeasure();
         log::Info("vr options: Calibrate body clicked; once the menu closes, stand straight with your arms out to "
                   "the sides (height after 2 s, arms after 5 s)");
+        input::Haptic(input::kLeft, 0.4f, 0.05f);
+        return;
+    }
+    if (row.kind == vr_menu::RowKind::kGripEditor) {
+        const bool open = hands::EditorHand() >= 0;
+        controls::RequestGripEditor();
+        log::Info("vr options: Edit hand grips clicked; the grip editor %s once the menu closes",
+                  open ? "closes" : "opens");
+        input::Haptic(input::kLeft, 0.4f, 0.05f);
+        return;
+    }
+    if (row.kind == vr_menu::RowKind::kMoveHolsters) {
+        controls::RequestHolsterMove();
+        log::Info("vr options: Move holsters clicked; once the menu closes, hold each item where you want its "
+                  "holster (5 s countdown, a buzz each second)");
         input::Haptic(input::kLeft, 0.4f, 0.05f);
         return;
     }

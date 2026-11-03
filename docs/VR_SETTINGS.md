@@ -45,6 +45,12 @@ writes the ini key(s) into `hole-vr.ini` in place (comments and layout kept,
 | Gun stops at walls | On, Off | `gun_wall_collision` |
 | Gun kick | Off, Light, Normal, Strong | `gun_recoil_kick` |
 | Calibrate body | (action) | after the menu closes: height at 2 to 4 s (`standing_height_cm`), arms at 5 s (`body-measure.ini`) |
+| Edit hand grips | (action) | opens the grip editor once the menu closes; while it is open the row reads "open, click to close" and closes it |
+| Move holsters | (action) | 5 s after the menu closes (a buzz each second), each holster moves to where the hand holding its item is |
+
+Move holsters is here because the right stick click (which used to be held
+for it) is now the kick. The grip editor (left Y hold) and the arm measure
+(left stick click hold) still open on their buttons too.
 
 Why cycle buttons and not the game's sliders, checkboxes and dropdowns: the
 game's option rows are bound to its own settings object, and dropdowns open a
@@ -141,7 +147,7 @@ appeared, this says whether shots need moving to the muzzle.
 - `vr options: ready (a VR tab is added to Options)` at start.
 - `vr options: following clicks through ...` the first time Options opens.
 - `vr options: VR tab button added to ...` and `vr options: VR page added to
-  Options (22 rows ...)` each time Options opens.
+  Options (24 rows ...)` each time Options opens.
 - `vr options: VR tab opened` when the VR tab is clicked.
 - `vr options: <row> -> <choice> (key=value)` and `settings: saved key=value in
   hole-vr.ini` on each click, then `controls: settings changed (...)`.
@@ -150,6 +156,9 @@ appeared, this says whether shots need moving to the muzzle.
 - `controls: physical crouch (...)` / `physical stand (...)`.
 - `teleport: arc uses ...`, `teleport: moved N cm`, `teleport: no room ...`.
 - `controls: height measured: your eyes are N cm above the floor`.
+- `vr options: Edit hand grips clicked ...` then `controls: opening/closing the
+  grip editor (asked for from the VR tab)`.
+- `vr options: Move holsters clicked ...` then the holster countdown lines.
 - `shot study 1: barrel line hits ... camera line hits ... N cm apart`, `shot
   study: gun ... fire functions: ...`, `lab: [..s] gun.<event>`.
 
@@ -157,5 +166,6 @@ appeared, this says whether shots need moving to the muzzle.
 
 - `tests/test_comfort.cpp`: vignette texture, levels, smoothing, real crouch
   and jump, aim smoothing, grip toggle.
-- `tests/test_vr_options.cpp`: ini edit in place, menu rows, current choice.
+- `tests/test_vr_options.cpp`: ini edit in place, menu rows, current choice,
+  teleport and hop to jump off by default, action rows.
 - `tests/test_teleport.cpp`: arc, stick gesture, landing check.
