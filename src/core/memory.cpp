@@ -129,6 +129,34 @@ bool IsReadable(uintptr_t p, size_t len) {
     return true;
 }
 
+bool RegionMemo::IsReadable(uintptr_t p, size_t len) {
+    if (p < 0x10000 || p >= 0x00007FFFFFFFFFFFull) return false;
+    uintptr_t end = p + len;
+    while (p < end) {
+        auto it = std::upper_bound(regions_.begin(), regions_.end(), p,
+                                   [](uintptr_t v, const Region& r) { return v < r.start; });
+        if (it != regions_.begin() && p < (it - 1)->end) {
+            if (!(it - 1)->readable) return false;
+            p = (it - 1)->end;
+            continue;
+        }
+        MEMORY_BASIC_INFORMATION mbi;
+        if (!VirtualQuery(reinterpret_cast<void*>(p), &mbi, sizeof(mbi))) return false;
+        Region r;
+        r.start = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+        r.end = r.start + mbi.RegionSize;
+        r.readable = mbi.State == MEM_COMMIT && ProtectReadable(mbi.Protect);
+        if (r.end <= p) return false;  // never expected; don't loop on it
+        if (regions_.size() >= 8192) regions_.clear();
+        regions_.insert(std::lower_bound(regions_.begin(), regions_.end(), r.start,
+                                         [](const Region& a, uintptr_t v) { return a.start < v; }),
+                        r);
+        if (!r.readable) return false;
+        p = r.end;
+    }
+    return true;
+}
+
 bool IsWritable(uintptr_t p, size_t len) {
     if (p < 0x10000 || p >= 0x00007FFFFFFFFFFFull) return false;
     uintptr_t end = p + len;

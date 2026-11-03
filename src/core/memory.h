@@ -60,6 +60,30 @@ public:
     static unsigned Lookups();
 };
 
+// Remembers which memory regions were readable, for one pass over many
+// objects. The per-thread cache behind IsReadable holds 4 regions, and a pass
+// over every object touches more than that per object, so without this nearly
+// every read in a pass asks Windows again. Make one on the stack for a single
+// pass (milliseconds) and drop it: memory can be freed later, so never keep
+// one around.
+class RegionMemo {
+public:
+    bool IsReadable(uintptr_t p, size_t len);
+    template <typename T>
+    bool Read(uintptr_t p, T& out) {
+        if (!IsReadable(p, sizeof(T))) return false;
+        std::memcpy(&out, reinterpret_cast<const void*>(p), sizeof(T));
+        return true;
+    }
+
+private:
+    struct Region {
+        uintptr_t start, end;
+        bool readable;
+    };
+    std::vector<Region> regions_;  // sorted by start
+};
+
 // True if [p, p+len) is committed read/write memory (heap objects, not code).
 bool IsWritable(uintptr_t p, size_t len);
 
