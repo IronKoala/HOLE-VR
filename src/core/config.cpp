@@ -178,6 +178,22 @@ const Block kBlocks[] = {
      "menu_fit_content=1\n"
      "; Most a menu is zoomed (1 = never)\n"
      "menu_fit_max_zoom=3\n"},
+    {"menu_text_outline",
+     "\n"
+     "; Black outline around the text of menus on the arm, so it reads over a\n"
+     "; bright scene (layout pixels; 0 = off)\n"
+     "menu_text_outline=2\n"},
+    {"hud_on_forearm",
+     "\n"
+     "; 1 = the game's in-level HUD (kill feed, objectives, money, prompts) sits\n"
+     "; on your forearm where the menus go, and shows when you look at your arm.\n"
+     "; 0 = it stays on the flat screen (stuck to your face in the headset)\n"
+     "hud_on_forearm=1\n"
+     "; Its size, times the menu's size on the arm\n"
+     "hud_forearm_size=1.0\n"
+     "; It shows when the arm faces you within this many degrees, this close to your eyes\n"
+     "hud_forearm_look_deg=50\n"
+     "hud_forearm_distance_m=0.8\n"},
     {"wrist_hud",
      "\n"
      "; --- Wrist display ---\n"

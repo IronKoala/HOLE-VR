@@ -12,6 +12,7 @@
 #include "core/config.h"
 #include "core/log.h"
 #include "core/memory.h"
+#include "ue/call.h"
 #include "ue/objects.h"
 #include "ue/reflection.h"
 #include "vr/cvars.h"
@@ -141,6 +142,11 @@ int32_t g_pp_component_settings = -1, g_pp_volume_settings = -1, g_camera_settin
 refl::PropertyInfo g_capture_every_frame, g_capture_on_movement;
 bool g_disable_player_capture = true;
 bool g_ready = false;
+// The player's scene captures we stop (Apply), so the death screen can run
+// them again (AllowPlayerCapture), and whether it currently does.
+std::mutex g_captures_mutex;
+std::vector<Target> g_captures;
+std::atomic<bool> g_allow_capture{false};
 std::unordered_map<UObject, Kind> g_kinds;
 
 // Per-run counters so the log says what was touched without repeating itself.
@@ -296,7 +302,7 @@ void Apply() {
     // pass, or most reads ask Windows again (2026-11-03 performance pass).
     mem::ScopedRegionCache region_cache;
     Counts c;
-    std::vector<Target> targets;
+    std::vector<Target> targets, captures;
     ue::objects::ForEach([&](int, UObject obj) {
         uint32_t flags = mem::ReadOr<uint32_t>(obj + ue::off::kObjFlags, kSkipFlags);
         if (flags & kSkipFlags) return;
@@ -317,6 +323,8 @@ void Apply() {
             else if (k.settings_offset == g_pp_component_settings) ++c.components;
             else ++c.volumes;
         } else if (k.is_capture && g_disable_player_capture && IsPlayerCapture(obj)) {
+            captures.push_back({obj, mem::ReadOr<int32_t>(obj + ue::off::kObjIndex, -1), 0});
+            if (g_allow_capture.load()) return;  // the death screen shows its picture
             bool ok = true;
             if (g_capture_every_frame.bool_mask)
                 ok &= SetBool(obj + g_capture_every_frame.offset, g_capture_every_frame.bool_mask, false);
@@ -328,6 +336,10 @@ void Apply() {
     {
         std::lock_guard<std::mutex> lock(g_targets_mutex);
         g_targets.swap(targets);
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_captures_mutex);
+        g_captures.swap(captures);
     }
     if (c != g_last) {
         log::Info("render fixes applied: %d cameras, %d post-process components, %d volumes, "
@@ -386,6 +398,39 @@ int SetPauseBlur(bool on) {
 
 void ApplyPauseBlurCvars(uintptr_t context) {
     for (const auto& [name, value] : PauseBlurCvars()) vr::cvars::RunNow(name + " " + value, context);
+}
+
+// The death screen's picture of whoever killed you (UIM_Results_C's
+// IMG_Killer) may come from the player's own scene capture, which Apply
+// stops in VR because it draws the whole level a second time every frame.
+// While the death screen is up nothing is played, so the capture runs again
+// (and takes a picture at once); when it closes, Apply stops it again.
+int AllowPlayerCapture(bool allow) {
+    if (g_allow_capture.exchange(allow) == allow) return 0;
+    std::vector<Target> captures;
+    {
+        std::lock_guard<std::mutex> lock(g_captures_mutex);
+        captures = g_captures;
+    }
+    int n = 0;
+    for (const Target& t : captures) {
+        if (t.index < 0 || ue::objects::Get(t.index) != t.obj) continue;
+        uint32_t flags = mem::ReadOr<uint32_t>(t.obj + ue::off::kObjFlags, kSkipFlags);
+        if (flags & kSkipFlags) continue;
+        if (g_capture_every_frame.bool_mask)
+            SetBool(t.obj + g_capture_every_frame.offset, g_capture_every_frame.bool_mask, allow);
+        UObject target = 0;
+        ue::GetProp(t.obj, "TextureTarget", target);
+        if (allow) {
+            ue::Call c(t.obj, "CaptureScene");
+            c.Invoke();
+        }
+        log::Info("render fixes: player scene capture %s %s (picture into %s)", ue::GetName(t.obj).c_str(),
+                  allow ? "running again for the death screen" : "stopped again",
+                  target ? ue::GetName(target).c_str() : "nothing");
+        ++n;
+    }
+    return n;
 }
 
 }  // namespace holevr::vr::render_fixes

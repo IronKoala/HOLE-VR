@@ -38,6 +38,19 @@ dump of the shipping game (`hole-vr/dump/game_classes.txt`).
   `stereo::SetGameFrameCallback` (game thread, every rendered frame, also
   while paused). `menu_mode=window` brings back the flat-screen panel, which
   is also the automatic fallback.
+- **Menu zoom, outlines and the HUD on the forearm** (`world_menu.cpp`).
+  A menu on the arm is measured once it has been drawn on its panel: each
+  widget's cached geometry (where Slate drew it, read through
+  `SlateBlueprintLibrary`) gives the part of the 1920x1080 layout that shows
+  something, and the panel is zoomed (up to `menu_fit_max_zoom`) so that part
+  fills the menu's space on the arm. The menu is see-through for the frame
+  or two this takes. Every TextBlock in a menu gets a thin black font outline
+  (`menu_text_outline`) so it reads over a bright scene. The in-level HUD
+  (`UIM_HUD_C`, from `BP_Player_C.HUD`) goes on its own panel at the menu's
+  spot and fades in when the arm faces you (`hud_on_forearm`); the crosshair
+  dot and waypoint marker are hidden there. While the death screen is up the
+  player's scene capture runs again (`render_fixes::AllowPlayerCapture`) for
+  its picture of the killer.
 
 ## Game UI inventory
 

@@ -21,4 +21,8 @@ int SetPauseBlur(bool on);
 // Console settings the pause blur needs, applied at once (context: any object
 // in the game world, for the console command).
 void ApplyPauseBlurCvars(uintptr_t context);
+// Game thread: lets the player's scene capture (stopped in VR) run while the
+// death screen is up, for its picture of who killed you. Returns how many
+// captures were switched.
+int AllowPlayerCapture(bool allow);
 }  // namespace holevr::vr::render_fixes

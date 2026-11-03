@@ -71,6 +71,11 @@ struct Settings {
     bool arrive_buzz = true;      // buzz the menu hand when the game puts a menu on the arm
     bool fit = true;              // zoom each menu so its buttons fill the space on the arm
     float fit_max_zoom = 3.f;
+    int text_outline = 2;         // black outline around menu text, in layout pixels (0 = off)
+    bool hud = true;              // the in-level HUD on the forearm, shown when you look at it
+    float hud_size = 1.f;         // its width, times the menu's
+    float hud_look_deg = 50.f;    // shown when the arm faces you within this angle...
+    float hud_distance_m = 0.8f;  // ...and is this close to your eyes
     bool on_top = true;           // menus drawn over everything (no depth test)
     int black_box = 1;            // kBoxGrow / kBoxHide / kBoxOff (KeepBoxesAway)
 } S;
@@ -177,6 +182,8 @@ struct Panel {
     double zoom = 1.0;
     double cx = kDrawW * 0.5, cy = kDrawH * 0.5;
     double half_w = kDrawW * 0.5, half_h = kDrawH * 0.5;
+    bool fit_pending = false;  // waiting to be drawn on its panel once, to be measured
+    double regrow_at = -1;     // GrowHitArea after a click
 };
 
 struct Pointer {
@@ -184,7 +191,14 @@ struct Pointer {
     int hand = input::kRight;
     bool key_down = false;
     float scroll_accum = 0.f;
+    bool scroll_held = false;  // stick pushed since it was last centred
+    double scroll_t = 0;       // last scroll update (s)
+    int scroll_logs = 0;
     bool was_over_button = false;
+    // Where the laser last was on a menu (layout pixels from its pivot), so
+    // the stick scrolls there after the laser slips off.
+    UObject spot_widget = 0;
+    double spot_y = 0, spot_z = 0;
 };
 
 struct State {
@@ -245,17 +259,21 @@ struct Lookups {
     int32_t image_brush = -1, image_color = -1, border_brush = -1, border_color = -1;
     int32_t brush_tint = -1, brush_resource = -1, brush_draw_as = -1, slate_color = -1;
     int32_t render_opacity = -1;
-    // FitContent: CanvasPanel children's layout (CanvasPanelSlot.LayoutData).
-    UObject canvas_class = 0, canvas_slot_class = 0;
-    int32_t slot_offsets = -1, slot_anchor_min = -1, slot_anchor_max = -1, slot_alignment = -1;
-    int32_t slot_autosize = -1;
-    uint8_t slot_autosize_mask = 0;
+    // FitContent: where the engine drew each widget (SlateBlueprintLibrary on
+    // a widget's cached geometry), and the widget kinds the measuring treats
+    // specially.
+    UObject slate_lib = 0;      // SlateBlueprintLibrary default object
+    UObject scroll_class = 0, switcher_class = 0, spacer_class = 0;
+    // Outlined text (OutlineText): TextBlock.Font (FSlateFontInfo) and, inside
+    // it, OutlineSettings.OutlineSize / OutlineColor.
+    UObject text_class = 0;
+    int32_t text_font = -1, font_size = 0, outline_size = -1, outline_color = -1;
     // DrawOnTop: UMaterial.bDisableDepthTest, from the engine's property data.
     UObject material_class = 0;
     int32_t depth_off = -1;
     uint8_t depth_off_mask = 0;
     // The widget tree, read straight from the engine's fields (TreeRoot,
-    // Children, SlotOf, Visibility): Widget.Visibility and .Slot,
+    // Children, Visibility): Widget.Visibility and .Slot,
     // UserWidget.WidgetTree, WidgetTree.RootWidget, PanelWidget.Slots (an
     // array of slots) and PanelSlot.Content (the child widget in a slot).
     UObject panel_slot_class = 0;
@@ -335,37 +353,30 @@ void ResolveCustomSource() {
     log::Warn("world menu: EWidgetInteractionSource not readable; using Custom = %d", kSourceCustom);
 }
 
-// CanvasPanelSlot.LayoutData (FAnchorData): Offsets (FMargin: Left, Top,
-// Right, Bottom floats), Anchors (Minimum, Maximum: FVector2D, doubles in
-// UE5) and Alignment (FVector2D), plus bAutoSize.
+// FitContent measures menus from the engine's own layout, and OutlineText
+// edits TextBlock.Font: the classes, and the font fields from the engine's
+// property data (each checked for the size this code writes).
 void ResolveFitOffsets() {
     namespace rf = ue::reflection;
-    L.canvas_class = Lookup("Class /Script/UMG.CanvasPanel");
-    L.canvas_slot_class = Lookup("Class /Script/UMG.CanvasPanelSlot");
-    if (!L.canvas_class || !L.canvas_slot_class) return;
-    rf::PropertyInfo layout = rf::FindProperty(L.canvas_slot_class, "LayoutData");
-    rf::PropertyInfo autosize = rf::FindProperty(L.canvas_slot_class, "bAutoSize");
-    if (!layout.valid() || !layout.inner || !autosize.valid()) {
-        log::Warn("world menu: CanvasPanelSlot layout not found; menus are not zoomed to fit");
+    L.slate_lib = Lookup("SlateBlueprintLibrary /Script/UMG.Default__SlateBlueprintLibrary");
+    L.scroll_class = Lookup("Class /Script/UMG.ScrollBox");
+    L.switcher_class = Lookup("Class /Script/UMG.WidgetSwitcher");
+    L.spacer_class = Lookup("Class /Script/UMG.Spacer");
+    L.text_class = Lookup("Class /Script/UMG.TextBlock");
+    if (!L.text_class) return;
+    rf::PropertyInfo font = rf::FindProperty(L.text_class, "Font");
+    rf::PropertyInfo outline = font.valid() && font.inner ? rf::FindProperty(font.inner, "OutlineSettings") : rf::PropertyInfo{};
+    rf::PropertyInfo size = outline.valid() && outline.inner ? rf::FindProperty(outline.inner, "OutlineSize") : rf::PropertyInfo{};
+    rf::PropertyInfo color = outline.valid() && outline.inner ? rf::FindProperty(outline.inner, "OutlineColor") : rf::PropertyInfo{};
+    if (!font.valid() || font.element_size <= 0 || font.element_size > 0x200 || !size.valid() ||
+        size.element_size != 4 || !color.valid() || color.element_size != 16) {
+        log::Warn("world menu: TextBlock font layout not found; menu text keeps no outline");
         return;
     }
-    rf::PropertyInfo offsets = rf::FindProperty(layout.inner, "Offsets");
-    rf::PropertyInfo anchors = rf::FindProperty(layout.inner, "Anchors");
-    rf::PropertyInfo align = rf::FindProperty(layout.inner, "Alignment");
-    rf::PropertyInfo amin = anchors.valid() && anchors.inner ? rf::FindProperty(anchors.inner, "Minimum") : rf::PropertyInfo{};
-    rf::PropertyInfo amax = anchors.valid() && anchors.inner ? rf::FindProperty(anchors.inner, "Maximum") : rf::PropertyInfo{};
-    // Only the layout this code reads: four floats, and doubles for the vectors.
-    if (!offsets.valid() || offsets.element_size != 16 || !align.valid() || align.element_size != 16 ||
-        !amin.valid() || amin.element_size != 16 || !amax.valid() || amax.element_size != 16) {
-        log::Warn("world menu: AnchorData layout is not the one expected; menus are not zoomed to fit");
-        return;
-    }
-    L.slot_offsets = layout.offset + offsets.offset;
-    L.slot_anchor_min = layout.offset + anchors.offset + amin.offset;
-    L.slot_anchor_max = layout.offset + anchors.offset + amax.offset;
-    L.slot_alignment = layout.offset + align.offset;
-    L.slot_autosize = autosize.offset;
-    L.slot_autosize_mask = autosize.bool_mask ? autosize.bool_mask : 0xFF;
+    L.text_font = font.offset;
+    L.font_size = font.element_size;
+    L.outline_size = outline.offset + size.offset;
+    L.outline_color = outline.offset + color.offset;
 }
 
 // Offsets for walking a menu's widget tree without calling into the engine
@@ -744,14 +755,6 @@ UObject TreeRoot(UObject user_widget) {
     return 0;
 }
 
-// The layout slot a widget sits in inside its parent panel, or 0.
-UObject SlotOf(UObject widget) {
-    if (L.widget_slot >= 0) return mem::ReadOr<UObject>(widget + L.widget_slot, 0);
-    UObject slot = 0;
-    ue::GetProp(widget, "Slot", slot);
-    return slot;
-}
-
 void ChildrenByCall(UObject panel, int max, std::vector<UObject>* out) {
     ue::Call count(panel, "GetChildrenCount");
     int n = count.Invoke() ? count.Result<int32_t>() : 0;
@@ -802,7 +805,7 @@ void Children(UObject panel, int max, std::vector<UObject>* out) {
 // e.g. its buttons) and collects any BackgroundBlur. Returns how many widgets
 // it looked at. Uses the engine's own PanelWidget.GetChildAt, so it only
 // touches the menu's widgets.
-int FindBlurs(UObject menu, std::vector<UObject>* blurs) {
+int FindBlurs(UObject menu, std::vector<UObject>* blurs, std::vector<UObject>* texts) {
     if (!L.panel_class || !L.user_widget_class) return 0;
     int seen = 0;
     std::vector<std::pair<UObject, int>> todo;  // widget, depth
@@ -816,6 +819,7 @@ int FindBlurs(UObject menu, std::vector<UObject>* blurs) {
         todo.pop_back();
         ++seen;
         if (L.blur_class && IsA(w, L.blur_class)) blurs->push_back(w);
+        if (texts && L.text_class && IsA(w, L.text_class)) texts->push_back(w);
         if (depth >= 32) continue;
         if (IsA(w, L.user_widget_class)) {
             push_tree(w, depth + 1);
@@ -930,10 +934,17 @@ int HideBackdrops(UObject menu, const std::string& menu_name) {
 // menu is a narrow column in the middle. Shrinking the whole screen onto the
 // arm left the text tiny (owner 2026-11-02: "the menu is big enough but its
 // still hard to read the text ... larger text but they dont overlap, and they
-// still fit the individual boxes"). So each menu is measured from its own
-// layout (where the game's CanvasPanel puts each part) and zoomed until the
-// part holding its buttons fills the space the whole screen used to take on
-// the arm. Text and boxes grow together, so nothing overlaps or spills out.
+// still fit the individual boxes"). So once a menu has been drawn on its
+// panel, the part of it that shows something is measured where the engine
+// actually drew it (each widget's cached geometry), and the panel is zoomed
+// until that part fills the space the whole screen used to take on the arm.
+// Text and boxes grow together, so nothing overlaps or spills out.
+//
+// The first version (2026-11-02) worked the layout out from CanvasPanel
+// slots and never measured a single menu: every menu's top widget is a
+// ScaleBox, which it didn't follow (owner's 2026-11-03 run: "couldn't
+// measure its layout" for Pause, Options, Task, area select and results).
+// Reading the engine's own layout doesn't depend on what a menu is built of.
 
 struct Rect {
     double x0 = 0, y0 = 0, x1 = 0, y1 = 0;
@@ -941,105 +952,143 @@ struct Rect {
     double H() const { return y1 - y0; }
 };
 
-Vector2D DesiredSize(UObject w) {
-    ue::Call c(w, "GetDesiredSize");
-    return c.Invoke() ? c.Result<Vector2D>() : Vector2D{0, 0};
-}
-
-// Where a CanvasPanel child sits inside the canvas's own rectangle.
-bool SlotRect(UObject child, UObject slot, const Rect& parent, Rect* out) {
-    uintptr_t b = static_cast<uintptr_t>(slot);
-    struct Margin {
-        float l, t, r, b;
+// Where the engine last drew a widget, in its window's pixels (for a menu on
+// a panel: the panel's 1920x1080 layout). Three engine calls: the widget's
+// cached geometry, then SlateBlueprintLibrary turns it into a position and a
+// size, so nothing here depends on how FGeometry is laid out.
+bool WidgetRect(UObject w, Rect* out) {
+    if (!L.slate_lib || !w) return false;
+    ue::Call g(w, "GetCachedGeometry");
+    if (!g.Invoke()) return false;
+    int32_t size = 0;
+    const uint8_t* geo = g.Raw("ReturnValue", &size);
+    if (!geo || size <= 0) return false;
+    auto with_geometry = [&](ue::Call& c) {
+        int32_t want = 0;
+        uint8_t* dst = c.Raw("Geometry", &want);
+        if (!dst || want != size) return false;
+        std::memcpy(dst, geo, static_cast<size_t>(size));
+        return true;
     };
-    Margin m = mem::ReadOr<Margin>(b + L.slot_offsets, Margin{0, 0, 0, 0});
-    Vector2D amin = mem::ReadOr<Vector2D>(b + L.slot_anchor_min, Vector2D{0, 0});
-    Vector2D amax = mem::ReadOr<Vector2D>(b + L.slot_anchor_max, Vector2D{0, 0});
-    Vector2D al = mem::ReadOr<Vector2D>(b + L.slot_alignment, Vector2D{0, 0});
-    bool autosize = (mem::ReadOr<uint8_t>(b + L.slot_autosize, 0) & L.slot_autosize_mask) != 0;
-    auto sane = [](double v) { return std::isfinite(v) && v > -10.0 && v < 10.0; };
-    if (!sane(amin.x) || !sane(amin.y) || !sane(amax.x) || !sane(amax.y) || !sane(al.x) || !sane(al.y)) return false;
-    Vector2D want = autosize ? DesiredSize(child) : Vector2D{m.r, m.b};
-    auto axis = [&](double lo, double size, double a0, double a1, float o0, float o1, double align, double desired,
-                    double* r0, double* r1) {
-        if (std::fabs(a1 - a0) < 1e-6) {  // anchored at a point: the offsets are position and size
-            double start = lo + a0 * size + o0 - align * desired;
-            *r0 = start;
-            *r1 = start + desired;
-        } else {  // stretched between two anchors: the offsets are margins
-            *r0 = lo + a0 * size + o0;
-            *r1 = lo + a1 * size - o1;
-        }
-    };
-    axis(parent.x0, parent.W(), amin.x, amax.x, m.l, m.r, al.x, want.x, &out->x0, &out->x1);
-    axis(parent.y0, parent.H(), amin.y, amax.y, m.t, m.b, al.y, want.y, &out->y0, &out->y1);
-    return std::isfinite(out->x0) && std::isfinite(out->x1) && std::isfinite(out->y0) && std::isfinite(out->y1);
+    ue::Call at(L.slate_lib, "LocalToAbsolute");
+    ue::Call extent(L.slate_lib, "GetAbsoluteSize");
+    if (!with_geometry(at) || !with_geometry(extent)) return false;
+    at.Set("LocalCoordinate", Vector2D{0, 0});
+    if (!at.Invoke() || !extent.Invoke()) return false;
+    Vector2D a = at.Result<Vector2D>(), e = extent.Result<Vector2D>();
+    if (!std::isfinite(a.x) || !std::isfinite(a.y) || !std::isfinite(e.x) || !std::isfinite(e.y) || e.x < 0 ||
+        e.y < 0)
+        return false;
+    *out = {a.x, a.y, a.x + e.x, a.y + e.y};
+    return true;
 }
 
-bool Covers(const Rect& r, const Rect& screen) {
-    return r.W() >= screen.W() * 0.9 && r.H() >= screen.H() * 0.9;
-}
-
-// Adds the parts of `w` (laid out in `r`) that show something to `box`.
-void Measure(UObject w, const Rect& r, const Rect& screen, int depth, Rect* box, bool* any, int* seen) {
-    if (!w || ++*seen > 600 || depth > 12) return;
-    uint8_t vis = Visibility(w);
-    if (vis == kCollapsed || vis == kHidden) return;
-    if (IsA(w, L.user_widget_class)) {
-        // A user widget that fills its spot with its own canvas: look inside.
-        UObject root = TreeRoot(w);
-        if (root && IsA(root, L.canvas_class)) {
-            Measure(root, r, screen, depth + 1, box, any, seen);
-            return;
-        }
-    } else if (IsA(w, L.canvas_class)) {
-        std::vector<UObject> kids;
-        Children(w, 128, &kids);
-        for (UObject child : kids) {
-            UObject slot = SlotOf(child);
-            if (!slot || !IsA(slot, L.canvas_slot_class)) continue;
-            Rect cr;
-            if (SlotRect(child, slot, r, &cr)) Measure(child, cr, screen, depth + 1, box, any, seen);
-        }
-        return;
-    }
-    Rect use = r;
-    if (Covers(r, screen)) {
-        // Something stretched over the whole screen (an overlay holding the
-        // real content in its middle): count its content's size, centred.
-        Vector2D d = DesiredSize(w);
-        if (d.x <= 1 || d.y <= 1 || d.x >= screen.W() * 0.9) return;
-        double mx = (r.x0 + r.x1) * 0.5, my = (r.y0 + r.y1) * 0.5;
-        use = {mx - d.x * 0.5, my - d.y * 0.5, mx + d.x * 0.5, my + d.y * 0.5};
-    }
-    if (use.W() <= 1 || use.H() <= 1) return;
-    if (!*any) *box = use;
-    else *box = {std::min(box->x0, use.x0), std::min(box->y0, use.y0), std::max(box->x1, use.x1),
-                 std::max(box->y1, use.y1)};
-    *any = true;
-}
-
-void FitContent(Panel& p) {
-    if (!S.fit || L.slot_offsets < 0 || !L.canvas_class || !L.user_widget_class) return;
-    CallVoid(p.widget, "ForceLayoutPrepass");  // so the desired sizes are known
+struct MeasureWalk {
     Rect screen{0, 0, static_cast<double>(kDrawW), static_cast<double>(kDrawH)};
     Rect box;
     bool any = false;
-    int seen = 0;
-    Measure(p.widget, screen, screen, 0, &box, &any, &seen);
-    if (!any) {
-        log::Info("world menu: %s: couldn't measure its layout, shown whole (%d widgets looked at)", p.name.c_str(), seen);
+    int asked = 0;    // widgets whose geometry was read
+    int counted = 0;  // parts that make up the box
+    int wide = 0;     // full-width or full-height strips left out
+};
+
+bool InvisibleImage(UObject w) {
+    if (!L.image_class || L.image_brush < 0 || !IsA(w, L.image_class)) return false;
+    BrushLook b = ReadBrush(w, L.image_brush, L.image_color);
+    return !b.drawn || b.alpha < 0.02f;
+}
+
+// Adds the parts of `w` that show something to the box. Buttons, tab pages
+// and other parts built as their own widget count as one piece (one engine
+// read each), a scrolling list as the part of it you can see, and of a
+// switcher only the page it shows. Anything as big as the screen is a layer
+// (a background, or an overlay holding the real content): looked inside if
+// it is a widget of its own, else left out. So are strips running the whole
+// width or height (lines and bars along an edge), which would stop any zoom.
+void Measure(UObject w, int depth, MeasureWalk& m) {
+    if (!w || depth > 24 || m.asked > 400) return;
+    uint8_t vis = Visibility(w);
+    if (vis == kCollapsed || vis == kHidden) return;
+    const bool user = IsA(w, L.user_widget_class);
+    const bool scroll = !user && L.scroll_class && IsA(w, L.scroll_class);
+    const bool panel = !user && !scroll && IsA(w, L.panel_class);
+    if (panel) {
+        if (L.switcher_class && IsA(w, L.switcher_class)) {
+            ue::Call a(w, "GetActiveWidget");
+            if (a.Invoke() && a.Result<UObject>()) Measure(a.Result<UObject>(), depth + 1, m);
+            return;
+        }
+        std::vector<UObject> kids;
+        Children(w, 256, &kids);
+        for (UObject k : kids) Measure(k, depth + 1, m);
         return;
     }
+    if (!user && ((L.spacer_class && IsA(w, L.spacer_class)) || InvisibleImage(w))) return;
+    Rect r;
+    ++m.asked;
+    if (!WidgetRect(w, &r)) return;
+    if (r.W() <= 1 || r.H() <= 1) return;  // never drawn
+    const Rect& s = m.screen;
+    if (r.x1 <= s.x0 || r.y1 <= s.y0 || r.x0 >= s.x1 || r.y0 >= s.y1) return;  // off the screen
+    if (r.W() >= s.W() * 0.9 && r.H() >= s.H() * 0.9) {
+        if (user)
+            if (UObject root = TreeRoot(w)) Measure(root, depth + 1, m);
+        return;
+    }
+    if (r.W() >= s.W() * 0.95 || r.H() >= s.H() * 0.95) {
+        ++m.wide;
+        return;
+    }
+    r = {std::max(r.x0, s.x0), std::max(r.y0, s.y0), std::min(r.x1, s.x1), std::min(r.y1, s.y1)};
+    if (!m.any) m.box = r;
+    else m.box = {std::min(m.box.x0, r.x0), std::min(m.box.y0, r.y0), std::max(m.box.x1, r.x1),
+                  std::max(m.box.y1, r.y1)};
+    m.any = true;
+    ++m.counted;
+}
+
+// The menu's whole layout has been drawn on its panel: its own top widget
+// then fills the panel exactly. Before that (it was just moved there), the
+// geometry is the flat screen's and means nothing here.
+bool DrawnOnPanel(const Panel& p, Rect* whole) {
+    if (!WidgetRect(p.widget, whole)) return false;
+    return std::fabs(whole->x0) < 2 && std::fabs(whole->y0) < 2 && std::fabs(whole->W() - kDrawW) < 2 &&
+           std::fabs(whole->H() - kDrawH) < 2;
+}
+
+bool MeasureMenu(const Panel& p, Rect* box, MeasureWalk* out) {
+    WalkScope walk;
+    MeasureWalk m;
+    Measure(p.widget, 0, m);
+    *out = m;
+    if (!m.any) return false;
     // Clamp to the screen and keep a small border so nothing touches the edge.
-    box = {std::max(0.0, box.x0 - 24), std::max(0.0, box.y0 - 24), std::min(screen.x1, box.x1 + 24),
-           std::min(screen.y1, box.y1 + 24)};
-    if (box.W() < 80 || box.H() < 40) {
-        log::Info("world menu: %s: measured %.0fx%.0f, too small to trust; shown whole", p.name.c_str(), box.W(), box.H());
-        return;
+    *box = {std::max(0.0, m.box.x0 - 24), std::max(0.0, m.box.y0 - 24), std::min(m.screen.x1, m.box.x1 + 24),
+            std::min(m.screen.y1, m.box.y1 + 24)};
+    return box->W() >= 80 && box->H() >= 40;
+}
+
+// Called each frame while a new menu waits to be fitted. Returns true once
+// it is done (fitted, or shown whole if it can't be measured).
+bool FitContent(Panel& p) {
+    if (!S.fit || !L.slate_lib) return true;
+    Rect whole;
+    if (!DrawnOnPanel(p, &whole)) {
+        if (Now() - p.hosted_at < 1.0) return false;  // not drawn on its panel yet: next frame
+        log::Info("world menu: %s: not laid out on its panel after 1 s (%.0fx%.0f at %.0f,%.0f); shown whole",
+                  p.name.c_str(), whole.W(), whole.H(), whole.x0, whole.y0);
+        return true;
     }
-    double zoom = std::min(screen.W() / box.W(), screen.H() / box.H());
-    zoom = std::clamp(zoom, 1.0, static_cast<double>(S.fit_max_zoom));
+    double t0 = perf::NowMs();
+    Rect box;
+    MeasureWalk m;
+    if (!MeasureMenu(p, &box, &m)) {
+        log::Info("world menu: %s: nothing to measure (%d widgets read, %d parts); shown whole", p.name.c_str(),
+                  m.asked, m.counted);
+        return true;
+    }
+    const double W = kDrawW, H = kDrawH;
+    double zoom = std::clamp(std::min(W / box.W(), H / box.H()), 1.0, static_cast<double>(S.fit_max_zoom));
     p.zoom = zoom;
     p.cx = (box.x0 + box.x1) * 0.5;
     p.cy = (box.y0 + box.y1) * 0.5;
@@ -1047,10 +1096,72 @@ void FitContent(Panel& p) {
     p.half_h = box.H() * 0.5;
     // The panel turns and sits around this point instead of the screen centre.
     ue::Call pivot(p.comp, "SetPivot");
-    pivot.Set("InPivot", Vector2D{p.cx / kDrawW, p.cy / kDrawH});
+    pivot.Set("InPivot", Vector2D{p.cx / W, p.cy / H});
     pivot.Invoke();
-    log::Info("world menu: %s: buttons fill %.0f,%.0f to %.0f,%.0f of the screen; zoomed %.2fx on the arm",
-              p.name.c_str(), box.x0, box.y0, box.x1, box.y1, zoom);
+    log::Info("world menu: %s: its parts fill %.0f,%.0f to %.0f,%.0f of the screen; zoomed %.2fx on the arm "
+              "(%d parts, %d edge strips left out, %d widgets read, %.1f ms)",
+              p.name.c_str(), box.x0, box.y0, box.x1, box.y1, zoom, m.counted, m.wide, m.asked,
+              perf::NowMs() - t0);
+    return true;
+}
+
+// After a click the menu may show other parts (another Options tab): the
+// laser's area grows to take them in. The zoom stays as it was, so the menu
+// never jumps in size under your hand.
+void GrowHitArea(Panel& p) {
+    if (!S.fit || p.fit_pending) return;
+    Rect box;
+    MeasureWalk m;
+    if (!MeasureMenu(p, &box, &m)) return;
+    double hw = std::max({p.half_w, p.cx - box.x0, box.x1 - p.cx});
+    double hh = std::max({p.half_h, p.cy - box.y0, box.y1 - p.cy});
+    if (hw > p.half_w + 1 || hh > p.half_h + 1)
+        log::Info("world menu: %s: laser area grown to %.0fx%.0f for parts shown after a click", p.name.c_str(),
+                  hw * 2, hh * 2);
+    p.half_w = hw;
+    p.half_h = hh;
+}
+
+// While a menu waits to be measured (a frame or two) it is drawn see-through,
+// so it never shows at the old size and then jumps.
+void SetPanelOpacity(UObject comp, float a) {
+    ue::Call c(comp, "SetTintColorAndOpacity");
+    c.Set("NewTintColorAndOpacity", LinearColor{1.f, 1.f, 1.f, a});
+    c.Invoke();
+}
+
+// ------------------------------------------------------- outlined text --
+// Menus on the arm have no backdrop (the owner never wants one), so their
+// text is drawn straight over the world. Over a bright scene, white text
+// was unreadable (owner 2026-11-03, death screen: "i cant read the text").
+// Every text in a menu on the arm gets a thin black outline, like subtitles,
+// unless the game gave it an outline of its own.
+int OutlineText(const std::vector<UObject>& texts) {
+    if (S.text_outline <= 0 || L.text_font < 0) return 0;
+    int n = 0;
+    std::vector<uint8_t> font(static_cast<size_t>(L.font_size));
+    for (UObject t : texts) {
+        if (!mem::SafeCopy(font.data(), reinterpret_cast<const void*>(t + L.text_font), font.size())) continue;
+        int32_t cur = 0;
+        std::memcpy(&cur, font.data() + L.outline_size, sizeof(cur));
+        if (cur > 0) continue;
+        ue::Call c(t, "SetFont");
+        int32_t want = 0;
+        uint8_t* dst = c.Raw("InFontInfo", &want);
+        if (!dst || want != L.font_size) {
+            log::Warn("world menu: TextBlock.SetFont takes %d bytes, the font is %d; text keeps no outline", want,
+                      L.font_size);
+            L.text_font = -1;
+            return n;
+        }
+        std::memcpy(dst, font.data(), font.size());
+        int32_t size = S.text_outline;
+        LinearColor black{0.f, 0.f, 0.f, 1.f};
+        std::memcpy(dst + L.outline_size, &size, sizeof(size));
+        std::memcpy(dst + L.outline_color, &black, sizeof(black));
+        if (c.Invoke()) ++n;
+    }
+    return n;
 }
 
 // ------------------------------------------------------------ hosting --
@@ -1396,8 +1507,8 @@ bool Host(const Candidate& c) {
     // widgets), never by scanning every object in the game.
     WalkScope walk;
     double t_walk = perf::NowMs();
-    std::vector<UObject> blurs;
-    int widgets = FindBlurs(c.obj, &blurs);
+    std::vector<UObject> blurs, texts;
+    int widgets = FindBlurs(c.obj, &blurs, &texts);
     double t_blurs = perf::NowMs();
     for (UObject b : blurs) {
         ue::Call v(b, "SetVisibility");
@@ -1409,13 +1520,18 @@ bool Host(const Candidate& c) {
     int boxes = HideBackdrops(c.obj, p.name);
     if (boxes > 0) log::Info("world menu: %s: hid %d see-through backdrop box(es)", p.name.c_str(), boxes);
     double t_boxes = perf::NowMs();
-    FitContent(G.panels.back());
-    if (G.placed) PosePanel(G.panels.back());  // zoomed, before this frame is drawn
+    int outlined = OutlineText(texts);
+    // Measured once it has been drawn on its panel (a frame or two from now,
+    // see OnGameFrame); see-through until then.
+    if (S.fit && L.slate_lib) {
+        G.panels.back().fit_pending = true;
+        SetPanelOpacity(comp, 0.f);
+    }
     double t_end = perf::NowMs();
-    log::Info("world menu: %s on the arm in %.1f ms (%d widgets; blurs %.1f ms, backdrops %.1f ms, fit %.1f ms, "
-              "%u memory lookups; holder %s)",
-              p.name.c_str(), t_end - t0, widgets, t_blurs - t_walk, t_boxes - t_hid, t_end - t_boxes,
-              mem::ScopedRegionCache::Lookups(), holder_ready ? "made at level start" : "made just now");
+    log::Info("world menu: %s on the arm in %.1f ms (%d widgets; blurs %.1f ms, backdrops %.1f ms, %d of %zu texts "
+              "outlined %.1f ms, %u memory lookups; holder %s)",
+              p.name.c_str(), t_end - t0, widgets, t_blurs - t_walk, t_boxes - t_hid, outlined, texts.size(),
+              t_end - t_boxes, mem::ScopedRegionCache::Lookups(), holder_ready ? "made at level start" : "made just now");
     // A menu the game put up by itself (the area select after the microwave
     // fall comes up in a dark pit) is easy to miss on the arm: buzz that hand
     // so you look. Only for the first menu; sub-menus come from your clicks.
@@ -1424,6 +1540,28 @@ bool Host(const Candidate& c) {
         log::Info("world menu: buzzed the %s hand: a menu is on the arm", S.arm == input::kLeft ? "left" : "right");
     }
     return true;
+}
+
+// The death screen (UIM_Results_C) showed no picture of who killed you on
+// the arm (owner 2026-11-03: "i cant see the kill shot photo"). The player's
+// scene capture, which VR stops for speed, runs again while it is up, and
+// what the picture is drawn from is logged so the next run shows if that was
+// the reason.
+void OnDeathScreen(UObject menu, bool up) {
+    int n = render_fixes::AllowPlayerCapture(up);
+    if (!up || !menu) return;
+    UObject img = 0;
+    ue::GetProp(menu, "IMG_Killer", img);
+    if (!img) {
+        log::Info("world menu: death screen: no IMG_Killer picture found; %d player capture(s) switched", n);
+        return;
+    }
+    UObject res = L.image_brush >= 0 ? mem::ReadOr<UObject>(img + L.image_brush + L.brush_resource, 0) : 0;
+    float opacity = L.render_opacity >= 0 ? mem::ReadOr<float>(img + L.render_opacity, -1.f) : -1.f;
+    log::Info("world menu: death screen: IMG_Killer (visibility %d, opacity %.2f) is drawn from %s %s; "
+              "%d player scene capture(s) running again",
+              Visibility(img), opacity, res ? ue::GetName(ue::GetClass(res)).c_str() : "nothing",
+              res ? ue::GetName(res).c_str() : "", n);
 }
 
 void ReleaseKey() {
@@ -1436,6 +1574,7 @@ void ReleaseKey() {
     ue::Call c(G.wic, "ReleasePointerKey");
     c.Set("Key", Key{LeftMouse()});
     c.Invoke();
+    if (!G.panels.empty()) G.panels.back().regrow_at = Now() + 0.3;
 }
 
 void Unhost(size_t i, const char* why) {
@@ -1470,9 +1609,13 @@ void TakeNewMenus() {
     }
 }
 
+// Widgets the game took away this frame (for the HUD too, see UpdateHud).
+std::vector<UObject> g_removed_now;
+
 // Lets go of menus the game took away (RemoveFromParent) or destroyed.
 void DropClosedMenus() {
-    std::vector<UObject> removed;
+    std::vector<UObject>& removed = g_removed_now;
+    removed.clear();
     {
         std::lock_guard<std::mutex> lock(g_events_mutex);
         removed.swap(g_removed);
@@ -1544,6 +1687,221 @@ void UpdateStack() {
                       ? "has it" : "asked for; B/Y may not reach it");
     }
     s_focused = want;
+}
+
+
+// ---------------------------------------------------- the HUD on the arm --
+// The game's in-level HUD (UIM_HUD_C: kill feed, objectives, money, pick-up
+// and interaction prompts) was left on the flat screen, which the headset
+// shows stuck to your face (owner 2026-11-03: "the in-level ui (such as the
+// kill feed) is still the flatscreen UI we need it to move to the forearm
+// sitting where the main menu sits"). It goes on a panel of its own at the
+// menu's spot on the forearm, the same way the menus do (onto the panel,
+// then off the flat screen, so the game never sees it destroyed), and fades
+// in when you turn the arm toward you like a watch. While a menu is up the
+// menu has that spot and the HUD is hidden. The laser never points at it.
+// Ammo and health stay on the back of the hand (vr/wrist_hud).
+struct HudPanel {
+    UObject widget = 0;
+    int widget_index = -1;
+    UObject comp = 0;
+    int comp_index = -1;
+    float alpha = 0.f;        // drawn opacity, fading toward 0 or 1
+    double look_until = -1;   // stays up a moment after you look away
+    float redraw = -1.f;      // the panel's redraw interval as last set
+    bool captured = false;    // a picture of it taken for the log folder
+    std::map<std::string, uint8_t> hidden;  // parts hidden on the arm, and their own visibility
+} HP;
+
+// Parts that only make sense on the flat screen: the crosshair dot (aim with
+// the sights) and the waypoint marker, which the game puts where the target
+// would be on the flat screen.
+const char* const kFlatOnlyHudParts[] = {"HUDP_Dot", "HUDP_NavIcon"};
+
+void HideFlatOnlyParts() {
+    for (const char* name : kFlatOnlyHudParts) {
+        UObject part = 0;
+        if (!ue::GetProp(HP.widget, name, part) || !part) continue;
+        uint8_t vis = Visibility(part);
+        if (vis == kCollapsed) continue;
+        if (!HP.hidden.count(name)) HP.hidden[name] = vis;
+        ue::Call v(part, "SetVisibility");
+        v.Set("InVisibility", kCollapsed);
+        v.Invoke();
+    }
+}
+
+// What the HUD is made of, once, so the log names the part that is the kill
+// feed (and anything else the owner asks to move).
+void LogHudParts(UObject hud) {
+    static bool s_logged = false;
+    if (s_logged) return;
+    s_logged = true;
+    UObject root = TreeRoot(hud);
+    std::vector<UObject> top, kids;
+    if (root) Children(root, 64, &top);
+    if (top.size() == 1 && !IsA(top[0], L.user_widget_class) && IsA(top[0], L.panel_class)) {
+        UObject only = top[0];
+        Children(only, 64, &top);
+    }
+    std::string parts;
+    for (UObject w : top) {
+        if (!parts.empty()) parts += ", ";
+        parts += ue::GetName(w) + " (" + ue::GetName(ue::GetClass(w)) + (Visibility(w) == kCollapsed ? ", collapsed" : Visibility(w) == kHidden ? ", hidden" : "") + ")";
+        if (parts.size() > 1500) break;
+    }
+    log::Info("world menu: HUD %s is made of: %s", root ? ue::GetName(root).c_str() : "(no tree)", parts.c_str());
+}
+
+bool HostHud(UObject hud) {
+    UObject comp = AddComponent(G.actor, L.widget_comp_class, true);
+    if (!comp) return false;
+    ue::SetProp<uint8_t>(comp, "Space", kSpaceWorld);
+    ue::SetProp<uint8_t>(comp, "BlendMode", kBlendTransparent);
+    struct IntPoint {
+        int32_t x, y;
+    } size{kDrawW, kDrawH};
+    ue::SetProp(comp, "DrawSize", size);
+    ue::SetProp<uint8_t>(comp, "bIsTwoSided", 1);
+    ue::SetProp<uint8_t>(comp, "TickWhenOffscreen", 1);
+    ue::SetProp(comp, "BackgroundColor", LinearColor{0.f, 0.f, 0.f, 0.f});
+    FinishComponent(G.actor, comp);
+    ue::Call nc(comp, "SetCollisionEnabled");
+    nc.Set("NewType", static_cast<uint8_t>(0));  // ECollisionEnabled::NoCollision
+    nc.Invoke();
+    SetPanelOpacity(comp, 0.f);
+    ue::Call set(comp, "SetWidget");
+    set.Set("Widget", hud);
+    set.Invoke();
+    t_our_call = true;
+    CallVoid(hud, "RemoveFromParent");
+    t_our_call = false;
+    HP.widget = hud;
+    HP.widget_index = IndexOf(hud);
+    HP.comp = comp;
+    HP.comp_index = IndexOf(comp);
+    HP.alpha = 0.f;
+    HP.look_until = -1;
+    HP.hidden.clear();
+    WalkScope walk;
+    std::vector<UObject> blurs, texts;
+    int widgets = FindBlurs(hud, &blurs, &texts);
+    for (UObject b : blurs) {
+        ue::Call v(b, "SetVisibility");
+        v.Set("InVisibility", kCollapsed);
+        v.Invoke();
+    }
+    int outlined = OutlineText(texts);
+    HideFlatOnlyParts();
+    log::Info("world menu: the in-level HUD (%s) is now on the forearm, off the flat screen; it shows when you "
+              "look at your arm (%d widgets, %d of %zu texts outlined, %zu blurs hidden)",
+              ue::GetName(ue::GetClass(hud)).c_str(), widgets, outlined, texts.size(), blurs.size());
+    LogHudParts(hud);
+    return true;
+}
+
+void UnhostHud(const char* why) {
+    if (!HP.widget) return;
+    if (Alive(HP.widget, HP.widget_index)) {
+        for (const auto& [name, vis] : HP.hidden) {
+            UObject part = 0;
+            if (!ue::GetProp(HP.widget, name, part) || !part) continue;
+            ue::Call v(part, "SetVisibility");
+            v.Set("InVisibility", vis);
+            v.Invoke();
+        }
+    }
+    DestroyComponent(HP.comp, HP.comp_index);
+    log::Info("world menu: the HUD %s; its forearm panel is gone", why);
+    HP = HudPanel{};
+}
+
+// Game thread, from the player's tick (twice a second): finds the HUD on the
+// player once the game has put it on the flat screen, and puts it on the arm.
+void FindHud(UObject player) {
+    static double s_next = 0;
+    double now = Now();
+    if (!S.enabled || !S.hud || !S.forearm || now < s_next) return;
+    s_next = now + 0.5;
+    if (!G.actor || !Alive(G.actor, G.actor_index)) return;
+    if (HP.widget) {
+        if (Alive(HP.widget, HP.widget_index)) HideFlatOnlyParts();  // the game may show them again
+        return;
+    }
+    UObject hud = 0;
+    if (!player || !ue::GetProp(player, "HUD", hud) || !hud) return;
+    if (!Alive(hud, IndexOf(hud)) || !CallBool(hud, "IsInViewport")) return;
+    HostHud(hud);
+}
+
+// Is the arm turned toward you, like looking at a watch?
+bool LookingAtArm() {
+    xr::EyeView eyes[2];
+    if (!xr::LatestViews(eyes)) return false;
+    XrPosef mid = eyes[0].pose;
+    mid.position.x = (eyes[0].pose.position.x + eyes[1].pose.position.x) * 0.5f;
+    mid.position.y = (eyes[0].pose.position.y + eyes[1].pose.position.y) * 0.5f;
+    mid.position.z = (eyes[0].pose.position.z + eyes[1].pose.position.z) * 0.5f;
+    FVector head;
+    FQuat hq;
+    if (!stereo::TrackingToWorld(mid, &head, &hq)) return false;
+    FVector to = head - G.centre;  // panel to eyes
+    double d = std::sqrt(DotV(to, to));
+    if (d < 1.0 || d > S.hud_distance_m * G.cm_per_m) return false;
+    FVector dir = to * (1.0 / d);
+    double facing = DotV(G.rot.Rotate(FVector{1, 0, 0}), dir);
+    double gaze = -DotV(hq.Rotate(FVector{1, 0, 0}), dir);
+    return facing > std::cos(S.hud_look_deg * kDegToRad) && gaze > std::cos(40.0 * kDegToRad);
+}
+
+// Every frame: keeps the HUD on the arm, fades it in and out, and lets go of
+// it when the game takes it away or puts it back on the flat screen.
+void UpdateHud(double now) {
+    if (!HP.widget) return;
+    if (std::find(g_removed_now.begin(), g_removed_now.end(), HP.widget) != g_removed_now.end())
+        return UnhostHud("was taken away by the game");
+    if (!Alive(HP.comp, HP.comp_index)) {
+        log::Info("world menu: the HUD's forearm panel went with the level");
+        HP = HudPanel{};
+        return;
+    }
+    if (!Alive(HP.widget, HP.widget_index)) return UnhostHud("was destroyed");
+    // The game put it on the flat screen again by itself: let it go there; it
+    // comes back onto the arm on the next look (FindHud).
+    if (CallBool(HP.widget, "IsInViewport")) return UnhostHud("was put back on the flat screen by the game");
+    bool want = false;
+    if (G.panels.empty() && PlaceOnForearm()) {
+        if (LookingAtArm()) HP.look_until = now + 0.4;
+        want = now < HP.look_until;
+        double s = Scale() * S.hud_size;
+        SetWorldPose(HP.comp, G.centre, PanelRotation());
+        ue::Call sc(HP.comp, "SetWorldScale3D");
+        sc.Set("NewScale", FVector{s, s, s});
+        sc.Invoke();
+    }
+    static double s_last = now;
+    double dt = std::clamp(now - s_last, 0.0, 0.1);
+    s_last = now;
+    float target = want ? 1.f : 0.f;
+    // Out of sight it is drawn four times a second, which keeps its own
+    // timers and animations going for a fraction of the GPU time.
+    float redraw = want || HP.alpha > 0.f ? 0.f : 0.25f;
+    if (redraw != HP.redraw) {
+        ue::Call r(HP.comp, "SetRedrawTime");
+        r.Set("InRedrawTime", redraw);
+        r.Invoke();
+        HP.redraw = redraw;
+    }
+    float a = G.panels.empty() ? HP.alpha + std::clamp(target - HP.alpha, static_cast<float>(-dt * 8), static_cast<float>(dt * 8)) : 0.f;
+    if (std::fabs(a - HP.alpha) > 0.001f || (a == 0.f) != (HP.alpha == 0.f)) {
+        SetPanelOpacity(HP.comp, a);
+        HP.alpha = a;
+    }
+    if (a >= 1.f && !HP.captured) {
+        HP.captured = true;
+        log::Info("world menu: HUD shown on the arm (you looked at it)");
+        xr::RequestCapture("forearm-hud");
+    }
 }
 
 // ------------------------------------------------------------ pointer --
@@ -1722,7 +2080,12 @@ void UpdatePointer() {
     laser.hand = G.pt.hand;
     FVector o;
     FQuat q;
-    Hit best;
+    Hit best, scroll_at;
+    // Up/down on the pointing hand's stick, or on the menu hand's while that
+    // one is still: either thumb scrolls (owner 2026-11-03: "i want to be
+    // able to use my joy stick to scroll though menu's").
+    float stick = h.stick_y;
+    if (std::fabs(stick) < 0.2f && S.forearm) stick = in.hand[S.arm].stick_y;
     if (h.aim_valid && stereo::TrackingToWorld(h.aim, &o, &q)) {
         FVector d = q.Rotate(FVector{1, 0, 0});
         for (const auto& p : G.panels) {
@@ -1730,6 +2093,37 @@ void UpdatePointer() {
             Hit hit = RayPanel(o, d, p);
             hit.panel = &p;
             if (hit.ok && (!best.ok || hit.t < best.t)) best = hit;
+        }
+        FQuat rot = ToQuat(PanelRotation());
+        if (best.ok) {
+            const Panel& p = *best.panel;
+            double s = Scale() * p.zoom;
+            FVector local = rot.Inverse().Rotate(best.point - PanelCentre(p));
+            G.pt.spot_widget = p.widget;
+            G.pt.spot_y = local.Y / s;
+            G.pt.spot_z = local.Z / s;
+            scroll_at = best;
+        } else if (std::fabs(stick) >= 0.2f) {
+            // The laser is off the menu: the pointer goes back to where it
+            // last was on the top menu (its middle if it never was), so the
+            // stick still scrolls that list. Nothing is clicked from there.
+            const Panel* top = nullptr;
+            for (const auto& p : G.panels)
+                if (p.shown && WidgetShows(p)) top = &p;
+            if (top) {
+                if (G.pt.spot_widget != top->widget) {
+                    G.pt.spot_widget = top->widget;
+                    G.pt.spot_y = G.pt.spot_z = 0;
+                }
+                double s = Scale() * top->zoom;
+                FVector n = rot.Rotate(FVector{1, 0, 0});
+                scroll_at.ok = true;
+                scroll_at.panel = top;
+                scroll_at.point = PanelCentre(*top) + rot.Rotate(FVector{0, G.pt.spot_y * s, G.pt.spot_z * s});
+                scroll_at.t = 0.03 * G.cm_per_m;
+                o = scroll_at.point + n * scroll_at.t;
+                d = n * -1.0;
+            }
         }
         if (best.ok) {
             // For the old collision-check pointer (menu_laser_own_hit=0): it
@@ -1741,12 +2135,12 @@ void UpdatePointer() {
             laser.hit = true;
             laser.length_m = static_cast<float>(best.t / G.cm_per_m);
         }
-        SendHit(best.ok ? &best : nullptr, o, d);
+        SendHit(scroll_at.ok ? &scroll_at : nullptr, o, d);
         LogLaser(best, d);
     } else {
         SendHit(nullptr, o, FVector{1, 0, 0});
     }
-    float want = best.ok ? static_cast<float>(0.06 * G.cm_per_m) : 0.f;
+    float want = scroll_at.ok ? static_cast<float>(0.06 * G.cm_per_m) : 0.f;
     if (want != G.last_distance) {
         ue::SetProp<float>(G.wic, "InteractionDistance", want);
         G.last_distance = want;
@@ -1783,17 +2177,35 @@ void UpdatePointer() {
         input::Haptic(static_cast<input::Hand>(G.pt.hand), 0.12f, 0.01f, 160.f);
     G.pt.was_over_button = over_button;
 
-    // Thumbstick up/down scrolls, about 4 notches a second at full tilt.
-    if (best.ok) {
-        G.pt.scroll_accum += h.stick_y * 4.f / 90.f;
-        if (std::fabs(h.stick_y) < 0.2f) G.pt.scroll_accum = 0.f;
-        if (std::fabs(G.pt.scroll_accum) >= 1.f) {
-            float notch = G.pt.scroll_accum > 0 ? 1.f : -1.f;
-            G.pt.scroll_accum -= notch;
+    // Stick up/down scrolls: one notch the moment it is pushed past half
+    // way, then 2 to 15 notches a second the further it is pushed (the old
+    // rate, 4 a second at full tilt on the pointing hand only, was too slow
+    // to get down a long Options list).
+    double t_now = perf::NowMs() / 1000.0;
+    double dt = std::clamp(t_now - G.pt.scroll_t, 0.0, 0.1);
+    G.pt.scroll_t = t_now;
+    float tilt = std::fabs(stick);
+    if (!scroll_at.ok || tilt < 0.2f) {
+        G.pt.scroll_accum = 0.f;
+        if (tilt < 0.2f) G.pt.scroll_held = false;
+    } else {
+        if (!G.pt.scroll_held && tilt >= 0.5f) {
+            G.pt.scroll_held = true;
+            G.pt.scroll_accum = 1.f;
+        }
+        G.pt.scroll_accum += static_cast<float>(dt) * (2.f + 13.f * tilt * tilt);
+        for (int i = 0; i < 3 && G.pt.scroll_accum >= 1.f; ++i) {
+            G.pt.scroll_accum -= 1.f;
             ue::process_event::GameCodeScope game_code;  // see ReleaseKey
             ue::Call c(G.wic, "ScrollWheel");
-            c.Set("ScrollDelta", notch);
+            c.Set("ScrollDelta", stick > 0 ? 1.f : -1.f);
             c.Invoke();
+            if (G.pt.scroll_logs < 12) {
+                ++G.pt.scroll_logs;
+                log::Info("world menu: stick scrolled %s %s (%s)", scroll_at.panel->name.c_str(),
+                          stick > 0 ? "up" : "down",
+                          best.ok ? "where the laser points" : "where the laser last was on it");
+            }
         }
     }
     std::lock_guard<std::mutex> lock(g_laser_mutex);
@@ -1818,6 +2230,16 @@ void OnGameFrame() {
     DropClosedMenus();
     UpdateStack();
     g_menu_up = !G.panels.empty();
+    {
+        static UObject s_death = 0;
+        UObject death = 0;
+        for (const auto& p : G.panels)
+            if (p.name == "UIM_Results_C") death = p.widget;
+        if (death != s_death) {
+            OnDeathScreen(death, death != 0);
+            s_death = death;
+        }
+    }
     // Blur the world past arm's length while a menu is on the arm.
     static bool s_blur = false;
     if (s_blur != !G.panels.empty()) {
@@ -1836,6 +2258,7 @@ void OnGameFrame() {
         else if (n >= 0)
             log::Info("world menu: pause blur off (%d settings)", n);
     }
+    UpdateHud(now);
     if (G.panels.empty()) {
         g_active = false;
         SendHit(nullptr, FVector{}, FVector{1, 0, 0});  // let go of the last menu's button
@@ -1876,6 +2299,19 @@ void OnGameFrame() {
         else {
             double diff = std::fabs(NormalizeAxis(yaw - G.yaw));
             if (diff > S.follow_deg) PlacePanels(head, yaw);
+        }
+    }
+    // New menus are measured once they have been drawn on their panel, then
+    // zoomed and shown (FitContent); after a click the laser area may grow.
+    for (auto& p : G.panels) {
+        if (p.fit_pending && FitContent(p)) {
+            p.fit_pending = false;
+            PosePanel(p);
+            SetPanelOpacity(p.comp, 1.f);
+        }
+        if (p.regrow_at > 0 && now >= p.regrow_at) {
+            p.regrow_at = -1;
+            GrowHitArea(p);
         }
     }
     KeepBoxesAway();
@@ -2188,6 +2624,11 @@ void Init() {
     }
     S.fit = config::GetBool("menu_fit_content", true);
     S.fit_max_zoom = std::clamp(config::GetFloat("menu_fit_max_zoom", 3.f), 1.f, 6.f);
+    S.text_outline = std::clamp(config::GetInt("menu_text_outline", 2), 0, 8);
+    S.hud = config::GetBool("hud_on_forearm", true);
+    S.hud_size = std::clamp(config::GetFloat("hud_forearm_size", 1.f), 0.3f, 3.f);
+    S.hud_look_deg = std::clamp(config::GetFloat("hud_forearm_look_deg", 50.f), 10.f, 90.f);
+    S.hud_distance_m = std::clamp(config::GetFloat("hud_forearm_distance_m", 0.8f), 0.2f, 2.f);
     if (!S.enabled) {
         log::Info("world menu: off (menu_mode=%s)", mode.c_str());
         return;
@@ -2269,6 +2710,7 @@ void FollowFromPlayer(UObject player) {
 void OnPlayerTick(UObject player, float) {
     if (S.enabled && ue::process_event::Ready()) FollowFromPlayer(player);
     if (S.enabled && player && G.panels.empty()) PrepareHolder(player);
+    if (S.enabled && player && G.panels.empty()) FindHud(player);
     OnGameFrame();
 }
 

@@ -138,7 +138,7 @@ void OnTick(UObject player, float dt) {
     static float s_acc = 0.f, s_hud_acc = 1.f;
     s_acc += dt;
     s_hud_acc += dt;
-    if (s_acc < 0.1f) return;  // ten reads a second is plenty for a display
+    if (s_acc < 0.05f) return;  // twenty reads a second
     s_acc = 0.f;
     Status st;
     st.valid = player != 0;
@@ -164,6 +164,19 @@ void OnTick(UObject player, float dt) {
             ManageFlatHud(player);
         }
     }
+    // Each change of the count is logged (the first 120), so a run's log
+    // shows the display followed every shot (owner 2026-11-03: "the ammo
+    // counter doesn't keep a live feed").
+    static int s_logs = 0;
+    static Status s_prev;
+    if (s_logs < 120 && st.has_gun &&
+        (st.chamber != s_prev.chamber || st.magazine != s_prev.magazine || st.has_magazine != s_prev.has_magazine ||
+         st.has_gun != s_prev.has_gun)) {
+        ++s_logs;
+        log::Info("wrist: the game's ammo is now %s%d+%d (magazine+chamber)", st.has_magazine ? "" : "no magazine, ",
+                  std::max(0, st.magazine), st.chamber);
+    }
+    s_prev = st;
     std::lock_guard<std::mutex> lock(g_status_mutex);
     g_status = st;
 }
@@ -385,10 +398,12 @@ D3D12_RESOURCE_BARRIER Transition(ID3D12Resource* r, D3D12_RESOURCE_STATES a, D3
 }
 
 bool Upload(const std::vector<uint32_t>& px) {
-    // Wait for the previous upload before reusing the buffer and allocator.
+    // Wait for the previous upload before reusing the buffer and allocator;
+    // if the GPU is still busy with it, try again next frame.
     if (g_fence->GetCompletedValue() < g_fence_value) {
         g_fence->SetEventOnCompletion(g_fence_value, g_event);
         WaitForSingleObject(g_event, 100);
+        if (g_fence->GetCompletedValue() < g_fence_value) return false;
     }
     void* map = nullptr;
     D3D12_RANGE none{0, 0};
@@ -411,7 +426,11 @@ bool Upload(const std::vector<uint32_t>& px) {
     if (XR_FAILED(acquire(L.swapchain, &ai, &index))) return false;
     XrSwapchainImageWaitInfo wi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
     wi.timeout = 100000000;
-    bool ok = XR_SUCCEEDED(wait(L.swapchain, &wi));
+    // XR_TIMEOUT_EXPIRED counts as success to XR_SUCCEEDED, but the image
+    // isn't ours yet: wait again (the spec wants a successful wait first).
+    XrResult wr = wait(L.swapchain, &wi);
+    for (int i = 0; i < 5 && wr == XR_TIMEOUT_EXPIRED; ++i) wr = wait(L.swapchain, &wi);
+    bool ok = wr == XR_SUCCESS;
     if (ok) {
         g_alloc->Reset();
         g_cmd->Reset(g_alloc, nullptr);
@@ -591,6 +610,14 @@ struct WristListener : xr::Listener {
             std::vector<uint32_t> px;
             Draw(st, px);
             if (Upload(px)) {
+                static int s_logs = 0;
+                if (s_logs < 120 && st.has_gun &&
+                    (!g_drawn_any || st.chamber != g_drawn.chamber || st.magazine != g_drawn.magazine ||
+                     st.has_magazine != g_drawn.has_magazine)) {
+                    ++s_logs;
+                    log::Info("wrist: display drawn with %s%d+%d", st.has_magazine ? "" : "no magazine, ",
+                              std::max(0, st.magazine), st.chamber);
+                }
                 g_drawn = st;
                 g_drawn_any = true;
                 L.has_image = true;
