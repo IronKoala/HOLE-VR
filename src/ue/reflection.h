@@ -42,6 +42,14 @@ int32_t FindPropertyOffset(UObject ustruct, const std::string& name);
 // Same search, returning the full property. valid() is false if not found.
 PropertyInfo FindProperty(UObject ustruct, const std::string& name);
 
+// A Blueprint function's compiled bytecode (UStruct::Script, right after
+// PropertiesSize/MinAlignment). False when it has none or the bytes don't end
+// with EX_EndOfScript (layout check). The bytes stay owned by the engine.
+bool GetScript(UObject ustruct, uintptr_t* data, int32_t* size);
+// FField (FProperty) name and type name, for bytecode listings.
+std::string FieldName(uintptr_t field);
+std::string FieldClassName(uintptr_t field);
+
 // EPropertyFlags bits we print in dumps.
 constexpr uint64_t CPF_Parm = 0x80;
 constexpr uint64_t CPF_OutParm = 0x100;

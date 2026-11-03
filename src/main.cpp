@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include <string>
+#include <vector>
 
 #include "core/config.h"
 #include "core/log.h"
@@ -13,6 +14,7 @@
 #include "proxy/dxgi_proxy.h"
 #include "version.h"
 #include "ue/dumper.h"
+#include "ue/script_dump.h"
 #include "ue/names.h"
 #include "ue/objects.h"
 #include "ue/process_event.h"
@@ -22,6 +24,7 @@
 #include "vr/comfort.h"
 #include "vr/hole_watch.h"
 #include "vr/controls.h"
+#include "vr/workbench.h"
 #include "vr/input.h"
 #include "vr/openxr.h"
 #include "vr/cvars.h"
@@ -104,6 +107,33 @@ void StartVr() {
     }
 }
 
+// Bytecode listings (dump/script/<Class>.txt) of the game's Blueprints whose
+// path contains one of the comma-separated dump_script_classes words: the
+// weapons, their parts, the workbench, the player and the save data. Empty
+// turns it off.
+void DumpScripts(const std::wstring& mod_dir) {
+    using namespace holevr;
+    const std::string list = config::GetString(
+        "dump_script_classes",
+        "/Game/Weapons/,BP_Player,BPC_WeaponManager,LCBP_Weapon,UIM_WeaponCustom,BPC_WeaponCustom,"
+        "BP_GameInstance,SGO_SaveData,UIP_WeaponModel,BPC_InventoryManager");
+    std::vector<std::string> filters;
+    size_t start = 0;
+    while (start <= list.size()) {
+        size_t comma = list.find(',', start);
+        if (comma == std::string::npos) comma = list.size();
+        std::string w = list.substr(start, comma - start);
+        while (!w.empty() && w.front() == ' ') w.erase(w.begin());
+        while (!w.empty() && w.back() == ' ') w.pop_back();
+        if (!w.empty()) filters.push_back(w);
+        start = comma + 1;
+    }
+    if (filters.empty()) return;
+    const DWORD t0 = GetTickCount();
+    const int n = ue::script::DumpClasses(mod_dir + L"\\dump", filters);
+    log::Info("script dump: %d classes in %lu ms", n, GetTickCount() - t0);
+}
+
 DWORD WINAPI InitThread(LPVOID) {
     using namespace holevr;
     const std::wstring& mod_dir = g_mod_dir;
@@ -139,6 +169,7 @@ DWORD WINAPI InitThread(LPVOID) {
         vr::controls::Init();
         vr::body::Init();  // after controls: reads this frame's hand poses
         vr::controls::InitLate();  // after the body: holsters ride this frame's body pose
+        vr::workbench::Init();     // after controls: reads this frame's hand poses
         vr::cvars::Init();
         vr::wrist_hud::InitGame();
         vr::world_menu::InitGame();
@@ -175,6 +206,7 @@ DWORD WINAPI InitThread(LPVOID) {
                 ingame_dumped = true;
                 log::Info("dump: in-game class dump (once per launch, dump_in_game=0 turns it off)");
                 ue::dumper::DumpAll(mod_dir);
+                DumpScripts(mod_dir);
             }
         }
         if (hooks) {
@@ -197,6 +229,7 @@ DWORD WINAPI InitThread(LPVOID) {
         if (dump && !dump_was_down) {
             log::Info("Ctrl+F9: dumping (%d live objects)", ue::objects::Count());
             ue::dumper::DumpAll(mod_dir);
+            DumpScripts(mod_dir);
         }
         if (recenter && !recenter_was_down) vr::stereo::Recenter();
         dump_was_down = dump;

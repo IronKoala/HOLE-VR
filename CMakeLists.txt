@@ -17,6 +17,7 @@ add_library(hole_vr SHARED
     src/ue/objects.cpp
     src/ue/reflection.cpp
     src/ue/dumper.cpp
+    src/ue/script_dump.cpp
     src/hooks/hooks.cpp
     src/vr/openxr.cpp
     src/vr/menu_study.cpp
@@ -54,6 +55,7 @@ add_library(hole_vr SHARED
     src/ue/call.cpp
     src/game/game.cpp
     src/game/gun.cpp
+    src/game/weapon_custom.cpp
     src/game/weapon_lab.cpp
     src/vr/render_fixes.cpp
     src/vr/cvars.cpp
@@ -61,6 +63,7 @@ add_library(hole_vr SHARED
     src/vr/world_menu.cpp
     src/vr/wrist_hud.cpp
     src/vr/launch.cpp
+    src/vr/workbench.cpp
     src/main.cpp
 )
 

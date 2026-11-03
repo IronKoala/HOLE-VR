@@ -24,14 +24,6 @@ uintptr_t o_array_dim = 0, o_element_size = 0, o_prop_flags = 0, o_offset = 0, o
 
 bool g_ready = false;
 
-std::string FieldName(uintptr_t field) {
-    return names::ToString(mem::ReadOr<FName>(field + o_ffield_name));
-}
-std::string FieldClassName(uintptr_t field) {
-    uintptr_t fc = mem::ReadOr<uintptr_t>(field + o_ffield_class);
-    return fc ? names::ToString(mem::ReadOr<FName>(fc)) : std::string();
-}
-
 bool FindSuperOffset(UObject actor, UObject object) {
     for (uintptr_t o = 0x30; o <= 0x60; o += 8) {
         if (mem::ReadOr<uintptr_t>(actor + o) == object) {
@@ -74,6 +66,30 @@ bool OffsetsFit(UObject ustruct) {
 }
 
 }  // namespace
+
+std::string FieldName(uintptr_t field) {
+    if (!o_ffield_name || !field) return {};
+    return names::ToString(mem::ReadOr<FName>(field + o_ffield_name));
+}
+std::string FieldClassName(uintptr_t field) {
+    if (!field) return {};
+    uintptr_t fc = mem::ReadOr<uintptr_t>(field + o_ffield_class);
+    return fc ? names::ToString(mem::ReadOr<FName>(fc)) : std::string();
+}
+
+bool GetScript(UObject s, uintptr_t* data, int32_t* size) {
+    if (!g_ready || !s) return false;
+    // TArray<uint8> Script { Data, Num, Max } after PropertiesSize + MinAlignment.
+    const uintptr_t o = o_props_size + 0x08;
+    uintptr_t d = 0;
+    int32_t num = 0, max = 0;
+    if (!mem::Read(s + o, d) || !mem::Read(s + o + 8, num) || !mem::Read(s + o + 12, max)) return false;
+    if (!d || num <= 0 || num > max || num > (64 << 20) || !mem::IsReadable(d, num)) return false;
+    if (mem::ReadOr<uint8_t>(d + num - 1, 0) != 0x53) return false;  // EX_EndOfScript
+    *data = d;
+    *size = num;
+    return true;
+}
 
 bool Init() {
     if (g_ready) return true;
