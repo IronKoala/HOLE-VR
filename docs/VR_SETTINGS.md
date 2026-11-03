@@ -7,8 +7,8 @@ Build 1 (PR #68): the VR tab, vignette, head-in-wall fade, height modes,
 real crouch and jump, grip toggle, aim smoothing. Build 2: teleport, world
 size, which stick moves, body calibration (height and arms) and the shot
 study (does the game shoot from the muzzle?). Then: empty hands stop at
-walls. Still to come: the gun in the left hand (full left-handed mode) and
-finger physics.
+walls, and their fingers rest on the surface. Still to come: the gun in the
+left hand (full left-handed mode).
 
 ## The VR tab (src/vr/vr_options.cpp, src/vr/vr_menu_model.cpp)
 
@@ -236,6 +236,18 @@ hand.
 - Runs after the arm measure (Calibrate body wants the real hands) and not
   while the grip editor holds the hands still.
 
+Fingers rest on the surface (owner's list, item 13, "physical fingers";
+`src/vr/body/finger_rest.cpp`): the wall check keeps the surface the hand
+last stopped against (its impact point and normal) while the hand stays
+within 20 cm of that point and on its open side. Each finger of that empty
+hand then takes the curl nearest to what the controller asks for that keeps
+its joints and tip out of the surface's plane (steps of 0.05 between straight
+and the fullest curl): an open hand pressed on a wall lies flat on it, and
+fingers pointed into a wall bend back against it. It is plain math on the
+plane, with no extra traces. `hand_fingers_rest_on_walls=1` (on); off with
+the hand wall check too. Fingers on the gun and magazines keep their stored
+grips.
+
 ## Log lines to check after a test
 
 - `vr options: ready (a VR tab is added to Options)` at start.
@@ -265,6 +277,9 @@ hand.
   then `hand walls: left/right hand stopped at <thing> for N s; the real hand
   went up to N cm past the surface` for the first 12 touches, then a count
   each minute.
+- `fingers: left/right hand's fingers rest on the surface it's against (curl
+  wanted->used: thumb 0.60->0.20, ...)`, the first 10 times a wall changes a
+  finger's curl noticeably (at most every 2 s per hand).
 - `shot study 1: barrel line hits ... camera line hits ... N cm apart`, `shot
   study: gun ... fire functions: ...`, `lab: [..s] gun.<event>`.
 
@@ -272,6 +287,9 @@ hand.
 
 - `tests/test_comfort.cpp`: vignette texture, levels, smoothing, real crouch
   and jump, aim smoothing, grip toggle.
+- `tests/test_finger_rest.cpp`: fingers against a plane (palm on a wall
+  opens the hand just enough, fingers pointed into a wall curl back, the
+  least-bad curl when nothing clears, same result anywhere in the world).
 - `tests/test_vr_options.cpp`: ini edit in place, menu rows, current choice,
   teleport and hop to jump off by default, action rows.
 - `tests/test_teleport.cpp`: arc, stick gesture, landing check.

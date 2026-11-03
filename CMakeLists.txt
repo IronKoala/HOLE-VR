@@ -39,6 +39,7 @@ add_library(hole_vr SHARED
     src/vr/body/hand_pose.cpp
     src/vr/body/skeleton.cpp
     src/vr/body/finger_solve.cpp
+    src/vr/body/finger_rest.cpp
     src/vr/body/grip_record.cpp
     src/vr/body/grip_editor.cpp
     src/vr/body/body.cpp

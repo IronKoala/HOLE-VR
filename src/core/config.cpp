@@ -259,6 +259,8 @@ const Block kBlocks[] = {
      "; 1 = empty hands stop at walls, floors, doors and tables instead of passing\n"
      "; through them (the controller still grabs and opens things where it really is).\n"
      "hand_wall_collision=1\n"
+     "; 1 = fingers of a hand against a wall or table rest on it instead of going in.\n"
+     "hand_fingers_rest_on_walls=1\n"
      "; Strength of the gun's kick in your hand when it fires (0 = off, 1 = normal).\n"
      "gun_recoil_kick=1\n"
      "; Comfort: let the game's recoil move your view and aim (0 = off; the gun\n"

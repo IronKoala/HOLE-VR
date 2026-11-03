@@ -26,6 +26,7 @@
 #include "vr/body/finger_solve.h"
 #include "vr/body/grip_editor.h"
 #include "vr/body/grip_record.h"
+#include "vr/body/finger_rest.h"
 #include "vr/body/hand_walls.h"
 #include "vr/body/hand_pose.h"
 #include "vr/body/ik_math.h"
@@ -80,6 +81,7 @@ struct Settings {
     bool gun_wrist_straight = true;
     bool fit_log = true;
     bool fixed_height = true;
+    bool fingers_rest = true;  // fingers rest on walls an empty hand is against
 } S;
 
 void LoadSettings() {
@@ -120,6 +122,7 @@ void LoadSettings() {
     S.gun_wrist_straight = config::GetBool("body_gun_wrist_straight", true);
     S.fit_log = config::GetBool("body_fit_log", true);
     S.fixed_height = config::GetBool("fixed_height", true);
+    S.fingers_rest = config::GetBool("hand_fingers_rest_on_walls", true);
 }
 
 // ---- small files beside the ini ----
@@ -2451,6 +2454,42 @@ bool BuildSlidePreset(int side, const hands::HandState& h, const hands::Pose& ob
     return true;
 }
 
+// Log lines for fingers resting on a wall: the first 10 times in a run that
+// the wall changed a finger's curl noticeably, at most every 2 s per hand.
+struct FingerRestNote {
+    bool any = false;
+    double want[hand_pose::kFingerCount] = {}, rest[hand_pose::kFingerCount] = {};
+};
+FingerRestNote g_rest_note[2];
+int g_rest_logged = 0;
+double g_rest_last_ms[2] = {-1e12, -1e12};
+
+void NoteFingerRest(int side, int f, double want, double rest) {
+    FingerRestNote& n = g_rest_note[side];
+    n.want[f] = want;
+    n.rest[f] = rest;
+    if (std::fabs(rest - want) >= 0.15) n.any = true;
+}
+
+void FlushFingerRest(int side) {
+    FingerRestNote& n = g_rest_note[side];
+    if (n.any && g_rest_logged < 10 && perf::NowMs() - g_rest_last_ms[side] > 2000.0) {
+        ++g_rest_logged;
+        g_rest_last_ms[side] = perf::NowMs();
+        static const char* names[hand_pose::kFingerCount] = {"thumb", "index", "middle", "ring", "pinky"};
+        std::string list;
+        for (int f = 0; f < hand_pose::kFingerCount; ++f) {
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), "%s%s %.2f->%.2f", list.empty() ? "" : ", ", names[f], n.want[f],
+                          n.rest[f]);
+            list += buf;
+        }
+        log::Info("fingers: %s hand's fingers rest on the surface it's against (curl wanted->used: %s)",
+                  side == kL ? "left" : "right", list.c_str());
+    }
+    n = FingerRestNote{};
+}
+
 void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, const hands::HandGrab& right_grab,
               const FVector& body_fwd, const FVector& body_right, double dt) {
     const Skeleton& k = G.skel;
@@ -2630,9 +2669,23 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
         want[hand_pose::kIndex] = fingers::Blend(idx, g.tip_angles[gr::kIndexPull], G.index_pull[side]);
     } else {
         hand_pose::Curl c = hand_pose::Target(grab.kind, fin);
-        for (int f = 0; f < hand_pose::kFingerCount; ++f)
-            want[f] = fingers::Curl(rig.chain[f], std::min(1.2, c.finger[f] * S.finger_scale),
-                                    fingers::DefaultLimits(f == hand_pose::kThumb));
+        // An empty hand against a wall or table: each finger takes the curl
+        // nearest the controller's that keeps it out of the surface.
+        FVector wall_at, wall_out;
+        const bool on_wall = grab.kind == hands::GrabKind::kNone && S.fingers_rest &&
+                             hand_walls::Contact(side, &wall_at, &wall_out);
+        for (int f = 0; f < hand_pose::kFingerCount; ++f) {
+            const fingers::Limits lim = fingers::DefaultLimits(f == hand_pose::kThumb);
+            double curl = std::min(1.2, c.finger[f] * S.finger_scale);
+            if (on_wall) {
+                const double rest =
+                    fingers::CurlClearOfPlane(rig.chain[f], lim, hand, curl, 1.2, wall_at, wall_out, S.finger_radius);
+                NoteFingerRest(side, f, curl, rest);
+                curl = rest;
+            }
+            want[f] = fingers::Curl(rig.chain[f], curl, lim);
+        }
+        if (on_wall) FlushFingerRest(side);
     }
     // Ease into a new pose (grab blend ~0.1 s); the index stays immediate.
     const double ease = 1.0 - std::exp(-dt / 0.04);
