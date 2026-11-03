@@ -18,6 +18,7 @@
 #include "vr/dxgi_hooks.h"
 #include "vr/hands.h"
 #include "vr/openxr.h"
+#include "vr/world_menu.h"
 
 namespace holevr::vr::comfort {
 namespace {
@@ -296,6 +297,13 @@ double HeadInWall(UObject player, const hands::Pose& head) {
         ue::Call h(capsule, "GetScaledCapsuleHalfHeight");
         if (h.Invoke() && h.Result<float>() > 10.f) half = h.Result<float>();
     }
+    // Far from the character, the game has moved its camera (the results
+    // screen after an extract or a death puts it elsewhere): the line would
+    // cross whatever lies between and fade a menu to black (owner 2026-11-03:
+    // "if i successfully extract i cant see the menu tho i can still use it";
+    // log: faded for the whole 31 s the results were up).
+    const double hx = head.location.X - cap.X, hy = head.location.Y - cap.Y;
+    if (hx * hx + hy * hy > 100.0 * 100.0) return 0;
     FVector start{cap.X, cap.Y, std::clamp(head.location.Z, cap.Z - half + 20.0, cap.Z + half - 5.0)};
     FVector d = head.location - start;
     double len = std::sqrt(d.X * d.X + d.Y * d.Y + d.Z * d.Z);
@@ -329,7 +337,9 @@ void OnTick(UObject player, float) {
     if (!S.wall_fade || !player) return;
     hands::Pose head;
     if (!hands::Head(&head)) return;
-    double dark = HeadInWall(player, head);
+    // A menu on the forearm is never faded out: it has to be readable even
+    // with your head in something (the fade is drawn over everything).
+    double dark = world_menu::MenuUp() ? 0.0 : HeadInWall(player, head);
     g_wall.store(static_cast<float>(dark));
     g_wall_at.store(NowS());
     bool inside = dark > 0.5;

@@ -51,6 +51,24 @@ dump of the shipping game (`hole-vr/dump/game_classes.txt`).
   dot and waypoint marker are hidden there. While the death screen is up the
   player's scene capture runs again (`render_fixes::AllowPlayerCapture`) for
   its picture of the killer.
+- **Bigger menu text that still fits** (`world_menu.cpp`, `GrowText`).
+  Before a menu is zoomed, every TextBlock in it gets a bigger font
+  (`menu_text_scale`, 1.5x). Once the engine has laid the menu out again, each
+  text on screen is checked: letters that need more room than the text's slot
+  (desired size over its local size), a text running past a box around it (up
+  to the first ScrollBox, which may scroll) by more than it did at the game's
+  size, or two texts covering each other that didn't before. Those texts, and
+  every text in a box one ran out of, step back by 0.85 until all fit (up to 6
+  rounds). Hidden tabs are skipped (their cached geometry is stale). Texts on
+  pages that appear later get the same 0.8 s after the menu opens and 0.3 s
+  after each click. A narrow menu gets a taller panel of the same area
+  (`menu_fit_shape`). The head-in-wall fade never covers a forearm menu
+  (`comfort.cpp`).
+- **The hole** (`hole_watch.cpp`). The level menu and the extract results come
+  from `LCBP_Hole_C`, which waits `WaitTimeLimit` seconds after you use it
+  (`WaitTimeTemp`, `IsPlayerInside` against `AreaRadius`). Its state, countdown,
+  distance and fall are logged as `hole:` lines, and both hands tick softly
+  each second while it counts (`hole_buzz`).
 
 ## Game UI inventory
 
