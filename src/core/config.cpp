@@ -277,6 +277,8 @@ const Block kBlocks[] = {
      "; 1 = empty hands stop at walls, floors, doors and tables instead of passing\n"
      "; through them (the controller still grabs and opens things where it really is).\n"
      "hand_wall_collision=1\n"
+     "; 1 = fingers of a hand against a wall or table rest on it instead of going in.\n"
+     "hand_fingers_rest_on_walls=1\n"
      "; Strength of the gun's kick in your hand when it fires (0 = off, 1 = normal).\n"
      "gun_recoil_kick=1\n"
      "; Comfort: let the game's recoil move your view and aim (0 = off; the gun\n"
@@ -301,7 +303,7 @@ const Block kBlocks[] = {
      "slide_grab_forward_cm=16\n"
      "; Pinch at the rear sight: radius, and how far it stretches back along the slide (cm)\n"
      "slide_pinch_radius_cm=6.5\n"
-     "slide_pinch_back_cm=0.64\n"},
+     "slide_pinch_back_cm=10\n"},
     {"holster_pistol",
      "\n"
      "; --- Holsters on your VR body ---\n"
@@ -416,6 +418,10 @@ const Block kBlocks[] = {
      "comfort_vignette_turn=0\n"
      "; 1 = the view fades to black when your head goes into a wall or object.\n"
      "head_wall_fade=1\n"
+     "; The fade begins this close to a wall or object (cm) and is black this\n"
+     "; close to it, so you never see through.\n"
+     "head_wall_fade_start_cm=15\n"
+     "head_wall_fade_full_cm=2\n"
      "; Height: fixed = always the character's eye height (real crouching does\n"
      "; not lower you unless physical_crouch crouches the character),\n"
      "; real = your own head height, seated = the character's height and\n"

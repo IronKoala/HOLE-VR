@@ -107,7 +107,8 @@ struct Settings {
     double belt_below_head = 60.0;  // belt height when the VR body is off, cm below the headset
     bool rack_trace = false;            // per-frame slide log while racking (debug)
     double slide_pinch_radius = 6.5;    // pinch zone around the rear sight...
-    double slide_pinch_back = 0.64;     // ...stretched this far back along the slide (cm)
+    double slide_pinch_back = 10.0;     // ...stretched this far back along the slide (cm): the controller's grip
+                                        // point sits 5-12 cm behind fingertips that pinch the rear of the slide
     double slide_grab_forward = 16.0;   // pistol slide grab zone reaches this far forward of the rear grab point
     bool wall_collision = true;    // keep the gun out of walls
     double recoil_kick = 1.0;      // scale of the in-hand recoil kick, 0 = off
@@ -163,7 +164,7 @@ void LoadSettings() {
     g_set.slide_grab_forward = config::GetFloat("slide_grab_forward_cm", 16.f);
     g_set.rack_trace = config::GetBool("debug_rack_trace", false);
     g_set.slide_pinch_radius = config::GetFloat("slide_pinch_radius_cm", 6.5f);
-    g_set.slide_pinch_back = config::GetFloat("slide_pinch_back_cm", 0.64f);
+    g_set.slide_pinch_back = config::GetFloat("slide_pinch_back_cm", 10.f);
     g_set.virtual_stock = config::GetBool("rifle_virtual_stock", true);
     g_set.stock_snap = config::GetFloat("rifle_stock_snap_cm", 12.f);
     g_set.stock_release = config::GetFloat("rifle_stock_release_cm", 20.f);
@@ -2231,6 +2232,64 @@ void ApplyCameraShakeSetting(UObject player) {
     }
 }
 
+// Kick aim (owner 2026-11-03: kicks "horribly unreliable" at landing where
+// aimed). The game's KickTrace sweeps a sphere from the foot toward the
+// actor location plus a reach turned by the CONTROL rotation, which in VR is
+// only the stick-turn yaw: the kick went where the character faced, not
+// where the player looks. Just for the trace, the control rotation takes the
+// headset's yaw and pitch, and is put back right after, inside the same game
+// call, so the camera and view never see it.
+struct KickAim {
+    UObject controller = 0;
+    FRotator saved{};
+    bool active = false;
+    int logs = 0;
+} g_kick_aim;
+
+bool BeforeKickTrace(UObject self, UObject, void*) {
+    g_kick_aim.active = false;
+    if (!g_set.enabled || !config::GetBool("kick_aim_with_head", true)) return true;
+    hands::Pose head;
+    if (!hands::Head(&head)) return true;
+    ue::Call gc(self, "GetController");
+    UObject controller = gc.Invoke() ? gc.Result<UObject>() : 0;
+    if (!controller) return true;
+    ue::Call get(controller, "GetControlRotation");
+    if (!get.Invoke()) return true;
+    const FRotator saved = get.Result<FRotator>();
+    FRotator look = ToRotator(head.rotation);
+    look.Pitch = std::clamp(look.Pitch, -50.0, 30.0);
+    look.Roll = 0;
+    ue::Call set(controller, "SetControlRotation");
+    set.Set("NewRotation", look);
+    if (!set.Invoke()) return true;
+    g_kick_aim.controller = controller;
+    g_kick_aim.saved = saved;
+    g_kick_aim.active = true;
+    if (g_kick_aim.logs++ < 6)
+        log::Info("controls: kick aimed where you look: yaw %.0f pitch %.0f (the character faces yaw %.0f, "
+                  "%.0f deg off)",
+                  look.Yaw, look.Pitch, saved.Yaw, NormalizeAxis(look.Yaw - saved.Yaw));
+    return true;
+}
+
+void AfterKickTrace(UObject, UObject, void*) {
+    if (!g_kick_aim.active) return;
+    g_kick_aim.active = false;
+    ue::Call set(g_kick_aim.controller, "SetControlRotation");
+    set.Set("NewRotation", g_kick_aim.saved);
+    set.Invoke();
+}
+
+void HookKickAim(UObject player) {
+    static bool done = false;
+    if (done || !player) return;
+    done = true;
+    UObject fn = ue::FindFunction(ue::GetClass(player), "TL_Kick__KickTrace__EventFunc");
+    const bool ok = fn && ue::process_event::On(fn, &BeforeKickTrace, &AfterKickTrace);
+    log::Info("controls: kick aim %s", ok ? "follows the headset" : "hook NOT found (kicks go where the body faces)");
+}
+
 void HookChargeTimeline() {
     static bool done = false;
     UObject cls = game::GunBaseClass();
@@ -2685,6 +2744,7 @@ void OnTick(UObject player, float dt) {
     DropDeadMagazines();
     HookChargeTimeline();
     HookPlayerRecoil(player);
+    HookKickAim(player);
     ShotStudyTick();
     {
         // A round leaving the gun while the trigger is held = a shot (works

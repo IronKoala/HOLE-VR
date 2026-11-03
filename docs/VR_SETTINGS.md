@@ -7,8 +7,8 @@ Build 1 (PR #68): the VR tab, vignette, head-in-wall fade, height modes,
 real crouch and jump, grip toggle, aim smoothing. Build 2: teleport, world
 size, which stick moves, body calibration (height and arms) and the shot
 study (does the game shoot from the muzzle?). Then: empty hands stop at
-walls. Still to come: the gun in the left hand (full left-handed mode) and
-finger physics.
+walls, and their fingers rest on the surface. Still to come: the gun in the
+left hand (full left-handed mode).
 
 ## The VR tab (src/vr/vr_options.cpp, src/vr/vr_menu_model.cpp)
 
@@ -42,6 +42,7 @@ whatever the laser is on). A step writes the ini key(s) into `hole-vr.ini` in pl
 | Vignette moving | Off, Light, Medium, Strong | `comfort_vignette_move` (0, 0.35, 0.6, 0.85) |
 | Vignette turning | Off, Light, Medium, Strong | `comfort_vignette_turn` |
 | Head in a wall | Fades, No fade | `head_wall_fade` |
+| Wall fade starts | 5, 10, 15, 20, 25 cm away | `head_wall_fade_start_cm` (15) |
 | Height | Character, Your own, Seated | `fixed_height` + `height_mode` |
 | Real crouch | On, Off | `physical_crouch` |
 | Hop to jump | Off, On | `physical_jump` |
@@ -85,9 +86,16 @@ levels. Each frame picks one part of it.
   3 m/s) or the turning setting times how fast you turn (full at 90 deg/s,
   smooth turning only). It closes in over 0.1 s and opens over 0.3 s. At
   Strong the clear circle is about 33 deg wide each side of centre.
-- Head in a wall: a line from the body's middle at head height to the head.
-  If it hits something, the view fades to black over the last 1 to 9 cm.
-  The player and the held gun are ignored. No fade while a menu is on the
+- Head in a wall: a ball is swept from the body's middle at head height to
+  the eyes. Its radius is where the fade begins (`head_wall_fade_start_cm`,
+  15 cm, the "Wall fade starts" row). Where it stops, the eyes are that
+  close to a surface; the further on they go, the darker, until black
+  `head_wall_fade_full_cm` (2 cm) before the surface. The first version used
+  a line and only began fading 1 cm inside the wall (black 9 cm in), and
+  the near clip plane is 1 cm, so the wall vanished and you saw through
+  before it went dark (owner 2026-11-03 10:07: "the wall fade needs to kick
+  in a lot sooner"). The player, the held gun and anything either hand
+  holds are ignored. No fade while a menu is on the
   forearm, or when the view is more than 1 m from the character's capsule
   (the game moving its camera, as on the extract results screen; menus
   thread, PR #79). Owner 2026-11-03: "if i successfully extract i cant see
@@ -236,21 +244,34 @@ hand.
 - Runs after the arm measure (Calibrate body wants the real hands) and not
   while the grip editor holds the hands still.
 
+Fingers rest on the surface (owner's list, item 13, "physical fingers";
+`src/vr/body/finger_rest.cpp`): the wall check keeps the surface the hand
+last stopped against (its impact point and normal) while the hand stays
+within 20 cm of that point and on its open side. Each finger of that empty
+hand then takes the curl nearest to what the controller asks for that keeps
+its joints and tip out of the surface's plane (steps of 0.05 between straight
+and the fullest curl): an open hand pressed on a wall lies flat on it, and
+fingers pointed into a wall bend back against it. It is plain math on the
+plane, with no extra traces. `hand_fingers_rest_on_walls=1` (on); off with
+the hand wall check too. Fingers on the gun and magazines keep their stored
+grips.
+
 ## Log lines to check after a test
 
 - `vr options: ready (a VR tab is added to Options)` at start.
 - `vr options: following clicks through ...` the first time Options opens.
 - `vr options: VR tab button added to ...` and `vr options: VR page added to
-  Options (24 rows ...)` each time Options opens.
+  Options (26 rows ...)` each time Options opens.
 - `vr options: VR tab opened` when the VR tab is clicked.
-- `vr options: VR page added to Options (24 rows ..., 21 rows with < >
+- `vr options: VR page added to Options (26 rows ..., 23 rows with < >
   arrows; made over N frames, X ms in all, Y ms at most in one frame)`.
 - `vr options: <row> -> <choice> (key=value, right arrow | left arrow | row
   clicked)` and `settings: saved key=value in hole-vr.ini` on each click, then
   `controls: settings changed (...)`; `... is already at its last choice` at
   an end.
-- `comfort: head inside a wall or object, view faded` / `head out of the wall
-  again after N s`.
+- `comfort: head close to a wall or object (N cm from it), view fading` /
+  `head away from the wall again after N s (it got to N cm from|past the
+  surface)`. Logged when the fade passes half way.
 - `controls: physical crouch (...)` / `physical stand (...)`.
 - `controls: crouch (right stick down)` / `stand up (...)`, then `stick crouch:
   the character is crouched (the game's own crouch input did it)` or `... left
@@ -265,6 +286,9 @@ hand.
   then `hand walls: left/right hand stopped at <thing> for N s; the real hand
   went up to N cm past the surface` for the first 12 touches, then a count
   each minute.
+- `fingers: left/right hand's fingers rest on the surface it's against (curl
+  wanted->used: thumb 0.60->0.20, ...)`, the first 10 times a wall changes a
+  finger's curl noticeably (at most every 2 s per hand).
 - `shot study 1: barrel line hits ... camera line hits ... N cm apart`, `shot
   study: gun ... fire functions: ...`, `lab: [..s] gun.<event>`.
 
@@ -272,6 +296,9 @@ hand.
 
 - `tests/test_comfort.cpp`: vignette texture, levels, smoothing, real crouch
   and jump, aim smoothing, grip toggle.
+- `tests/test_finger_rest.cpp`: fingers against a plane (palm on a wall
+  opens the hand just enough, fingers pointed into a wall curl back, the
+  least-bad curl when nothing clears, same result anywhere in the world).
 - `tests/test_vr_options.cpp`: ini edit in place, menu rows, current choice,
   teleport and hop to jump off by default, action rows.
 - `tests/test_teleport.cpp`: arc, stick gesture, landing check.

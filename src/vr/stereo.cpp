@@ -191,6 +191,54 @@ WorldMapping g_world;
 FVector g_pending_origin_m;
 FVector g_pending_world_cm;
 
+// The camera's expected move during the player's tick (view_lead_math.h).
+// Guarded by g_world_mutex.
+constexpr double kMaxLeadCm = 120.0;  // more than this in one frame is a teleport, not walking
+view_lead::Anchors g_anchor_end;      // after the latest tick's listeners
+view_lead::Anchors g_anchor_view;     // g_anchor_end when the latest left eye was set up
+view_lead::Leads g_leads;             // from the latest tick start since those views
+bool g_leads_set = false;
+int g_lead_used = -1;
+FVector g_lead_cm;  // added to the camera by TrackingToWorld and GameCameraLocation
+// How far off the hands would have been, for the log. Leaf lock: the report
+// line takes it and nothing else is taken while it is held.
+std::mutex g_lead_stats_mutex;
+view_lead::Stats g_lead_stats;
+
+// The 10 s report line: how far the hands would have trailed the view, and
+// how far off each anchor's prediction was.
+std::string LeadReport(double) {
+    view_lead::Stats s;
+    {
+        std::lock_guard<std::mutex> lock(g_lead_stats_mutex);
+        s = g_lead_stats;
+        g_lead_stats = {};
+    }
+    if (s.frames == 0 && s.turn_frames == 0) return {};
+    const int choice = static_cast<int>(config::GetFloat("view_lead", -1.f));
+    std::string each;
+    for (int k = 0; k < view_lead::kKinds; ++k) {
+        if (!s.n[k]) continue;
+        char b[64];
+        std::snprintf(b, sizeof(b), "%s%s %.1f", each.empty() ? "" : ", ", view_lead::kKindNames[k],
+                      s.sum[k] / s.n[k]);
+        each += b;
+    }
+    const long long f = s.frames > 0 ? s.frames : 1;
+    const long long tf = s.turn_frames > 0 ? s.turn_frames : 1;
+    // A hand at arm's length (about 45 cm out from the eyes) trails a turn
+    // of a degrees by about 45 * a * pi / 180 cm.
+    char line[640];
+    std::snprintf(line, sizeof(line),
+                  "frame timing: hands vs view while moving: %lld frames; uncorrected they would trail the view by "
+                  "%.1f cm on average (worst %.1f), corrected %.1f cm (worst %.1f) with view_lead %d; by anchor: %s "
+                  "cm. Turning: %lld frames, %.2f deg a frame on average (worst %.1f), about %.1f cm at arm's length",
+                  s.frames, s.none_sum / f, s.none_max, s.used_sum / f, s.used_max, choice,
+                  each.empty() ? "none" : each.c_str(), s.turn_frames, s.turn_sum / tf, s.turn_max,
+                  45.0 * (s.turn_sum / tf) * kDegToRad);
+    return line;
+}
+
 std::atomic<void (*)()> g_frame_callback{nullptr};
 std::atomic<DWORD> g_view_thread{0};
 
@@ -211,6 +259,7 @@ void RunFrameCallback() {
         s_registered = true;
         perf::Register(&g_perf_gt_frame);
         perf::Register(&g_perf_after_eyes);
+        perf::AddReportLine(&LeadReport);
         ue::process_event::SetGameThread(me);
     }
     if (s_last > 0.0 && now - s_last < 1000.0) g_perf_gt_frame.Add(now - s_last);
@@ -254,10 +303,41 @@ void HookCalcOffset(void* self, int32_t view_index, FRotator* rotation, float en
     const double world_to_meters = engine_world_to_meters / WorldScale();
     if (view_index == 1) xr::SetRenderedViews(views);
     if (view_index == 0) {
-        std::lock_guard<std::mutex> lock(g_world_mutex);
-        g_origin_m = g_origin_m + g_pending_origin_m;
-        g_pending_origin_m = FVector{};
-        g_pending_world_cm = FVector{};
+        view_lead::Leads leads;
+        int used = -1;
+        FVector actual;
+        bool measured = false;
+        double turn = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_world_mutex);
+            static double s_last_yaw = 0;
+            turn = NormalizeAxis(rotation->Yaw - s_last_yaw);
+            s_last_yaw = rotation->Yaw;
+            // How the camera really moved since the latest views, less the
+            // room-scale steps (already taken off the tracking origin): what
+            // the tick's prediction should have said.
+            if (g_leads_set && g_world.valid) {
+                measured = true;
+                leads = g_leads;
+                used = g_lead_used;
+                actual = *location - g_world.camera_location - g_pending_world_cm;
+            }
+            g_origin_m = g_origin_m + g_pending_origin_m;
+            g_pending_origin_m = FVector{};
+            g_pending_world_cm = FVector{};
+            // From here the camera is where the character is: no lead until
+            // the next tick moves it again.
+            g_anchor_view = g_anchor_end;
+            g_leads = {};
+            g_leads_set = false;
+            g_lead_used = -1;
+            g_lead_cm = FVector{};
+        }
+        if (measured) {
+            std::lock_guard<std::mutex> lock(g_lead_stats_mutex);
+            g_lead_stats.Add(actual, leads, used);
+            g_lead_stats.AddTurn(turn);
+        }
     }
 
     if (g_recenter.exchange(false)) {
@@ -546,9 +626,11 @@ void SetGameFrameCallback(void (*fn)()) { g_frame_callback.store(fn); }
 
 bool TrackingToWorld(const XrPosef& pose, FVector* world_location, FQuat* world_rotation) {
     WorldMapping m;
+    FVector lead;
     {
         std::lock_guard<std::mutex> lock(g_world_mutex);
         m = g_world;
+        lead = g_lead_cm;
     }
     if (!m.valid) return false;
     FQuat q = XrToUeQuat(pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w);
@@ -556,7 +638,7 @@ bool TrackingToWorld(const XrPosef& pose, FVector* world_location, FQuat* world_
     FVector local_p = m.recenter.Rotate(p - m.origin_m) * m.world_to_meters;
     local_p.Z -= m.height_drop_m * m.world_to_meters;
     local_p.Z += m.raise_cm;
-    if (world_location) *world_location = m.camera_location + m.base.Rotate(local_p);
+    if (world_location) *world_location = m.camera_location + lead + m.base.Rotate(local_p);
     if (world_rotation) *world_rotation = m.base * (m.recenter * q);
     return true;
 }
@@ -587,8 +669,23 @@ bool ShiftOriginWorld(const FVector& world_delta_cm) {
 bool GameCameraLocation(FVector* world_cm) {
     std::lock_guard<std::mutex> lock(g_world_mutex);
     if (!g_world.valid) return false;
-    *world_cm = g_world.camera_location;
+    *world_cm = g_world.camera_location + g_lead_cm;
     return true;
+}
+
+void CharacterAtTickStart(const view_lead::Anchors& now) {
+    const int choice = static_cast<int>(config::GetFloat("view_lead", -1.f));
+    std::lock_guard<std::mutex> lock(g_world_mutex);
+    if (!g_world.valid) return;
+    g_leads = view_lead::Predict(g_anchor_view, now, g_world.camera_location, kMaxLeadCm);
+    g_leads_set = true;
+    g_lead_used = view_lead::Pick(g_leads, choice);
+    g_lead_cm = g_lead_used >= 0 ? g_leads.move[g_lead_used] : FVector{};
+}
+
+void CharacterAtTickEnd(const view_lead::Anchors& now) {
+    std::lock_guard<std::mutex> lock(g_world_mutex);
+    g_anchor_end = now;
 }
 
 void SetViewRaiseCm(double cm) { g_view_raise_cm.store(cm); }

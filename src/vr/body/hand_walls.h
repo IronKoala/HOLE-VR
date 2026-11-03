@@ -26,4 +26,10 @@ void LoadSettings();
 void Apply(UObject player, const hands::Pose& head, hands::HandState hs[2], const hands::HandGrab grab[2],
            double dt);
 
+// The surface an empty hand (0 left, 1 right) last stopped against: a point
+// on it and its normal (out of the surface, toward the hand). Kept while the
+// hand stays within 20 cm of that point and on its open side, so fingers
+// can rest on a wall the ball itself isn't touching. False otherwise.
+bool Contact(int side, FVector* point, FVector* normal);
+
 }  // namespace holevr::vr::body::hand_walls

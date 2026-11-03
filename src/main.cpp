@@ -33,6 +33,7 @@
 #include "vr/menu_study.h"
 #include "vr/launch.h"
 #include "vr/stereo.h"
+#include "vr/view_lead.h"
 
 namespace {
 
@@ -131,6 +132,7 @@ DWORD WINAPI InitThread(LPVOID) {
                        WaitFor("ProcessEvent", ue::process_event::Init, timeout) && game::Init();
     if (hooks) {
         game::weapon_lab::Init();
+        vr::view_lead::Init();  // hands and held things follow the character's move each tick
         vr::controls::Init();
         vr::body::Init();  // after controls: reads this frame's hand poses
         vr::controls::InitLate();  // after the body: holsters ride this frame's body pose

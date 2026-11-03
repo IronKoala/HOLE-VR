@@ -46,6 +46,11 @@ struct Side {
     // A clear sweep is reused while the eyes and the hand stay put.
     bool last_clear = false;
     FVector last_from, last_to;
+    // The surface the hand last touched (fingers rest on it), kept while
+    // the hand stays near it.
+    bool have_plane = false;
+    FVector plane_point, plane_normal;
+    FVector drawn;  // where the hand is drawn this frame
 };
 Side g_side[2];
 
@@ -95,7 +100,7 @@ void RefreshAttached(UObject player, double dt) {
 // sweep starts inside something: the eyes are in a wall, so there is no
 // sensible place to stop the hand).
 bool Sweep(UObject player, const FVector& from, const FVector& to, const std::vector<UObject>& ignore, FVector* at,
-           std::string* what) {
+           FVector* surface, FVector* normal, std::string* what) {
     ue::Call t(g_ksl, "SphereTraceSingle");
     if (!t.Valid()) return false;
     if (g_radius_size < 0) {
@@ -124,6 +129,8 @@ bool Sweep(UObject player, const FVector& from, const FVector& to, const std::ve
     std::memcpy(in, hit, static_cast<size_t>(hit_size));
     if (!b.Invoke() || !b.Get<bool>("bBlockingHit") || b.Get<bool>("bInitialOverlap")) return false;
     *at = b.Get<FVector>("Location");
+    *surface = b.Get<FVector>("ImpactPoint");
+    *normal = b.Get<FVector>("ImpactNormal");
     UObject actor = b.Get<UObject>("HitActor");
     *what = actor ? ue::GetName(actor) : "something";
     return true;
@@ -169,6 +176,7 @@ void Apply(UObject player, const hands::Pose& head, hands::HandState hs[2], cons
     if (!S.on || !player) {
         EndTouch(0);
         EndTouch(1);
+        g_side[0].have_plane = g_side[1].have_plane = false;
         return;
     }
     perf::Scope timer(g_perf);
@@ -193,13 +201,15 @@ void Apply(UObject player, const hands::Pose& head, hands::HandState hs[2], cons
         if (!h.valid || grab[side].kind != hands::GrabKind::kNone) {
             EndTouch(side);
             s.last_clear = false;
+            s.have_plane = false;
             continue;
         }
         const FVector from = head.location, to = h.grip.location;
+        s.drawn = to;
         if (s.last_clear && Near(from, s.last_from) && Near(to, s.last_to)) continue;
-        FVector at;
+        FVector at, surface, normal;
         std::string what;
-        if (!Sweep(player, from, to, ignore, &at, &what)) {
+        if (!Sweep(player, from, to, ignore, &at, &surface, &normal, &what)) {
             EndTouch(side);
             s.last_clear = true;
             s.last_from = from;
@@ -217,6 +227,12 @@ void Apply(UObject player, const hands::Pose& head, hands::HandState hs[2], cons
         s.touch_time += dt;
         s.deepest = std::max(s.deepest, depth);
         s.what = what;
+        if (ik::Length(normal) > 0.5) {
+            s.have_plane = true;
+            s.plane_point = surface;
+            s.plane_normal = normal * (1.0 / ik::Length(normal));
+        }
+        s.drawn = at;
         h.grip.location = at;
         h.aim.location = h.aim.location + shift;
         h.wrist.location = h.wrist.location + shift;
@@ -229,6 +245,21 @@ void Apply(UObject player, const hands::Pose& head, hands::HandState hs[2], cons
         g_touches = 0;
         g_summary_age = 0;
     }
+}
+
+bool Contact(int side, FVector* point, FVector* normal) {
+    if (side < 0 || side > 1 || !S.on) return false;
+    Side& s = g_side[side];
+    if (!s.have_plane) return false;
+    // Forget it once the hand has moved away from that spot, or is past the
+    // surface's plane (round an edge or corner, where the plane isn't).
+    if (ik::Length(s.drawn - s.plane_point) > 20.0 || ik::Dot(s.drawn - s.plane_point, s.plane_normal) < 0.0) {
+        s.have_plane = false;
+        return false;
+    }
+    *point = s.plane_point;
+    *normal = s.plane_normal;
+    return true;
 }
 
 }  // namespace holevr::vr::body::hand_walls
