@@ -2446,6 +2446,65 @@ void SetBodySquash(PressButton& b, double depth) {
     ss.Invoke();
 }
 
+// Owner 2026-11-03 15:23: "make a second pass at the modeling make it look
+// 1:1 like the original". The mod can't open the game's model, so it takes
+// pictures: once a run, when the player stands within 1 m looking at the
+// timer with no hand near it, the game's own timer is shown for a moment
+// and saved (capture-timer-original.bmp), then the rebuilt one
+// (capture-timer-rebuilt.bmp), to model the next version from.
+void SetTimerShown(PressButton& b, bool original) {
+    auto vis = [](UObject c, bool on) {
+        if (!c) return;
+        ue::Call v(c, "SetVisibility");
+        v.Set("bNewVisibility", on).Set("bPropagateToChildren", false);
+        v.Invoke();
+    };
+    vis(b.parts[0].comp, original);
+    vis(b.base_comp, !original);
+    vis(b.cap_comp, !original);
+}
+
+void TimerLookCapture(PressButton& b) {
+    static int stage = 0;   // 0 waiting, 1 original shown, 2 original saved, 3 rebuilt saved, 4 done
+    static double at = 0;
+    if (stage >= 4 || !b.cap_comp) return;
+    if (stage == 0) {
+        hands::Pose head;
+        if (!hands::Head(&head) || g_clock < 20.0) return;
+        const FVector top = b.rest.translation + b.rest.rotation.Rotate(
+                                FVector{b.center_l.X, b.center_l.Y, b.bottom_l + b.base_h});
+        const FVector to = top - head.location;
+        const double dist = std::sqrt(to.X * to.X + to.Y * to.Y + to.Z * to.Z);
+        if (dist > 100.0 || dist < 25.0) return;
+        const FVector fwd = head.rotation.Rotate(FVector{1, 0, 0});
+        if ((fwd.X * to.X + fwd.Y * to.Y + fwd.Z * to.Z) / dist < std::cos(20.0 * kDegToRad)) return;
+        for (int h = 0; h < 2; ++h) {
+            const hands::HandState hs = hands::Get(h == 0 ? hands::kLeft : hands::kRight);
+            const FVector d = hs.grip.location - top;
+            if (hs.valid && std::sqrt(d.X * d.X + d.Y * d.Y + d.Z * d.Z) < 30.0) return;
+        }
+        SetTimerShown(b, true);
+        stage = 1;
+        at = g_clock + 0.15;
+        log::Info("controls: range timer: taking a picture of the game's own timer from %.0f cm (for modelling)", dist);
+        return;
+    }
+    if (g_clock < at) return;
+    if (stage == 1) {
+        xr::RequestCapture("timer-original");
+        stage = 2;
+        at = g_clock + 0.25;
+    } else if (stage == 2) {
+        SetTimerShown(b, false);
+        stage = 3;
+        at = g_clock + 0.15;
+    } else if (stage == 3) {
+        xr::RequestCapture("timer-rebuilt");
+        stage = 4;
+        log::Info("controls: range timer: pictures saved (capture-timer-original.bmp, capture-timer-rebuilt.bmp)");
+    }
+}
+
 void PhysicalButtons(UObject player) {
     RefreshPressButtons(player);
     for (PressButton& b : g_press.buttons) {
@@ -2486,10 +2545,22 @@ void PhysicalButtons(UObject player) {
             Ball pts[16];
             int n = 0;
             const FQuat ar = hs.aim.rotation;
-            pts[n++] = {hs.wrist.location, 4.5};
-            pts[n++] = {hs.grip.location, 4.5};
-            pts[n++] = {hs.grip.location + ar.Rotate(FVector{5, 0, 0}), 4.5};
-            pts[n++] = {hs.grip.location + ar.Rotate(FVector{9, 0, 0}), 3.0};
+            // Owner 2026-11-03 15:23: "the hit boxes aren't very precise".
+            // The hand the owner sees (vr/body, after hand walls and finger
+            // give) when it is drawn: five fingertips and the palm, which
+            // sits as a 3 cm ball just inside the palm skin. Else the
+            // controller's rough balls.
+            body::HandContacts hc;
+            if (body::GetHandContacts(h, &hc)) {
+                const double tr = std::fmax(hc.tip_radius, 0.8);
+                for (int f = 0; f < 5; ++f) pts[n++] = {hc.tip[f], tr};
+                pts[n++] = {hc.palm - hc.palm_out * 2.5, 3.0};
+            } else {
+                pts[n++] = {hs.wrist.location, 4.5};
+                pts[n++] = {hs.grip.location, 4.5};
+                pts[n++] = {hs.grip.location + ar.Rotate(FVector{5, 0, 0}), 4.5};
+                pts[n++] = {hs.grip.location + ar.Rotate(FVector{9, 0, 0}), 3.0};
+            }
             const bool gun_here = h == 1 && W.gun && W.in_hand && W.have_pose;
             if (gun_here) {
                 for (double x = -4.0; x <= W.muzzle_dist + 0.1 && n < 16; x += 4.0)
@@ -2543,6 +2614,7 @@ void PhysicalButtons(UObject player) {
             b.inside[h] = side;
         }
         if (!b.body_rest) continue;
+        TimerLookCapture(b);
         // The red top follows the push, and springs back up when let go.
         const double target = std::clamp(push, 0.0, kPressTravel);
         const double back = 25.0 * g_dt;   // cm per tick going up
