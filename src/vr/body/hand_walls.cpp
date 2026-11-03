@@ -11,6 +11,7 @@
 #include "core/perf.h"
 #include "ue/call.h"
 #include "vr/body/ik_math.h"
+#include "vr/world_menu.h"
 
 namespace holevr::vr::body::hand_walls {
 namespace {
@@ -194,6 +195,9 @@ void Apply(UObject player, const hands::Pose& head, hands::HandState hs[2], cons
         if (Alive(k)) ignore.push_back(k.obj);
     for (int i = 0; i < 2; ++i)
         if (grab[i].object) ignore.push_back(grab[i].object);
+    // The forearm menu and wrist HUD panels sit between the eyes and the
+    // left hand whenever you look at your wrist.
+    if (UObject holder = world_menu::PanelHolder()) ignore.push_back(holder);
 
     for (int side = 0; side < 2; ++side) {
         Side& s = g_side[side];

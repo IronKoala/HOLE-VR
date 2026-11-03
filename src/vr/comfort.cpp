@@ -290,6 +290,7 @@ struct WallState {
     bool was_inside = false;
     double inside_since = 0;
     double closest = 1e9;      // nearest the eyes got to the surface while faded, cm
+    UObject what = 0;          // what the fade sweep last touched
 } WS;
 
 double HeadInWall(UObject player, const hands::Pose& head, double* gap) {
@@ -322,7 +323,7 @@ double HeadInWall(UObject player, const hands::Pose& head, double* gap) {
     if (len < 4.0) return 0;  // head right over the capsule: nothing to cross
     // The gun and whatever the hands hold (a magazine brought up to the
     // face) never fade the view.
-    UObject ignore[4] = {player, 0, 0, 0};
+    UObject ignore[5] = {player, 0, 0, 0, 0};
     int32_t n = 1;
     game::Gun gun = game::Gun::Current(player);
     if (gun.Valid()) ignore[n++] = gun.Object();
@@ -330,6 +331,8 @@ double HeadInWall(UObject player, const hands::Pose& head, double* gap) {
         const UObject held = hands::GetGrab(h).object;
         if (held && held != ignore[1]) ignore[n++] = held;
     }
+    // The wrist HUD and menu panels, held up in front of the face.
+    if (UObject holder = world_menu::PanelHolder()) ignore[n++] = holder;
     TArrayRaw arr{ignore, n, n};
     ue::Call t(WS.ksl, "SphereTraceSingle");
     if (!t.Valid()) return 0;
@@ -365,6 +368,7 @@ double HeadInWall(UObject player, const hands::Pose& head, double* gap) {
     FVector past = head.location - at;
     double depth = std::sqrt(past.X * past.X + past.Y * past.Y + past.Z * past.Z);
     if (gap) *gap = S.wall_start - depth;
+    WS.what = b.Get<UObject>("HitActor");
     return std::clamp(depth / (S.wall_start - S.wall_full), 0.0, 1.0);
 }
 
@@ -385,7 +389,8 @@ void OnTick(UObject player, float) {
         if (inside) {
             WS.inside_since = NowS();
             WS.closest = gap;
-            log::Info("comfort: head close to a wall or object (%.0f cm from it), view fading", gap);
+            log::Info("comfort: head close to %s (%.0f cm from it), view fading",
+                      WS.what ? ue::GetName(WS.what).c_str() : "a wall or object", gap);
         } else {
             log::Info("comfort: head away from the wall again after %.1f s (it got to %.0f cm %s the surface)",
                       NowS() - WS.inside_since, std::fabs(WS.closest), WS.closest < 0 ? "past" : "from");

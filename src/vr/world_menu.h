@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 
 // Menus as panels in the world.
 //
@@ -34,5 +35,12 @@ void RequestClosePause();
 bool Active();
 // True when world panels are switched on in the settings.
 bool Enabled();
+// Game thread: the actor holding the menu and HUD panels (0 if there is
+// none now). Its panels block the game's visibility traces, so traces that
+// stand for the player's own body (hands stopping at walls, the head-in-wall
+// fade) ignore it: looking at the wrist put the panels between the eyes and
+// the left hand, which stopped the hand up to 22 cm short (slide pinch
+// thread, run 2026-11-03 10:47).
+uintptr_t PanelHolder();
 
 }  // namespace holevr::vr::world_menu

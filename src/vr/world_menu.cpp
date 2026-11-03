@@ -4333,5 +4333,6 @@ bool PauseMenuOnTop() { return g_menu_up.load() && g_top_is_pause.load(); }
 void RequestClosePause() { g_close_pause = true; }
 bool Active() { return g_active.load(); }
 bool Enabled() { return S.enabled; }
+uintptr_t PanelHolder() { return G.actor && Alive(G.actor, G.actor_index) ? G.actor : 0; }
 
 }  // namespace holevr::vr::world_menu
