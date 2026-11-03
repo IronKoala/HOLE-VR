@@ -127,6 +127,11 @@ static void TestDefaultsAndActions() {
     EXPECT(std::string(monitor.choices[static_cast<size_t>(CurrentChoice(monitor, get))].text) == "Right eye");
     ini["monitor_view"] = "Both";
     EXPECT(std::string(monitor.choices[static_cast<size_t>(CurrentChoice(monitor, get))].text) == "Both eyes");
+    // Empty hands stop at walls unless turned off.
+    const Row& hand_walls = RowNamed("Hands stop at walls");
+    EXPECT(std::string(hand_walls.choices[static_cast<size_t>(CurrentChoice(hand_walls, get))].text) == "On");
+    ini["hand_wall_collision"] = "0";
+    EXPECT(std::string(hand_walls.choices[static_cast<size_t>(CurrentChoice(hand_walls, get))].text) == "Off");
 }
 
 int main() {

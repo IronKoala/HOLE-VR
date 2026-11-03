@@ -6,8 +6,9 @@ full list and build order is in the project plan (vr-features-2026-11-03).
 Build 1 (PR #68): the VR tab, vignette, head-in-wall fade, height modes,
 real crouch and jump, grip toggle, aim smoothing. Build 2: teleport, world
 size, which stick moves, body calibration (height and arms) and the shot
-study (does the game shoot from the muzzle?). Still to come: the gun in the
-left hand (full left-handed mode), then physics hands and finger physics.
+study (does the game shoot from the muzzle?). Then: empty hands stop at
+walls. Still to come: the gun in the left hand (full left-handed mode) and
+finger physics.
 
 ## The VR tab (src/vr/vr_options.cpp, src/vr/vr_menu_model.cpp)
 
@@ -51,6 +52,7 @@ whatever the laser is on). A step writes the ini key(s) into `hole-vr.ini` in pl
 | Aim smoothing | Off, Light, Medium, Strong | `aim_smoothing` (0, 0.33, 0.66, 1) |
 | Rifle stock | On, Off | `rifle_virtual_stock` |
 | Gun stops at walls | On, Off | `gun_wall_collision` |
+| Hands stop at walls | On, Off | `hand_wall_collision` |
 | Gun kick | Off, Light, Normal, Strong | `gun_recoil_kick` |
 | Monitor shows | Right eye, Left eye, Both eyes | `monitor_view` (right, left, both) |
 | Calibrate body | (action) | after the menu closes: height at 2 to 4 s (`standing_height_cm`), arms at 5 s (`body-measure.ini`) |
@@ -209,14 +211,39 @@ refuses to record while SteamVR runs over Steam Link (the Steam Frame), with
   WxH from (x,y) as WxH at (x,y) in the WxH window`. Cost shows in the perf
   report as "monitor view (one eye on the monitor)".
 
+## Hands stop at walls (src/vr/body/hand_walls.cpp)
+
+Owner's list, item 12: "physics hands that stop at walls". Each frame, for
+each empty hand, a ball 4 cm in radius (`hand_wall_radius_cm`) is swept from
+the eyes to the controller with the game's own trace (KismetSystemLibrary
+`SphereTraceSingle`, visibility channel, the player and everything attached
+to the player ignored). If it touches something, the VR body draws that hand
+where the ball stopped: against the wall, floor, door, table or person in
+the way, sliding along it as the real hand moves. The arm follows the drawn
+hand.
+
+- Only the drawn hand moves. Grabbing, holsters, the mag pouch, doors and
+  the menu laser still use where the controller really is, so nothing gets
+  harder to reach.
+- A hand holding something follows that object: the gun keeps itself out of
+  walls (`gun_wall_collision`, a trace from the eyes to the muzzle), and the
+  support hand and slide hand follow the gun.
+- If the eyes themselves are inside something (leaning through a wall), the
+  hands are not stopped, since there is no sensible surface to stop them at.
+- A clear sweep is reused while the eyes and the hand stay within 3 mm of
+  where they were, so a still hand costs nothing. The time shows in the
+  perf report as "body hands stop at walls".
+- Runs after the arm measure (Calibrate body wants the real hands) and not
+  while the grip editor holds the hands still.
+
 ## Log lines to check after a test
 
 - `vr options: ready (a VR tab is added to Options)` at start.
 - `vr options: following clicks through ...` the first time Options opens.
 - `vr options: VR tab button added to ...` and `vr options: VR page added to
-  Options (23 rows ...)` each time Options opens.
+  Options (24 rows ...)` each time Options opens.
 - `vr options: VR tab opened` when the VR tab is clicked.
-- `vr options: VR page added to Options (23 rows ..., 20 rows with < >
+- `vr options: VR page added to Options (24 rows ..., 21 rows with < >
   arrows; made over N frames, X ms in all, Y ms at most in one frame)`.
 - `vr options: <row> -> <choice> (key=value, right arrow | left arrow | row
   clicked)` and `settings: saved key=value in hole-vr.ini` on each click, then
@@ -234,6 +261,10 @@ refuses to record while SteamVR runs over Steam Link (the Steam Frame), with
 - `vr options: Edit hand grips clicked ...` then `controls: opening/closing the
   grip editor (asked for from the VR tab)`.
 - `vr options: Move holsters clicked ...` then the holster countdown lines.
+- `hand walls: on (a 4.0 cm ball from the eyes to each empty hand ...)` once,
+  then `hand walls: left/right hand stopped at <thing> for N s; the real hand
+  went up to N cm past the surface` for the first 12 touches, then a count
+  each minute.
 - `shot study 1: barrel line hits ... camera line hits ... N cm apart`, `shot
   study: gun ... fire functions: ...`, `lab: [..s] gun.<event>`.
 

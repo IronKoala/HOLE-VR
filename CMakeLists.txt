@@ -42,6 +42,7 @@ add_library(hole_vr SHARED
     src/vr/body/grip_record.cpp
     src/vr/body/grip_editor.cpp
     src/vr/body/body.cpp
+    src/vr/body/hand_walls.cpp
     src/ue/process_event.cpp
     src/ue/call.cpp
     src/game/game.cpp

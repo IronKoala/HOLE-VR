@@ -81,6 +81,8 @@ const std::vector<Row>& Rows() {
          {{"On", {{"rifle_virtual_stock", "1"}}}, {"Off", {{"rifle_virtual_stock", "0"}}}}, 0},
         {"Gun stops at walls", K::kChoice,
          {{"On", {{"gun_wall_collision", "1"}}}, {"Off", {{"gun_wall_collision", "0"}}}}, 0},
+        {"Hands stop at walls", K::kChoice,
+         {{"On", {{"hand_wall_collision", "1"}}}, {"Off", {{"hand_wall_collision", "0"}}}}, 0},
         {"Gun kick",
          K::kChoice,
          {{"Off", {{"gun_recoil_kick", "0"}}},

@@ -26,6 +26,7 @@
 #include "vr/body/finger_solve.h"
 #include "vr/body/grip_editor.h"
 #include "vr/body/grip_record.h"
+#include "vr/body/hand_walls.h"
 #include "vr/body/hand_pose.h"
 #include "vr/body/ik_math.h"
 #include "vr/body/skeleton.h"
@@ -2888,6 +2889,9 @@ void OnTick(UObject player, float dt_f) {
 
     UpdateEditor(grab, hs, live, dt);
     StepMeasure(hs, sc_target, body_right, dt);
+    // Empty hands stop at walls (after the arm measure, which wants the real
+    // hands; not while the grip editor holds the hands still).
+    if (!g_freeze.on) hand_walls::Apply(player, head, hs, grab, dt);
     for (int side = 0; side < 2; ++side)
         if (hs[side].valid) SolveArm(side, hs[side], grab[side], grab[kR], body_fwd, body_right, dt);
 
@@ -3034,7 +3038,9 @@ void RequestMeasure() {
 
 void Init() {
     LoadSettings();
+    hand_walls::LoadSettings();
     config::AddChangeListener(&LoadSettings);
+    config::AddChangeListener(&hand_walls::LoadSettings);
     game::AddTickListener(&OnTick);
     NotifyStudyInit();
     log::Info("body: ready (%s; F9 toggles; grip editor: hold left Y 1 s while holding the gun)",
