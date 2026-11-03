@@ -28,6 +28,12 @@ constexpr double kEventGapMs = 10000;
 constexpr int kEventScore = 40;    // odd 8 px blocks more in one eye than the other
 constexpr int kOddScore = 6;       // counted as an odd strip in the report
 constexpr double kWorstGapMs = 5000;
+// Lone dots (CountDots): a strip with this many more in one eye than the
+// other is saved, with the whole picture at full size from the next strips.
+constexpr int kDotStripEvent = 60;
+constexpr int kMaxDotEvents = 3;
+constexpr double kDotEventGapMs = 20000;
+constexpr int kMaxStrips = 64;
 
 bool g_on = false;
 
@@ -83,6 +89,20 @@ std::mutex g_stats_mutex;
 long long g_checked = 0, g_odd = 0, g_busy = 0;
 int g_worst = 0, g_worst_eye = 0, g_worst_y = 0, g_worst_shift = 0;
 std::string g_saved;
+// Where strips get lost on the way, for the report (in the 2026-11-03 10:59
+// run the first watcher copied strips but never compared one).
+long long g_recorded_n = 0, g_collected_n = 0, g_map_failed = 0;
+long long g_dots[2] = {0, 0};
+int g_dot_grid[2][32] = {};
+int g_dot_worst = 0, g_dot_worst_eye = 0, g_dot_worst_y = 0;
+// The latest dot counts of each strip of the picture, for LatestSweep.
+struct StripDots {
+    int dots[2] = {0, 0};
+    int grid[2][32] = {};
+    double at_ms = -1;
+};
+StripDots g_strip_dots[kMaxStrips];
+int g_strip_count = 0;
 
 // Worker thread only.
 int g_events = 0;
@@ -92,6 +112,12 @@ int g_burst = 0;  // strips still to add to the event's whole picture
 int g_burst_n = 0;
 UINT g_burst_w = 0, g_burst_h = 0;  // half size
 std::vector<uint8_t> g_burst_rgb;   // half size, top row first
+int g_dot_events = 0;
+double g_last_dot_event = -1e12;
+int g_full = 0;  // strips still to add to the dot event's full-size picture
+int g_full_n = 0;
+UINT g_full_w = 0, g_full_h = 0;
+std::vector<uint8_t> g_full_rgb;  // full size, top row first
 
 void Rgb(uint32_t px, bool bgra, bool ten, uint8_t out[3]) {
     if (ten) {
@@ -173,6 +199,72 @@ void AddToBurst(const Job& j) {
     }
 }
 
+void AddToFull(const Job& j) {
+    const bool bgra = IsBgra(j.format), ten = IsTenBit(j.format);
+    for (UINT y = 0; y < j.rows && j.y0 + y < g_full_h; ++y) {
+        const uint8_t* src = j.data.data() + static_cast<size_t>(y) * j.row_pitch;
+        uint8_t* dst = &g_full_rgb[static_cast<size_t>(j.y0 + y) * g_full_w * 3];
+        for (UINT x = 0; x < g_full_w && x < j.width; ++x) {
+            uint32_t px;
+            std::memcpy(&px, src + x * 4, 4);
+            Rgb(px, bgra, ten, dst + x * 3);
+        }
+    }
+}
+
+void CheckDots(const Job& j, const Band& band, double now) {
+    const Dots d = CountDots(band, static_cast<int>(j.y0));
+    const int strip = static_cast<int>(j.y0 / std::max(1u, j.rows));
+    const int strips = static_cast<int>((j.full_h + j.rows - 1) / std::max(1u, j.rows));
+    {
+        std::lock_guard<std::mutex> lock(g_stats_mutex);
+        for (int e = 0; e < 2; ++e) {
+            g_dots[e] += d.count[e];
+            for (int i = 0; i < 32; ++i) g_dot_grid[e][i] += d.grid[e][i];
+        }
+        if (d.Odd() > g_dot_worst) {
+            g_dot_worst = d.Odd();
+            g_dot_worst_eye = d.Eye();
+            g_dot_worst_y = static_cast<int>(j.y0);
+        }
+        if (strip >= 0 && strip < kMaxStrips) {
+            StripDots& sd = g_strip_dots[strip];
+            sd.dots[0] = d.count[0];
+            sd.dots[1] = d.count[1];
+            std::memcpy(sd.grid, d.grid, sizeof(sd.grid));
+            sd.at_ms = now;
+            g_strip_count = std::min(strips, kMaxStrips);
+        }
+    }
+
+    if (g_full > 0) {
+        AddToFull(j);
+        if (--g_full == 0) {
+            const std::string name = "capture-dots-" + std::to_string(g_full_n) + ".bmp";
+            if (WriteBmp(name, g_full_rgb, g_full_w, g_full_h)) Saved(name);
+            g_full_rgb.clear();
+            g_full_rgb.shrink_to_fit();
+        }
+        return;
+    }
+    if (d.Odd() >= kDotStripEvent && g_dot_events < kMaxDotEvents && now - g_last_dot_event >= kDotEventGapMs) {
+        g_last_dot_event = now;
+        g_full_n = ++g_dot_events;
+        log::Info("square watch: %d lone dots in the %s eye's strip %u rows down that the other eye doesn't have "
+                  "(%d vs %d; %.0f%% of them on one cell of an 8x4 grid); saving it as capture-dots-%d-strip.bmp and "
+                  "the whole picture at full size as capture-dots-%d.bmp",
+                  d.Odd(), d.Eye() ? "right" : "left", j.y0, d.count[d.Eye()], d.count[1 - d.Eye()],
+                  100.f * GridShare(d.grid[d.Eye()]), g_full_n, g_full_n);
+        SaveStrip(j, "capture-dots-" + std::to_string(g_full_n) + "-strip.bmp");
+        g_full_w = j.width;
+        g_full_h = j.full_h;
+        g_full_rgb.assign(static_cast<size_t>(g_full_w) * g_full_h * 3, 0);
+        for (size_t i = 0; i + 2 < g_full_rgb.size(); i += 3) g_full_rgb[i] = g_full_rgb[i + 2] = 255;  // magenta: not seen
+        AddToFull(j);
+        g_full = static_cast<int>((j.full_h + j.rows - 1) / j.rows) + 1;
+    }
+}
+
 void Check(const Job& j) {
     perf::Scope t(g_perf_check);
     const bool bgra = IsBgra(j.format), ten = IsTenBit(j.format);
@@ -190,6 +282,8 @@ void Check(const Job& j) {
             dst[x] = Luma(px, bgra, ten);
         }
     }
+    const double now_ms = perf::NowMs();
+    CheckDots(j, band, now_ms);
     const Odd o = FindOdd(band, Settings{}, &scratch);
     const int score = o.Score(), eye = o.Eye();
     {
@@ -203,7 +297,7 @@ void Check(const Job& j) {
             g_worst_shift = o.scene_shift;
         }
     }
-    const double now = perf::NowMs();
+    const double now = now_ms;
 
     if (g_burst > 0) {
         AddToBurst(j);
@@ -258,10 +352,24 @@ void Worker() {
 void Collect(Slot& s) {
     s.state = Slot::kFree;
     const UINT rows = s.fp.Footprint.Height;
+    // The buffer holds RowPitch x rows bytes (made that size in Record). The
+    // copy's own footprint ends short of that on the last row, and the first
+    // watcher mapped RowPitch x rows of a buffer only footprint-sized: a map
+    // past a buffer's end fails, the likely reason it never compared a strip
+    // in the 2026-11-03 10:59 run (the report below now counts each step).
     const size_t bytes = static_cast<size_t>(s.fp.Footprint.RowPitch) * rows;
     void* mapped = nullptr;
-    D3D12_RANGE range{0, static_cast<SIZE_T>(bytes)};
-    if (FAILED(s.buffer->Map(0, &range, &mapped)) || !mapped) return;
+    D3D12_RANGE range{0, static_cast<SIZE_T>(std::min<UINT64>(bytes, s.size))};
+    if (bytes > s.size || FAILED(s.buffer->Map(0, &range, &mapped)) || !mapped) {
+        std::lock_guard<std::mutex> lock(g_stats_mutex);
+        if (g_map_failed++ == 0) log::Warn("square watch: could not read a strip back (%zu bytes, buffer %llu)", bytes,
+                                           static_cast<unsigned long long>(s.size));
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_stats_mutex);
+        ++g_collected_n;
+    }
     Job j;
     {
         std::lock_guard<std::mutex> lock(g_jobs_mutex);
@@ -298,16 +406,23 @@ void Collect(Slot& s) {
 
 std::string Report(double) {
     std::lock_guard<std::mutex> lock(g_stats_mutex);
-    if (g_checked == 0 && g_saved.empty()) return {};
-    char buf[512];
+    if (g_recorded_n == 0 && g_checked == 0 && g_saved.empty()) return {};
+    char buf[768];
     std::snprintf(buf, sizeof(buf),
-                  "white squares watch: compared the eyes in %lld strips of the picture; %lld had bright blocks in "
-                  "one eye only (worst %d blocks, %s eye, %d rows down, eyes %d px apart)%s",
-                  g_checked, g_odd, g_worst, g_worst_eye ? "right" : "left", g_worst_y, g_worst_shift,
-                  g_busy ? "; some strips skipped (checker busy)" : "");
+                  "white squares watch: %lld strips copied, %lld read back, %lld compared%s; lone dots left eye %lld "
+                  "(%.0f%% on one 8x4 grid cell), right eye %lld (%.0f%%), most in one strip %d (%s eye, %d rows "
+                  "down); bright blocks in one eye only in %lld strips (worst %d, %s eye, %d rows down)%s",
+                  g_recorded_n, g_collected_n, g_checked, g_map_failed ? " (read-back failed)" : "", g_dots[0],
+                  100.f * GridShare(g_dot_grid[0]), g_dots[1], 100.f * GridShare(g_dot_grid[1]), g_dot_worst,
+                  g_dot_worst_eye ? "right" : "left", g_dot_worst_y, g_odd, g_worst, g_worst_eye ? "right" : "left",
+                  g_worst_y, g_busy ? "; some strips skipped (checker busy)" : "");
     std::string out = buf;
     if (!g_saved.empty()) out += "; saved " + g_saved;
     g_checked = g_odd = g_busy = 0;
+    g_recorded_n = g_collected_n = g_map_failed = 0;
+    g_dots[0] = g_dots[1] = 0;
+    std::memset(g_dot_grid, 0, sizeof(g_dot_grid));
+    g_dot_worst = g_dot_worst_eye = g_dot_worst_y = 0;
     g_worst = g_worst_eye = g_worst_y = g_worst_shift = 0;
     g_saved.clear();
     return out;
@@ -367,6 +482,7 @@ void Record(ID3D12Device* device, ID3D12GraphicsCommandList* cmd, ID3D12Resource
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
     UINT64 total = 0;
     device->GetCopyableFootprints(&bd, 0, 1, 0, &fp, nullptr, nullptr, &total);
+    total = std::max<UINT64>(total, static_cast<UINT64>(fp.Footprint.RowPitch) * rows);
     Slot& s = g_slots[idx];
     if (!s.buffer || s.size < total) {
         if (s.buffer) s.buffer->Release();
@@ -407,6 +523,8 @@ void Record(ID3D12Device* device, ID3D12GraphicsCommandList* cmd, ID3D12Resource
     s.full_h = height;
     s.state = Slot::kRecorded;
     g_recorded = idx;
+    std::lock_guard<std::mutex> lock(g_stats_mutex);
+    ++g_recorded_n;
 }
 
 void Submitted(ID3D12Fence* fence, UINT64 value) {
@@ -415,6 +533,25 @@ void Submitted(ID3D12Fence* fence, UINT64 value) {
     g_slots[g_recorded].state = Slot::kPending;
     g_slots[g_recorded].fence_value = value;
     g_recorded = -1;
+}
+
+bool LatestSweep(double since_ms, Sweep* out) {
+    if (!g_on || !out) return false;
+    std::lock_guard<std::mutex> lock(g_stats_mutex);
+    *out = Sweep{};
+    out->strips = g_strip_count;
+    int grid[2][32] = {};
+    for (int i = 0; i < g_strip_count; ++i) {
+        const StripDots& sd = g_strip_dots[i];
+        if (sd.at_ms < since_ms) continue;
+        ++out->fresh;
+        for (int e = 0; e < 2; ++e) {
+            out->dots[e] += sd.dots[e];
+            for (int c = 0; c < 32; ++c) grid[e][c] += sd.grid[e][c];
+        }
+    }
+    for (int e = 0; e < 2; ++e) out->grid_share[e] = GridShare(grid[e]);
+    return out->strips > 0 && out->fresh == out->strips;
 }
 
 }  // namespace holevr::vr::square_watch

@@ -34,6 +34,7 @@
 #include "vr/launch.h"
 #include "vr/stereo.h"
 #include "vr/view_lead.h"
+#include "vr/square_test.h"
 #include "vr/square_watch.h"
 
 namespace {
@@ -146,6 +147,7 @@ DWORD WINAPI InitThread(LPVOID) {
         vr::hole_watch::InitGame();
         vr::menu_study::InitGame();
         vr::ui_panel::InitGame();
+        vr::square_test::Init();  // after cvars: switches render features for its tests
     }
 
     // Development hotkeys. Polled rather than hooked so nothing here can
