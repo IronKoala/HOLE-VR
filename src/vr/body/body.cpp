@@ -31,6 +31,7 @@
 #include "vr/body/hand_pose.h"
 #include "vr/body/ik_math.h"
 #include "vr/body/skeleton.h"
+#include "vr/body/slide_pose.h"
 #include "vr/hands.h"
 #include "vr/input.h"
 #include "vr/interact/holster.h"
@@ -1114,15 +1115,15 @@ struct FreeSlideHand {
     FVector pos;
 } g_free_slide[2];
 
-// Slide grabs have three poses, picked once when the hand closes on the
+// Slide grabs have several poses, picked once when the hand closes on the
 // slide (like Half-Life: Alyx). Hand on the FRONT half of the slide = front
 // hold. On the rear half the angle decides: palm facing down onto it =
-// overhand, palm facing the muzzle (hand behind the slide) = rear pinch.
-// Each is its own record.
-enum SlideHold { kSlideOver, kSlideRear, kSlideFront, kSlideHoldCount };
+// overhand, otherwise a rear pinch. The rear pinch has two records, posed
+// from above and from behind the slide (PickRearPinch). Each is its own record.
+enum SlideHold { kSlideOver, kSlideRear, kSlideFront, kSlideBehind, kSlideHoldCount };
 // (New names on 2026-11-02 so the owner's earlier test saves, slide-over/front, do not hide the built-in holds.)
-const char* kSlideHoldKey[] = {"rear-flat", "rear-pinch", "front-flat"};
-const char* kSlideHoldName[] = {"rear overhand", "rear pinch", "front"};
+const char* kSlideHoldKey[] = {"rear-flat", "rear-pinch", "front-flat", "rear-pinch-behind"};
+const char* kSlideHoldName[] = {"rear overhand", "rear pinch", "front", "rear pinch from behind"};
 int g_slide_hold[2] = {kSlideOver, kSlideOver};
 UObject g_slide_jump_logged[2] = {0, 0};  // slide grab whose drawn jump is logged
 
@@ -2422,7 +2423,7 @@ bool BuildSlidePreset(int side, const hands::HandState& h, const hands::Pose& ob
     const UObject slide = g_shape.slide;
     if (!slide || g_shape.parts.empty()) return false;
     const int hold = g_slide_hold[side];
-    const bool pinch = hold == kSlideRear;
+    const bool pinch = hold == kSlideRear || hold == kSlideBehind;
     // Hand where the controller grabbed, in the object frame.
     FQuat hand_rot;
     FVector hand_pos;
@@ -2566,6 +2567,68 @@ void FlushFingerRest(int side) {
     n = FingerRestNote{};
 }
 
+// Which rear pinch record to draw. Owner 2026-11-03 14:14: "i couldn't pinch
+// the slide no matter what i did". His 08:02 run: every grab caught, but the
+// one saved rear pinch was posed with the hand over the top of the slide
+// (forearm 81 deg right, 64 deg up from the barrel), and he reaches in from
+// behind the slide with the palm toward the muzzle. The drawn hand jumped
+// 15-20 cm and turned 80-130 deg onto the slide, and he let go within 0.2 s:
+// 3 of 48 such grabs racked, against 12 of 21 that turned under 60 deg.
+// Half-Life: Alyx's pistol slide (vr_alyxgun_slide_anim_interact) has two
+// authored hand poses, each with its own grab point: a pinch at the rear
+// serrations with the wrist behind the slide and the fingers toward the
+// muzzle (vr_alyxgun_slide_anim, bone "interact"), and an overhand grab at the
+// front (vr_alyxgun_slide_anim_alt, bone "interact1"). So the rear pinch has
+// two records here: posed from above (key rear-pinch, the owner's first save)
+// and from behind (rear-pinch-behind). The saved one the hand turns least to
+// reach is drawn. One that would turn it more than hand_slide_pose_max_turn_deg
+// is not used; then the from-behind pinch, until it is posed, is the built-in
+// fist with the thumb out at the hand's own angle (BuildSlidePreset), so the
+// hand never flips onto the slide.
+int PickRearPinch(int side, const hands::HandState& h, const hands::Pose& obj, const hands::HandGrab& grab) {
+    static const double max_turn = config::GetFloat("hand_slide_pose_max_turn_deg", 60.f);
+    const HandRig& rig = G.rig[side];
+    if (!rig.ok) return kSlideRear;
+    FQuat free_rot;
+    FVector free_pos;
+    FreeHand(side, h, h.grip.location, &free_rot, &free_pos);
+    const int kinds[2] = {kSlideRear, kSlideBehind};
+    bool saved[2] = {false, false};
+    double turn[2] = {0.0, 0.0};
+    for (int i = 0; i < 2; ++i) {
+        g_slide_hold[side] = kinds[i];
+        const std::string key = RecordKey(side, grab);
+        gr::Record rec;
+        auto cached = g_grip_cache.find(CacheKey(side, key));
+        if (cached != g_grip_cache.end() && cached->second.from_file) {
+            rec = cached->second.rec;
+            saved[i] = true;
+        } else {
+            bool from_file = false;
+            saved[i] = GripRecord(side, hands::GrabKind::kSlideGrab, grab.object, key, &rec, &from_file) && from_file;
+        }
+        if (!saved[i]) continue;
+        FQuat rot_o;
+        FVector pos_o;
+        gr::HandInObject(rec, rig.geo, &rot_o, &pos_o);
+        const FQuat drawn = Normalized(obj.rotation * rot_o);
+        const double dq = std::fabs(free_rot.X * drawn.X + free_rot.Y * drawn.Y + free_rot.Z * drawn.Z +
+                                    free_rot.W * drawn.W);
+        turn[i] = 2.0 * std::acos(std::min(1.0, dq)) * kRadToDeg;
+    }
+    const int pick = kinds[slide_pose::ChooseRearPinch(saved, turn, max_turn)];
+    g_slide_hold[side] = pick;
+    char above[48], behind[48];
+    if (saved[0]) std::snprintf(above, sizeof(above), "turns the hand %.0f deg", turn[0]);
+    else std::snprintf(above, sizeof(above), "not posed");
+    if (saved[1]) std::snprintf(behind, sizeof(behind), "turns the hand %.0f deg", turn[1]);
+    else std::snprintf(behind, sizeof(behind), "not posed (built from where the hand is)");
+    log::Info("body: slide rear pinch: the pose from above %s, the pose from behind %s; drawing the %s (a pose that "
+              "turns the hand more than %.0f deg is not used)",
+              above, behind, kSlideHoldName[pick], max_turn);
+    return pick;
+}
+
 void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, const hands::HandGrab& right_grab,
               const FVector& body_fwd, const FVector& body_right, double dt) {
     const Skeleton& k = G.skel;
@@ -2579,8 +2642,10 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
     if (grab.object != g.object || grab.kind != g.kind) {
         if (g_editor.Active() && g_edit_side == side) StopEditor();
         hands::Pose gun;
-        if (grab.kind == hands::GrabKind::kSlideGrab && ObjectFrame(grab, right_grab, &gun))
+        if (grab.kind == hands::GrabKind::kSlideGrab && ObjectFrame(grab, right_grab, &gun)) {
             g_slide_hold[side] = PickSlideHold(h, gun, grab.object);
+            if (g_slide_hold[side] == kSlideRear) g_slide_hold[side] = PickRearPinch(side, h, gun, grab);
+        }
         LoadGrip(side, grab);
         g_free_slide[side].on = false;
         if (grab.kind == hands::GrabKind::kSlideGrab && !g.have && !g.pending && ObjectFrame(grab, right_grab, &gun) &&
