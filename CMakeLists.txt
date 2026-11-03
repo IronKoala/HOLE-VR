@@ -66,6 +66,7 @@ add_library(hole_vr SHARED
     src/vr/wrist_hud.cpp
     src/vr/launch.cpp
     src/vr/workbench.cpp
+    src/vr/drinks.cpp
     src/main.cpp
 )
 

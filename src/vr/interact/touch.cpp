@@ -22,6 +22,7 @@
 #include "ue/reflection.h"
 #include "ue/script_dump.h"
 #include "vr/body/body.h"
+#include "vr/drinks.h"
 #include "vr/hands.h"
 #include "vr/input.h"
 #include "vr/interact/touch_math.h"
@@ -543,7 +544,9 @@ int HandBalls(int h, const hands::HandState& hs, Ball* out) {
 bool HandFree(int h, const hands::HandState& hs) {
     if (!hs.valid || hands::EditorHand() == h) return false;
     if (hands::GetGrab(h == 0 ? hands::kLeft : hands::kRight).kind != hands::GrabKind::kNone) return false;
-    if (workbench::ClaimsGrip(h)) return false;
+    // The workbench (a hand at or holding an attachment) and the drink
+    // machine (a hand at or holding a can) own the hand then.
+    if (workbench::ClaimsGrip(h) || drinks::ClaimsGrip(h)) return false;
     body::HandContacts hc;
     if (body::GetHandContacts(h, &hc) && !hc.empty) return false;
     return true;
