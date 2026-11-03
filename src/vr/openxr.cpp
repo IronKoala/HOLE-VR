@@ -997,7 +997,7 @@ void RunFrame() {
         perf::Register(&g_perf_game);
         perf::Register(&g_perf_wait);
         perf::Register(&g_perf_submit);
-        for (perf::Counter* c : {&g_perf_begin, &g_perf_images, &g_perf_copy, &g_perf_layers, &g_perf_end})
+        for (perf::Counter* c : {&g_perf_begin, &g_perf_locate, &g_perf_images, &g_perf_copy, &g_perf_layers, &g_perf_end})
             perf::Register(c);
         perf::AddReportLine(&HeadsetReport);
         perf::AddReportLine(&PairReport);

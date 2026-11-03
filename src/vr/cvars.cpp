@@ -1,5 +1,6 @@
 #include "vr/cvars.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
@@ -74,11 +75,50 @@ bool IsInteger(const std::string& v) {
     return end && *end == '\0';
 }
 
+// Game thread, once with a level loaded: what the game renders with, and
+// room in the virtual shadow map page pool for two eyes.
+//
+// White squares and bars in one eye (owner 2026-11-03): they come during a
+// run, never with a menu up, randomly in either eye; one capture had square
+// blocks of speckled light on a shadowed floor in the left eye only. With
+// virtual shadow maps each eye is its own view with its own directional
+// light clipmap, so two eyes ask for about twice the shadow pages of the flat
+// game. When the pool runs out, the pages that don't fit are drawn without
+// their shadow: square patches of full sunlight (this game's sun patches are
+// near white) in whichever eye lost out. vr_shadow_pages: -1 = twice the
+// game's pool (default), 0 = leave it, N = that many pages (64 KB each).
+void StereoRenderSetup(UObject ksl) {
+    static bool s_done = false;
+    if (s_done) return;
+    s_done = true;
+    int vsm = -1, pages = -1, cache = -1, quality = -1, gi = -1, refl = -1;
+    ReadInt(ksl, "r.Shadow.Virtual.Enable", &vsm);
+    ReadInt(ksl, "r.Shadow.Virtual.MaxPhysicalPages", &pages);
+    ReadInt(ksl, "r.Shadow.Virtual.Cache", &cache);
+    ReadInt(ksl, "sg.ShadowQuality", &quality);
+    ReadInt(ksl, "r.DynamicGlobalIlluminationMethod", &gi);
+    ReadInt(ksl, "r.ReflectionMethod", &refl);
+    log::Info("cvars: the game renders with virtual shadow maps %s (%d pages, cache %d), shadow quality %d, "
+              "global illumination method %d, reflection method %d",
+              vsm == 1 ? "on" : vsm == 0 ? "off" : "unknown", pages, cache, quality, gi, refl);
+    if (vsm != 1 || pages <= 0) return;
+    int target = config::GetInt("vr_shadow_pages", -1);
+    if (target < 0) target = pages * 2;
+    target = std::min(target, 16384);
+    if (target > pages) {
+        log::Info("cvars: virtual shadow map pool %d -> %d pages for two eyes (+%d MB of video memory; "
+                  "vr_shadow_pages)",
+                  pages, target, (target - pages) / 16);
+        Want("r.Shadow.Virtual.MaxPhysicalPages", std::to_string(target));
+    }
+}
+
 // Game thread: set every wanted variable that differs from its current value.
 void ApplyOnGameThread() {
     UObject ksl = Library();
     UObject player = game::Player();
     if (!ksl || !player) return;  // needs a world; menus before the first level wait
+    StereoRenderSetup(ksl);
     std::map<std::string, std::string> wanted;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
