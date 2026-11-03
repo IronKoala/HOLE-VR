@@ -33,12 +33,16 @@ struct Settings {
     double vignette_move = 0.0;  // 0..1
     double vignette_turn = 0.0;
     bool wall_fade = true;
+    double wall_start = 15.0;  // cm from a surface where the head-in-wall fade begins
+    double wall_full = 2.0;    // cm from it where the view is black
 } S;
 
 void LoadSettings() {
     S.vignette_move = std::clamp<double>(config::GetFloat("comfort_vignette_move", 0.f), 0.0, 1.0);
     S.vignette_turn = std::clamp<double>(config::GetFloat("comfort_vignette_turn", 0.f), 0.0, 1.0);
     S.wall_fade = config::GetBool("head_wall_fade", true);
+    S.wall_start = std::clamp<double>(config::GetFloat("head_wall_fade_start_cm", 15.f), 3.0, 30.0);
+    S.wall_full = std::clamp<double>(config::GetFloat("head_wall_fade_full_cm", 2.f), 0.0, S.wall_start - 1.0);
 }
 
 double NowS() {
@@ -265,9 +269,15 @@ struct Listener : xr::Listener {
 } g_listener;
 
 // ---------------------------------------------------- head in a wall --
-// A line from the middle of the character's collision capsule (at head
-// height) to the eyes. If the level's collision is in the way, the head is
-// through a wall: the deeper, the darker (black 8 cm in).
+// A ball is swept from the middle of the character's collision capsule (at
+// head height) to the eyes. Its radius is where the fade begins
+// (head_wall_fade_start_cm, 15): where it stops, the eyes are that close to
+// a wall or object, and the further they go on past that point, the darker:
+// black head_wall_fade_full_cm (2) before the surface. The first version
+// only began fading 1 cm inside the wall and was black 9 cm in, so you saw
+// through first (owner 2026-11-03 10:07: "the wall fade needs to kick in a
+// lot sooner"; the near clip plane is 1 cm, so the wall vanishes as soon as
+// the eyes cross it).
 struct TArrayRaw {
     const UObject* data;
     int32_t num, max;
@@ -276,11 +286,13 @@ struct TArrayRaw {
 struct WallState {
     UObject ksl = 0, gps = 0;
     int lookups = 0;
+    int32_t radius_size = -1;  // SphereTraceSingle's Radius: float (4) or double (8)
     bool was_inside = false;
     double inside_since = 0;
+    double closest = 1e9;      // nearest the eyes got to the surface while faded, cm
 } WS;
 
-double HeadInWall(UObject player, const hands::Pose& head) {
+double HeadInWall(UObject player, const hands::Pose& head, double* gap) {
     if ((!WS.ksl || !WS.gps) && WS.lookups < 3) {
         ++WS.lookups;
         if (!WS.ksl) WS.ksl = ue::FindObject("KismetSystemLibrary /Script/Engine.Default__KismetSystemLibrary");
@@ -308,12 +320,31 @@ double HeadInWall(UObject player, const hands::Pose& head) {
     FVector d = head.location - start;
     double len = std::sqrt(d.X * d.X + d.Y * d.Y + d.Z * d.Z);
     if (len < 4.0) return 0;  // head right over the capsule: nothing to cross
-    UObject ignore[2] = {player, 0};
+    // The gun and whatever the hands hold (a magazine brought up to the
+    // face) never fade the view.
+    UObject ignore[4] = {player, 0, 0, 0};
     int32_t n = 1;
     game::Gun gun = game::Gun::Current(player);
     if (gun.Valid()) ignore[n++] = gun.Object();
+    for (hands::Hand h : {hands::kLeft, hands::kRight}) {
+        const UObject held = hands::GetGrab(h).object;
+        if (held && held != ignore[1]) ignore[n++] = held;
+    }
     TArrayRaw arr{ignore, n, n};
-    ue::Call t(WS.ksl, "LineTraceSingle");
+    ue::Call t(WS.ksl, "SphereTraceSingle");
+    if (!t.Valid()) return 0;
+    if (WS.radius_size < 0) {
+        int32_t sz = 0;
+        t.Raw("Radius", &sz);
+        WS.radius_size = sz;
+        if (sz != 4 && sz != 8) log::Warn("comfort: sphere trace radius is %d bytes; head-in-wall fade is off", sz);
+    }
+    if (WS.radius_size == 4)
+        t.Set("Radius", static_cast<float>(S.wall_start));
+    else if (WS.radius_size == 8)
+        t.Set("Radius", S.wall_start);
+    else
+        return 0;
     t.Set("WorldContextObject", player).Set("Start", start).Set("End", head.location)
         .Set("TraceChannel", uint8_t{0}).Set("bTraceComplex", false).Set("ActorsToIgnore", arr)
         .Set("bIgnoreSelf", true);
@@ -327,10 +358,14 @@ double HeadInWall(UObject player, const hands::Pose& head) {
     if (!in || in_size != hit_size) return 0;
     std::memcpy(in, hit, static_cast<size_t>(hit_size));
     if (!b.Invoke() || !b.Get<bool>("bBlockingHit") || b.Get<bool>("bInitialOverlap")) return 0;
+    // The ball's centre where it touched: the eyes are wall_start from the
+    // surface there (head-on), and each cm further along brings them a cm
+    // closer.
     FVector at = b.Get<FVector>("Location");
     FVector past = head.location - at;
     double depth = std::sqrt(past.X * past.X + past.Y * past.Y + past.Z * past.Z);
-    return std::clamp((depth - 1.0) / 8.0, 0.0, 1.0);
+    if (gap) *gap = S.wall_start - depth;
+    return std::clamp(depth / (S.wall_start - S.wall_full), 0.0, 1.0);
 }
 
 void OnTick(UObject player, float) {
@@ -339,17 +374,21 @@ void OnTick(UObject player, float) {
     if (!hands::Head(&head)) return;
     // A menu on the forearm is never faded out: it has to be readable even
     // with your head in something (the fade is drawn over everything).
-    double dark = world_menu::MenuUp() ? 0.0 : HeadInWall(player, head);
+    double gap = 1e9;
+    double dark = world_menu::MenuUp() ? 0.0 : HeadInWall(player, head, &gap);
     g_wall.store(static_cast<float>(dark));
     g_wall_at.store(NowS());
     bool inside = dark > 0.5;
+    if (inside) WS.closest = std::min(WS.closest, gap);
     if (inside != WS.was_inside) {
         WS.was_inside = inside;
         if (inside) {
             WS.inside_since = NowS();
-            log::Info("comfort: head inside a wall or object, view faded");
+            WS.closest = gap;
+            log::Info("comfort: head close to a wall or object (%.0f cm from it), view fading", gap);
         } else {
-            log::Info("comfort: head out of the wall again after %.1f s", NowS() - WS.inside_since);
+            log::Info("comfort: head away from the wall again after %.1f s (it got to %.0f cm %s the surface)",
+                      NowS() - WS.inside_since, std::fabs(WS.closest), WS.closest < 0 ? "past" : "from");
         }
     }
 }
@@ -368,8 +407,9 @@ void Init() {
     LoadSettings();
     config::AddChangeListener(&LoadSettings);
     xr::RegisterListener(&g_listener);
-    log::Info("comfort: vignette moving %.2f, turning %.2f; head-in-wall fade %s", S.vignette_move, S.vignette_turn,
-              S.wall_fade ? "on" : "off");
+    log::Info("comfort: vignette moving %.2f, turning %.2f; head-in-wall fade %s (begins %.0f cm from a surface, "
+              "black at %.0f cm)", S.vignette_move, S.vignette_turn, S.wall_fade ? "on" : "off", S.wall_start,
+              S.wall_full);
 }
 
 void InitGame() { game::AddTickListener(&OnTick); }

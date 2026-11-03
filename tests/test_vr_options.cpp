@@ -127,6 +127,11 @@ static void TestDefaultsAndActions() {
     EXPECT(std::string(monitor.choices[static_cast<size_t>(CurrentChoice(monitor, get))].text) == "Right eye");
     ini["monitor_view"] = "Both";
     EXPECT(std::string(monitor.choices[static_cast<size_t>(CurrentChoice(monitor, get))].text) == "Both eyes");
+    // The wall fade starts 15 cm from a surface unless chosen otherwise.
+    const Row& fade = RowNamed("Wall fade starts");
+    EXPECT(std::string(fade.choices[static_cast<size_t>(CurrentChoice(fade, get))].text) == "15 cm away");
+    ini["head_wall_fade_start_cm"] = "25";
+    EXPECT(std::string(fade.choices[static_cast<size_t>(CurrentChoice(fade, get))].text) == "25 cm away");
     // Empty hands stop at walls unless turned off.
     const Row& hand_walls = RowNamed("Hands stop at walls");
     EXPECT(std::string(hand_walls.choices[static_cast<size_t>(CurrentChoice(hand_walls, get))].text) == "On");
