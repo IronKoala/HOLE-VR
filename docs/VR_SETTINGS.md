@@ -94,8 +94,8 @@ levels. Each frame picks one part of it.
   a line and only began fading 1 cm inside the wall (black 9 cm in), and
   the near clip plane is 1 cm, so the wall vanished and you saw through
   before it went dark (owner 2026-11-03 10:07: "the wall fade needs to kick
-  in a lot sooner"). The player, the held gun and anything either hand
-  holds are ignored. No fade while a menu is on the
+  in a lot sooner"). The player, the held gun, anything either hand
+  holds and the forearm menu/HUD panels are ignored. No fade while a menu is on the
   forearm, or when the view is more than 1 m from the character's capsule
   (the game moving its camera, as on the extract results screen; menus
   thread, PR #79). Owner 2026-11-03: "if i successfully extract i cant see
@@ -238,6 +238,11 @@ hand.
   support hand and slide hand follow the gun.
 - If the eyes themselves are inside something (leaning through a wall), the
   hands are not stopped, since there is no sensible surface to stop them at.
+- The forearm menu and wrist HUD panels are ignored too (they block the
+  game's visibility traces). Before, looking at your wrist put the panels
+  between the eyes and the left hand, and the hand was stopped up to 22 cm
+  short of the controller for as long as you looked (run 2026-11-03 10:47,
+  found by the slide pinch thread).
 - A clear sweep is reused while the eyes and the hand stay within 3 mm of
   where they were, so a still hand costs nothing. The time shows in the
   perf report as "body hands stop at walls".
@@ -269,7 +274,7 @@ grips.
   clicked)` and `settings: saved key=value in hole-vr.ini` on each click, then
   `controls: settings changed (...)`; `... is already at its last choice` at
   an end.
-- `comfort: head close to a wall or object (N cm from it), view fading` /
+- `comfort: head close to <thing> (N cm from it), view fading` /
   `head away from the wall again after N s (it got to N cm from|past the
   surface)`. Logged when the fade passes half way.
 - `controls: physical crouch (...)` / `physical stand (...)`.
