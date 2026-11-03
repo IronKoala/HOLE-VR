@@ -112,6 +112,13 @@ struct Settings {
     double slide_pinch_back = 14.0;     // ...stretched this far back along the slide (cm): the controller's grip
                                         // point sits 5-12 cm behind fingertips that pinch the rear of the slide
     double slide_grab_forward = 16.0;   // pistol slide grab zone reaches this far forward of the rear grab point
+    // The visible fingers' pinch (thumb tip and index middle knuckle) also
+    // grabs when it is at the rear sight: within slide_pinch_radius of the
+    // line from the sight to this far past the slide's rear end (owner
+    // 2026-11-03 03:25: "extend it about .25 inch past the back of the slide").
+    bool finger_pinch = true;
+    double finger_pinch_past_rear = 0.64;
+    int slide_hold_log = 30;            // slide holds per run that log their frame-by-frame pull
     bool wall_collision = true;    // keep the gun out of walls
     double recoil_kick = 1.0;      // scale of the in-hand recoil kick, 0 = off
     bool game_recoil = false;      // let the game's camera/aim recoil run
@@ -175,6 +182,9 @@ void LoadSettings() {
     g_set.rack_trace = config::GetBool("debug_rack_trace", false);
     g_set.slide_pinch_radius = config::GetFloat("slide_pinch_radius_cm", 6.5f);
     g_set.slide_pinch_back = config::GetFloat("slide_pinch_back_cm", 14.f);
+    g_set.finger_pinch = config::GetBool("slide_finger_pinch", true);
+    g_set.finger_pinch_past_rear = config::GetFloat("slide_finger_pinch_past_rear_cm", 0.64f);
+    g_set.slide_hold_log = config::GetInt("slide_hold_log_count", 30);
     g_set.virtual_stock = config::GetBool("rifle_virtual_stock", true);
     g_set.stock_snap = config::GetFloat("rifle_stock_snap_cm", 12.f);
     g_set.stock_release = config::GetFloat("rifle_stock_release_cm", 20.f);
@@ -590,6 +600,22 @@ struct WeaponState {
     FVector release_loc;
     FQuat release_rot;
     interact::HolsterZone mag_zone;  // left hand at the magazine pouch (haptic tick)
+    // Slide hold diagnostics (2026-11-03: grabs from behind caught but let
+    // go at 0-20% and the log couldn't say why).
+    struct SlideDiag {
+        bool have_prev = false;
+        FVector prev_hand;          // left controller in slide space, last frame
+        double prev_clock = 0;
+        int holds = 0;              // holds with this gun
+        bool holding = false;
+        double grab_clock = 0;
+        FVector grab_hand_w, grab_gun_w;
+        double hand_moved = 0, gun_moved = 0;  // furthest from where they were at the grab, world cm
+        float grip_min = 1.f, grip_last = 0.f, trigger_max = 0.f;
+        double needed_cm = 0;       // hand pull a full rack needs
+        bool by_fingers = false;    // caught by the visible fingers' pinch, not the controller centre
+        std::string pulls, grips;   // per frame, for the first holds
+    } sd;
 } W;
 
 double Len(const FVector& v) { return std::sqrt(v.X * v.X + v.Y * v.Y + v.Z * v.Z); }
@@ -1129,12 +1155,111 @@ void SlideHandling(game::Gun& gun, const hands::HandState& lh, const input::Hand
     W.slide.Configure(cfg);
     W.slide.SetRest(rest);
 
-    if (lin.grip_button.pressed && W.held_mag == 0 && in_hand)
+    // The visible hand's pinch (thumb tip, index middle knuckle), from the
+    // body's last frame, carried by this frame's controller.
+    FVector thumb_g, index_g, thumb{}, index{}, pinch{};
+    const bool have_fingers = W.is_pistol && cfg.use_span && body::PinchPoint(0, &thumb_g, &index_g);
+    double pinch_dist = -1;   // pinch point to the rear-sight line, cm
+    if (have_fingers) {
+        thumb = ToLocal(pt, lh.grip.location + lh.grip.rotation.Rotate(thumb_g));
+        index = ToLocal(pt, lh.grip.location + lh.grip.rotation.Rotate(index_g));
+        pinch = (thumb + index) * 0.5;
+        // Line from the rear sight back to just past the slide's rear end.
+        const double back = std::fmax(0.0, interact::Dot(cfg.span_rear - cfg.sight_center, cfg.axis)) +
+                            g_set.finger_pinch_past_rear;
+        const double t = std::clamp(interact::Dot(pinch - cfg.sight_center, cfg.axis), 0.0, back);
+        pinch_dist = Len(pinch - (cfg.sight_center + cfg.axis * t));
+    }
+    const bool fingers_in = have_fingers && g_set.finger_pinch && pinch_dist <= g_set.slide_pinch_radius;
+    const bool centre_in = W.slide.InZone(hand);
+    W.slide.AcceptNextPress(fingers_in);
+
+    // Left hand's speed along the slide (+ = back toward you), cm/s.
+    double pull_speed = 0;
+    if (W.sd.have_prev && g_clock > W.sd.prev_clock)
+        pull_speed = interact::Dot(hand - W.sd.prev_hand, cfg.axis) / (g_clock - W.sd.prev_clock);
+    W.sd.prev_hand = hand;
+    W.sd.prev_clock = g_clock;
+    W.sd.have_prev = true;
+
+    if (lin.grip_button.pressed && W.held_mag == 0 && in_hand) {
         log::Info("controls: left grab at slide-space (%.1f %.1f %.1f), %s the slide zone", hand.X, hand.Y,
-                  hand.Z, W.slide.InZone(hand) ? "inside" : "outside");
+                  hand.Z, centre_in ? "inside" : "outside");
+        const FVector palm = Norm(pt.rotation.Inverse().Rotate(lh.palm_normal));
+        if (Len(hand - cfg.grab_center) > 40.0) {
+            // Nowhere near the slide (the pouch, a door): no finger details.
+        } else if (have_fingers)
+            log::Info("controls: left grab: fingers at slide-space thumb tip (%.1f %.1f %.1f), index knuckle "
+                      "(%.1f %.1f %.1f), pinch %.1f cm from the rear sight line (grabs within %.1f%s); controller "
+                      "centre %s; palm (%.2f %.2f %.2f); hand moving %.0f cm/s back along the slide; squeeze %.2f",
+                      thumb.X, thumb.Y, thumb.Z, index.X, index.Y, index.Z, pinch_dist, g_set.slide_pinch_radius,
+                      g_set.finger_pinch ? "" : ", off", centre_in ? "inside" : "outside", palm.X, palm.Y, palm.Z,
+                      pull_speed, lin.grip_value);
+        else
+            log::Info("controls: left grab: fingers not known (%s); palm (%.2f %.2f %.2f); hand moving %.0f cm/s "
+                      "back along the slide; squeeze %.2f",
+                      !W.is_pistol ? "not a pistol" : !cfg.use_span ? "slide not measured yet" : "VR body hand not posed",
+                      palm.X, palm.Y, palm.Z, pull_speed, lin.grip_value);
+    }
 
     using interact::SlideEvent;
-    SlideEvent e = W.slide.Update(hand, lin.grip_button.down && W.held_mag == 0 && in_hand, dt);
+    const bool grab_down = lin.grip_button.down && W.held_mag == 0 && in_hand;
+    SlideEvent e = W.slide.Update(hand, grab_down, dt);
+    // Hold diagnostics: every frame while held, a summary when it ends.
+    if (e == SlideEvent::kGrabbed) {
+        W.sd.holding = true;
+        ++W.sd.holds;
+        W.sd.grab_clock = g_clock;
+        W.sd.grab_hand_w = lh.grip.location;
+        W.sd.grab_gun_w = pt.translation;
+        W.sd.hand_moved = W.sd.gun_moved = 0;
+        W.sd.grip_min = lin.grip_value;
+        W.sd.trigger_max = lin.trigger;
+        W.sd.needed_cm = std::fmax(0.0, cfg.full_threshold - W.slide.Travel()) * cfg.length;
+        W.sd.by_fingers = fingers_in && !centre_in;
+        W.sd.pulls.clear();
+        W.sd.grips.clear();
+        log::Info("controls: slide hold #%d: grabbed by the %s (controller centre %s, fingers %s); a rack needs "
+                  "%.1f cm of pull",
+                  W.sd.holds, W.sd.by_fingers ? "fingers' pinch at the rear sight" : "controller centre",
+                  centre_in ? "inside" : "outside",
+                  !have_fingers ? "not known" : fingers_in ? "at the rear sight" : "not at the rear sight",
+                  W.sd.needed_cm);
+    } else if (W.sd.holding && W.slide.Held()) {
+        W.sd.hand_moved = std::fmax(W.sd.hand_moved, Len(lh.grip.location - W.sd.grab_hand_w));
+        W.sd.gun_moved = std::fmax(W.sd.gun_moved, Len(pt.translation - W.sd.grab_gun_w));
+        W.sd.grip_min = std::fmin(W.sd.grip_min, lin.grip_value);
+        W.sd.trigger_max = std::fmax(W.sd.trigger_max, lin.trigger);
+        if (W.sd.holds <= g_set.slide_hold_log && W.sd.pulls.size() < 420) {
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), " %.1f", W.slide.Stats().last_pull);
+            W.sd.pulls += buf;
+            std::snprintf(buf, sizeof(buf), " %.2f", lin.grip_value);
+            W.sd.grips += buf;
+        }
+    }
+    W.sd.grip_last = lin.grip_value;
+    if (W.sd.holding && !W.slide.Held()) {
+        W.sd.holding = false;
+        const interact::SlideHoldStats& st = W.slide.Stats();
+        const char* why = st.slipped                    ? "the hand slipped off (far from the slide and from where it grabbed)"
+                          : !in_hand                   ? "the pistol left the hand"
+                          : W.held_mag != 0            ? "a magazine was taken"
+                          : !lin.grip_button.down      ? "the grip was let go"
+                                                       : "unknown";
+        log::Info("controls: slide hold #%d ended after %.2f s (%d frames): %s (squeeze now %.2f, lowest %.2f while "
+                  "held; holds while above 0.35); hand went back up to %.1f cm and forward up to %.1f cm along the "
+                  "slide (a rack needed %.1f), ended at %.1f; sideways up to %.1f cm from where it grabbed (grabbed "
+                  "%.1f cm off the slide's line); slide reached %.0f%%; trigger up to %.2f; in the world the hand "
+                  "moved up to %.1f cm and the gun %.1f cm; %s",
+                  W.sd.holds, g_clock - W.sd.grab_clock, st.frames, why, lin.grip_value, W.sd.grip_min, st.max_pull,
+                  -st.min_pull, W.sd.needed_cm, st.last_pull, st.max_drift, st.start_off_axis, W.slide.Peak() * 100,
+                  W.sd.trigger_max, W.sd.hand_moved, W.sd.gun_moved,
+                  e == SlideEvent::kRacked ? "RACKED" : "not racked");
+        if (!W.sd.pulls.empty())
+            log::Info("controls: slide hold #%d per frame: pull back (cm)%s | squeeze%s", W.sd.holds,
+                      W.sd.pulls.c_str(), W.sd.grips.c_str());
+    }
     switch (e) {
         case SlideEvent::kGrabbed:
             input::Haptic(input::kLeft, 0.3f, 0.03f);

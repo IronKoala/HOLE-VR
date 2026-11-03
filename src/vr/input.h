@@ -53,6 +53,10 @@ Snapshot Peek();
 // in its picture (the forearm menu).
 Snapshot PeekGame();
 
+// What the latest Consume returned (same poses, same edges), for checks
+// that must see exactly the hand pose the game frame used.
+Snapshot LastConsumed();
+
 // Vibration, queued from any thread and played on the next frame.
 void Haptic(Hand hand, float amplitude, float seconds, float frequency_hz = 0.f);
 

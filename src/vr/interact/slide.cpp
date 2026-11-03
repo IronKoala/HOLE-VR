@@ -44,26 +44,38 @@ SlideEvent Slide::Update(const FVector& hand, bool grab_down, double dt) {
     const bool pressed = grab_down && !was_grab_down_;
     was_grab_down_ = grab_down;
     const double along = Dot(hand - cfg_.grab_center, cfg_.axis);
+    // The hand's offset from the line the slide runs on.
+    const FVector perp = hand - (cfg_.grab_center + cfg_.axis * along);
 
     if (!held_) {
         // Spring forward when not held.
         if (travel_ > rest_) travel_ = std::max(rest_, travel_ - cfg_.return_speed * dt);
         else travel_ = rest_;
-        if (pressed && InZone(hand)) {
+        const bool accept = accept_next_;
+        if (pressed) accept_next_ = false;
+        if (pressed && (accept || InZone(hand))) {
             held_ = true;
             reached_back_ = false;
             peak_ = travel_;
             const double grabbed_at = cfg_.grab_at_closed ? 0.0 : travel_;
             start_ = along - grabbed_at * cfg_.length;
             handle_ = grabbed_at;
+            grab_perp_ = perp;
+            grab_along_ = along;
+            stats_ = SlideHoldStats{};
+            stats_.start_off_axis = Length(perp);
             return SlideEvent::kGrabbed;
         }
         return SlideEvent::kNone;
     }
 
-    // Off-axis distance: how far the hand is from the line the slide runs on.
-    FVector on_axis = cfg_.grab_center + cfg_.axis * along;
-    double off_axis = Length(hand - on_axis);
+    // The hand slips off only when it is far from the slide's line AND far
+    // from the line it grabbed on. (Before 2026-11-03 only the first: a grab
+    // taken at the edge of the zone, 6-8 cm off the line, let go after
+    // 1-3 cm of sideways wobble.)
+    const double off_axis = Length(perp);
+    const double drift = Length(perp - grab_perp_);
+    const double pull = along - grab_along_;   // cm back from where the hand grabbed
 
     auto let_go = [&](SlideEvent partial_event) {
         held_ = false;
@@ -75,7 +87,16 @@ SlideEvent Slide::Update(const FVector& hand, bool grab_down, double dt) {
     };
 
     if (!grab_down) return let_go(SlideEvent::kPartialRelease);
-    if (off_axis > cfg_.max_off_axis) return let_go(SlideEvent::kSlipped);
+    stats_.frames += 1;
+    stats_.seconds += dt;
+    stats_.last_pull = pull;
+    stats_.max_pull = std::max(stats_.max_pull, stats_.last_pull);
+    stats_.min_pull = std::min(stats_.min_pull, stats_.last_pull);
+    stats_.max_drift = std::max(stats_.max_drift, drift);
+    if (off_axis > cfg_.max_off_axis && drift > cfg_.max_off_axis) {
+        stats_.slipped = true;
+        return let_go(SlideEvent::kSlipped);
+    }
 
     // A locked-open slide cannot go further forward than the catch.
     handle_ = std::clamp((along - start_) / cfg_.length, 0.0, 1.0);

@@ -58,6 +58,21 @@ struct SlideConfig {
 
 enum class SlideEvent { kNone, kGrabbed, kReachedBack, kRacked, kPartialRelease, kSlipped };
 
+// What one hold of the slide did, for the log (owner 2026-11-03: grabs from
+// behind the slide caught but let go at 0-20% and the log couldn't say why).
+// Distances in cm in the slide's parent space; pull is measured from where
+// the hand was when it grabbed, + = back (the pull direction).
+struct SlideHoldStats {
+    int frames = 0;            // held frames after the grab frame
+    double seconds = 0.0;
+    double max_pull = 0.0;     // furthest the hand went back along the slide
+    double min_pull = 0.0;     // furthest it went forward (<= 0)
+    double last_pull = 0.0;    // where it was on the last held frame
+    double max_drift = 0.0;    // furthest it moved away from the line it grabbed on
+    double start_off_axis = 0.0;  // how far the grab was from the slide's line
+    bool slipped = false;      // let go because the hand left the slide
+};
+
 class Slide {
 public:
     explicit Slide(const SlideConfig& c = SlideConfig()) : cfg_(c) {}
@@ -77,6 +92,12 @@ public:
     // slide; for a charging handle it can be ahead of a locked-back bolt.
     double HandleTravel() const { return held_ ? handle_ : 0.0; }
     bool InZone(const FVector& hand) const;
+    // The current (or last) hold, reset on each grab.
+    const SlideHoldStats& Stats() const { return stats_; }
+    // A grab that the caller has already found inside a zone of its own
+    // (e.g. the visible fingers at the rear sight) counts even when `hand`
+    // is outside InZone. Applies to the next press only.
+    void AcceptNextPress(bool accept) { accept_next_ = accept; }
 
 private:
     SlideConfig cfg_;
@@ -88,6 +109,10 @@ private:
     double rest_ = 0.0;
     double peak_ = 0.0;
     double handle_ = 0.0;
+    FVector grab_perp_;     // hand's offset from the slide's line when it grabbed
+    double grab_along_ = 0.0;  // hand's position along the slide when it grabbed
+    bool accept_next_ = false;
+    SlideHoldStats stats_;
 };
 
 double Dot(const FVector& a, const FVector& b);

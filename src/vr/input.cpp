@@ -461,6 +461,11 @@ Snapshot Peek() {
     return g_latest;
 }
 
+Snapshot LastConsumed() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return g_consumed;
+}
+
 Snapshot PeekGame() {
     const XrTime shown = xr::NewPictureShownTime();
     std::lock_guard<std::mutex> lock(g_mutex);

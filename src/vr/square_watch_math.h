@@ -62,6 +62,34 @@ Odd FindOdd(const Band& band, const Settings& s = Settings{}, Scratch* scratch =
 // one that makes the two halves of the band most alike.
 int SceneShift(const Band& band, const Settings& s = Settings{});
 
+// Lone bright dots: single pixels (or pairs) much brighter than the ring of
+// pixels two steps around them. The owner's 2026-11-03 10:47 screenshot of
+// the "white squares" in a run: no solid blocks at all, but rectangles of
+// lone dots, one pixel in every 8 x 4 on a fixed grid of the picture, in one
+// eye, tracing rows of text. The block check above never fires on those.
+struct DotSettings {
+    float min_luma = 0.12f;   // a dot is at least this bright
+    float min_jump = 0.08f;   // and this much brighter than the ring around it
+    float min_ratio = 2.0f;   // and this many times as bright as the ring
+};
+
+struct Dots {
+    int count[2] = {0, 0};  // lone dots in the left eye, the right eye
+    // Where the dots sit on an 8 x 4 grid of the picture: cell
+    // (x mod 8) + 8 * (y mod 4), x within the eye, y from the picture's top.
+    // Spread evenly each cell gets 1/32; the 10:47 dots crowd a few cells.
+    int grid[2][32] = {};
+    int Odd() const { return count[0] > count[1] ? count[0] - count[1] : count[1] - count[0]; }
+    int Eye() const { return count[1] > count[0] ? 1 : 0; }
+};
+
+// Counts lone dots in each eye of the band. y0: the band's first row in the
+// whole picture (for the grid cells).
+Dots CountDots(const Band& band, int y0, const DotSettings& s = DotSettings{});
+
+// Share of the dots in the fullest grid cell (0..1; 1/32 when spread evenly).
+float GridShare(const int grid[32]);
+
 // Brightness of one pixel of a read-back picture: R8G8B8A8, B8G8R8A8 or
 // R10G10B10A2 as the bgra / ten_bit flags say.
 float Luma(uint32_t px, bool bgra, bool ten_bit);
