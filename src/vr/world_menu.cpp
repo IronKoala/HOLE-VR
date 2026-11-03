@@ -73,6 +73,10 @@ struct Settings {
     float fit_max_zoom = 3.f;
     int text_outline = 2;         // black outline around menu text, in layout pixels (0 = off)
     float text_scale = 1.5f;      // menu fonts this much bigger, pulled back where they don't fit (GrowText)
+    float text_min_px = 32.f;     // ...and small print at least this big (layout pixels)...
+    float text_max_px = 64.f;     // ...but no text grown past this (titles are big already)...
+    float text_max_scale = 2.5f;  // ...nor more than this many times the game's size
+    int snapshots = 2;            // pictures of each menu's panel per run, to check its layout (0 = off)
     bool fit_shape = true;        // a tall narrow menu gets a tall panel of the same area (FitContent)
     bool hud = true;              // the in-level HUD on the forearm, shown when you look at it
     float hud_size = 1.f;         // its width, times the menu's
@@ -180,10 +184,18 @@ struct TextItem {
     float base = 0;                // the game's font size
     float scale = 1;               // how much bigger it is now
     bool measured = false;         // drawn at the game's size and measured
+    bool grown = false;            // made bigger once (a text pulled back to the game's size stays there)
+    double want_w = 0, want_h = 0; // the room its letters asked for at the last check (its words changed if this does)
     Rect before;                   // where it was then
     std::vector<UObject> chain;    // the widgets around it, nearest first, up to the menu
     size_t boxes = 0;              // how many of them it must fit in (up to the first list)
     std::vector<double> base_over; // how far it already ran past each of those
+    struct Beside {
+        UObject obj = 0;
+        int index = -1;
+        Rect before;
+    };
+    std::vector<Beside> beside;    // pictures beside it in the same box (icons, lines, its backdrop), at the game's size
 };
 
 struct Panel {
@@ -213,6 +225,15 @@ struct Panel {
     int text_wait = 0;         // frames to let the engine lay the menu out again
     int text_pulled = 0;
     bool regrow_after_text = false;  // GrowHitArea once the texts of a new page fit
+    double text_watch_at = 0;  // next look for texts that came into view or changed (TextWatch)
+    double text_scan_at = 0;   // next look for texts the game added (NewPageTexts)
+    double snapshot_at = -1;   // a picture of the panel then (SnapshotPanel)
+    int switcher_page = -2;    // the death screen's page, to tell when it changes
+    double page_watch_at = 0;  // next look at it (WatchDeathScreen)
+    double page_snapshot_at = -1;
+    double kill_capture_at = 0;
+    int kill_captures = 0;
+    bool quiet_check = false;  // a check because a text's words changed: logged only if something moved
 };
 constexpr int kTextOff = 0, kTextBaseline = 1, kTextCheck = 2;
 
@@ -293,6 +314,7 @@ struct Lookups {
     // a widget's cached geometry), and the widget kinds the measuring treats
     // specially.
     UObject slate_lib = 0;      // SlateBlueprintLibrary default object
+    UObject krl = 0;            // KismetRenderingLibrary default object (panel pictures)
     UObject scroll_class = 0, switcher_class = 0, spacer_class = 0;
     // Outlined text (OutlineText): TextBlock.Font (FSlateFontInfo) and, inside
     // it, OutlineSettings.OutlineSize / OutlineColor.
@@ -396,6 +418,7 @@ void ResolveCustomSource() {
 void ResolveFitOffsets() {
     namespace rf = ue::reflection;
     L.slate_lib = Lookup("SlateBlueprintLibrary /Script/UMG.Default__SlateBlueprintLibrary");
+    L.krl = Lookup("KismetRenderingLibrary /Script/Engine.Default__KismetRenderingLibrary");
     L.scroll_class = Lookup("Class /Script/UMG.ScrollBox");
     L.switcher_class = Lookup("Class /Script/UMG.WidgetSwitcher");
     L.spacer_class = Lookup("Class /Script/UMG.Spacer");
@@ -1396,30 +1419,57 @@ double Overlap(const Rect& a, const Rect& b) {
     return w > 0 && h > 0 ? w * h : 0.0;
 }
 
+// How big a text the game drew at `base` is made: everything
+// menu_text_scale times bigger, small print up to menu_text_min_px (the
+// death screen's 12-point lines were what the owner still couldn't read,
+// 2026-11-03), titles no bigger than menu_text_max_px (they are big
+// already, and the room they leave goes to the small print), and nothing
+// past menu_text_max_scale times the game's size.
+float TargetScale(float base) {
+    if (base <= 0) return 1.f;
+    double size = std::max<double>(S.text_min_px, base * S.text_scale);
+    size = std::min(size, std::max<double>(base, S.text_max_px));
+    size = std::min(size, base * static_cast<double>(S.text_max_scale));
+    return static_cast<float>(std::max(1.0, size / base));
+}
+
 // Adds the texts not yet known to the panel (all of them when it was just put
-// on the arm; after a click, the ones the new page brought).
-int AddTexts(Panel& p, const std::vector<UObject>& texts) {
+// on the arm; later, the ones the game added). A text this mod made bigger
+// before (the pause menu is the same widget every time) goes back to the
+// game's size first, so it is measured as the game laid it out; *reset says
+// whether any did.
+int AddTexts(Panel& p, const std::vector<UObject>& texts, bool* reset = nullptr) {
     if (S.text_scale <= 1.001f || L.font_pt < 0) return 0;
+    std::unordered_set<UObject> known;
+    for (const auto& k : p.texts) known.insert(k.obj);
     int added = 0;
     for (UObject t : texts) {
-        bool known = false;
-        for (const auto& k : p.texts) known = known || k.obj == t;
-        if (known || p.texts.size() >= 1500) continue;
+        if (known.count(t) || p.texts.size() >= 1500) continue;
         TextItem item;
         item.obj = t;
         item.index = IndexOf(t);
         item.base = GameFontSize(t);
-        item.scale = ReadFontSize(t) / std::max(item.base, 0.01f);
         if (item.base < 1.f || item.base > 400.f) continue;
+        item.scale = ReadFontSize(t) / item.base;
+        if (std::fabs(item.scale - 1.f) > 0.01f) {
+            SetTextScale(item, 1.f);
+            if (reset) *reset = true;
+        }
+        known.insert(t);
         p.texts.push_back(item);
         ++added;
     }
     return added;
 }
 
-// Measures the texts the panel shows at the game's size, then makes them
-// bigger. The menu must have been drawn on its panel.
-void GrowTexts(Panel& p) {
+// Measures the texts the panel shows at the game's size, then makes those
+// bigger. A text that isn't on the screen yet (another tab, a line the death
+// screen hasn't shown yet) stays at the game's size until it is: TextWatch
+// measures and grows it then. Growing texts nobody had measured left them
+// unchecked, and the level menu's and death screen's later texts came out
+// over each other (owner 2026-11-03: "some text overlap in the top left").
+// Returns how many it made bigger.
+int GrowTexts(Panel& p) {
     std::unordered_map<UObject, Rect> boxes;
     auto box_rect = [&](UObject w) {
         auto it = boxes.find(w);
@@ -1435,7 +1485,7 @@ void GrowTexts(Panel& p) {
         if (t.chain.empty()) TextChain(t, p.widget);
         if (t.measured || std::fabs(t.scale - 1.f) > 0.01f || !ShownNow(t, active)) continue;
         Placed pl = PlaceOf(t.obj, false);
-        if (!pl.ok || !Drawn(pl.r)) continue;  // not on screen now (another tab): grown below, checked when shown
+        if (!pl.ok || !Drawn(pl.r)) continue;  // not on the screen yet: TextWatch looks again
         t.measured = true;
         t.before = pl.r;
         t.base_over.clear();
@@ -1444,10 +1494,34 @@ void GrowTexts(Panel& p) {
             bool list = L.scroll_class && IsA(t.chain[k], L.scroll_class);
             t.base_over.push_back(Drawn(br) ? RunsPast(pl.r, br, list) : 0.0);
         }
+        // The pictures next to it in the same box: a growing text mustn't run
+        // over an icon or a line, or out of a picture it sat inside.
+        t.beside.clear();
+        if (!t.chain.empty() && L.image_class && IsA(t.chain[0], L.panel_class)) {
+            std::vector<UObject> kids;
+            Children(t.chain[0], 64, &kids);
+            for (UObject k : kids) {
+                if (k == t.obj || t.beside.size() >= 12 || !IsA(k, L.image_class) || InvisibleImage(k)) continue;
+                uint8_t v = Visibility(k);
+                if (v == kCollapsed || v == kHidden) continue;
+                Placed kp = PlaceOf(k, false);
+                if (kp.ok && Drawn(kp.r)) t.beside.push_back({k, IndexOf(k), kp.r});
+            }
+        }
     }
-    for (auto& t : p.texts)
-        if (t.scale < S.text_scale - 0.01f && t.scale <= 1.01f) SetTextScale(t, S.text_scale);
+    int n = 0;
+    for (auto& t : p.texts) {
+        if (!t.measured || t.grown || t.scale > 1.01f || !Alive(t.obj, t.index)) continue;
+        t.grown = true;
+        float s = TargetScale(t.base);
+        if (s <= 1.01f) continue;
+        SetTextScale(t, s);
+        ++n;
+    }
+    return n;
 }
+
+double Area(const Rect& r) { return std::max(0.0, r.W()) * std::max(0.0, r.H()); }
 
 // One check after the engine has laid the menu out with the bigger texts.
 // Returns how many texts were pulled back this round (0 = all fit).
@@ -1479,6 +1553,8 @@ int CheckTexts(Panel& p) {
         if (!pl.ok || !Drawn(pl.r)) continue;
         now[i] = {pl.r, true};  // texts at the game's size still count for covering
         if (!grown) continue;
+        t.want_w = pl.want_w;
+        t.want_h = pl.want_h;
         // Its letters need more room than its slot gives: they spill out.
         if (pl.local_w > 1 && (pl.want_w > pl.local_w + 1.0 || pl.want_h > pl.local_h + 1.0)) pull[i] = 1;
         for (size_t k = 0; k < t.boxes; ++k) {
@@ -1492,19 +1568,36 @@ int CheckTexts(Panel& p) {
                 break;
             }
         }
+        for (const auto& n : t.beside) {
+            if (pull[i]) break;
+            if (!Alive(n.obj, n.index)) continue;
+            Placed np = PlaceOf(n.obj, false);
+            if (!np.ok || !Drawn(np.r)) continue;
+            if (RunsPast(t.before, n.before, false) <= 0.5) {  // it sat inside this picture
+                if (RunsPast(pl.r, np.r, false) > 2.0) pull[i] = 1;
+                continue;
+            }
+            double share = Overlap(pl.r, np.r) / std::max(1.0, std::min(Area(pl.r), Area(np.r)));
+            double was = Overlap(t.before, n.before) / std::max(1.0, std::min(Area(t.before), Area(n.before)));
+            if (share > 0.08 && share > was + 0.08) pull[i] = 1;
+        }
     }
-    // Two texts that now cover each other (and didn't at the game's size).
+    // Two texts that now cover each other more than they did at the game's
+    // size. Measured as a share of the smaller one, so two texts the game
+    // stacks on purpose (a glow under a title) don't count just for growing.
     for (size_t i = 0; i < p.texts.size(); ++i) {
         if (!now[i].drawn) continue;
         for (size_t j = i + 1; j < p.texts.size(); ++j) {
             if (!now[j].drawn) continue;
             double o = Overlap(now[i].r, now[j].r);
             if (o <= 0) continue;
-            double small = std::min(now[i].r.W() * now[i].r.H(), now[j].r.W() * now[j].r.H());
-            if (o < 0.08 * small) continue;
+            double share = o / std::max(1.0, std::min(Area(now[i].r), Area(now[j].r)));
+            if (share < 0.08) continue;
             const TextItem &a = p.texts[i], &b = p.texts[j];
-            double was = a.measured && b.measured ? Overlap(a.before, b.before) : 0.0;
-            if (o <= was * 1.2 + 4.0) continue;
+            double was = 0;
+            if (a.measured && b.measured)
+                was = Overlap(a.before, b.before) / std::max(1.0, std::min(Area(a.before), Area(b.before)));
+            if (share <= was + 0.08) continue;
             pull[i] = pull[j] = 1;
         }
     }
@@ -1521,15 +1614,44 @@ int CheckTexts(Panel& p) {
         if (!pull[i] || t.scale <= 1.01f) continue;
         float next = t.scale * 0.85f;
         SetTextScale(t, next < 1.05f ? 1.f : next);
+        t.want_w = t.want_h = 0;  // laid out again before it is compared
         ++n;
     }
     return n;
+}
+
+// Each text of a menu once per run (and once more after texts came into
+// view), so an overlap the owner reports can be matched to its texts.
+std::unordered_map<std::string, int> g_text_dumps;
+
+void LogTexts(const Panel& p) {
+    int& dumps = g_text_dumps[p.name];
+    if (dumps >= 2) return;
+    ++dumps;
+    int lines = 0;
+    std::unordered_map<UObject, UObject> active;
+    for (const auto& t : p.texts) {
+        if (lines >= 90) break;
+        if (!Alive(t.obj, t.index) || !ShownNow(t, active)) continue;
+        Placed pl = PlaceOf(t.obj, false);
+        if (!pl.ok || !Drawn(pl.r)) continue;
+        UObject owner = ue::GetOuter(ue::GetOuter(t.obj));  // text -> its widget tree -> the widget it belongs to
+        ++lines;
+        log::Info("world menu: %s: text %s (in %s): game size %.0f, now %.2fx, at %.0f,%.0f %.0fx%.0f%s", p.name.c_str(),
+                  ue::GetName(t.obj).c_str(), owner ? ue::GetName(owner).c_str() : "?", t.base, t.scale, pl.r.x0,
+                  pl.r.y0, pl.r.W(), pl.r.H(),
+                  t.measured ? "" : " (not measured at the game's size)");
+    }
 }
 
 // Runs each frame while texts are being grown. Returns true once they fit
 // (or there is nothing to grow), so the menu can be zoomed.
 bool TextStep(Panel& p) {
     if (p.text_phase == kTextOff) return true;
+    if (p.text_wait > 0) {
+        --p.text_wait;
+        return false;
+    }
     if (p.text_phase == kTextBaseline) {
         GrowTexts(p);
         p.text_phase = kTextCheck;
@@ -1537,12 +1659,8 @@ bool TextStep(Panel& p) {
         p.text_wait = 2;
         return false;
     }
-    if (p.text_wait > 0) {
-        --p.text_wait;
-        return false;
-    }
     double t0 = perf::NowMs();
-    if (p.text_round < 6) {
+    if (p.text_round < 8) {
         int pulled = CheckTexts(p);
         p.text_pulled += pulled;
         ++p.text_round;
@@ -1553,30 +1671,44 @@ bool TextStep(Panel& p) {
             return false;
         }
     }
-    int grown = 0, measured = 0, full = 0;
+    p.text_phase = kTextOff;
+    if (p.quiet_check && p.text_pulled == 0) {  // its words changed, and it still fits: nothing to say
+        p.quiet_check = false;
+        return true;
+    }
+    int grown = 0, measured = 0, waiting = 0, small = 0, small_grown = 0;
     double sum = 0;
     float base_min = 1e9f, base_max = 0;
     for (const auto& t : p.texts) {
-        if (t.scale > 1.01f) ++grown;
-        if (t.scale >= S.text_scale - 0.01f) ++full;
+        if (t.scale > 1.01f) {
+            ++grown;
+            sum += t.scale;
+        }
         if (t.measured) ++measured;
-        sum += t.scale;
+        else if (!t.grown) ++waiting;
+        if (t.measured && t.base < S.text_min_px) {
+            ++small;
+            if (t.base * t.scale >= S.text_min_px * 0.85f) ++small_grown;
+        }
         base_min = std::min(base_min, t.base);
         base_max = std::max(base_max, t.base);
     }
-    log::Info("world menu: %s: text made bigger: %d of %zu texts grown, %d of them the full %.2fx, %.2fx on "
-              "average (game sizes %.0f-%.0f; %d measured on screen); %d step(s) back where a text didn't fit, "
-              "%d rounds, last %.1f ms",
-              p.name.c_str(), grown, p.texts.size(), full, S.text_scale,
-              p.texts.empty() ? 1.0 : sum / p.texts.size(), p.texts.empty() ? 0.f : base_min, base_max, measured,
-              p.text_pulled, p.text_round, perf::NowMs() - t0);
-    p.text_phase = kTextOff;
+    log::Info("world menu: %s: text made bigger%s: %d of %zu texts grown, %.2fx on average (game sizes %.0f-%.0f); "
+              "%d of %d small texts now near %.0f px; %d measured on screen, %d not shown yet; %d step(s) back "
+              "where a text didn't fit, %d rounds, last %.1f ms",
+              p.name.c_str(), p.quiet_check ? " (checked again: a text's words changed)" : "", grown, p.texts.size(),
+              grown ? sum / grown : 1.0, p.texts.empty() ? 0.f : base_min,
+              base_max, small_grown, small, S.text_min_px, measured, waiting, p.text_pulled, p.text_round,
+              perf::NowMs() - t0);
+    if (!p.quiet_check) LogTexts(p);
+    p.quiet_check = false;
     return true;
 }
 
-// After a click (another Options tab) or once the game has filled a menu's
-// lists: texts that weren't there before get the outline and the bigger font
-// too. Returns true if texts are being grown (the laser area waits for them).
+// The texts of a page shown after a click (another Options tab), or ones the
+// game added later (the death screen's kill list): the outline and the
+// bigger font too. Returns true if texts are being grown (the laser area
+// waits for them).
 bool NewPageTexts(Panel& p) {
     if (!Alive(p.widget, p.widget_index)) return false;
     std::vector<UObject> blurs, texts;
@@ -1588,21 +1720,229 @@ bool NewPageTexts(Panel& p) {
         v.Invoke();
         log::Info("world menu: hid %s (a background blur on a new page)", ue::GetName(b).c_str());
     }
+    std::unordered_set<UObject> known;
+    for (const auto& k : p.texts) known.insert(k.obj);
     std::vector<UObject> fresh;
-    for (UObject t : texts) {
-        bool known = false;
-        for (const auto& k : p.texts) known = known || k.obj == t;
-        if (!known) fresh.push_back(t);
-    }
+    for (UObject t : texts)
+        if (!known.count(t)) fresh.push_back(t);
     if (fresh.empty()) return false;
     int outlined = OutlineText(fresh);
-    int added = AddTexts(p, fresh);
+    bool reset = false;
+    int added = AddTexts(p, fresh, &reset);
     log::Info("world menu: %s: %zu new texts on the page (%d outlined, %d to grow)", p.name.c_str(), fresh.size(),
               outlined, added);
     if (added <= 0) return false;
     p.text_phase = kTextBaseline;
+    p.text_wait = reset ? 2 : 0;  // laid out at the game's sizes before they are measured
     p.text_pulled = 0;
     return true;
+}
+
+// Twice a second while a menu is on the arm and nothing is being grown:
+// texts that came into view since (the death screen shows its lines one by
+// one; a tab you opened) are measured and grown, and grown texts whose
+// words changed (a count running up) are checked again. Returns 1 if texts
+// are being grown, 2 if checked again, else 0.
+int TextWatch(Panel& p) {
+    if (p.texts.empty() || !L.slate_lib) return 0;
+    std::unordered_map<UObject, UObject> active;
+    int appeared = 0, changed = 0;
+    for (auto& t : p.texts) {
+        if (!Alive(t.obj, t.index)) continue;
+        const bool waiting = !t.measured && !t.grown && std::fabs(t.scale - 1.f) <= 0.01f;
+        const bool grown = t.scale > 1.01f;
+        if (!waiting && !(grown && t.want_w > 0)) continue;
+        if (t.chain.empty()) TextChain(t, p.widget);
+        if (!ShownNow(t, active)) continue;
+        if (waiting) {
+            Placed pl = PlaceOf(t.obj, false);
+            if (pl.ok && Drawn(pl.r)) ++appeared;
+            continue;
+        }
+        ue::Call d(t.obj, "GetDesiredSize");
+        if (!d.Invoke()) continue;
+        Vector2D v = d.Result<Vector2D>();
+        if (std::fabs(v.x - t.want_w) > 2.0 || std::fabs(v.y - t.want_h) > 2.0) ++changed;
+    }
+    p.text_pulled = 0;
+    if (appeared > 0) {
+        log::Info("world menu: %s: %d text(s) came into view: measured, then made bigger", p.name.c_str(), appeared);
+        p.text_phase = kTextBaseline;
+        p.text_wait = 0;
+        p.quiet_check = false;
+        return 1;
+    }
+    if (changed > 0) {
+        p.text_phase = kTextCheck;
+        p.text_round = 0;
+        p.text_wait = 0;
+        p.quiet_check = true;
+        return 2;
+    }
+    return 0;
+}
+
+// ------------------------------------------------------- panel pictures --
+// A picture of what a menu's panel shows (its whole 1920x1080 layout, not
+// the headset view, which rarely has the arm in it), saved beside the log as
+// panel-<menu>-<n>.png, so a layout can be checked without asking the owner.
+// The engine reads the picture back and packs it, a short hitch, so only a
+// couple per menu and run (menu_snapshots).
+
+struct FStringView {
+    const wchar_t* data;
+    int32_t num, max;
+};
+
+std::unordered_map<std::string, int> g_snapshots;
+
+void SnapshotPanel(const Panel& p, const std::string& tag) {
+    if (S.snapshots <= 0 || !L.krl || !Alive(p.comp, p.comp_index)) return;
+    const std::string key = p.name + tag;
+    int& n = g_snapshots[key];
+    if (n >= S.snapshots) return;
+    ue::Call rt(p.comp, "GetRenderTarget");
+    UObject target = rt.Invoke() ? rt.Result<UObject>() : 0;
+    if (!target) {
+        log::Info("world menu: %s: no picture of its panel (it has no render target)", p.name.c_str());
+        return;
+    }
+    ++n;
+    const std::string file = "panel-" + key + "-" + std::to_string(n) + ".png";
+    std::wstring dir = config::Dir(), wfile(file.begin(), file.end());
+    FStringView d{dir.c_str(), static_cast<int32_t>(dir.size() + 1), static_cast<int32_t>(dir.size() + 1)};
+    FStringView f{wfile.c_str(), static_cast<int32_t>(wfile.size() + 1), static_cast<int32_t>(wfile.size() + 1)};
+    ue::Call c(L.krl, "ExportRenderTarget");
+    c.Set("WorldContextObject", p.comp).Set("TextureRenderTarget", target).Set("FilePath", d).Set("Filename", f);
+    double t0 = perf::NowMs();
+    bool ok = c.Invoke();
+    double ms = perf::NowMs() - t0;
+    // What landed on disk (the engine may pick its own file type).
+    std::wstring pattern = dir + L"\\panel-" + std::wstring(key.begin(), key.end()) + L"-" + std::to_wstring(n) + L"*";
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
+    std::string found = "nothing written";
+    if (h != INVALID_HANDLE_VALUE) {
+        std::wstring w = fd.cFileName;
+        found = std::string(w.begin(), w.end()) + " (" + std::to_string(fd.nFileSizeLow / 1024) + " KB)";
+        FindClose(h);
+    }
+    log::Info("world menu: %s: picture of its panel%s: %s, %s, %.0f ms", p.name.c_str(), tag.c_str(),
+              ok ? "taken" : "the engine call failed", found.c_str(), ms);
+}
+
+// ------------------------------------------------------- the kill shot --
+// The death screen (UIM_Results_C) has pages (a WidgetSwitcher); one shows
+// the kill shot (UIP_DeadReview): a picture the game takes of your body in a
+// small room (LCBP_DeadReviewRoom) with its own scene capture. The owner
+// couldn't see it on the arm (2026-11-03). Each time the page changes, the
+// log says what the kill shot view is made of and whether its room takes a
+// picture, and a picture of the panel is saved.
+
+void DescribeKillShot(UObject menu, int page) {
+    UObject review = 0;
+    ue::GetProp(menu, "UIP_DeadReview", review);
+    if (!review) {
+        log::Info("world menu: death screen page %d: no kill shot view (UIP_DeadReview) in it", page);
+        return;
+    }
+    // It and what it sits in: hidden parts, and the page each switcher shows.
+    std::string chain;
+    UObject below = review;
+    for (UObject w = ParentOf(review); w && w != menu && chain.size() < 600; below = w, w = ParentOf(w)) {
+        uint8_t v = Visibility(w);
+        chain += " < " + ue::GetName(w);
+        if (v == kCollapsed) chain += " (collapsed)";
+        else if (v == kHidden) chain += " (hidden)";
+        if (L.switcher_class && IsA(w, L.switcher_class)) {
+            ue::Call a(w, "GetActiveWidget");
+            UObject shown = a.Invoke() ? a.Result<UObject>() : 0;
+            chain += shown == below ? " (showing it)" : " (showing " + (shown ? ue::GetName(shown) : "nothing") + ")";
+        }
+    }
+    Rect r;
+    bool placed = WidgetRect(review, &r);
+    log::Info("world menu: death screen page %d: kill shot view %s: visibility %d, %s%s", page,
+              ue::GetName(review).c_str(), Visibility(review),
+              placed ? ("drawn at " + std::to_string(int(r.x0)) + "," + std::to_string(int(r.y0)) + " " +
+                        std::to_string(int(r.W())) + "x" + std::to_string(int(r.H())))
+                           .c_str()
+                     : "never drawn",
+              chain.c_str());
+    // What it is made of.
+    std::vector<std::pair<UObject, int>> todo;
+    std::vector<UObject> kids;
+    if (UObject root = TreeRoot(review)) todo.push_back({root, 0});
+    int seen = 0;
+    while (!todo.empty() && seen < 40) {
+        auto [w, depth] = todo.back();
+        todo.pop_back();
+        ++seen;
+        std::string what = ue::GetName(ue::GetClass(w)) + " " + ue::GetName(w);
+        uint8_t v = Visibility(w);
+        Rect wr;
+        bool wp = WidgetRect(w, &wr);
+        std::string extra;
+        if (L.image_class && IsA(w, L.image_class) && L.image_brush >= 0) {
+            BrushLook b = ReadBrush(w, L.image_brush, L.image_color);
+            UObject res = mem::ReadOr<UObject>(w + L.image_brush + L.brush_resource, 0);
+            extra = ", picture from " + (res ? ue::GetName(ue::GetClass(res)) + " " + ue::GetName(res) : "nothing") +
+                    ", drawn " + std::to_string(int(b.alpha * 100)) + "% opaque" + (b.drawn ? "" : " (draw-as none)");
+        }
+        log::Info("world menu:   kill shot part %s: visibility %d, %s%s", what.c_str(), v,
+                  wp ? (std::to_string(int(wr.x0)) + "," + std::to_string(int(wr.y0)) + " " +
+                        std::to_string(int(wr.W())) + "x" + std::to_string(int(wr.H())))
+                           .c_str()
+                     : "never drawn",
+                  extra.c_str());
+        if (depth >= 8) continue;
+        if (IsA(w, L.user_widget_class)) {
+            if (UObject root = TreeRoot(w)) todo.push_back({root, depth + 1});
+        } else if (IsA(w, L.panel_class)) {
+            Children(w, 32, &kids);
+            for (UObject k : kids) todo.push_back({k, depth + 1});
+        }
+    }
+    // The rooms that take its pictures.
+    for (const char* room_name : {"ShotRoom", "Room"}) {
+        UObject room = 0;
+        ue::GetProp(review, room_name, room);
+        UObject cap = 0;
+        if (room) ue::GetProp(room, "SceneCaptureComponent2D", cap);
+        UObject target = 0;
+        int32_t sx = 0, sy = 0;
+        bool every = false;
+        uint8_t source = 255;
+        if (cap) {
+            ue::GetProp(cap, "CaptureSource", source);
+            ue::GetProp(cap, "TextureTarget", target);
+            auto pi = ue::reflection::FindProperty(ue::GetClass(cap), "bCaptureEveryFrame");
+            if (pi.valid()) every = (mem::ReadOr<uint8_t>(cap + pi.offset, 0) & (pi.bool_mask ? pi.bool_mask : 0xFF)) != 0;
+        }
+        if (target) {
+            ue::GetProp(target, "SizeX", sx);
+            ue::GetProp(target, "SizeY", sy);
+        }
+        log::Info("world menu:   kill shot %s: %s; its camera %s, picture into %s %dx%d (source %d), %s", room_name,
+                  room ? ue::GetName(room).c_str() : "none", cap ? ue::GetName(cap).c_str() : "none",
+                  target ? ue::GetName(target).c_str() : "nothing", sx, sy, source,
+                  every ? "takes a picture every frame" : "takes pictures only when asked");
+    }
+}
+
+// The kill shot room's camera, if it only takes a picture when asked: asked
+// four times a second while the death screen is up, so the picture is
+// there however the game set the room up. Returns the camera, or 0.
+UObject KillShotCamera(UObject menu, bool* every) {
+    UObject review = 0, room = 0, cap = 0, target = 0;
+    ue::GetProp(menu, "UIP_DeadReview", review);
+    if (review) ue::GetProp(review, "ShotRoom", room);
+    if (room) ue::GetProp(room, "SceneCaptureComponent2D", cap);
+    if (cap) ue::GetProp(cap, "TextureTarget", target);
+    if (!target) return 0;
+    auto pi = ue::reflection::FindProperty(ue::GetClass(cap), "bCaptureEveryFrame");
+    *every = pi.valid() && (mem::ReadOr<uint8_t>(cap + pi.offset, 0) & (pi.bool_mask ? pi.bool_mask : 0xFF)) != 0;
+    return cap;
 }
 
 // ------------------------------------------------------------ hosting --
@@ -1969,6 +2309,9 @@ bool Host(const Candidate& c) {
     if (G.panels.back().fit_pending) SetPanelOpacity(comp, 0.f);  // shown once grown and zoomed
     // Lists the game fills a moment after the menu is built get the same.
     G.panels.back().regrow_at = Now() + 0.8;
+    // Then texts that come into view later, and texts the game adds later.
+    G.panels.back().text_watch_at = Now() + 1.0;
+    G.panels.back().text_scan_at = Now() + 3.0;
     double t_end = perf::NowMs();
     log::Info("world menu: %s on the arm in %.1f ms (%d widgets; blurs %.1f ms, backdrops %.1f ms, %d of %zu texts "
               "outlined %.1f ms, %u memory lookups; holder %s)",
@@ -2004,6 +2347,81 @@ void OnDeathScreen(UObject menu, bool up) {
               "%d player scene capture(s) running again",
               Visibility(img), opacity, res ? ue::GetName(ue::GetClass(res)).c_str() : "nothing",
               res ? ue::GetName(res).c_str() : "", n);
+}
+
+// Whether a widget inside a menu shows: nothing around it hidden, and every
+// switcher on the way showing the page it is on.
+bool ShownInMenu(UObject w, UObject menu) {
+    uint8_t v = Visibility(w);
+    if (v == kCollapsed || v == kHidden) return false;
+    UObject below = w;
+    for (UObject up = ParentOf(w); up && up != menu; below = up, up = ParentOf(up)) {
+        v = Visibility(up);
+        if (v == kCollapsed || v == kHidden) return false;
+        if (L.switcher_class && IsA(up, L.switcher_class)) {
+            ue::Call a(up, "GetActiveWidget");
+            if (!a.Invoke() || a.Result<UObject>() != below) return false;
+        }
+    }
+    return true;
+}
+
+// While the death screen is up: each time its page changes, what the kill
+// shot view is made of (DescribeKillShot) and a picture of the panel a second
+// later; and the kill shot room's camera, if it only takes pictures when
+// asked, asked four times a second while the kill shot shows.
+void WatchDeathScreen(Panel& p, double now) {
+    if (now >= p.page_watch_at) {
+        p.page_watch_at = now + 0.5;
+        WalkScope walk;
+        UObject sw = 0;
+        ue::GetProp(p.widget, "WidgetSwitcher", sw);
+        int page = -1;
+        if (sw) {
+            ue::Call a(sw, "GetActiveWidgetIndex");
+            if (a.Invoke()) page = a.Result<int32_t>();
+        }
+        if (page != p.switcher_page) {
+            if (p.switcher_page == -2 && sw) {
+                ue::Call n(sw, "GetNumWidgets");
+                int count = n.Invoke() ? n.Result<int32_t>() : 0;
+                std::string pages;
+                for (int i = 0; i < count && i < 8; ++i) {
+                    ue::Call g(sw, "GetWidgetAtIndex");
+                    g.Set("Index", static_cast<int32_t>(i));
+                    UObject w = g.Invoke() ? g.Result<UObject>() : 0;
+                    if (!pages.empty()) pages += ", ";
+                    pages += std::to_string(i) + " " + (w ? ue::GetName(w) : "?");
+                }
+                log::Info("world menu: death screen has %d page(s): %s", count, pages.c_str());
+            }
+            log::Info("world menu: death screen now on page %d", page);
+            p.switcher_page = page;
+            DescribeKillShot(p.widget, page);
+            p.page_snapshot_at = now + 1.0;
+        }
+    }
+    if (p.page_snapshot_at > 0 && now >= p.page_snapshot_at && p.text_phase == kTextOff) {
+        p.page_snapshot_at = -1;
+        WalkScope walk;
+        SnapshotPanel(p, "-page" + std::to_string(p.switcher_page));
+    }
+    if (now >= p.kill_capture_at) {
+        p.kill_capture_at = now + 0.25;
+        WalkScope walk;
+        UObject review = 0;
+        ue::GetProp(p.widget, "UIP_DeadReview", review);
+        bool every = false;
+        UObject cam = review && ShownInMenu(review, p.widget) ? KillShotCamera(p.widget, &every) : 0;
+        if (cam && !every) {
+            ue::Call c(cam, "CaptureScene");
+            bool ok = c.Invoke();
+            if (p.kill_captures++ == 0)
+                log::Info("world menu: kill shot shows and its camera only takes pictures when asked: asking it "
+                          "4 times a second (%s)",
+                          ok ? "it took one" : "the call failed");
+        }
+    }
 }
 
 void ReleaseKey() {
@@ -2726,9 +3144,15 @@ void OnGameFrame() {
         s_frames = 0;
         s_rate_at = now;
     }
+    // The headset picture is taken once you look at the menu on your arm (at
+    // a fixed second the arm was rarely in view), or never after 20 s.
     if (g_capture_at > 0 && now >= g_capture_at) {
-        g_capture_at = -1;
-        xr::RequestCapture(("forearm-" + g_capture_name).c_str());
+        if (now >= g_capture_at + 20.0) {
+            g_capture_at = -1;
+        } else if (!S.forearm || LookingAtArm()) {
+            g_capture_at = -1;
+            xr::RequestCapture(("forearm-" + g_capture_name).c_str());
+        }
     }
     g_active = !G.panels.empty();
     if (G.panels.empty()) return;
@@ -2748,6 +3172,22 @@ void OnGameFrame() {
     // New menus are measured once they have been drawn on their panel, then
     // zoomed and shown (FitContent); after a click the laser area may grow.
     for (auto& p : G.panels) {
+        const bool settled = !p.fit_pending && p.regrow_at < 0 && p.text_phase == kTextOff;
+        if (settled && p.shown && now >= p.text_scan_at) {
+            p.text_scan_at = now + 3.0;
+            WalkScope walk;
+            if (NewPageTexts(p)) p.regrow_after_text = true;
+        } else if (settled && p.shown && now >= p.text_watch_at) {
+            p.text_watch_at = now + 0.5;
+            WalkScope walk;
+            if (TextWatch(p) == 1) p.regrow_after_text = true;
+        }
+        if (p.name == "UIM_Results_C" && !p.fit_pending) WatchDeathScreen(p, now);
+        if (p.snapshot_at > 0 && now >= p.snapshot_at && !p.fit_pending && p.text_phase == kTextOff) {
+            p.snapshot_at = -1;
+            WalkScope walk;
+            if (p.name != "UIM_Results_C") SnapshotPanel(p, "");  // the death screen: one per page instead
+        }
         if (!p.fit_pending && p.regrow_at < 0 && p.text_phase == kTextOff) continue;
         WalkScope walk;
         if (p.fit_pending || p.text_phase != kTextOff) {
@@ -2761,10 +3201,12 @@ void OnGameFrame() {
                         p.fit_pending = false;
                         PosePanel(p);
                         SetPanelOpacity(p.comp, 1.f);
+                        p.snapshot_at = now + 1.0;
                     }
                     if (was_growing && p.regrow_after_text) {
                         p.regrow_after_text = false;
                         GrowHitArea(p);
+                        p.snapshot_at = now + 1.0;
                     }
                 }
             }
@@ -3088,6 +3530,10 @@ void Init() {
     S.text_outline = std::clamp(config::GetInt("menu_text_outline", 2), 0, 8);
     S.text_scale = std::clamp(config::GetFloat("menu_text_scale", 1.5f), 1.f, 3.f);
     S.fit_shape = config::GetBool("menu_fit_shape", true);
+    S.text_min_px = std::clamp(config::GetFloat("menu_text_min_px", 32.f), 0.f, 120.f);
+    S.text_max_px = std::clamp(config::GetFloat("menu_text_max_px", 64.f), 10.f, 200.f);
+    S.text_max_scale = std::clamp(config::GetFloat("menu_text_max_scale", 2.5f), 1.f, 4.f);
+    S.snapshots = std::clamp(config::GetInt("menu_snapshots", 2), 0, 10);
     S.hud = config::GetBool("hud_on_forearm", true);
     S.hud_size = std::clamp(config::GetFloat("hud_forearm_size", 1.f), 0.3f, 3.f);
     S.hud_look_deg = std::clamp(config::GetFloat("hud_forearm_look_deg", 50.f), 10.f, 90.f);
