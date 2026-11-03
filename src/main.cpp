@@ -133,6 +133,7 @@ DWORD WINAPI InitThread(LPVOID) {
         vr::wrist_hud::InitGame();
         vr::world_menu::InitGame();
         vr::menu_study::InitGame();
+        vr::ui_panel::InitGame();
     }
 
     // Development hotkeys. Polled rather than hooked so nothing here can

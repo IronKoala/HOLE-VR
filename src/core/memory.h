@@ -30,10 +30,24 @@ const Module& Game();
 // game memory goes through this first.
 bool IsReadable(uintptr_t p, size_t len);
 
+// Copies len bytes from src to dst and returns true, or returns false instead
+// of crashing when either side faults. IsReadable alone is not enough: its
+// cache can still call a block readable after the game has freed it (level
+// change, garbage collection), and the game can free memory on another thread
+// between the check and the copy. A fault inside this copy is caught by a
+// vectored exception handler (MinGW has no __try) and the region is dropped
+// from this thread's cache. Any other crash is left alone.
+bool SafeCopy(void* dst, const void* src, size_t len);
+
+// How many faults SafeCopy has caught since start.
+unsigned CaughtFaults();
+
 template <typename T>
 bool Read(uintptr_t p, T& out) {
     if (!IsReadable(p, sizeof(T))) return false;
-    std::memcpy(&out, reinterpret_cast<const void*>(p), sizeof(T));
+    alignas(T) unsigned char buf[sizeof(T)];
+    if (!SafeCopy(buf, reinterpret_cast<const void*>(p), sizeof(T))) return false;
+    std::memcpy(&out, buf, sizeof(T));
     return true;
 }
 
@@ -72,7 +86,9 @@ public:
     template <typename T>
     bool Read(uintptr_t p, T& out) {
         if (!IsReadable(p, sizeof(T))) return false;
-        std::memcpy(&out, reinterpret_cast<const void*>(p), sizeof(T));
+        alignas(T) unsigned char buf[sizeof(T)];
+        if (!SafeCopy(buf, reinterpret_cast<const void*>(p), sizeof(T))) return false;
+        std::memcpy(&out, buf, sizeof(T));
         return true;
     }
 
@@ -90,8 +106,7 @@ bool IsWritable(uintptr_t p, size_t len);
 template <typename T>
 bool Write(uintptr_t p, const T& value) {
     if (!IsWritable(p, sizeof(T))) return false;
-    std::memcpy(reinterpret_cast<void*>(p), &value, sizeof(T));
-    return true;
+    return SafeCopy(reinterpret_cast<void*>(p), &value, sizeof(T));
 }
 
 // Plausible user-mode heap/module pointer on x64 Windows.

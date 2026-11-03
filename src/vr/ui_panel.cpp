@@ -37,21 +37,50 @@ struct Settings {
 
 // ----------------------------------------------------- menu detection --
 // The game shows the mouse cursor whenever a menu wants mouse input. We read
-// APlayerController::bShowMouseCursor every frame from the present thread;
-// the controller pointer and its class are refreshed once a second.
+// APlayerController::bShowMouseCursor on the GAME thread, from the player's
+// tick, straight off the player's current controller, and hand the answer to
+// the present thread as a flag.
+//
+// It used to be read every frame from the present thread through a
+// controller pointer refreshed once a second. On "Return to Title" the game
+// frees the old level's controller while the headset keeps drawing, and that
+// read hit the freed memory: the game's "Fatal Error!" (owner's run
+// 2026-11-02 21:14 local; crash in UiListener::AddLayers on the RHI thread).
+// The present thread now never touches game objects.
 
-std::atomic<uintptr_t> g_pc{0};
-std::atomic<uintptr_t> g_pc_class{0};
-int32_t g_cursor_offset = -1;
-uint8_t g_cursor_mask = 0;
-UObject g_pc_base_class = 0;
+std::atomic<int32_t> g_cursor_offset{-1};
+std::atomic<uint8_t> g_cursor_mask{0};
+UObject g_pc_base_class = 0;  // background thread only (Maintain)
+std::atomic<UObject> g_pc_class_ok{0};  // a controller class known to be a PlayerController
+std::atomic<bool> g_cursor_shown{false};
+std::atomic<uint64_t> g_cursor_read_ms{0};
 std::atomic<bool> g_menu_open{false};
 
+// A reading older than this (loading, title screen, paused: the player isn't
+// ticking) counts as "no cursor menu". The pause menu and the other forearm
+// menus are covered by world_menu::MenuUp() instead.
+constexpr uint64_t kCursorStaleMs = 500;
+
 bool ReadMenuOpen() {
-    uintptr_t pc = g_pc.load();
-    if (!pc || g_cursor_offset < 0) return false;
-    if (mem::ReadOr<uintptr_t>(pc + ue::off::kObjClass) != g_pc_class.load()) return false;
-    return (mem::ReadOr<uint8_t>(pc + g_cursor_offset) & g_cursor_mask) != 0;
+    if (GetTickCount64() - g_cursor_read_ms.load() > kCursorStaleMs) return false;
+    return g_cursor_shown.load();
+}
+
+// Game thread, after the player's Blueprint tick.
+void OnPlayerTick(UObject player, float) {
+    int32_t offset = g_cursor_offset.load(std::memory_order_acquire);
+    if (offset < 0 || !player) return;
+    UObject pc = 0;
+    bool shown = false;
+    if (ue::GetProp(player, "Controller", pc) && pc) {
+        UObject cls = ue::GetClass(pc);
+        if (cls && cls != g_pc_class_ok.load() && g_pc_base_class && ue::reflection::IsA(pc, g_pc_base_class))
+            g_pc_class_ok = cls;
+        if (cls && cls == g_pc_class_ok.load())
+            shown = (mem::ReadOr<uint8_t>(pc + offset) & g_cursor_mask.load()) != 0;
+    }
+    g_cursor_shown = shown;
+    g_cursor_read_ms = GetTickCount64();
 }
 
 // --------------------------------------------------------------- window --
@@ -93,6 +122,7 @@ struct Buttons {
 } PT;
 
 struct UiListener : xr::Listener {
+    // Present thread: reads only flags the game thread set, never game memory.
     void AddLayers(XrSession, XrSpace, XrTime, std::vector<const XrCompositionLayerBaseHeader*>&) override {
         bool open = ReadMenuOpen();
         if (open != g_menu_open.load()) {
@@ -140,31 +170,25 @@ void Init() {
               S.pause_button ? "pauses" : "off");
 }
 
+void InitGame() {
+    game::AddTickListener(&OnPlayerTick);
+    log::Info("menu panel: menu cursor read on the game thread (player tick)");
+}
+
 void Maintain() {
-    if (!ue::reflection::Ready()) return;
-    if (!g_pc_base_class) {
-        g_pc_base_class = ue::FindObject("Class /Script/Engine.PlayerController");
-        if (!g_pc_base_class) return;
-        auto prop = ue::reflection::FindProperty(g_pc_base_class, "bShowMouseCursor");
-        if (!prop.valid() || !prop.bool_mask) {
-            log::Warn("menu panel: PlayerController.bShowMouseCursor not found; menus stay on the monitor");
-            g_pc_base_class = 0;
-            return;
-        }
-        g_cursor_offset = prop.offset;
-        g_cursor_mask = prop.bool_mask;
+    if (!ue::reflection::Ready() || g_cursor_offset.load() >= 0) return;
+    if (!g_pc_base_class) g_pc_base_class = ue::FindObject("Class /Script/Engine.PlayerController");
+    if (!g_pc_base_class) return;
+    auto prop = ue::reflection::FindProperty(g_pc_base_class, "bShowMouseCursor");
+    if (!prop.valid() || !prop.bool_mask) {
+        static bool s_warned = false;
+        if (!s_warned) log::Warn("menu panel: PlayerController.bShowMouseCursor not found; cursor menus not detected");
+        s_warned = true;
+        return;
     }
-    // The player's controller when there is a player, else any live one (title screen).
-    UObject pc = 0;
-    if (UObject player = game::Player()) ue::GetProp(player, "Controller", pc);
-    uintptr_t cur = g_pc.load();
-    if (!pc && cur && mem::ReadOr<uintptr_t>(cur + ue::off::kObjClass) == g_pc_class.load()) return;
-    if (!pc) pc = ue::FindFirstInstance(g_pc_base_class);
-    if (pc != cur) {
-        g_pc_class = pc ? ue::GetClass(pc) : 0;
-        g_pc = pc;
-        if (pc) log::Info("menu panel: watching %s", ue::GetName(ue::GetClass(pc)).c_str());
-    }
+    g_cursor_mask.store(prop.bool_mask, std::memory_order_relaxed);
+    g_cursor_offset.store(prop.offset, std::memory_order_release);
+    log::Info("menu panel: PlayerController.bShowMouseCursor at +0x%x", prop.offset);
 }
 
 // The cursor never shows for the VR pause menu, so a menu on the forearm
