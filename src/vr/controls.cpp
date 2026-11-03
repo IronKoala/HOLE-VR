@@ -1805,11 +1805,13 @@ UObject FindInteractTarget(UObject player, const hands::HandState& hs, std::stri
     const FVector d = hs.aim.rotation.Rotate(FVector{1, 0, 0});
     UObject best = 0;
     double best_score = 1e9;
+    UObject nearest = 0;
+    double nearest_touch = 1e9;
     for (int i = 0; i < arr.num && i < 1024; ++i) {
         UObject a = mem::ReadOr<uintptr_t>(arr.data + i * sizeof(uintptr_t), 0);
         if (!a || a == player) continue;
         ue::Call b(a, "GetActorBounds");
-        b.Set("bOnlyCollidingComponents", true).Set("bIncludeFromChildActors", false);
+        b.Set("bOnlyCollidingComponents", false).Set("bIncludeFromChildActors", false);
         if (!b.Invoke()) continue;
         const FVector c = b.Get<FVector>("Origin"), e = b.Get<FVector>("BoxExtent");
         if (e.X > 800 || e.Y > 800 || e.Z > 800) continue;   // a whole room, not a thing
@@ -1819,6 +1821,10 @@ UObject FindInteractTarget(UObject player, const hands::HandState& hs, std::stri
         const double dy = std::fmax(0.0, std::fabs(hand.Y - c.Y) - e.Y);
         const double dz = std::fmax(0.0, std::fabs(hand.Z - c.Z) - e.Z);
         const double touch = std::sqrt(dx * dx + dy * dy + dz * dz);
+        if (touch < nearest_touch) {
+            nearest_touch = touch;
+            nearest = a;
+        }
         double score = 1e9;
         if (touch <= 20.0) {
             // Inside or at several boxes: the smaller thing wins (a big
@@ -1848,6 +1854,10 @@ UObject FindInteractTarget(UObject player, const hands::HandState& hs, std::stri
             best = a;
         }
     }
+    static int s_diag = 0;
+    if (!best && s_diag++ < 20)
+        log::Info("controls: hand interact: %d interactable things in the level; nearest %s, %.0f cm from the hand",
+                  arr.num, nearest ? ue::GetName(nearest).c_str() : "none", nearest_touch);
     if (best && how) *how = best_score < 40.0 ? "touching" : "pointing at";
     if (score_out) *score_out = best_score;
     return best;
