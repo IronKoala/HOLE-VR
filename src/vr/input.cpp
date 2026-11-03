@@ -33,6 +33,16 @@ struct Actions {
 
 std::mutex g_mutex;
 Snapshot g_latest;     // written on the render thread
+// The same controllers predicted ahead to when the game's picture will be
+// shown (xr::PredictAhead), for the game thread: Consume and PeekGame put
+// these poses in. Guarded by g_mutex.
+struct GamePoses {
+    bool grip_valid = false, aim_valid = false;
+    XrPosef grip{{0, 0, 0, 1}, {0, 0, 0}}, aim{{0, 0, 0, 1}, {0, 0, 0}};
+    XrVector3f linear_velocity{0, 0, 0};
+};
+GamePoses g_game[2];
+bool g_have_game = false;
 Snapshot g_consumed;   // what the game thread last saw (for edges)
 bool g_pending_edges[2][6][2] = {};  // [hand][button][pressed/released] accumulated
 
@@ -200,6 +210,8 @@ struct InputListener : xr::Listener {
 
         Snapshot s;
         s.valid = true;
+        GamePoses game[2];
+        const XrDuration ahead = xr::PredictAhead();
         s.time = time;
         for (int h = 0; h < 2; ++h) {
             HandInput& hi = s.hand[h];
@@ -252,6 +264,27 @@ struct InputListener : xr::Listener {
                 hi.aim_valid = true;
                 hi.aim = aloc.pose;
             }
+            // For the game: the same, at the time its picture will be shown.
+            GamePoses& gp = game[h];
+            gp = GamePoses{};
+            gp.grip_valid = hi.grip_valid, gp.grip = hi.grip, gp.linear_velocity = hi.linear_velocity;
+            gp.aim_valid = hi.aim_valid, gp.aim = hi.aim;
+            if (ahead > 0) {
+                XrSpaceVelocity gvel{XR_TYPE_SPACE_VELOCITY};
+                XrSpaceLocation gloc{XR_TYPE_SPACE_LOCATION, &gvel};
+                if (g_grip_space[h] && XR_SUCCEEDED(locate(g_grip_space[h], space, time + ahead, &gloc)) &&
+                    (gloc.locationFlags & kTracked) == kTracked) {
+                    gp.grip_valid = true;
+                    gp.grip = gloc.pose;
+                    if (gvel.velocityFlags & XR_SPACE_VELOCITY_LINEAR_VALID_BIT) gp.linear_velocity = gvel.linearVelocity;
+                }
+                XrSpaceLocation galoc{XR_TYPE_SPACE_LOCATION};
+                if (g_aim_space[h] && XR_SUCCEEDED(locate(g_aim_space[h], space, time + ahead, &galoc)) &&
+                    (galoc.locationFlags & kTracked) == kTracked) {
+                    gp.aim_valid = true;
+                    gp.aim = galoc.pose;
+                }
+            }
         }
 
         std::vector<HapticRequest> haptics;
@@ -276,6 +309,8 @@ struct InputListener : xr::Listener {
                 }
             }
             g_latest = s;
+            for (int h = 0; h < 2; ++h) g_game[h] = game[h];
+            g_have_game = true;
             haptics.swap(g_haptics);
         }
         for (const auto& r : haptics) {
@@ -293,6 +328,7 @@ struct InputListener : xr::Listener {
     void OnSessionEnding() override {
         std::lock_guard<std::mutex> lock(g_mutex);
         g_latest = Snapshot();
+        g_have_game = false;
     }
 };
 
@@ -302,9 +338,24 @@ InputListener g_listener;
 
 void Init() { xr::RegisterListener(&g_listener); }
 
+// g_latest with the game's (predicted ahead) controller poses. Under g_mutex.
+Snapshot ForGame() {
+    Snapshot s = g_latest;
+    if (!g_have_game) return s;
+    for (int h = 0; h < 2; ++h) {
+        HandInput& hi = s.hand[h];
+        hi.grip_valid = g_game[h].grip_valid;
+        hi.grip = g_game[h].grip;
+        hi.linear_velocity = g_game[h].linear_velocity;
+        hi.aim_valid = g_game[h].aim_valid;
+        hi.aim = g_game[h].aim;
+    }
+    return s;
+}
+
 Snapshot Consume() {
     std::lock_guard<std::mutex> lock(g_mutex);
-    Snapshot s = g_latest;
+    Snapshot s = ForGame();
     for (int h = 0; h < 2; ++h) {
         Button* buttons[6] = {&s.hand[h].stick_click, &s.hand[h].primary, &s.hand[h].secondary,
                               &s.hand[h].menu, &s.hand[h].trigger_button, &s.hand[h].grip_button};
@@ -321,6 +372,11 @@ Snapshot Consume() {
 Snapshot Peek() {
     std::lock_guard<std::mutex> lock(g_mutex);
     return g_latest;
+}
+
+Snapshot PeekGame() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return ForGame();
 }
 
 void Haptic(Hand hand, float amplitude, float seconds, float frequency_hz) {

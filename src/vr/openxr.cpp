@@ -186,6 +186,10 @@ long long g_win_trimmed = 0;    // extra view sets dropped in the current check 
 bool g_pair_auto_off = false;   // pairing paused by the safety net below
 struct PairStats {
     long long pushes = 0, merged = 0, presents = 0, empty = 0, stale = 0, trimmed = 0;
+    // Headset frames from the one the views were located at to the one the
+    // picture is shown in (what PredictAhead has to cover).
+    double lag_sum = 0, lag_max = 0, lag_min = 1e9;
+    long long lag_n = 0;
     long long newer[3] = {};  // frames already drawn after the presented one: 0, 1, 2+
     double age_sum = 0, age_max = 0, age_min = 1e9;
     long long age_n = 0;
@@ -219,7 +223,33 @@ void PushViews(const EyeView views[2]) {
 
 // At Present: the views the picture being presented was drawn with. Falls
 // back to the newest views when nothing usable is queued.
-void TakePresentedViews(EyeView out[2], bool* have) {
+// ---- predicting ahead ----
+// The game takes a frame's head pose (g_latest, located at the headset frame
+// then current) and its picture reaches the headset about two frames later
+// (2026-11-03 log: 28-36 ms). Sent with the pose it was drawn with (pose
+// pairing), the headset then has to turn the picture by two frames of head
+// motion to show it, and the edges it uncovers are black (owner 2026-11-03:
+// "the image isn't keeping up with my headset so i see black on the edges a
+// lot when i move my head"). So the head (and hand) poses the game draws with
+// are predicted for the headset frame the picture will actually be shown in:
+// the measured lag in frames, smoothed. predict_ahead_frames in hole-vr.ini:
+// -1 = measured (default), 0 = off, or a fixed number of frames.
+std::atomic<long long> g_ahead_ns{0};
+double g_lag_frames = 0;  // smoothed, guarded by g_view_mutex
+bool g_lag_known = false;
+
+void UpdateAhead(XrDuration period, bool pairing) {
+    double frames = 0;
+    const double fixed = config::GetFloat("predict_ahead_frames", -1.f);
+    if (!pairing) frames = 0;  // newest views are sent: nothing to line up
+    else if (fixed >= 0) frames = fixed;
+    else if (g_lag_known) frames = g_lag_frames;
+    const double max_frames = std::max(0.0, static_cast<double>(config::GetFloat("predict_ahead_max_frames", 4.f)));
+    frames = std::clamp(frames, 0.0, max_frames);
+    g_ahead_ns.store(period > 0 ? static_cast<long long>(frames * static_cast<double>(period)) : 0);
+}
+
+void TakePresentedViews(EyeView out[2], bool* have, XrTime display_time, XrDuration period) {
     std::lock_guard<std::mutex> lock(g_view_mutex);
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
@@ -235,6 +265,17 @@ void TakePresentedViews(EyeView out[2], bool* have) {
         g_paired[0] = q.v[0];
         g_paired[1] = q.v[1];
         g_have_paired = true;
+        if (q.v[0].base_time > 0 && period > 0 && display_time >= q.v[0].base_time) {
+            const double lag = static_cast<double>(display_time - q.v[0].base_time) / static_cast<double>(period);
+            if (lag < 10.0) {
+                g_lag_frames = g_lag_known ? g_lag_frames + (lag - g_lag_frames) * 0.05 : lag;
+                g_lag_known = true;
+                g_pair.lag_sum += lag;
+                g_pair.lag_max = std::max(g_pair.lag_max, lag);
+                g_pair.lag_min = std::min(g_pair.lag_min, lag);
+                ++g_pair.lag_n;
+            }
+        }
         double age = QpcMs(now.QuadPart - q.qpc);
         g_pair.age_sum += age;
         g_pair.age_max = std::max(g_pair.age_max, age);
@@ -275,6 +316,7 @@ void TakePresentedViews(EyeView out[2], bool* have) {
     }
     g_pair_auto_off = auto_off;
     const bool pairing = config::GetBool("pose_pairing", true) && !auto_off;
+    UpdateAhead(period, pairing);
     if (pairing && g_have_paired) {
         out[0] = g_paired[0];
         out[1] = g_paired[1];
@@ -296,17 +338,24 @@ std::string PairReport(double) {
         auto_off = g_pair_auto_off;
     }
     if (!p.presents) return {};
+    char ahead[200] = "";
+    if (p.lag_n)
+        std::snprintf(ahead, sizeof(ahead),
+                      "; pictures shown %.2f headset frames after their views' frame (%.1f-%.1f), poses predicted "
+                      "%.1f ms ahead to match",
+                      p.lag_sum / p.lag_n, p.lag_min, p.lag_max, g_ahead_ns.load() / 1e6);
     long long n = p.newer[0] + p.newer[1] + p.newer[2];
     auto pct = [&](long long v) { return n ? 100.0 * v / n : 0.0; };
-    char buf[600];
+    char buf[800];
     std::snprintf(buf, sizeof(buf),
-                  "frame timing: pose pairing %s; picture reached Present %.1f ms after its views were taken "
+                  "frame timing: pose pairing %s%s; picture reached Present %.1f ms after its views were taken "
                   "(%.1f-%.1f); at Present the game had already drawn 0/1/2+ newer frames %.0f%%/%.0f%%/%.0f%% "
                   "(the old pairing used the newest, so it was off by that many frames); %lld presents, %lld view "
                   "sets (%lld repeats merged), %lld presents with no new views, %lld stale and %lld extra views dropped",
                   !config::GetBool("pose_pairing", true) ? "off (newest views)"
                   : auto_off                             ? "paused (too many view sets)"
                                                          : "on",
+                  ahead,
                   p.age_n ? p.age_sum / p.age_n : 0.0, p.age_n ? p.age_min : 0.0, p.age_max, pct(p.newer[0]),
                   pct(p.newer[1]), pct(p.newer[2]), p.presents, p.pushes, p.merged, p.empty, p.stale, p.trimmed);
     return buf;
@@ -788,7 +837,8 @@ void PollEvents() {
     }
 }
 
-void LocateViews(XrTime time) {
+// base: this headset frame's display time; time: when to predict for.
+void LocateViews(XrTime base, XrTime time) {
     XrViewLocateInfo li{XR_TYPE_VIEW_LOCATE_INFO};
     li.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
     li.displayTime = time;
@@ -799,7 +849,7 @@ void LocateViews(XrTime time) {
     if (XR_FAILED(Proc<PFN_xrLocateViews>("xrLocateViews")(g_session, &li, &vs, 2, &n, views)) || n != 2) return;
     if (!(vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)) return;
     std::lock_guard<std::mutex> lock(g_view_mutex);
-    for (int i = 0; i < 2; ++i) g_latest[i] = {views[i].pose, views[i].fov};
+    for (int i = 0; i < 2; ++i) g_latest[i] = {views[i].pose, views[i].fov, base};
     g_have_latest = true;
 }
 
@@ -912,7 +962,9 @@ void RunFrame() {
     XrFrameBeginInfo bi{XR_TYPE_FRAME_BEGIN_INFO};
     if (XR_FAILED(Proc<PFN_xrBeginFrame>("xrBeginFrame")(g_session, &bi))) return;
 
-    LocateViews(fs.predictedDisplayTime);
+    // Head poses for the game, predicted for when its picture will be shown
+    // (see PredictAhead); controllers likewise (input::Consume).
+    LocateViews(fs.predictedDisplayTime, fs.predictedDisplayTime + g_ahead_ns.load());
     for (Listener* l : Listeners()) l->OnFrame(g_session, g_space, fs.predictedDisplayTime);
     step(g_perf_begin);
 
@@ -933,7 +985,7 @@ void RunFrame() {
     }
     EyeView rendered[2];
     bool have_rendered = false;
-    TakePresentedViews(rendered, &have_rendered);
+    TakePresentedViews(rendered, &have_rendered, fs.predictedDisplayTime, fs.predictedDisplayPeriod);
     if (fs.shouldRender && source && have_rendered) {
         D3D12_RESOURCE_DESC sd = source->GetDesc();
         bool ok = (sd.Width == g_source_width && sd.Height == g_source_height && sd.Format == g_source_format) ||
@@ -1152,6 +1204,8 @@ void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* back_buffer) {
 void SetEyeTexture(ID3D12Resource* texture) { g_eye_texture = texture; }
 void SetFallbackTexture(ID3D12Resource* texture) { g_fallback_texture = texture; }
 ID3D12Resource* WindowTexture() { return g_fallback_texture; }
+
+XrDuration PredictAhead() { return g_ahead_ns.load(); }
 
 bool LatestViews(EyeView out[2]) {
     std::lock_guard<std::mutex> lock(g_view_mutex);

@@ -621,7 +621,8 @@ double DotV(const FVector& a, const FVector& b) { return a.X * b.X + a.Y * b.Y +
 // whichever side of the arm is higher in your view, so it reads upright.
 // Uses the controller, not the body, so it works whatever the body does.
 bool PlaceOnForearm() {
-    input::Snapshot in = input::Peek();
+    // Drawn by the game: the controller predicted like the arm it sits on.
+    input::Snapshot in = input::PeekGame();
     if (!in.valid || !in.hand[S.arm].grip_valid) return G.placed;
     FVector loc;
     FQuat q;
@@ -1821,7 +1822,7 @@ void OnGameFrame() {
         // Set right here, before the blur starts: the background cvars pass
         // only runs while the player ticks and had not run yet on the
         // owner's 2026-11-02 12:13 run, so the hands came out blurred.
-        if (s_blur) cvars::RunNow("r.DOF.Kernel.MaxForegroundRadius 0", G.actor);
+        if (s_blur) render_fixes::ApplyPauseBlurCvars(G.actor);
         int n = render_fixes::SetPauseBlur(s_blur);
         if (n >= 0 && s_blur)
             log::Info("world menu: pause blur on (%d settings; r.DepthOfFieldQuality %d, "
@@ -2211,7 +2212,7 @@ void PrepareHolder(UObject player) {
     if (G.actor && Alive(G.actor, G.actor_index) && G.wic && Alive(G.wic, G.wic_index)) return;
     double t0 = perf::NowMs();
     if (EnsureActor(player)) {
-        cvars::RunNow("r.DOF.Kernel.MaxForegroundRadius 0", player);  // for the pause blur
+        render_fixes::ApplyPauseBlurCvars(player);  // for the pause blur
         log::Info("world menu: forearm menu holder ready for this level (%.1f ms)", perf::NowMs() - t0);
     }
 }

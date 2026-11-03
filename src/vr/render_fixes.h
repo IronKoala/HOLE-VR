@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 
 namespace holevr::vr::render_fixes {
 // Turns off post-process effects that look wrong or cause discomfort in a
@@ -17,4 +18,7 @@ void Apply();
 // Returns how many cameras/post-process components were updated, or -1 if
 // the pause blur is off.
 int SetPauseBlur(bool on);
+// Console settings the pause blur needs, applied at once (context: any object
+// in the game world, for the console command).
+void ApplyPauseBlurCvars(uintptr_t context);
 }  // namespace holevr::vr::render_fixes

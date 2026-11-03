@@ -43,10 +43,15 @@ void Init();
 
 // Latest controller state, consumed by the game thread once per game frame:
 // the pressed/released edges accumulate between calls so short taps are not lost.
+// Poses are predicted for when the game's picture will be shown
+// (xr::PredictAhead), to match the head pose the game draws with.
 Snapshot Consume();
-// Latest state without taking the button edges (for the menu pointer, which
-// runs on the render thread and keeps its own edge state).
+// Latest state without taking the button edges, poses at this headset frame's
+// display time: for layers the headset draws itself (wrist display, laser).
 Snapshot Peek();
+// Like Peek, with the game's predicted-ahead poses: for things the game draws
+// in its picture (the forearm menu).
+Snapshot PeekGame();
 
 // Vibration, queued from any thread and played on the next frame.
 void Haptic(Hand hand, float amplitude, float seconds, float frequency_hz = 0.f);

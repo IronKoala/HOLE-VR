@@ -6,6 +6,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "core/config.h"
@@ -58,6 +59,23 @@ std::vector<Fix> g_fixes = {
     // Grain is drawn per eye and shimmers in stereo.
     {"vr_disable_film_grain", "bOverride_FilmGrainIntensity", "FilmGrainIntensity", 0.f},
 };
+
+// Console settings for the pause blur.
+// - Nothing nearer than the focus gets blurred: hands, arms, body, menu.
+// - No bokeh sprites ("scatter"): in the owner's 2026-11-03 run the left eye
+//   of a blurred menu frame (capture-forearm-UIM_Results_C.bmp, the game's
+//   own picture before it reaches the headset) was covered in white dots and
+//   bars in tile-sized blocks, the depth of field's sprite passes going wrong
+//   with both eyes in one frame. The gather blur alone gives the soft
+//   background. pause_blur_scatter=1 puts the sprites back.
+std::vector<std::pair<std::string, std::string>> PauseBlurCvars() {
+    std::vector<std::pair<std::string, std::string>> v = {{"r.DOF.Kernel.MaxForegroundRadius", "0.0"}};
+    if (!config::GetBool("pause_blur_scatter", false)) {
+        v.push_back({"r.DOF.Scatter.ForegroundCompositing", "0"});
+        v.push_back({"r.DOF.Scatter.BackgroundCompositing", "0"});
+    }
+    return v;
+}
 
 // Pause blur: while a forearm menu is up, depth of field is switched on and
 // focused about arm's length away, so the world behind the menu goes soft
@@ -257,8 +275,7 @@ bool Init() {
             p.value_offset = val.offset;
         }
         if (ok) {
-            // Nothing nearer than the focus gets blurred: hands, arms, body, menu.
-            vr::cvars::Want("r.DOF.Kernel.MaxForegroundRadius", "0.0");
+            for (const auto& [name, value] : PauseBlurCvars()) vr::cvars::Want(name, value);
             g_pause_ready = true;
             log::Info("render fixes: pause blur ready (focus %.2f m, sensor %.0f mm; the game's aperture and "
                       "exposure are left alone)",
@@ -365,6 +382,10 @@ int SetPauseBlur(bool on) {
     }
     if (on) log::Info("render fixes: pause blur on %d settings (aperture/exposure untouched:%s)", n, seen.c_str());
     return n;
+}
+
+void ApplyPauseBlurCvars(uintptr_t context) {
+    for (const auto& [name, value] : PauseBlurCvars()) vr::cvars::RunNow(name + " " + value, context);
 }
 
 }  // namespace holevr::vr::render_fixes
