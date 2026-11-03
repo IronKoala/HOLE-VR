@@ -78,6 +78,7 @@ struct Settings {
     float text_max_scale = 2.5f;  // ...nor more than this many times the game's size
     int snapshots = 2;            // pictures of each menu's panel per run, to check its layout (0 = off)
     bool fit_shape = true;        // a tall narrow menu gets a tall panel of the same area (FitContent)
+    float fit_min_zoom = 1.3f;    // menus filling the whole screen still get at least this zoom
     bool hud = true;              // the in-level HUD on the forearm, shown when you look at it
     float hud_size = 1.f;         // its width, times the menu's
     float hud_look_deg = 50.f;    // shown when the arm faces you within this angle...
@@ -151,6 +152,11 @@ std::vector<UObject> g_removed;
 thread_local bool t_our_call = false;  // our own RemoveFromParent
 ue::process_event::NativeFn g_orig_remove = nullptr;
 std::atomic<bool> g_menu_up{false};
+// The menu button (vr/ui_panel, present thread) closes the pause menu when it
+// is the menu on top: the game itself only opens it with Escape (owner
+// 2026-11-03: "i want it to be a toggle instead of only an on button").
+std::atomic<bool> g_top_is_pause{false};
+std::atomic<bool> g_close_pause{false};
 std::unordered_set<UObject> g_not_menu_classes;
 
 bool IsMenuClass(UObject cls) {
@@ -189,13 +195,19 @@ struct TextItem {
     Rect before;                   // where it was then
     std::vector<UObject> chain;    // the widgets around it, nearest first, up to the menu
     size_t boxes = 0;              // how many of them it must fit in (up to the first list)
-    std::vector<double> base_over; // how far it already ran past each of those
-    struct Beside {
-        UObject obj = 0;
-        int index = -1;
-        Rect before;
-    };
-    std::vector<Beside> beside;    // pictures beside it in the same box (icons, lines, its backdrop), at the game's size
+    std::vector<uint8_t> box_mode; // per widget around it: kBoth, kAcross (x only), kAlong (y only), kNone
+    std::vector<double> base_over; // how far it already ran past each of those at the game's size
+    float prev_scale = 1;          // its size before the last change (to tell when the engine has laid it out)
+    double base_want_h = 0;        // the height its letters asked for at the game's size
+};
+constexpr uint8_t kBoth = 0, kAcross = 1, kAlong = 2, kNone = 3;
+
+// A picture in a menu (an icon, a line, a card or button face): a growing
+// text mustn't run over one it didn't cover, or out of one it sat inside.
+struct Picture {
+    UObject obj = 0;
+    int index = -1;
+    Rect before;
 };
 
 struct Panel {
@@ -220,7 +232,11 @@ struct Panel {
     double regrow_at = -1;     // GrowHitArea after a click
     // GrowText: the menu's texts, and where the growing is (see TextStep).
     std::vector<TextItem> texts;
+    std::vector<Picture> pictures;
     int text_phase = 0;        // kTextOff / kTextBaseline / kTextCheck
+    int text_stale = 0;        // frames waited for the engine to lay out the new sizes
+    double recheck_at = -1;    // one more look a moment after the texts fit (TextStep)
+    int rechecks = 0;
     int text_round = 0;
     int text_wait = 0;         // frames to let the engine lay the menu out again
     int text_pulled = 0;
@@ -325,6 +341,7 @@ struct Lookups {
     // to the boxes around it.
     int32_t font_pt = -1;
     bool font_pt_float = true;
+    int32_t text_color = -1;    // TextBlock.ColorAndOpacity (FSlateColor: its colour first)
     int32_t slot_parent = -1;
     UObject tree_class = 0;
     // DrawOnTop: UMaterial.bDisableDepthTest, from the engine's property data.
@@ -437,6 +454,8 @@ void ResolveFitOffsets() {
     L.font_size = font.element_size;
     L.outline_size = outline.offset + size.offset;
     L.outline_color = outline.offset + color.offset;
+    rf::PropertyInfo tc = rf::FindProperty(L.text_class, "ColorAndOpacity");
+    if (tc.valid() && tc.element_size >= 16) L.text_color = tc.offset;
     rf::PropertyInfo pt = rf::FindProperty(font.inner, "Size");
     if (pt.valid() && pt.element_size == 4 && pt.offset >= 0 && pt.offset + 4 <= L.font_size &&
         (pt.type == "FloatProperty" || pt.type == "IntProperty")) {
@@ -763,10 +782,25 @@ bool PlaceOnForearm() {
     return true;
 }
 
+// Where the panel's own middle goes, so that the part of the menu holding
+// its buttons (FitContent's box, centred on cx,cy in the 1920x1080 layout)
+// sits at PanelCentre. The panel keeps the engine's pivot (its middle):
+// setting the pivot to the box moved where the laser thought the menu was
+// but not the picture, which the engine had already built around the old
+// pivot, so every click landed off by the box's distance from the screen
+// centre (owner 2026-11-03: "i have to aim at the sub menu above the one i
+// actually want", and the task giver's Get Reward buttons couldn't be hit).
+// The widget's layout x runs along the panel's -Y and its y along -Z.
+FVector PanelOrigin(const Panel& p) {
+    double s = Scale() * p.zoom;
+    FQuat rot = ToQuat(PanelRotation());
+    return PanelCentre(p) + rot.Rotate(FVector{0, (p.cx - kDrawW * 0.5) * s, (p.cy - kDrawH * 0.5) * s});
+}
+
 void PosePanel(const Panel& p) {
     if (!Alive(p.comp, p.comp_index)) return;
     double s = Scale() * p.zoom;
-    SetWorldPose(p.comp, PanelCentre(p), PanelRotation());
+    SetWorldPose(p.comp, PanelOrigin(p), PanelRotation());
     ue::Call sc(p.comp, "SetWorldScale3D");
     sc.Set("NewScale", FVector{s, s, s});
     sc.Invoke();
@@ -1135,6 +1169,32 @@ bool MeasureMenu(const Panel& p, Rect* box, MeasureWalk* out) {
 
 // Called each frame while a new menu waits to be fitted. Returns true once
 // it is done (fitted, or shown whole if it can't be measured).
+// The zoom and centre for a menu whose buttons fill `box` of the layout.
+void ApplyFit(Panel& p, const Rect& box) {
+    const double W = kDrawW, H = kDrawH;
+    double zoom = std::min(W / box.W(), H / box.H());
+    if (S.fit_shape) {
+        // The same area on the arm as the whole screen had, shaped like the
+        // menu: the pause menu (a narrow column) was held to the screen's
+        // height and came out small; now it gets a taller, narrower panel.
+        const double aspect = box.W() / box.H();
+        const double fw = std::min(std::sqrt(W * H * aspect), W * 1.25);
+        const double fh = std::min(std::sqrt(W * H / aspect), H * 1.5);
+        zoom = std::max(zoom, std::min(fw / box.W(), fh / box.H()));
+    }
+    // Menus that fill the whole screen (death screen, Options, credits,
+    // task cards) could hardly be zoomed at all and their print stayed tiny
+    // (owner 2026-11-03): they get a panel at least this much bigger.
+    zoom = std::max(zoom, static_cast<double>(S.fit_min_zoom));
+    zoom = std::clamp(zoom, 1.0, static_cast<double>(S.fit_max_zoom));
+    p.zoom = zoom;
+    p.cx = (box.x0 + box.x1) * 0.5;
+    p.cy = (box.y0 + box.y1) * 0.5;
+    p.half_w = box.W() * 0.5;
+    p.half_h = box.H() * 0.5;
+    // The panel is placed so this point sits on the arm (PanelOrigin).
+}
+
 bool FitContent(Panel& p) {
     if (!S.fit || !L.slate_lib) return true;
     Rect whole;
@@ -1152,42 +1212,34 @@ bool FitContent(Panel& p) {
                   m.asked, m.counted);
         return true;
     }
-    const double W = kDrawW, H = kDrawH;
-    double zoom = std::min(W / box.W(), H / box.H());
-    if (S.fit_shape) {
-        // The same area on the arm as the whole screen had, shaped like the
-        // menu: the pause menu (a narrow column) was held to the screen's
-        // height and came out small; now it gets a taller, narrower panel.
-        const double aspect = box.W() / box.H();
-        const double fw = std::min(std::sqrt(W * H * aspect), W * 1.25);
-        const double fh = std::min(std::sqrt(W * H / aspect), H * 1.5);
-        zoom = std::max(zoom, std::min(fw / box.W(), fh / box.H()));
-    }
-    zoom = std::clamp(zoom, 1.0, static_cast<double>(S.fit_max_zoom));
-    p.zoom = zoom;
-    p.cx = (box.x0 + box.x1) * 0.5;
-    p.cy = (box.y0 + box.y1) * 0.5;
-    p.half_w = box.W() * 0.5;
-    p.half_h = box.H() * 0.5;
-    // The panel turns and sits around this point instead of the screen centre.
-    ue::Call pivot(p.comp, "SetPivot");
-    pivot.Set("InPivot", Vector2D{p.cx / W, p.cy / H});
-    pivot.Invoke();
+    ApplyFit(p, box);
     log::Info("world menu: %s: its parts fill %.0f,%.0f to %.0f,%.0f of the screen; zoomed %.2fx on the arm "
               "(%d parts, %d edge strips left out, %d widgets read, %.1f ms)",
-              p.name.c_str(), box.x0, box.y0, box.x1, box.y1, zoom, m.counted, m.wide, m.asked,
+              p.name.c_str(), box.x0, box.y0, box.x1, box.y1, p.zoom, m.counted, m.wide, m.asked,
               perf::NowMs() - t0);
     return true;
 }
 
 // After a click the menu may show other parts (another Options tab): the
 // laser's area grows to take them in. The zoom stays as it was, so the menu
-// never jumps in size under your hand.
+// never jumps in size under your hand. Only in the first seconds after it
+// opened, when the game is still filling it (the task giver's cards came a
+// moment after the menu, and it was zoomed onto the first card alone), a
+// menu that turned out much bigger is fitted again.
 void GrowHitArea(Panel& p) {
     if (!S.fit || p.fit_pending) return;
     Rect box;
     MeasureWalk m;
     if (!MeasureMenu(p, &box, &m)) return;
+    if (Now() - p.hosted_at < 3.0 && (box.W() > p.half_w * 2 * 1.15 || box.H() > p.half_h * 2 * 1.15)) {
+        double was = p.zoom;
+        ApplyFit(p, box);
+        PosePanel(p);
+        log::Info("world menu: %s: the game filled it after it opened (parts now %.0f,%.0f to %.0f,%.0f): fitted "
+                  "again, zoom %.2fx -> %.2fx",
+                  p.name.c_str(), box.x0, box.y0, box.x1, box.y1, was, p.zoom);
+        return;
+    }
     double hw = std::max({p.half_w, p.cx - box.x0, box.x1 - p.cx});
     double hh = std::max({p.half_h, p.cy - box.y0, box.y1 - p.cy});
     if (hw > p.half_w + 1 || hh > p.half_h + 1)
@@ -1292,6 +1344,7 @@ void SetTextScale(TextItem& t, float scale) {
     if (!Alive(t.obj, t.index) || t.base <= 0) return;
     float size = t.base * scale;
     if (WriteFontSize(t.obj, size)) {
+        t.prev_scale = t.scale;
         t.scale = scale;
         if (g_font_sizes.size() > 20000) g_font_sizes.clear();
         g_font_sizes[t.obj] = {ReadFontSize(t.obj), t.base};
@@ -1313,17 +1366,30 @@ UObject ParentOf(UObject w) {
 // The widgets around a text, nearest first, up to the menu itself, and how
 // many of them are boxes it must fit in: up to and including the first list
 // (ScrollBox), since what is in a list may run past its ends (it scrolls).
+// Every widget around it is checked; from a list up, only across the list
+// (along it, its content scrolls). `boxes` stays the ones up to the first
+// list: running out of one of those makes every text in it step back.
 void TextChain(TextItem& t, UObject menu) {
     t.chain.clear();
+    t.box_mode.clear();
     t.boxes = 0;
     bool in_list = false;
+    uint8_t mode = kBoth;
     UObject w = t.obj;
     for (int i = 0; i < 32; ++i) {
         w = ParentOf(w);
         if (!w || w == menu) break;
+        if (L.scroll_class && IsA(w, L.scroll_class)) {
+            uint8_t orient = 1;  // EOrientation: 0 across the screen, 1 down it
+            ue::GetProp(w, "Orientation", orient);
+            uint8_t across = orient == 0 ? kAlong : kAcross;
+            mode = mode == kBoth || mode == across ? across : kNone;
+            if (!in_list) t.boxes = t.chain.size() + 1;
+            in_list = true;
+        }
         t.chain.push_back(w);
+        t.box_mode.push_back(mode);
         if (!in_list) t.boxes = t.chain.size();
-        if (!in_list && L.scroll_class && IsA(w, L.scroll_class)) in_list = true;
     }
 }
 
@@ -1337,9 +1403,19 @@ bool ShownNow(const TextItem& t, std::unordered_map<UObject, UObject>& active) {
         return v == kCollapsed || v == kHidden;
     };
     if (hidden(t.obj)) return false;
+    // Drawn fully see-through (the game's "Lock" label on its buttons is a
+    // big invisible text that used to make the real label shrink).
+    double alpha = 1.0;
+    if (L.text_color >= 0) alpha = mem::ReadOr<LinearColor>(t.obj + L.text_color, LinearColor{1, 1, 1, 1}).a;
+    if (L.render_opacity >= 0) alpha *= mem::ReadOr<float>(t.obj + L.render_opacity, 1.f);
+    if (alpha < 0.05) return false;
     UObject below = t.obj;
     for (UObject w : t.chain) {
         if (hidden(w)) return false;
+        if (L.render_opacity >= 0) {
+            alpha *= mem::ReadOr<float>(w + L.render_opacity, 1.f);
+            if (alpha < 0.05) return false;
+        }
         if (L.switcher_class && IsA(w, L.switcher_class)) {
             auto it = active.find(w);
             if (it == active.end()) {
@@ -1407,10 +1483,10 @@ bool Drawn(const Rect& r) { return r.W() > 1 && r.H() > 1; }
 
 // How far `r` runs past box `b` (pixels; 0 or less is inside). A list only
 // counts across: along it, its content scrolls.
-double RunsPast(const Rect& r, const Rect& b, bool across_only) {
-    double o = std::max(b.x0 - r.x0, r.x1 - b.x1);
-    if (!across_only) o = std::max({o, b.y0 - r.y0, r.y1 - b.y1});
-    return o;
+double RunsPast(const Rect& r, const Rect& b, uint8_t mode = kBoth) {
+    if (mode == kNone) return -1e9;
+    double x = std::max(b.x0 - r.x0, r.x1 - b.x1), y = std::max(b.y0 - r.y0, r.y1 - b.y1);
+    return mode == kAcross ? x : mode == kAlong ? y : std::max(x, y);
 }
 
 double Overlap(const Rect& a, const Rect& b) {
@@ -1462,6 +1538,42 @@ int AddTexts(Panel& p, const std::vector<UObject>& texts, bool* reset = nullptr)
     return added;
 }
 
+// The pictures a menu shows now, where the engine drew them. Whole-screen
+// layers are left out (everything is inside those).
+void CollectPictures(Panel& p) {
+    p.pictures.clear();
+    if (!L.image_class) return;
+    std::vector<std::pair<UObject, int>> todo;
+    std::vector<UObject> kids;
+    if (UObject root = TreeRoot(p.widget)) todo.push_back({root, 0});
+    int seen = 0;
+    while (!todo.empty() && seen < 1500 && p.pictures.size() < 200) {
+        auto [w, depth] = todo.back();
+        todo.pop_back();
+        ++seen;
+        uint8_t v = Visibility(w);
+        if (v == kCollapsed || v == kHidden) continue;
+        if (L.render_opacity >= 0 && mem::ReadOr<float>(w + L.render_opacity, 1.f) < 0.05f) continue;
+        if (IsA(w, L.image_class)) {
+            if (InvisibleImage(w)) continue;
+            Placed pl = PlaceOf(w, false);
+            if (!pl.ok || !Drawn(pl.r) || (pl.r.W() >= kDrawW * 0.9 && pl.r.H() >= kDrawH * 0.9)) continue;
+            p.pictures.push_back({w, IndexOf(w), pl.r});
+            continue;
+        }
+        if (depth >= 24) continue;
+        if (IsA(w, L.user_widget_class)) {
+            if (UObject root = TreeRoot(w)) todo.push_back({root, depth + 1});
+        } else if (L.switcher_class && IsA(w, L.switcher_class)) {
+            ue::Call a(w, "GetActiveWidget");
+            if (a.Invoke() && a.Result<UObject>()) todo.push_back({a.Result<UObject>(), depth + 1});
+        } else if (IsA(w, L.panel_class)) {
+            Children(w, 256, &kids);
+            for (UObject k : kids) todo.push_back({k, depth + 1});
+        }
+    }
+}
+
 // Measures the texts the panel shows at the game's size, then makes those
 // bigger. A text that isn't on the screen yet (another tab, a line the death
 // screen hasn't shown yet) stays at the game's size until it is: TextWatch
@@ -1484,31 +1596,19 @@ int GrowTexts(Panel& p) {
         if (!Alive(t.obj, t.index)) continue;
         if (t.chain.empty()) TextChain(t, p.widget);
         if (t.measured || std::fabs(t.scale - 1.f) > 0.01f || !ShownNow(t, active)) continue;
-        Placed pl = PlaceOf(t.obj, false);
+        Placed pl = PlaceOf(t.obj, true);
         if (!pl.ok || !Drawn(pl.r)) continue;  // not on the screen yet: TextWatch looks again
         t.measured = true;
         t.before = pl.r;
+        t.base_want_h = pl.want_h;
+        t.prev_scale = t.scale;
         t.base_over.clear();
-        for (size_t k = 0; k < t.boxes; ++k) {
+        for (size_t k = 0; k < t.chain.size(); ++k) {
             Rect br = box_rect(t.chain[k]);
-            bool list = L.scroll_class && IsA(t.chain[k], L.scroll_class);
-            t.base_over.push_back(Drawn(br) ? RunsPast(pl.r, br, list) : 0.0);
-        }
-        // The pictures next to it in the same box: a growing text mustn't run
-        // over an icon or a line, or out of a picture it sat inside.
-        t.beside.clear();
-        if (!t.chain.empty() && L.image_class && IsA(t.chain[0], L.panel_class)) {
-            std::vector<UObject> kids;
-            Children(t.chain[0], 64, &kids);
-            for (UObject k : kids) {
-                if (k == t.obj || t.beside.size() >= 12 || !IsA(k, L.image_class) || InvisibleImage(k)) continue;
-                uint8_t v = Visibility(k);
-                if (v == kCollapsed || v == kHidden) continue;
-                Placed kp = PlaceOf(k, false);
-                if (kp.ok && Drawn(kp.r)) t.beside.push_back({k, IndexOf(k), kp.r});
-            }
+            t.base_over.push_back(Drawn(br) ? RunsPast(pl.r, br, t.box_mode[k]) : 0.0);
         }
     }
+    CollectPictures(p);
     int n = 0;
     for (auto& t : p.texts) {
         if (!t.measured || t.grown || t.scale > 1.01f || !Alive(t.obj, t.index)) continue;
@@ -1524,7 +1624,9 @@ int GrowTexts(Panel& p) {
 double Area(const Rect& r) { return std::max(0.0, r.W()) * std::max(0.0, r.H()); }
 
 // One check after the engine has laid the menu out with the bigger texts.
-// Returns how many texts were pulled back this round (0 = all fit).
+// Returns how many texts were pulled back this round (0 = all fit), or -1
+// if the engine hasn't laid the new sizes out yet (look again next frame:
+// checking the old layout passed texts that then ran out of their buttons).
 int CheckTexts(Panel& p) {
     std::unordered_map<UObject, Rect> boxes;
     auto box_rect = [&](UObject w) {
@@ -1543,6 +1645,8 @@ int CheckTexts(Panel& p) {
     std::vector<char> pull(p.texts.size(), 0);
     std::vector<UObject> tight;  // boxes something ran out of: everything in them steps back
     std::unordered_map<UObject, UObject> active;
+    std::vector<Placed> placed(p.texts.size());
+    int stale = 0;
     for (size_t i = 0; i < p.texts.size(); ++i) {
         TextItem& t = p.texts[i];
         if (!Alive(t.obj, t.index)) continue;
@@ -1551,35 +1655,54 @@ int CheckTexts(Panel& p) {
         const bool grown = t.scale > 1.01f;
         Placed pl = PlaceOf(t.obj, grown);
         if (!pl.ok || !Drawn(pl.r)) continue;
+        placed[i] = pl;
+        if (grown && t.base_want_h > 1 && pl.want_h > 1 && std::fabs(t.prev_scale - t.scale) > 0.01f) {
+            const double was = t.base_want_h * t.prev_scale, want = t.base_want_h * t.scale;
+            if (std::fabs(pl.want_h - was) < std::fabs(pl.want_h - want)) ++stale;
+        }
+    }
+    if (stale > 0) return -1;
+    std::vector<Rect> pic_now(p.pictures.size());
+    for (size_t j = 0; j < p.pictures.size(); ++j) {
+        const Picture& pic = p.pictures[j];
+        if (!Alive(pic.obj, pic.index)) continue;
+        Placed pp = PlaceOf(pic.obj, false);
+        if (pp.ok) pic_now[j] = pp.r;
+    }
+    for (size_t i = 0; i < p.texts.size(); ++i) {
+        TextItem& t = p.texts[i];
+        const Placed& pl = placed[i];
+        if (!pl.ok) continue;
+        t.prev_scale = t.scale;  // the engine has laid it out at this size
+        const bool grown = t.scale > 1.01f;
         now[i] = {pl.r, true};  // texts at the game's size still count for covering
         if (!grown) continue;
         t.want_w = pl.want_w;
         t.want_h = pl.want_h;
         // Its letters need more room than its slot gives: they spill out.
         if (pl.local_w > 1 && (pl.want_w > pl.local_w + 1.0 || pl.want_h > pl.local_h + 1.0)) pull[i] = 1;
-        for (size_t k = 0; k < t.boxes; ++k) {
+        for (size_t k = 0; k < t.chain.size() && k < t.box_mode.size(); ++k) {
             Rect br = box_rect(t.chain[k]);
             if (!Drawn(br)) continue;
-            bool list = L.scroll_class && IsA(t.chain[k], L.scroll_class);
             double before = k < t.base_over.size() ? t.base_over[k] : 0.0;
-            if (RunsPast(pl.r, br, list) > std::max(before, 0.0) + 2.0) {
+            if (RunsPast(pl.r, br, t.box_mode[k]) > std::max(before, 0.0) + 2.0) {
                 pull[i] = 1;
-                tight.push_back(t.chain[k]);
+                if (k < t.boxes) tight.push_back(t.chain[k]);
                 break;
             }
         }
-        for (const auto& n : t.beside) {
-            if (pull[i]) break;
-            if (!Alive(n.obj, n.index)) continue;
-            Placed np = PlaceOf(n.obj, false);
-            if (!np.ok || !Drawn(np.r)) continue;
-            if (RunsPast(t.before, n.before, false) <= 0.5) {  // it sat inside this picture
-                if (RunsPast(pl.r, np.r, false) > 2.0) pull[i] = 1;
+        for (size_t j = 0; j < p.pictures.size() && !pull[i] && t.measured; ++j) {
+            const Rect& was_r = p.pictures[j].before;
+            const Rect& is_r = pic_now[j];
+            if (!Drawn(is_r)) continue;
+            if (RunsPast(t.before, was_r) <= 0.5) {  // it sat inside this picture: it stays inside
+                if (RunsPast(pl.r, is_r) > 2.0) pull[i] = 1;
                 continue;
             }
-            double share = Overlap(pl.r, np.r) / std::max(1.0, std::min(Area(pl.r), Area(np.r)));
-            double was = Overlap(t.before, n.before) / std::max(1.0, std::min(Area(t.before), Area(n.before)));
-            if (share > 0.08 && share > was + 0.08) pull[i] = 1;
+            double share = Overlap(pl.r, is_r) / std::max(1.0, std::min(Area(pl.r), Area(is_r)));
+            if (share < 0.08) continue;
+            double was = Overlap(t.before, was_r) / std::max(1.0, std::min(Area(t.before), Area(was_r)));
+            if (share > was + 0.08) pull[i] = 1;
         }
     }
     // Two texts that now cover each other more than they did at the game's
@@ -1662,6 +1785,13 @@ bool TextStep(Panel& p) {
     double t0 = perf::NowMs();
     if (p.text_round < 8) {
         int pulled = CheckTexts(p);
+        if (pulled < 0) {
+            if (++p.text_stale < 40) return false;  // laid out with the new sizes in a frame or two
+            log::Info("world menu: %s: the engine didn't lay out the new text sizes in 40 frames; checked as it is",
+                      p.name.c_str());
+            pulled = 0;
+        }
+        p.text_stale = 0;
         p.text_pulled += pulled;
         ++p.text_round;
         if (pulled > 0) {
@@ -1672,7 +1802,13 @@ bool TextStep(Panel& p) {
         }
     }
     p.text_phase = kTextOff;
-    if (p.quiet_check && p.text_pulled == 0) {  // its words changed, and it still fits: nothing to say
+    // One more look a moment later, in case the engine laid something out
+    // late; again after any look that had to pull a text back.
+    if ((!p.quiet_check || p.text_pulled > 0) && p.rechecks < 6) {
+        p.recheck_at = Now() + 0.6;
+        ++p.rechecks;
+    }
+    if (p.quiet_check && p.text_pulled == 0) {  // nothing moved: nothing to say
         p.quiet_check = false;
         return true;
     }
@@ -1696,7 +1832,7 @@ bool TextStep(Panel& p) {
     log::Info("world menu: %s: text made bigger%s: %d of %zu texts grown, %.2fx on average (game sizes %.0f-%.0f); "
               "%d of %d small texts now near %.0f px; %d measured on screen, %d not shown yet; %d step(s) back "
               "where a text didn't fit, %d rounds, last %.1f ms",
-              p.name.c_str(), p.quiet_check ? " (checked again: a text's words changed)" : "", grown, p.texts.size(),
+              p.name.c_str(), p.quiet_check ? " (looked again)" : "", grown, p.texts.size(),
               grown ? sum / grown : 1.0, p.texts.empty() ? 0.f : base_min,
               base_max, small_grown, small, S.text_min_px, measured, waiting, p.text_pulled, p.text_round,
               perf::NowMs() - t0);
@@ -1785,7 +1921,7 @@ int TextWatch(Panel& p) {
 // ------------------------------------------------------- panel pictures --
 // A picture of what a menu's panel shows (its whole 1920x1080 layout, not
 // the headset view, which rarely has the arm in it), saved beside the log as
-// panel-<menu>-<n>.png, so a layout can be checked without asking the owner.
+// panel-<menu>-<n>.exr, so a layout can be checked without asking the owner.
 // The engine reads the picture back and packs it, a short hitch, so only a
 // couple per menu and run (menu_snapshots).
 
@@ -1808,7 +1944,8 @@ void SnapshotPanel(const Panel& p, const std::string& tag) {
         return;
     }
     ++n;
-    const std::string file = "panel-" + key + "-" + std::to_string(n) + ".png";
+    // The engine writes this float render target as OpenEXR, whatever the name.
+    const std::string file = "panel-" + key + "-" + std::to_string(n) + ".exr";
     std::wstring dir = config::Dir(), wfile(file.begin(), file.end());
     FStringView d{dir.c_str(), static_cast<int32_t>(dir.size() + 1), static_cast<int32_t>(dir.size() + 1)};
     FStringView f{wfile.c_str(), static_cast<int32_t>(wfile.size() + 1), static_cast<int32_t>(wfile.size() + 1)};
@@ -2547,6 +2684,31 @@ void UpdateStack() {
                       ? "has it" : "asked for; B/Y may not reach it");
     }
     s_focused = want;
+    g_top_is_pause = top >= 0 && G.panels[top].name == "UIM_Pause_C";
+}
+
+// The menu button was pressed with the pause menu on top: does what its
+// Return button does (back to the game).
+void ClosePauseMenu() {
+    int top = -1;
+    for (int i = static_cast<int>(G.panels.size()) - 1; i >= 0 && top < 0; --i)
+        if (WidgetShows(G.panels[i])) top = i;
+    if (top < 0 || G.panels[top].name != "UIM_Pause_C") return;
+    UObject pause = G.panels[top].widget;
+    ue::Call ret(pause, "BndEvt__UIM_Pause_UIP_Button_Secondary_Return_K2Node_ComponentBoundEvent_0_OnClicked__DelegateSignature");
+    const char* how = "its Return button";
+    bool ok = false;
+    {
+        ue::process_event::GameCodeScope game_code;  // the game may open or close menus from here
+        if (ret.Valid()) {
+            ok = ret.Invoke();
+        } else {
+            ue::Call rg(pause, "ReturnGame");
+            how = "ReturnGame";
+            ok = rg.Invoke();
+        }
+    }
+    log::Info("world menu: menu button closes the pause menu (%s: %s)", how, ok ? "done" : "the call failed");
 }
 
 
@@ -3091,9 +3253,14 @@ void OnGameFrame() {
     TakeNewMenus();
     DropClosedMenus();
     UpdateStack();
+    if (g_close_pause.exchange(false)) {
+        ClosePauseMenu();
+        DropClosedMenus();
+        UpdateStack();
+    }
     g_menu_up = !G.panels.empty();
+    static UObject s_death = 0;
     {
-        static UObject s_death = 0;
         UObject death = 0;
         for (const auto& p : G.panels)
             if (p.name == "UIM_Results_C") death = p.widget;
@@ -3102,10 +3269,14 @@ void OnGameFrame() {
             s_death = death;
         }
     }
-    // Blur the world past arm's length while a menu is on the arm.
+    // Blur the world past arm's length while a menu is on the arm. Not on the
+    // death screen: its kill shot is a picture the game takes of your body a
+    // few metres away, and the blur turned it into a smear (2026-11-03 panel
+    // picture; owner: "kill shot screen: no").
     static bool s_blur = false;
-    if (s_blur != !G.panels.empty()) {
-        s_blur = !G.panels.empty();
+    const bool want_blur = !G.panels.empty() && !s_death;
+    if (s_blur != want_blur) {
+        s_blur = want_blur;
         // Nothing nearer than the focus may blur (hands, arms, body, menu).
         // Set right here, before the blur starts: the background cvars pass
         // only runs while the player ticks and had not run yet on the
@@ -3173,7 +3344,14 @@ void OnGameFrame() {
     // zoomed and shown (FitContent); after a click the laser area may grow.
     for (auto& p : G.panels) {
         const bool settled = !p.fit_pending && p.regrow_at < 0 && p.text_phase == kTextOff;
-        if (settled && p.shown && now >= p.text_scan_at) {
+        if (settled && p.recheck_at > 0 && now >= p.recheck_at) {
+            p.recheck_at = -1;
+            p.text_phase = kTextCheck;
+            p.text_round = 0;
+            p.text_wait = 0;
+            p.text_pulled = 0;
+            p.quiet_check = true;
+        } else if (settled && p.shown && now >= p.text_scan_at) {
             p.text_scan_at = now + 3.0;
             WalkScope walk;
             if (NewPageTexts(p)) p.regrow_after_text = true;
@@ -3530,6 +3708,7 @@ void Init() {
     S.text_outline = std::clamp(config::GetInt("menu_text_outline", 2), 0, 8);
     S.text_scale = std::clamp(config::GetFloat("menu_text_scale", 1.5f), 1.f, 3.f);
     S.fit_shape = config::GetBool("menu_fit_shape", true);
+    S.fit_min_zoom = std::clamp(config::GetFloat("menu_fit_min_zoom", 1.3f), 1.f, 3.f);
     S.text_min_px = std::clamp(config::GetFloat("menu_text_min_px", 32.f), 0.f, 120.f);
     S.text_max_px = std::clamp(config::GetFloat("menu_text_max_px", 64.f), 10.f, 200.f);
     S.text_max_scale = std::clamp(config::GetFloat("menu_text_max_scale", 2.5f), 1.f, 4.f);
@@ -3738,6 +3917,8 @@ void Scan() {
 }
 
 bool MenuUp() { return g_menu_up.load(); }
+bool PauseMenuOnTop() { return g_menu_up.load() && g_top_is_pause.load(); }
+void RequestClosePause() { g_close_pause = true; }
 bool Active() { return g_active.load(); }
 bool Enabled() { return S.enabled; }
 

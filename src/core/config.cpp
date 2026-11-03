@@ -204,6 +204,12 @@ const Block kBlocks[] = {
      "; Pictures of each menu's panel saved beside the log per run, to check its\n"
      "; layout (each costs a short hitch when taken; 0 = off)\n"
      "menu_snapshots=2\n"},
+    {"menu_fit_min_zoom",
+     "\n"
+     "; Menus that fill the whole screen (death screen, Options, credits, task\n"
+     "; cards) are made at least this much bigger on the arm than the whole\n"
+     "; screen would be (1 = no bigger)\n"
+     "menu_fit_min_zoom=1.3\n"},
     {"hole_buzz",
      "\n"
      "; 1 = both hands tick softly each second while the hole in the floor counts\n"

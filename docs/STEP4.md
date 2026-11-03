@@ -76,10 +76,29 @@ dump of the shipping game (`hole-vr/dump/game_classes.txt`).
   menu (`comfort.cpp`).
 - **Panel pictures** (`SnapshotPanel`). A second after a menu is fitted (and
   after texts came into view), the panel's own 1920x1080 picture is saved as
-  `hole-vr/panel-<menu>-<n>.png` through `KismetRenderingLibrary.ExportRenderTarget`;
+  `hole-vr/panel-<menu>-<n>.exr` (OpenEXR: the panel's render target is half-float) through
+  `KismetRenderingLibrary.ExportRenderTarget` (about 100 ms each);
   the death screen saves one per page. Each costs a short hitch, so at most
   `menu_snapshots` (2) per menu per run. The headset picture
   (`capture-forearm-<menu>.bmp`) now waits until you look at the arm.
+- **Panel placement** (`PanelOrigin`, 2026-11-03 evening). The panel keeps
+  the engine's middle pivot and is moved so FitContent's box sits on the arm.
+  `SetPivot` changed where the laser's hit landed in the layout but not the
+  picture (the engine had built the panel around the old pivot), so clicks
+  landed off by the box's distance from the screen centre: one item low in the
+  pause menu, above the task giver's Get Reward buttons. A menu the game fills
+  after it opens (the task cards) is fitted again in its first 3 s, and menus
+  that fill the whole screen get at least `menu_fit_min_zoom` (1.3).
+- **Text checks, second round.** Fully see-through texts are ignored (each
+  game button has a large invisible "Lock" text that made the real label shrink).
+  Every widget around a text is checked (from a list up, only across it), and
+  every picture in the menu: a text mustn't newly cover one, or run out of one
+  it sat inside. A check waits until the engine has laid out the new sizes
+  (desired heights match), and one more check runs 0.6 s after the texts fit.
+- **Menu button toggles** (`ui_panel.cpp`, `ClosePauseMenu`). With the pause
+  menu on top, the menu button runs the pause menu's Return button.
+- **No menu blur on the death screen**: the blur smeared the kill shot (a
+  scene capture of your body a few metres away).
 - **Kill shot** (`WatchDeathScreen`). The death screen's WidgetSwitcher page is
   watched; on each change the kill shot view (`UIP_DeadReview`) is described in
   the log (what hides it, its pictures and where they come from, the

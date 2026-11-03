@@ -132,13 +132,17 @@ struct UiListener : xr::Listener {
         input::Snapshot in = input::Peek();
         HWND w = GameWindow();
 
-        // Menu button on either controller toggles the pause menu (Escape).
-        // A half-second guard so a double press doesn't open and close it.
+        // Menu button on either controller toggles the pause menu: Escape
+        // opens it (the game only opens it with that), and with the pause
+        // menu on top the game thread closes it (world_menu). In a sub-menu
+        // it goes back a step, like B/Y. A half-second guard so a double
+        // press doesn't open and close it.
         static DWORD s_last_menu = 0;
         for (int hnd = 0; hnd < 2; ++hnd) {
             bool m = in.valid && in.hand[hnd].menu.down;
             if (S.pause_button && m && !PT.menu_down[hnd] && w && GetTickCount() - s_last_menu > 500) {
-                PostKey(w, VK_ESCAPE);
+                if (world_menu::PauseMenuOnTop()) world_menu::RequestClosePause();
+                else PostKey(w, VK_ESCAPE);
                 s_last_menu = GetTickCount();
             }
             PT.menu_down[hnd] = m;

@@ -25,6 +25,11 @@ void InitGame();
 void Scan();
 // True while a game menu is on the forearm (the game is in a menu).
 bool MenuUp();
+// True while the pause menu is the menu on top (any thread).
+bool PauseMenuOnTop();
+// Any thread: close the pause menu on the next game frame (the menu button
+// toggles it).
+void RequestClosePause();
 // True while at least one menu is on a world panel.
 bool Active();
 // True when world panels are switched on in the settings.
