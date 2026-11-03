@@ -26,6 +26,7 @@
 #include "vr/comfort.h"
 #include "vr/comfort_math.h"
 #include "vr/teleport.h"
+#include "ue/names.h"
 #include "vr/hands.h"
 #include "vr/workbench.h"
 #include "vr/input.h"
@@ -2201,6 +2202,12 @@ struct PressButton {
     UETransform rest{};         // world transform of the body at rest
     double depth = 0.0;         // how far it is pushed in now, cm
     bool armed = true;          // pushed back up since the last press
+    // Owner 2026-11-03 14:35: "i only want the red button its self to react,
+    // not its square base". The game's timer is one mesh, so it is hidden and
+    // drawn again from engine shapes: a dark base and a red cap that sinks.
+    UObject base_comp = 0, cap_comp = 0;
+    FVector center_l;           // footprint centre, rest-local, scaled cm
+    double bottom_l = 0, base_h = 0, cap_h = 0, cap_d = 0;
 };
 
 // The timer mesh's GetLocalBounds came back 0 x 0 x 0 in the owner's 10:56
@@ -2311,8 +2318,100 @@ constexpr double kPressTravel = 3.0;
 constexpr double kPressFire = 1.8;
 constexpr double kPressRearm = 0.6;
 
+// One engine-shape piece of the rebuilt timer: a 100 cm Cube or Cylinder
+// (pivot at its centre) placed in world space, no collision, plain colour.
+UObject MakeTimerShape(UObject actor, const char* mesh_path, float r, float g, float bl) {
+    static UObject cls = ue::FindObject("Class /Script/Engine.StaticMeshComponent");
+    static UObject mat = ue::FindObject("Material /Engine/BasicShapes/BasicShapeMaterial.BasicShapeMaterial");
+    static ue::FName color{};
+    static bool have_color = ue::names::Find("Color", &color);
+    UObject mesh = ue::FindObject(mesh_path);
+    if (!cls || !mesh || !actor) return 0;
+    ue::Call add(actor, "AddComponentByClass");
+    add.Set("Class", cls).Set("bManualAttachment", true).Set("RelativeTransform", UETransform{})
+        .Set("bDeferredFinish", false);
+    UObject c = add.Invoke() ? add.Result<UObject>() : 0;
+    if (!c) return 0;
+    ue::Call col(c, "SetCollisionEnabled");
+    col.Set("NewType", uint8_t{0});   // NoCollision
+    col.Invoke();
+    ue::Call ov(c, "SetGenerateOverlapEvents");
+    ov.Set("bInGenerateOverlapEvents", false);
+    ov.Invoke();
+    ue::Call mob(c, "SetMobility");
+    mob.Set("NewMobility", uint8_t{2});
+    mob.Invoke();
+    ue::Call sm(c, "SetStaticMesh");
+    sm.Set("NewMesh", mesh);
+    sm.Invoke();
+    if (mat && have_color) {
+        ue::Call mid(c, "CreateDynamicMaterialInstance");
+        mid.Set("ElementIndex", int32_t{0}).Set("SourceMaterial", mat);
+        UObject m = mid.Invoke() ? mid.Result<UObject>() : 0;
+        if (m) {
+            struct { float r, g, b, a; } lc{r, g, bl, 1.0f};
+            ue::Call v(m, "SetVectorParameterValue");
+            v.Set("ParameterName", color).Set("Value", lc);
+            v.Invoke();
+        }
+    } else {
+        log::Warn("controls: range timer shapes: no BasicShapeMaterial colour (material %s)", mat ? "found" : "missing");
+    }
+    return c;
+}
+
+void PlaceTimerShape(const PressButton& b, UObject comp, const FVector& local_center, const FVector& size_cm) {
+    UETransform t;
+    t.rotation = b.rest.rotation;
+    t.translation = b.rest.translation + b.rest.rotation.Rotate(local_center);
+    t.scale = FVector{size_cm.X / 100.0, size_cm.Y / 100.0, size_cm.Z / 100.0};
+    ue::Call c(comp, "K2_SetWorldTransform");
+    c.Set("NewTransform", t).Set("bSweep", false).Set("bTeleport", true);
+    c.Invoke();
+}
+
+void PlaceTimerCap(const PressButton& b, double depth) {
+    if (!b.cap_comp) return;
+    const FVector at{b.center_l.X, b.center_l.Y, b.bottom_l + b.base_h + b.cap_h * 0.5 - depth};
+    PlaceTimerShape(b, b.cap_comp, at, FVector{b.cap_d, b.cap_d, b.cap_h});
+}
+
+// Rest pose known: hide the game's one-piece timer and draw base + cap.
+// Proportions are a first guess from its 18 x 18 x 19 cm box: base the
+// lower 60 %, cap 65 % of the width. On any failure the old squash stays.
+void RebuildTimerShapes(PressButton& b) {
+    const PressPart& p = b.parts[0];
+    const FVector sc{std::fabs(b.rest.scale.X), std::fabs(b.rest.scale.Y), std::fabs(b.rest.scale.Z)};
+    const double w = (p.mx.X - p.mn.X) * sc.X, d = (p.mx.Y - p.mn.Y) * sc.Y, h = (p.mx.Z - p.mn.Z) * sc.Z;
+    if (w < 2 || d < 2 || h < 4) return;
+    b.center_l = FVector{(p.mn.X + p.mx.X) * 0.5 * sc.X, (p.mn.Y + p.mx.Y) * 0.5 * sc.Y, 0};
+    b.bottom_l = p.mn.Z * sc.Z;
+    b.base_h = h * 0.6;
+    b.cap_h = h - b.base_h;
+    b.cap_d = std::fmin(w, d) * 0.65;
+    b.base_comp = MakeTimerShape(b.actor, "StaticMesh /Engine/BasicShapes/Cube.Cube", 0.03f, 0.03f, 0.035f);
+    b.cap_comp = b.base_comp ? MakeTimerShape(b.actor, "StaticMesh /Engine/BasicShapes/Cylinder.Cylinder", 0.7f, 0.02f, 0.02f) : 0;
+    if (!b.base_comp || !b.cap_comp) {
+        log::Warn("controls: range timer: could not build the base and red cap; the whole timer squashes instead");
+        b.base_comp = b.cap_comp = 0;
+        return;
+    }
+    PlaceTimerShape(b, b.base_comp, FVector{b.center_l.X, b.center_l.Y, b.bottom_l + b.base_h * 0.5},
+                    FVector{w, d, b.base_h});
+    PlaceTimerCap(b, 0.0);
+    ue::Call vis(p.comp, "SetVisibility");
+    vis.Set("bNewVisibility", false).Set("bPropagateToChildren", false);
+    vis.Invoke();
+    log::Info("controls: range timer rebuilt: base %.1f x %.1f x %.1f cm, red cap %.1f cm wide, %.1f cm tall; only the cap sinks",
+              w, d, b.base_h, b.cap_d, b.cap_h);
+}
+
 void SetBodySquash(PressButton& b, double depth) {
     if (!b.body_rest || b.n_parts == 0) return;
+    if (b.cap_comp) {
+        PlaceTimerCap(b, depth);
+        return;
+    }
     UObject comp = b.parts[0].comp;
     const UETransform& t = b.rest;
     const double sz = std::fabs(t.scale.Z);
@@ -2348,6 +2447,7 @@ void PhysicalButtons(UObject player) {
                 m.Invoke();
                 b.rest = tr[0];
                 b.body_rest = true;
+                RebuildTimerShapes(b);
                 UObject sm = 0;
                 ue::GetProp(body, "StaticMesh", sm);
                 log::Info("controls: range timer button sinks when pushed (mesh %s, %.1f cm tall)",
@@ -2389,15 +2489,22 @@ void PhysicalButtons(UObject player) {
                     const FVector& mx = b.parts[i].mx;
                     const FVector l = t.rotation.Inverse().Rotate(bl.p - t.translation);
                     const double sx = std::fabs(t.scale.X), sy = std::fabs(t.scale.Y), sz = std::fabs(t.scale.Z);
-                    const bool over_xy = l.X > mn.X * sx && l.X < mx.X * sx && l.Y > mn.Y * sy && l.Y < mx.Y * sy;
+                    bool over_xy = l.X > mn.X * sx && l.X < mx.X * sx && l.Y > mn.Y * sy && l.Y < mx.Y * sy;
+                    if (i == 0 && b.cap_comp) {
+                        // Only the red cap is pushed down from above.
+                        const double rx = l.X - b.center_l.X, ry = l.Y - b.center_l.Y;
+                        over_xy = rx * rx + ry * ry < std::pow(b.cap_d * 0.5 + bl.r * 0.5, 2);
+                    }
                     const double top = mx.Z * sz;
                     if (i == 0 && b.body_rest && over_xy && l.Z > top - kPressTravel) {
                         // Over the top: how far the ball's bottom is below it.
                         hand_push = std::fmax(hand_push, top - (l.Z - bl.r));
                         continue;
                     }
+                    // Rebuilt timer: above the base only the cap's own sides count.
+                    const double side_top = i == 0 && b.cap_comp && !over_xy ? b.bottom_l + b.base_h : top;
                     if (l.X > mn.X * sx - bl.r && l.X < mx.X * sx + bl.r && l.Y > mn.Y * sy - bl.r &&
-                        l.Y < mx.Y * sy + bl.r && l.Z > mn.Z * sz - bl.r && l.Z < top + bl.r)
+                        l.Y < mx.Y * sy + bl.r && l.Z > mn.Z * sz - bl.r && l.Z < side_top + bl.r)
                         side = true;
                 }
             }
