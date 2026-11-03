@@ -1997,10 +1997,10 @@ void OnAnyEvent(UObject self, UObject function, void*) {
     enum : uint8_t { kOther = 0, kConstruct = 1, kFocus = 2 };
     uint8_t kind;
     if (g_fn_names_ok.load(std::memory_order_relaxed)) {
-        // The engine is calling this live function right now, so its name
-        // is safe to read directly.
+        // The engine is calling this function right now; the read still goes
+        // through SafeCopy (about 20 ns) so freed memory can never crash it.
         ue::FName fn;
-        std::memcpy(&fn, reinterpret_cast<const void*>(function + ue::off::kObjName), sizeof(fn));
+        if (!mem::SafeCopy(&fn, reinterpret_cast<const void*>(function + ue::off::kObjName), sizeof(fn))) return;
         if (fn.number != 0) return;
         kind = fn.comparison_index == g_construct_entry ? kConstruct
                : fn.comparison_index == g_focus_entry   ? kFocus

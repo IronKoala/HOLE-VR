@@ -58,13 +58,17 @@ void Write(const char* level, const char* fmt, va_list args, bool now) {
              t.wSecond, t.wMilliseconds, level, msg);
     if (IsDebuggerPresent()) OutputDebugStringA(line);
     g_lines.fetch_add(1, std::memory_order_relaxed);
+    bool first;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
+        first = g_pending.empty();
         g_pending.emplace_back(line);
     }
     HANDLE wake = g_wake.load();
     if (now || !wake) Drain();
-    else SetEvent(wake);
+    // Only the first line of a batch wakes the writer: one kernel call per
+    // batch instead of one per line.
+    else if (first) SetEvent(wake);
 }
 }  // namespace
 
