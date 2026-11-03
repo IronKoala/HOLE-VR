@@ -2154,13 +2154,22 @@ void HandInteract(UObject player, int hand) {
     const char* side = hand == input::kLeft ? "left" : "right";
     input::Haptic(static_cast<input::Hand>(hand), 0.2f, 0.02f);
     if (pick && pick != game_target) {
-        // The hand's target wins: call its Interact the way the game does.
-        ue::Call c(pick, "Interact");
-        c.Set("Actor", player).Set("SelectIndex", int32_t{0});
+        // The hand's target wins. Owner 2026-11-03: "the game crashed (fatal
+        // Error!) when i tried to pick up a CD": calling the CD's Interact
+        // straight away skipped what the game does when you look at a thing
+        // (its InteractInOverlay, which sets up the item's prompt), and the
+        // CD's pickup needed that. So the hand now goes through the game's
+        // own steps: focus the thing as if looked at, then the game's own
+        // interact input. The game's view trace hands focus back next tick.
+        ue::Call focus(pick, "InteractInOverlay");
+        const bool focused = focus.Invoke();
+        ue::SetProp(player, "InteractTarget", pick);
+        ue::SetProp(player, "IsInteractReady", uint8_t{1});
+        ue::Call c(player, "PlayerInput_Interact");
         const bool ok = c.Invoke();
-        log::Info("controls: interact (%s hand %s %s%s; the game's view target: %s)", side, how.c_str(),
-                  ue::GetName(pick).c_str(), ok ? "" : ", call failed",
-                  game_target ? ue::GetName(game_target).c_str() : "none");
+        log::Info("controls: interact (%s hand %s %s%s%s, through the game's interact; the game's view target: %s)",
+                  side, how.c_str(), ue::GetName(pick).c_str(), focused ? "" : ", no InteractInOverlay",
+                  ok ? "" : ", call failed", game_target ? ue::GetName(game_target).c_str() : "none");
         return;
     }
     ue::Call c(player, "PlayerInput_Interact");
