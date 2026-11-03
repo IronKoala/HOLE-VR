@@ -96,6 +96,21 @@ static void TestStats() {
     EXPECT(std::fabs(s.none_sum - 4) < 1e-9);
     EXPECT(std::fabs(s.used_sum - 1) < 1e-9);
     EXPECT(s.n[kCamera] == 1 && s.n[kMesh] == 0);
+    // The 1 cm miss is along world X; facing 90 degrees (world +Y) that is
+    // sideways, not forward. Under 1 cm or more is not one of the worst.
+    Stats t;
+    t.Add({4, 0, 0}, l, kCamera, 90.0);
+    EXPECT(std::fabs(t.axis_sum[0]) < 1e-9);
+    EXPECT(std::fabs(t.axis_sum[1] - 1) < 1e-9);
+    EXPECT(t.worst_count == 0);
+    // Worst frames: kept largest first, at most kWorst.
+    const double misses[] = {2, 5, 1.5, 4, 3};
+    for (double m : misses) t.Add({3 + m, 0, 0}, l, kCamera, 0.0);
+    EXPECT(t.worst_count == Stats::kWorst);
+    EXPECT(std::fabs(t.worst[0].cm - 5) < 1e-9);
+    EXPECT(std::fabs(t.worst[1].cm - 4) < 1e-9);
+    EXPECT(std::fabs(t.worst[2].cm - 3) < 1e-9);
+    EXPECT(std::fabs(t.worst[0].miss.X - 5) < 1e-9 && t.worst[0].used == kCamera);
 }
 
 static void TestGunShake() {
@@ -121,6 +136,27 @@ static void TestGunShake() {
     j.AddMovedAfter(2.0);
     EXPECT(j.checked_frames == 2 && j.moved_frames == 1 && std::fabs(j.moved_max - 2.0) < 1e-9);
     EXPECT(std::fabs(AngleDeg(Yaw(30)) - 30.0) < 1e-6);
+
+    // The gun against the hand: a fixed offset gives no wobble; a 0.5 cm
+    // twitch shows as 0.5 then 0.5 back; a re-grip (big jump) is left out;
+    // a frame with no grip restarts it.
+    GunShake p;
+    for (int i = 0; i < 5; ++i) p.AddPlacement(true, FVector{10, 2, 3}, Yaw(5), true);
+    EXPECT(p.place_n[1] == 4 && p.place_cm_sum[1] < 1e-9 && p.place_deg_sum[1] < 1e-6);
+    p.AddPlacement(true, FVector{10.5, 2, 3}, Yaw(5), true);
+    p.AddPlacement(true, FVector{10, 2, 3}, Yaw(7), true);
+    EXPECT(p.place_n[1] == 6);
+    EXPECT(std::fabs(p.place_cm_sum[1] - 1.0) < 1e-9);
+    EXPECT(std::fabs(p.place_deg_max[1] - 2.0) < 1e-6);
+    p.AddPlacement(true, FVector{40, 2, 3}, Yaw(7), false);
+    EXPECT(p.place_n[0] == 0 && p.place_n[1] == 6);
+    p.AddPlacement(false, {}, {}, false);
+    p.AddPlacement(true, FVector{0, 0, 0}, FQuat{}, false);
+    EXPECT(p.place_n[0] == 0);
+    p.AddPlacement(true, FVector{0.1, 0, 0}, FQuat{}, false);
+    EXPECT(p.place_n[0] == 1 && std::fabs(p.place_cm_max[0] - 0.1) < 1e-9);
+    p.ResetTotals();
+    EXPECT(p.place_n[0] == 0 && p.place_n[1] == 0 && p.place_cm_max[0] == 0);
 }
 
 int main() {

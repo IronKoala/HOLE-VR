@@ -6,6 +6,8 @@
 #include "ue/call.h"
 #include "vr/body/skeleton.h"
 #include "vr/hands.h"
+#include "vr/input.h"
+#include "vr/math.h"
 #include "vr/stereo.h"
 #include "vr/view_lead_math.h"
 
@@ -54,6 +56,15 @@ Anchors Sample(UObject player) {
             a.held = grab.object;
             a.held_at = x.translation;
             a.held_rot = x.rotation;
+            // The controller pose this tick's hands came from.
+            const input::Snapshot s = input::LastConsumed();
+            const input::HandInput& h = s.hand[input::kRight];
+            if (s.valid && h.grip_valid) {
+                a.grip = true;
+                a.grip_m = XrToUePosition(h.grip.position.x, h.grip.position.y, h.grip.position.z, 1.0);
+                a.grip_rot = XrToUeQuat(h.grip.orientation.x, h.grip.orientation.y, h.grip.orientation.z,
+                                        h.grip.orientation.w);
+            }
         }
     }
     static bool s_logged = false;
