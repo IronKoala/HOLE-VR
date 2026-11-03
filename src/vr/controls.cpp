@@ -403,6 +403,9 @@ void UpdateHands(const input::Snapshot& s) {
 
 // ---- locomotion and turning ----
 bool g_snap_armed = true;
+// Sprinting: the game only sprints on (near) full stick, so while sprint is
+// on, any push past half way counts as full.
+bool g_sprint_full = false;
 
 double Locomotion(UObject player, const input::Snapshot& s, double dt) {
     const input::HandInput& left = s.hand[input::kLeft];
@@ -418,6 +421,7 @@ double Locomotion(UObject player, const input::Snapshot& s, double dt) {
     s_teleport_on = teleport_now;
     if (!g_set.teleport && mag > g_set.deadzone) {
         double scale = std::fmin(1.0, (mag - g_set.deadzone) / (1.0 - g_set.deadzone)) / mag;
+        if (g_sprint_full && mag > 0.5) scale = 1.0 / mag;
         double yaw = 0;
         hands::HandState lh = hands::Get(g_set.swap_sticks ? hands::kRight : hands::kLeft);
         hands::Pose head;
@@ -1773,6 +1777,10 @@ struct GameActionState {
     int crouch_want = -1;              // 1 crouched, 0 standing, -1 unknown
     double crouch_check_at = -1, crouch_watch_until = -1;
     bool sprinting = false;
+    double sprint_on_at = -1;      // when sprint was switched on
+    double sprint_idle_since = -1; // stick in the deadzone since
+    bool sprint_moved = false;     // stick left the deadzone since sprint on
+    bool sprint_checked = false;   // gait checked after sprint on
     double y_down_at = -1;
     double melee_ready_at = 0;
     double melee_release_at = -1;
@@ -2560,13 +2568,85 @@ void PhysicalButtons(UObject player) {
     }
 }
 
+// Reads a (possibly bitfield) bool property. -1 if it can't be read.
+int ReadBoolProp(UObject obj, const char* name) {
+    auto p = ue::reflection::FindProperty(ue::GetClass(obj), name);
+    if (!p.valid() || p.type != "BoolProperty") return -1;
+    uint8_t b = 0;
+    if (!mem::Read(obj + p.offset, b)) return -1;
+    return (b & (p.bool_mask ? p.bool_mask : 0xFF)) ? 1 : 0;
+}
+
+// The game's sprint input: with its "toggle sprint" option on, each press
+// flips sprinting and a release does nothing, so the mod's on/off would get
+// out of step. Then each change is a press and release.
+void SendSprint(UObject player, bool on) {
+    const bool toggle = ReadBoolProp(player, "ToggleSprint") == 1;
+    if (toggle) {
+        // Already in the asked-for gait (the game ends a sprint by itself
+        // when you stop): a press would flip it the wrong way.
+        uint8_t gait = 255;
+        if (ue::GetProp(player, "Gait", gait) && gait <= 3 && (gait == 2) == on) return;
+        FireEvent(player, GA.sprint_down);
+        FireEvent(player, GA.sprint_up);
+    } else {
+        FireEvent(player, on ? GA.sprint_down : GA.sprint_up);
+    }
+}
+
+void StopSprint(UObject player, const char* why) {
+    if (!GA.sprinting) return;
+    GA.sprinting = false;
+    g_sprint_full = false;
+    SendSprint(player, false);
+    log::Info("controls: sprint off (%s, after %.1f s)", why, g_clock - GA.sprint_on_at);
+}
+
+void SprintControl(UObject player, const input::HandInput& l) {
+    const double mag = std::sqrt(l.stick_x * l.stick_x + l.stick_y * l.stick_y);
+    if (l.stick_click.pressed) {
+        if (GA.sprinting) {
+            StopSprint(player, "left stick click");
+        } else {
+            GA.sprinting = true;
+            g_sprint_full = true;
+            GA.sprint_on_at = g_clock;
+            GA.sprint_idle_since = -1;
+            GA.sprint_moved = mag >= g_set.deadzone;
+            GA.sprint_checked = false;
+            SendSprint(player, true);
+            log::Info("controls: sprint on (left stick click; stick at %.2f; game toggle-sprint option %s)", mag,
+                      ReadBoolProp(player, "ToggleSprint") == 1 ? "on" : "off");
+        }
+    }
+    if (!GA.sprinting) return;
+    if (mag >= g_set.deadzone) {
+        GA.sprint_moved = true;
+        GA.sprint_idle_since = -1;
+    } else {
+        if (GA.sprint_idle_since < 0) GA.sprint_idle_since = g_clock;
+        const bool waiting_for_push = !GA.sprint_moved && g_clock - GA.sprint_on_at < 1.0;
+        if (!waiting_for_push && g_clock - GA.sprint_idle_since >= 0.35) StopSprint(player, "stopped");
+    }
+    // Diagnostic: 0.6 s into a sprint, is the character really sprinting?
+    if (GA.sprinting && !GA.sprint_checked && GA.sprint_moved && g_clock - GA.sprint_on_at > 0.6) {
+        GA.sprint_checked = true;
+        uint8_t gait = 255;
+        ue::GetProp(player, "Gait", gait);
+        ue::Call v(player, "GetVelocity");
+        const FVector vel = v.Invoke() ? v.Result<FVector>() : FVector{};
+        log::Info("controls: sprint check: game gait %d (2 = sprinting), speed %.0f cm/s, stick %.2f", gait,
+                  std::sqrt(vel.X * vel.X + vel.Y * vel.Y), mag);
+    }
+}
+
 void GameActions(UObject player, const input::Snapshot& s) {
     if (!player) return;
     LabTraceTick();
     const input::HandInput& l = s.hand[input::kLeft];
     const input::HandInput& r = s.hand[input::kRight];
     if (ui_panel::MenuOpen()) {
-        if (GA.sprinting) { FireEvent(player, GA.sprint_up); GA.sprinting = false; }
+        if (GA.sprinting) StopSprint(player, "menu");
         if (GA.light_down) {
             ue::Call c(player, "PlayerInput_SwitchLight");
             c.Set("IsPressed", false);
@@ -2627,9 +2707,7 @@ void GameActions(UObject player, const input::Snapshot& s) {
         const bool was = GameCrouched(player, &known);
         // Crouching ends a sprint, as it does in most games.
         if (known && !was && GA.sprinting) {
-            GA.sprinting = false;
-            FireEvent(player, GA.sprint_up);
-            log::Info("controls: sprint off (crouching)");
+            StopSprint(player, "crouching");
         }
         FireEvent(player, GA.crouch_down);
         g_crouch_pressed = true;
@@ -2657,16 +2735,14 @@ void GameActions(UObject player, const input::Snapshot& s) {
     StickCrouchCheck(player);
 
     // Left stick click: sprint on/off; it ends by itself when you stop.
-    if (l.stick_click.pressed) {
-        GA.sprinting = !GA.sprinting;
-        FireEvent(player, GA.sprinting ? GA.sprint_down : GA.sprint_up);
-        log::Info("controls: sprint %s (left stick click)", GA.sprinting ? "on" : "off");
-    }
-    if (GA.sprinting && std::sqrt(l.stick_x * l.stick_x + l.stick_y * l.stick_y) < g_set.deadzone) {
-        GA.sprinting = false;
-        FireEvent(player, GA.sprint_up);
-        log::Info("controls: sprint off (stopped)");
-    }
+    // Owner 2026-11-03: "sprinting is very unreliable". The 15:24 log had
+    // sprints ending 0.3 to 1.2 s after the click: pressing the stick in
+    // lets it slip back towards the centre, and the old code ended the
+    // sprint the moment it touched the deadzone. Now a sprint waits up to
+    // 1 s for the stick to be pushed after the click, ends only after the
+    // stick has rested for 0.35 s, and any push past half way is full speed
+    // (the game won't sprint on a part push).
+    SprintControl(player, l);
 
     // Right A / B with the right hand empty (pistol holstered): switch
     // weapon / objective markers. With the gun in hand they are the
