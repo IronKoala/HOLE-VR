@@ -17,8 +17,16 @@ copy of the game's own tab button class, so it looks and clicks like the rest.
 Its page is a scroll box in the game's `WidgetSwitcher_OPTION`, holding one
 button per setting. The buttons are copies of the game's Back button class.
 
-Each row reads "Setting: choice". Clicking a row moves it to the next choice,
-writes the ini key(s) into `hole-vr.ini` in place (comments and layout kept,
+Each setting row is `[<] [Setting: choice] [>]` (owner, 2026-11-03: "left
+and right arrows to switch between options"). The right arrow steps to the
+next choice and the left arrow to the previous one; both stop at the ends
+(the choices are listed low to high, so right is faster, stronger or
+bigger). Clicking the middle still steps forward and wraps round. The arrows
+are copies of the same game button inside 64-unit-wide size boxes, in a
+horizontal box. The setup rows (Calibrate body, Edit hand grips, Move
+holsters) are one button. The right stick scrolls the page (the forearm
+menu's own stick scrolling, `world_menu.cpp`, which sends the mouse wheel to
+whatever the laser is on). A step writes the ini key(s) into `hole-vr.ini` in place (comments and layout kept,
 `config::Set`), and tells every part of the mod to re-read its settings
 (`config::NotifyChanged`). Nothing needs a restart.
 
@@ -45,6 +53,12 @@ writes the ini key(s) into `hole-vr.ini` in place (comments and layout kept,
 | Gun stops at walls | On, Off | `gun_wall_collision` |
 | Gun kick | Off, Light, Normal, Strong | `gun_recoil_kick` |
 | Calibrate body | (action) | after the menu closes: height at 2 to 4 s (`standing_height_cm`), arms at 5 s (`body-measure.ini`) |
+| Edit hand grips | (action) | opens the grip editor once the menu closes; while it is open the row reads "open, click to close" and closes it |
+| Move holsters | (action) | 5 s after the menu closes (a buzz each second), each holster moves to where the hand holding its item is |
+
+Move holsters is here because the right stick click (which used to be held
+for it) is now the kick. The grip editor (left Y hold) and the arm measure
+(left stick click hold) still open on their buttons too.
 
 Why cycle buttons and not the game's sliders, checkboxes and dropdowns: the
 game's option rows are bound to its own settings object, and dropdowns open a
@@ -80,6 +94,21 @@ levels. Each frame picks one part of it.
   first 1.5 s and is the highest still head height under 2.3 m.
 - **Hop to jump** (off by default): the head rising faster than 1.1 m/s while
   above standing height presses jump. Then 1 s before it can fire again.
+
+### Stick crouch check and the camera hold (controls.cpp)
+
+- **Stick crouch** (right stick down) sends the game's own crouch input. 0.4 s
+  later the character must be in the stance the press asked for
+  (`bIsCrouched`); if not, `Crouch`/`UnCrouch` is called directly. Crouching
+  ends a sprint. For 3 s after, a stance change nobody asked for is logged.
+  (Owner, 2026-11-03: "i cant stay crouched"; the run showed 11 presses in
+  10 s and no stance readout.)
+- **Camera hold** (Character and Seated height): if the game camera sits more
+  than 8 cm below its standing height with no crouch for 2 s while the
+  character stands still, the view is held at standing height until the
+  camera comes back. Sprinting lowers the game camera 11 to 26 cm on purpose,
+  so moving or sprinting never starts the hold (the first version did, on
+  every sprint).
 
 ## Grip toggle and aim smoothing
 
@@ -141,15 +170,26 @@ appeared, this says whether shots need moving to the muzzle.
 - `vr options: ready (a VR tab is added to Options)` at start.
 - `vr options: following clicks through ...` the first time Options opens.
 - `vr options: VR tab button added to ...` and `vr options: VR page added to
-  Options (22 rows ...)` each time Options opens.
+  Options (24 rows ...)` each time Options opens.
 - `vr options: VR tab opened` when the VR tab is clicked.
-- `vr options: <row> -> <choice> (key=value)` and `settings: saved key=value in
-  hole-vr.ini` on each click, then `controls: settings changed (...)`.
+- `vr options: VR page added to Options (24 rows ..., 21 rows with < >
+  arrows, slot ok)`.
+- `vr options: <row> -> <choice> (key=value, right arrow | left arrow | row
+  clicked)` and `settings: saved key=value in hole-vr.ini` on each click, then
+  `controls: settings changed (...)`; `... is already at its last choice` at
+  an end.
 - `comfort: head inside a wall or object, view faded` / `head out of the wall
   again after N s`.
 - `controls: physical crouch (...)` / `physical stand (...)`.
+- `controls: crouch (right stick down)` / `stand up (...)`, then `stick crouch:
+  the character is crouched (the game's own crouch input did it)` or `... left
+  the character standing; calling Crouch directly`, and `... by itself N s
+  after` if something else changes it.
 - `teleport: arc uses ...`, `teleport: moved N cm`, `teleport: no room ...`.
 - `controls: height measured: your eyes are N cm above the floor`.
+- `vr options: Edit hand grips clicked ...` then `controls: opening/closing the
+  grip editor (asked for from the VR tab)`.
+- `vr options: Move holsters clicked ...` then the holster countdown lines.
 - `shot study 1: barrel line hits ... camera line hits ... N cm apart`, `shot
   study: gun ... fire functions: ...`, `lab: [..s] gun.<event>`.
 
@@ -157,5 +197,6 @@ appeared, this says whether shots need moving to the muzzle.
 
 - `tests/test_comfort.cpp`: vignette texture, levels, smoothing, real crouch
   and jump, aim smoothing, grip toggle.
-- `tests/test_vr_options.cpp`: ini edit in place, menu rows, current choice.
+- `tests/test_vr_options.cpp`: ini edit in place, menu rows, current choice,
+  teleport and hop to jump off by default, action rows.
 - `tests/test_teleport.cpp`: arc, stick gesture, landing check.

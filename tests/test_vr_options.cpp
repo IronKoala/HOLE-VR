@@ -106,10 +106,29 @@ static void TestCurrent() {
     EXPECT(!SameValue("1", "0"));
 }
 
+// Teleport and hop to jump stay off unless chosen; the setup tools are
+// action rows.
+static void TestDefaultsAndActions() {
+    std::map<std::string, std::string> ini;
+    Getter get = [&](const char* k) {
+        auto it = ini.find(k);
+        return it == ini.end() ? std::string() : it->second;
+    };
+    const Row& moving = RowNamed("Moving");
+    EXPECT(std::string(moving.choices[static_cast<size_t>(CurrentChoice(moving, get))].text) == "Smooth");
+    const Row& hop = RowNamed("Hop to jump");
+    EXPECT(std::string(hop.choices[static_cast<size_t>(CurrentChoice(hop, get))].text) == "Off");
+    EXPECT(RowNamed("Calibrate body").kind == RowKind::kMeasureArms);
+    EXPECT(RowNamed("Edit hand grips").kind == RowKind::kGripEditor);
+    EXPECT(RowNamed("Edit hand grips").choices.size() == 2);  // closed, open
+    EXPECT(RowNamed("Move holsters").kind == RowKind::kMoveHolsters);
+}
+
 int main() {
     TestIniEdit();
     TestRows();
     TestCurrent();
+    TestDefaultsAndActions();
     if (failures) {
         std::printf("%d failure(s)\n", failures);
         return 1;

@@ -358,15 +358,14 @@ void UpdateHands(const input::Snapshot& s) {
         g_fingers[i].thumb_touch = in.primary.down || in.secondary.down || in.stick_click.down;
         g_edit_buttons.grip_down[i] = in.grip_value > 0.6f;
     }
-    // The grip editor's buttons (left Y, left stick click) only reach it
-    // while it is open; it is opened from the VR tab (RequestGripEditor),
-    // which holds Y for it for 1.1 s. Left stick hold no longer measures the
-    // arms (VR tab: Measure arms).
+    // The grip editor opens on left Y held 1 s (or from the VR tab, which
+    // holds Y for it for 1.1 s); left stick click held 2 s measures the arms.
     const bool editor_open = hands::EditorHand() >= 0;
     const bool synth_y = g_clock < g_editor_y_until;
-    g_edit_buttons.y_down = synth_y || (editor_open && s.hand[input::kLeft].secondary.down);
-    g_edit_buttons.left_stick_pressed = editor_open && s.hand[input::kLeft].stick_click.pressed;
-    g_edit_buttons.left_stick_down = false;
+    (void)editor_open;
+    g_edit_buttons.y_down = synth_y || s.hand[input::kLeft].secondary.down;
+    g_edit_buttons.left_stick_pressed = s.hand[input::kLeft].stick_click.pressed;
+    g_edit_buttons.left_stick_down = s.hand[input::kLeft].stick_click.down;
     g_hands[0] = h[0];
     g_hands[1] = h[1];
     g_head = head;
@@ -1557,7 +1556,13 @@ struct GameActionState {
     ActionEvent nav{"InpActEvt_CheckNavigationIcon_K2Node_InputActionEvent_0"};
     bool jump_armed = true, crouch_armed = true;
     double jump_release_at = -1, crouch_release_at = -1;
+    // Stick crouch check: 0.4 s after a press the character must be in the
+    // stance the press asked for (else Crouch/UnCrouch is called directly),
+    // and for 3 s after, a stance change nobody asked for is logged.
+    int crouch_want = -1;              // 1 crouched, 0 standing, -1 unknown
+    double crouch_check_at = -1, crouch_watch_until = -1;
     bool sprinting = false;
+    double y_down_at = -1;
     double melee_ready_at = 0;
     double melee_release_at = -1;
     bool light_down = false;     // left trigger is pressing the weapon light
@@ -1641,6 +1646,54 @@ bool CameraOnCharacter(UObject player, double* rel, double* side) {
     return true;
 }
 
+// The stick crouch sends the game's own crouch input (press, then release
+// 0.1 s later). Owner 2026-11-03: "i cant stay crouched". Whether the game
+// crouches on the press or only while it is held is the game's own setting,
+// so 0.4 s after each press the character must be in the stance asked for;
+// if it is not, Crouch/UnCrouch is called directly (as real crouch does).
+// For 3 s after, a stance change nobody asked for is logged.
+void StickCrouchCheck(UObject player) {
+    static bool direct_called = false;
+    if (GA.crouch_check_at > 0 && g_clock >= GA.crouch_check_at) {
+        GA.crouch_check_at = -1;
+        bool known = false;
+        const bool now = GameCrouched(player, &known);
+        if (!known || GA.crouch_want < 0) return;
+        const bool want = GA.crouch_want == 1;
+        if (now == want) {
+            log::Info("controls: stick crouch: the character is %s%s", now ? "crouched" : "standing",
+                      direct_called ? " (after calling it directly)" : " (the game's own crouch input did it)");
+            direct_called = false;
+            GA.crouch_watch_until = g_clock + 3.0;
+        } else if (!direct_called) {
+            ue::Call c(player, want ? "Crouch" : "UnCrouch");
+            c.Set("bClientSimulation", false);
+            const bool ok = c.Invoke();
+            log::Info("controls: stick crouch: the game's crouch input left the character %s; %s", now ? "crouched" : "standing",
+                      ok ? (want ? "calling Crouch directly" : "calling UnCrouch directly") : "the character has no Crouch/UnCrouch");
+            direct_called = ok;
+            if (ok) GA.crouch_check_at = g_clock + 0.4;  // the movement applies it on its next update
+        } else {
+            log::Info("controls: stick crouch: the character is still %s after calling %s directly (no room, or in the air)",
+                      now ? "crouched" : "standing", want ? "Crouch" : "UnCrouch");
+            direct_called = false;
+        }
+        return;
+    }
+    if (GA.crouch_watch_until > 0) {
+        bool known = false;
+        const bool now = GameCrouched(player, &known);
+        if (g_clock >= GA.crouch_watch_until || !known || GA.crouch_want < 0) {
+            GA.crouch_watch_until = -1;
+        } else if (now != (GA.crouch_want == 1)) {
+            log::Info("controls: stick crouch: the character %s by itself %.1f s after (sprint %s)",
+                      now ? "crouched" : "stood up", 3.0 - (GA.crouch_watch_until - g_clock),
+                      GA.sprinting ? "on" : "off");
+            GA.crouch_watch_until = -1;
+        }
+    }
+}
+
 void CameraHeightView(UObject player, bool crouched, bool known) {
     if (player != g_camh_player) {
         g_camh.Reset();
@@ -1652,12 +1705,15 @@ void CameraHeightView(UObject player, bool crouched, bool known) {
     double raise = 0;
     if (CameraOnCharacter(player, &rel, &side)) {
         const bool had = g_camh.HaveStanding(), was = g_camh.Holding();
-        raise = g_camh.Update(rel, known && crouched, pressed, g_set.real_height, g_dt);
+        ue::Call v(player, "GetVelocity");
+        const FVector vel = v.Invoke() ? v.Result<FVector>() : FVector{};
+        const bool still = !GA.sprinting && std::sqrt(vel.X * vel.X + vel.Y * vel.Y) < 30.0;
+        raise = g_camh.Update(rel, known && crouched, pressed, still, g_set.real_height, g_dt);
         if (!had && g_camh.HaveStanding())
             log::Info("controls: the game camera stands %.0f cm above the character's feet", g_camh.Standing());
         if (g_camh.Holding() != was) {
             if (g_camh.Holding())
-                log::Info("controls: the game camera has been %.0f cm below standing height for 1.5 s with no crouch "
+                log::Info("controls: the game camera has been %.0f cm below standing height for 2 s standing still with no crouch "
                           "(character %s, %d stick crouch presses, camera %.0f cm from the character's middle); "
                           "your view is held at standing height",
                           g_camh.Drop(), !known ? "stance unknown" : crouched ? "crouched" : "standing",
@@ -1755,13 +1811,12 @@ void PhysicalCrouchAndJump(UObject player) {
     }
 }
 
-// Every other game action, one press of one button each; no gestures (no
-// flicks, taps, holds or punches). Lean is left out: lean for real.
+// Every other game action on the controllers. No motion gestures (owner's
+// rule: no punching or swinging to act). Lean is left out: lean for real.
 //   Left stick            move; click: sprint on/off (ends when you stop)
 //   Left trigger          weapon light with the left hand right next to the gun, else interact
-//   Left X                jump
-//   Left Y                crouch / stand
-//   Right stick           turn; click: kick (fire selector on a rifle)
+//   Left Y                tap: switch weapon; hold 1 s: grip editor
+//   Right stick           left/right turn, up jump, down crouch / stand; click: kick (fire selector on a rifle)
 //   Right trigger         fire with the gun in hand, interact with the hand empty
 //   Right A / B           magazine release / slide release with the gun in hand;
 //                         switch weapon / objective markers with the hand empty
@@ -1806,11 +1861,13 @@ UObject FindInteractTarget(UObject player, const hands::HandState& hs, std::stri
     const FVector d = hs.aim.rotation.Rotate(FVector{1, 0, 0});
     UObject best = 0;
     double best_score = 1e9;
+    UObject nearest = 0;
+    double nearest_touch = 1e9;
     for (int i = 0; i < arr.num && i < 1024; ++i) {
         UObject a = mem::ReadOr<uintptr_t>(arr.data + i * sizeof(uintptr_t), 0);
         if (!a || a == player) continue;
         ue::Call b(a, "GetActorBounds");
-        b.Set("bOnlyCollidingComponents", true).Set("bIncludeFromChildActors", false);
+        b.Set("bOnlyCollidingComponents", false).Set("bIncludeFromChildActors", false);
         if (!b.Invoke()) continue;
         const FVector c = b.Get<FVector>("Origin"), e = b.Get<FVector>("BoxExtent");
         if (e.X > 800 || e.Y > 800 || e.Z > 800) continue;   // a whole room, not a thing
@@ -1820,6 +1877,10 @@ UObject FindInteractTarget(UObject player, const hands::HandState& hs, std::stri
         const double dy = std::fmax(0.0, std::fabs(hand.Y - c.Y) - e.Y);
         const double dz = std::fmax(0.0, std::fabs(hand.Z - c.Z) - e.Z);
         const double touch = std::sqrt(dx * dx + dy * dy + dz * dz);
+        if (touch < nearest_touch) {
+            nearest_touch = touch;
+            nearest = a;
+        }
         double score = 1e9;
         if (touch <= 20.0) {
             // Inside or at several boxes: the smaller thing wins (a big
@@ -1849,6 +1910,10 @@ UObject FindInteractTarget(UObject player, const hands::HandState& hs, std::stri
             best = a;
         }
     }
+    static int s_diag = 0;
+    if (!best && s_diag++ < 20)
+        log::Info("controls: hand interact: %d interactable things in the level; nearest %s, %.0f cm from the hand",
+                  arr.num, nearest ? ue::GetName(nearest).c_str() : "none", nearest_touch);
     if (best && how) *how = best_score < 40.0 ? "touching" : "pointing at";
     if (score_out) *score_out = best_score;
     return best;
@@ -1933,21 +1998,49 @@ void GameActions(UObject player, const input::Snapshot& s) {
     // No gestures (owner's rule): every action is one press of one button,
     // and the combat ones never need the left thumb off the move stick.
     const bool gun_in_hand = W.gun && W.in_hand;
-    // Left X: jump.
-    if (l.primary.pressed && GA.jump_release_at < 0) {
+    // Right stick up: jump. Right stick down: crouch / stand.
+    const bool up = r.stick_y > 0.75f && std::fabs(r.stick_x) < 0.6f;
+    const bool down = r.stick_y < -0.75f && std::fabs(r.stick_x) < 0.6f;
+    if (up && GA.jump_armed && GA.jump_release_at < 0) {
+        GA.jump_armed = false;
         FireEvent(player, GA.jump_down);
         GA.jump_release_at = g_clock + 0.15;
-        log::Info("controls: jump (left X)");
+        log::Info("controls: jump (right stick up)");
     }
-    // Left Y: crouch / stand.
-    if (l.secondary.pressed && GA.crouch_release_at < 0) {
+    if (down && GA.crouch_armed && GA.crouch_release_at < 0) {
+        GA.crouch_armed = false;
+        bool known = false;
+        const bool was = GameCrouched(player, &known);
+        // Crouching ends a sprint, as it does in most games.
+        if (known && !was && GA.sprinting) {
+            GA.sprinting = false;
+            FireEvent(player, GA.sprint_up);
+            log::Info("controls: sprint off (crouching)");
+        }
         FireEvent(player, GA.crouch_down);
         g_crouch_pressed = true;
         GA.crouch_release_at = g_clock + 0.1;
-        log::Info("controls: crouch / stand (left Y)");
+        GA.crouch_want = known ? (was ? 0 : 1) : -1;
+        GA.crouch_check_at = g_clock + 0.4;
+        GA.crouch_watch_until = -1;
+        log::Info("controls: %s (right stick down)", !known ? "crouch / stand" : was ? "stand up" : "crouch");
+    }
+    if (r.stick_y < 0.4f) GA.jump_armed = true;
+    if (r.stick_y > -0.4f) GA.crouch_armed = true;
+    // Left Y tap: next weapon (holding Y 1 s is the grip editor).
+    if (l.secondary.pressed) GA.y_down_at = g_clock;
+    if (l.secondary.released && GA.y_down_at > 0) {
+        if (g_clock - GA.y_down_at < 0.4) {
+            ue::Call c(player, "PlayerInput_ScrollWeapon");
+            c.Set("IsUp", true);
+            c.Invoke();
+            log::Info("controls: switch weapon (left Y)");
+        }
+        GA.y_down_at = -1;
     }
     if (GA.jump_release_at > 0 && g_clock >= GA.jump_release_at) { FireEvent(player, GA.jump_up); GA.jump_release_at = -1; }
     if (GA.crouch_release_at > 0 && g_clock >= GA.crouch_release_at) { FireEvent(player, GA.crouch_up); GA.crouch_release_at = -1; }
+    StickCrouchCheck(player);
 
     // Left stick click: sprint on/off; it ends by itself when you stop.
     if (l.stick_click.pressed) {
@@ -2496,8 +2589,8 @@ void HolsterCalibration(const input::HandInput&, const hands::HandState& rh, con
         ++moved;
     }
     if (!moved) {
-        log::Info("holster: to move a holster, hold the pistol and/or a magazine where you want it, then hold the "
-                  "right stick click 2 s");
+        log::Info("holster: nothing moved: during the 5 s countdown (VR tab: Move holsters), hold the pistol "
+                  "and/or a magazine where you want it");
         return;
     }
     const bool saved = SaveHolsterSpots();
@@ -2751,7 +2844,7 @@ void Init() {
 void InitLate() {
     game::AddTickListener(&OnLateTick);
     log::Info("controls: holsters ready (pistol %s, %s; magazine pouch; to move one anywhere on the body, hold its "
-              "item there at the angle you want and hold the right stick click 2 s)",
+              "item there at the angle you want after VR tab: Move holsters)",
               g_set.holster_pistol ? "in a holster" : "always in the hand",
               g_set.holster_toggle ? "squeeze to draw, squeeze at the holster to put it away"
                                    : "hold the right grip to hold it");

@@ -17,7 +17,10 @@ struct Choice {
     const char* text;
     std::vector<KeyValue> sets;  // the first one decides which choice is current
 };
-enum class RowKind { kChoice, kMeasureArms };
+// kChoice cycles a setting. The others are actions run when clicked:
+// kMeasureArms = Calibrate body, kGripEditor = open/close the grip editor
+// (choice 1 is shown while it is open), kMoveHolsters = move the holsters.
+enum class RowKind { kChoice, kMeasureArms, kGripEditor, kMoveHolsters };
 struct Row {
     const char* label;
     RowKind kind = RowKind::kChoice;

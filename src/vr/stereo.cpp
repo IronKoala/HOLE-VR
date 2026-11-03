@@ -162,7 +162,7 @@ const float* FindNearPlane(uintptr_t projection_fn) {
 bool FrameViews(bool new_sample, xr::EyeView out[2]) {
     std::lock_guard<std::mutex> lock(g_frame_mutex);
     if (new_sample || !g_have_frame_views) {
-        if (!xr::SessionRunning() || !xr::LatestViews(g_frame_views)) return false;
+        if (!xr::SessionRunning() || !xr::ViewsForNewPicture(g_frame_views)) return false;
         g_have_frame_views = true;
     }
     out[0] = g_frame_views[0];

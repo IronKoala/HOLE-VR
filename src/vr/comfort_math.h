@@ -117,9 +117,12 @@ class CameraHeight {
 public:
     // rel_cm: the game camera's height above the character's feet this
     // frame. crouched: the character's crouch flag. crouch_press: the stick
-    // crouch was pressed this frame (a crouch the flag may not show).
-    // Returns how far to raise the view, cm.
-    double Update(double rel_cm, bool crouched, bool crouch_press, bool real_mode, double dt);
+    // crouch was pressed this frame (a crouch the flag may not show). still:
+    // the character is standing still, not sprinting (sprinting and moving
+    // lower the game camera 10-26 cm on purpose, so only a drop that stays
+    // while standing still starts the hold). Returns how far to raise the
+    // view, cm.
+    double Update(double rel_cm, bool crouched, bool crouch_press, bool still, bool real_mode, double dt);
     bool HaveStanding() const { return have_; }
     double Standing() const { return stand_; }
     double Drop() const { return drop_; }
@@ -133,7 +136,7 @@ private:
     double stable_ref_ = 0, stable_t_ = 0;
     int presses_ = 0;          // stick crouches since the camera was last at standing height (0.6 s)
     double standing_t_ = 0;
-    double low_t_ = 0;         // how long an unexplained drop has lasted
+    double low_t_ = 0;         // how long an unexplained drop has lasted standing still
     bool holding_ = false;
     double drop_ = 0;
     double extra_ = 0;

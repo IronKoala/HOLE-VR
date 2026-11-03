@@ -89,6 +89,8 @@ const std::vector<Row>& Rows() {
           {"Strong", {{"gun_recoil_kick", "1.5"}}}},
          2},
         {"Calibrate body", K::kMeasureArms, {{"click, then close menu", {}}}, 0},
+        {"Edit hand grips", K::kGripEditor, {{"click, then close menu", {}}, {"open, click to close", {}}}, 0},
+        {"Move holsters", K::kMoveHolsters, {{"click, then close menu", {}}}, 0},
     };
     return rows;
 }
