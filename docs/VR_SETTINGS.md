@@ -241,9 +241,9 @@ hand.
 - `vr options: ready (a VR tab is added to Options)` at start.
 - `vr options: following clicks through ...` the first time Options opens.
 - `vr options: VR tab button added to ...` and `vr options: VR page added to
-  Options (24 rows ...)` each time Options opens.
+  Options (25 rows ...)` each time Options opens.
 - `vr options: VR tab opened` when the VR tab is clicked.
-- `vr options: VR page added to Options (24 rows ..., 21 rows with < >
+- `vr options: VR page added to Options (25 rows ..., 22 rows with < >
   arrows; made over N frames, X ms in all, Y ms at most in one frame)`.
 - `vr options: <row> -> <choice> (key=value, right arrow | left arrow | row
   clicked)` and `settings: saved key=value in hole-vr.ini` on each click, then
