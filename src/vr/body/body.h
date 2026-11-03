@@ -65,6 +65,21 @@ bool SlideMarks(uintptr_t gun, FVector* rear_sight, FVector* rear_end, FVector* 
 // newer than 0.5 s.
 bool PinchPoint(int side, FVector* thumb_in_grip, FVector* index_in_grip);
 
+// What the visible hand can touch things with, in the world, as drawn on the
+// body's last frame: after empty hands stop at walls, fingers give way on
+// surfaces and the palm settles flat (vr/body/hand_walls, finger_rest). For
+// pressing buttons with the hand the player sees, not the controller.
+struct HandContacts {
+    FVector tip[5];            // fingertips: thumb, index, middle, ring, pinky
+    double tip_radius = 0.5;   // finger thickness about each tip, cm
+    FVector palm;              // middle of the palm, on its skin side
+    FVector palm_out;          // out of the palm
+    bool empty = true;         // the hand holds nothing
+};
+// False when the body is off, the hand's fingers aren't posed, or nothing
+// newer than 0.1 s. side: 0 left, 1 right.
+bool GetHandContacts(int side, HandContacts* out);
+
 // Measures the arms like holding the left stick click 2 s does: a 5 s
 // countdown (buzzes) once the game runs again, then stand straight with both
 // arms straight out to the sides. For the VR tab in Options.

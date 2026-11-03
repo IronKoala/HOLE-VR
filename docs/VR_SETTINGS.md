@@ -285,6 +285,13 @@ so this copies the result:
   (on); off with the hand wall check too. Fingers on the gun and magazines
   keep their stored grips.
 
+Other code that wants the hand the player sees (pressing the range timer's
+button, for example) reads `body::GetHandContacts(side, &c)`: the five
+drawn fingertips with the finger radius, the palm's middle and its outward
+direction, and whether the hand is empty, as of the body's last frame (false
+when older than 0.1 s). These are after the hand stopped at a wall and its
+fingers gave way, so a press matches what the eyes see.
+
 Hands settle flat on walls (owner 2026-11-03 14:14: the fingers "would
 close and make a fist, in real life people tend to press their hand
 against the wall"). The first version (1694d3d) turned the palm toward a

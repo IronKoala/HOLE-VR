@@ -1705,6 +1705,13 @@ struct PinchNote {
 PinchNote g_pinch[2];
 hands::Pose g_raw_grip[2];  // controller grip before hand_walls moved the drawn hand
 std::mutex g_pinch_mutex;
+// What each visible hand touches things with (GetHandContacts), under g_pinch_mutex.
+struct ContactNote {
+    bool valid = false;
+    double ms = 0;
+    HandContacts c;
+};
+ContactNote g_contact[2];
 
 void HideMarkers();
 void StopEditor() {
@@ -2994,6 +3001,17 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
         p.ms = perf::NowMs();
         p.valid = true;
     }
+    {
+        HandContacts hc;
+        for (int f = 0; f < hand_pose::kFingerCount && f < 5; ++f)
+            hc.tip[f] = fingers::TipWorld(rig.chain[f], G.cur[side][f], hw);
+        hc.tip_radius = S.finger_radius;
+        hc.palm = g_palm_world[side];
+        hc.palm_out = Normalize(hw.rotation.Rotate(rig.palm_h));
+        hc.empty = grab.kind == hands::GrabKind::kNone;
+        std::lock_guard<std::mutex> lock(g_pinch_mutex);
+        g_contact[side] = {true, perf::NowMs(), hc};
+    }
 }
 
 bool g_toggle_down = false;
@@ -3346,6 +3364,15 @@ bool PinchPoint(int side, FVector* thumb_in_grip, FVector* index_in_grip) {
     if (!p.valid || perf::NowMs() - p.ms > 500.0) return false;
     *thumb_in_grip = p.thumb;
     *index_in_grip = p.index;
+    return true;
+}
+
+bool GetHandContacts(int side, HandContacts* out) {
+    if (side < 0 || side > 1 || !out) return false;
+    std::lock_guard<std::mutex> lock(g_pinch_mutex);
+    const ContactNote& n = g_contact[side];
+    if (!n.valid || perf::NowMs() - n.ms > 100.0) return false;
+    *out = n.c;
     return true;
 }
 
