@@ -376,7 +376,7 @@ void UpdateHands(const input::Snapshot& s) {
 // ---- locomotion and turning ----
 bool g_snap_armed = true;
 
-void Locomotion(UObject player, const input::Snapshot& s, double dt) {
+double Locomotion(UObject player, const input::Snapshot& s, double dt) {
     const input::HandInput& left = s.hand[input::kLeft];
     const input::HandInput& right = s.hand[input::kRight];
 
@@ -435,9 +435,35 @@ void Locomotion(UObject player, const input::Snapshot& s, double dt) {
             r.Yaw = NormalizeAxis(r.Yaw + turn);
             ue::Call set(controller, "SetControlRotation");
             set.Set("NewRotation", r);
-            set.Invoke();
+            if (set.Invoke()) return turn;
         }
     }
+    return 0;
+}
+
+// A stick turn takes effect on the next views (the game camera follows the
+// control rotation after the tick), but the hands were mapped before it with
+// the latest views' yaw: the gun trailed every turn by that frame's angle
+// (perf thread 2026-11-03: 2.2 deg a frame, ~1.7 cm at arm's length). Turn
+// this tick's hands and head about the game camera by the same angle.
+void TurnHandsWithView(double turn) {
+    if (turn == 0) return;
+    FVector pivot;
+    if (!stereo::GameCameraLocation(&pivot)) return;
+    const FQuat q = YawOnly(turn);
+    auto turn_pose = [&](hands::Pose& p) {
+        p.location = pivot + q.Rotate(p.location - pivot);
+        p.rotation = q * p.rotation;
+    };
+    std::lock_guard<std::mutex> lock(g_hands_mutex);
+    for (int i = 0; i < 2; ++i) {
+        if (!g_hands[i].valid) continue;
+        turn_pose(g_hands[i].grip);
+        turn_pose(g_hands[i].aim);
+        turn_pose(g_hands[i].wrist);
+        g_hands[i].palm_normal = q.Rotate(g_hands[i].palm_normal);
+    }
+    if (g_head_valid) turn_pose(g_head);
 }
 
 // Room-scale walking: when you step around the room, move the character
@@ -2708,7 +2734,7 @@ void OnTick(UObject player, float dt) {
         std::swap(a.stick_y, b.stick_y);
         std::swap(a.stick_click, b.stick_click);
     }
-    Locomotion(player, s, dt);
+    TurnHandsWithView(Locomotion(player, s, dt));
     RoomScaleFollow(player);
     GameActions(player, s);
     ApplyCameraShakeSetting(player);
