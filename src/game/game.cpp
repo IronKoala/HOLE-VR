@@ -38,12 +38,29 @@ perf::Counter g_tick_perf{"mod tick total"};
 
 std::atomic<UObject> g_gun_class{0}, g_weapon_class{0}, g_mag_class{0};
 
+// One Maintain at a time: the early watcher and the main loop both call it.
+std::mutex g_maintain_mutex;
+
+// Seconds since the game process started, for the log.
+double SinceLaunch() {
+    FILETIME created, exited, kernel, user, now;
+    if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) return -1;
+    GetSystemTimeAsFileTime(&now);
+    ULARGE_INTEGER c{{created.dwLowDateTime, created.dwHighDateTime}};
+    ULARGE_INTEGER n{{now.dwLowDateTime, now.dwHighDateTime}};
+    return (n.QuadPart - c.QuadPart) / 1e7;
+}
+
+std::atomic<bool> g_first_tick_logged{false};
+
 void OnPlayerTick(UObject self, UObject, void* params) {
     // ReceiveTick(float DeltaSeconds): the only parameter, at offset 0.
     float dt = 0.f;
     std::memcpy(&dt, params, sizeof(dt));
     g_player.store(self);
     g_last_tick_ms.store(GetTickCount());
+    if (!g_first_tick_logged.exchange(true))
+        log::Info("game: the player's first tick, %.1f s after launch", SinceLaunch());
 
     perf::Scope total(g_tick_perf);
     double t0 = perf::NowMs();
@@ -87,23 +104,9 @@ void RefreshClass(const char* full_name, std::atomic<UObject>& cache) {
     cache.store(FindObject(full_name));
 }
 
-}  // namespace
-
-bool Init() {
-    if (!ue::process_event::Ready()) return false;
-    // BP_Player_C and the NPCs derive from Character; guns and magazines from
-    // Actor; the weapon manager from ActorComponent. Each native class has its
-    // own vtable, so hook each one we need to observe.
-    bool ok = HookClassDefault("Character /Script/Engine.Default__Character");
-    HookClassDefault("Actor /Script/Engine.Default__Actor");
-    HookClassDefault("ActorComponent /Script/Engine.Default__ActorComponent");
-    return ok;
-}
-
-void Maintain() {
-    RefreshClass(kGunClass, g_gun_class);
-    RefreshClass(kWeaponClass, g_weapon_class);
-    RefreshClass(kMagClass, g_mag_class);
+// Finds the player's Blueprint tick and follows it. Call with
+// g_maintain_mutex held.
+void FollowPlayerTick() {
     UObject fn = g_tick_fn.load();
     DWORD since = GetTickCount() - g_last_tick_ms.load();
     if (fn && since < 2000) return;
@@ -114,8 +117,50 @@ void Maintain() {
     if (found && found != fn) {
         ue::process_event::On(found, nullptr, &OnPlayerTick);
         g_tick_fn.store(found);
-        log::Info("game: following the player's tick (%p)", reinterpret_cast<void*>(found));
+        log::Info("game: following the player's tick (%p), %.1f s after launch",
+                  reinterpret_cast<void*>(found), SinceLaunch());
     }
+}
+
+}  // namespace
+
+bool Init() {
+    if (!ue::process_event::Ready()) return false;
+    // BP_Player_C and the NPCs derive from Character; guns and magazines from
+    // Actor; the weapon manager from ActorComponent. Each native class has its
+    // own vtable, so hook each one we need to observe.
+    bool ok = HookClassDefault("Character /Script/Engine.Default__Character");
+    HookClassDefault("Actor /Script/Engine.Default__Actor");
+    HookClassDefault("ActorComponent /Script/Engine.Default__ActorComponent");
+    if (ok) {
+        // Everything that runs on the player's tick (the VR body, controls,
+        // holsters) waits for us to find it. The main loop only starts once
+        // all the other start-up work is done, which was ~9 s after the
+        // title closed, so look for it right away, ten times a second (twice
+        // a second after the first two minutes), until the player ticks.
+        if (HANDLE t = CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
+                for (int i = 0; i < 2400 && !g_first_tick_logged.load(); ++i) {
+                    {
+                        std::unique_lock<std::mutex> lock(g_maintain_mutex, std::try_to_lock);
+                        if (lock.owns_lock()) FollowPlayerTick();
+                    }
+                    Sleep(i < 1200 ? 100 : 500);
+                }
+                return 0;
+            }, nullptr, 0, nullptr))
+            CloseHandle(t);
+    }
+    return ok;
+}
+
+void Maintain() {
+    std::unique_lock<std::mutex> lock(g_maintain_mutex, std::try_to_lock);
+    if (!lock.owns_lock()) return;
+    // The player's tick first: everything on it waits for this.
+    FollowPlayerTick();
+    RefreshClass(kGunClass, g_gun_class);
+    RefreshClass(kWeaponClass, g_weapon_class);
+    RefreshClass(kMagClass, g_mag_class);
 }
 
 UObject Player() { return g_player.load(); }

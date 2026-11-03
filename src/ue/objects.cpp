@@ -1,5 +1,7 @@
 #include "ue/objects.h"
 
+#include <algorithm>
+#include <cstdlib>
 #include <vector>
 
 #include "core/log.h"
@@ -89,10 +91,24 @@ UObject Get(int index) {
 }
 
 void ForEach(const std::function<void(int, UObject)>& fn) {
+    if (!g_chunked) return;
     int n = Count();
-    for (int i = 0; i < n; ++i) {
-        UObject o = Get(i);
-        if (o) fn(i, o);
+    uintptr_t chunks = mem::ReadOr<uintptr_t>(g_chunked);
+    if (!chunks) return;
+    // The engine allocates each chunk of object slots once and never frees
+    // it, so one readability check per chunk covers all its slots (instead
+    // of three checked reads per object).
+    for (int first = 0; first < n; first += kChunkSize) {
+        uintptr_t chunk = mem::ReadOr<uintptr_t>(chunks + (first / kChunkSize) * 8ull);
+        if (!chunk) continue;
+        int count = std::min(kChunkSize, n - first);
+        bool direct = mem::IsReadable(chunk, static_cast<size_t>(count) * g_stride);
+        for (int k = 0; k < count; ++k) {
+            uintptr_t item = chunk + static_cast<size_t>(k) * g_stride;
+            UObject o = direct ? *reinterpret_cast<const volatile uintptr_t*>(item)
+                               : mem::ReadOr<uintptr_t>(item);
+            if (o) fn(first + k, o);
+        }
     }
 }
 
@@ -129,10 +145,36 @@ UObject FindObject(const std::string& full_name) {
     // Compare the object's own name first: far cheaper than building every path.
     size_t last = full_name.find_last_of(".:");
     std::string short_name = full_name.substr(last == std::string::npos ? space + 1 : last + 1);
+    // An object's name is an entry in the name pool plus a number ("Bullet_3"
+    // is entry "Bullet", number 4; "Bullet" is number 0). Look the entry up
+    // once, then compare 8 bytes per object instead of building each name.
+    // A name that is not in the pool belongs to no object.
+    FName wanted[2];
+    int wanted_n = 0;
+    if (names::Find(short_name, &wanted[wanted_n])) ++wanted_n;
+    size_t us = short_name.rfind('_');
+    if (us != std::string::npos && us > 0 && us + 1 < short_name.size()) {
+        const std::string digits = short_name.substr(us + 1);
+        bool canonical = digits.size() <= 10 && (digits.size() == 1 || digits[0] != '0') &&
+                         digits.find_first_not_of("0123456789") == std::string::npos;
+        unsigned long long number = canonical ? std::strtoull(digits.c_str(), nullptr, 10) : 0;
+        if (canonical && number < 0xFFFFFFFFull &&
+            names::Find(short_name.substr(0, us), &wanted[wanted_n])) {
+            wanted[wanted_n].number = static_cast<uint32_t>(number + 1);
+            ++wanted_n;
+        }
+    }
+    if (wanted_n == 0) return 0;
+    mem::RegionMemo memo;
     UObject found = 0;
     objects::ForEach([&](int, UObject o) {
-        if (found || GetName(o) != short_name) return;
-        if (GetFullName(o) == full_name) found = o;
+        if (found) return;
+        FName name;
+        if (!memo.Read(o + off::kObjName, name)) return;
+        bool match = false;
+        for (int i = 0; i < wanted_n; ++i)
+            match |= name.comparison_index == wanted[i].comparison_index && name.number == wanted[i].number;
+        if (match && GetFullName(o) == full_name) found = o;
     });
     return found;
 }
