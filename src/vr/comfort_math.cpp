@@ -201,7 +201,11 @@ double CameraHeight::Update(double rel_cm, bool crouched, bool crouch_press, boo
             stable_ref_ = rel_cm;
             stable_t_ = 0;
         }
-        if (stable_t_ >= 1.0 && (!have_ || stable_ref_ > stand_)) {
+        // Later it may only creep up a little: a camera held 14 cm higher for
+        // a second (2026-11-03 run 2, after the title: 165 against 151) is
+        // not the character standing taller.
+        if (stable_t_ >= 1.0 && (!have_ || (stable_ref_ > stand_ && stable_ref_ <= first_ + 4.0))) {
+            if (!have_) first_ = stable_ref_;
             stand_ = stable_ref_;
             have_ = true;
         }

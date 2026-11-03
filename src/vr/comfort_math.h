@@ -132,7 +132,7 @@ public:
 
 private:
     bool have_ = false;
-    double stand_ = 0;
+    double stand_ = 0, first_ = 0;  // standing height, and the first one learned
     double stable_ref_ = 0, stable_t_ = 0;
     int presses_ = 0;          // stick crouches since the camera was last at standing height (0.6 s)
     double standing_t_ = 0;

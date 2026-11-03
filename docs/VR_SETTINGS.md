@@ -103,12 +103,19 @@ levels. Each frame picks one part of it.
   ends a sprint. For 3 s after, a stance change nobody asked for is logged.
   (Owner, 2026-11-03: "i cant stay crouched"; the run showed 11 presses in
   10 s and no stance readout.)
+- Verified 2026-11-03 (three runs, 06:47 to 07:37 UTC): the game's own crouch
+  input never crouched the character from standing (its crouch is
+  hold-to-crouch, and the release 0.1 s later stands it up), so each crouch
+  went through `Crouch` directly and stayed until the next press; standing
+  up through the game's input works.
 - **Camera hold** (Character and Seated height): if the game camera sits more
   than 8 cm below its standing height with no crouch for 2 s while the
   character stands still, the view is held at standing height until the
   camera comes back. Sprinting lowers the game camera 11 to 26 cm on purpose,
   so moving or sprinting never starts the hold (the first version did, on
-  every sprint).
+  every sprint). The standing height is the highest camera height held for
+  1 s, but after the first one it may only rise 4 cm (run 2 learned 165 cm
+  after 151 cm and then held the view 13 cm too high).
 
 ## Grip toggle and aim smoothing
 
@@ -170,9 +177,9 @@ appeared, this says whether shots need moving to the muzzle.
 - `vr options: ready (a VR tab is added to Options)` at start.
 - `vr options: following clicks through ...` the first time Options opens.
 - `vr options: VR tab button added to ...` and `vr options: VR page added to
-  Options (24 rows ...)` each time Options opens.
+  Options (23 rows ...)` each time Options opens.
 - `vr options: VR tab opened` when the VR tab is clicked.
-- `vr options: VR page added to Options (24 rows ..., 21 rows with < >
+- `vr options: VR page added to Options (23 rows ..., 20 rows with < >
   arrows, slot ok)`.
 - `vr options: <row> -> <choice> (key=value, right arrow | left arrow | row
   clicked)` and `settings: saved key=value in hole-vr.ini` on each click, then

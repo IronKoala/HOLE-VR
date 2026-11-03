@@ -220,6 +220,14 @@ static void TestCameraHeight() {
     EXPECT(run(s, 128, 6.0, false, false, false) == 0.0);
     EXPECT(!s.Holding());
     EXPECT(run(s, 152, 0.5) == 0.0);
+    // A camera held well above the first standing height is not learned
+    // (run 2: 165 after 151); a small creep up is.
+    CameraHeight u;
+    run(u, 151, 1.5);
+    run(u, 165, 1.5);
+    EXPECT(std::fabs(u.Standing() - 151) < 0.01);
+    run(u, 153, 1.5);
+    EXPECT(std::fabs(u.Standing() - 153) < 0.01);
     // A brief lift (an animation) is not learned as standing.
     CameraHeight h;
     run(h, 152, 1.5);
