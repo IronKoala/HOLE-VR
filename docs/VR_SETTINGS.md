@@ -42,6 +42,7 @@ whatever the laser is on). A step writes the ini key(s) into `hole-vr.ini` in pl
 | Vignette moving | Off, Light, Medium, Strong | `comfort_vignette_move` (0, 0.35, 0.6, 0.85) |
 | Vignette turning | Off, Light, Medium, Strong | `comfort_vignette_turn` |
 | Head in a wall | Fades, No fade | `head_wall_fade` |
+| Wall fade starts | 5, 10, 15, 20, 25 cm away | `head_wall_fade_start_cm` (15) |
 | Height | Character, Your own, Seated | `fixed_height` + `height_mode` |
 | Real crouch | On, Off | `physical_crouch` |
 | Hop to jump | Off, On | `physical_jump` |
@@ -85,9 +86,16 @@ levels. Each frame picks one part of it.
   3 m/s) or the turning setting times how fast you turn (full at 90 deg/s,
   smooth turning only). It closes in over 0.1 s and opens over 0.3 s. At
   Strong the clear circle is about 33 deg wide each side of centre.
-- Head in a wall: a line from the body's middle at head height to the head.
-  If it hits something, the view fades to black over the last 1 to 9 cm.
-  The player and the held gun are ignored. No fade while a menu is on the
+- Head in a wall: a ball is swept from the body's middle at head height to
+  the eyes. Its radius is where the fade begins (`head_wall_fade_start_cm`,
+  15 cm, the "Wall fade starts" row). Where it stops, the eyes are that
+  close to a surface; the further on they go, the darker, until black
+  `head_wall_fade_full_cm` (2 cm) before the surface. The first version used
+  a line and only began fading 1 cm inside the wall (black 9 cm in), and
+  the near clip plane is 1 cm, so the wall vanished and you saw through
+  before it went dark (owner 2026-11-03 10:07: "the wall fade needs to kick
+  in a lot sooner"). The player, the held gun and anything either hand
+  holds are ignored. No fade while a menu is on the
   forearm, or when the view is more than 1 m from the character's capsule
   (the game moving its camera, as on the extract results screen; menus
   thread, PR #79). Owner 2026-11-03: "if i successfully extract i cant see
@@ -253,16 +261,17 @@ grips.
 - `vr options: ready (a VR tab is added to Options)` at start.
 - `vr options: following clicks through ...` the first time Options opens.
 - `vr options: VR tab button added to ...` and `vr options: VR page added to
-  Options (25 rows ...)` each time Options opens.
+  Options (26 rows ...)` each time Options opens.
 - `vr options: VR tab opened` when the VR tab is clicked.
-- `vr options: VR page added to Options (25 rows ..., 22 rows with < >
+- `vr options: VR page added to Options (26 rows ..., 23 rows with < >
   arrows; made over N frames, X ms in all, Y ms at most in one frame)`.
 - `vr options: <row> -> <choice> (key=value, right arrow | left arrow | row
   clicked)` and `settings: saved key=value in hole-vr.ini` on each click, then
   `controls: settings changed (...)`; `... is already at its last choice` at
   an end.
-- `comfort: head inside a wall or object, view faded` / `head out of the wall
-  again after N s`.
+- `comfort: head close to a wall or object (N cm from it), view fading` /
+  `head away from the wall again after N s (it got to N cm from|past the
+  surface)`. Logged when the fade passes half way.
 - `controls: physical crouch (...)` / `physical stand (...)`.
 - `controls: crouch (right stick down)` / `stand up (...)`, then `stick crouch:
   the character is crouched (the game's own crouch input did it)` or `... left
