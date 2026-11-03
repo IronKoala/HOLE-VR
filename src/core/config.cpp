@@ -356,6 +356,22 @@ const Block kBlocks[] = {
      "holster_mag_radius_cm=14\n"
      "; With the VR body off (F9), the belt is taken this far below the headset.\n"
      "holster_belt_below_head_cm=60\n"},
+    {"rifle_left_hand_carry",
+     "\n"
+     "; --- Rifle in your left hand while the pistol is out ---\n"
+     "; 1 = the left hand can hold the rifle by its handguard on its own: let go of\n"
+     "; the rifle's grip (or draw the pistol) with the left hand on the handguard and\n"
+     "; the left hand keeps it; or grab the handguard of the rifle on your back. Let\n"
+     "; go and it goes back on your back. Grab its grip with the right hand to fire it.\n"
+     "rifle_left_hand_carry=1\n"
+     "; How the rifle sits in the left hand when picked up from your back: the bore\n"
+     "; this far above your fist (cm), and turned (degrees: + pitch tips the muzzle up).\n"
+     "rifle_carry_fist_below_bore_cm=4\n"
+     "rifle_carry_pitch_deg=0\n"
+     "rifle_carry_yaw_deg=0\n"
+     "rifle_carry_roll_deg=0\n"
+     "; The right hand takes the rifle when it squeezes this close to its grip (cm).\n"
+     "rifle_grip_reach_cm=14\n"},
     {"fixed_height",
      "\n"
      "; 1 = your in-game height is always the character's, seated or standing\n"
