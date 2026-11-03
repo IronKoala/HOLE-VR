@@ -457,6 +457,7 @@ struct WeaponState {
     UObject held_mag = 0;      // magazine in the left hand, not yet inserted
     UObject pouch_mag = 0;     // spare magazine shown at the pouch, ready to grab
     UObject mag_class = 0;     // class of this gun's magazines, for spawning spares
+    double mag_wait_until = -1.0;  // when to stop waiting for the game to give the gun a magazine
     double refill_pouch_at = 0; // when to put a new magazine in the pouch
     bool trigger_down = false;
     bool have_frame = false;
@@ -1168,18 +1169,34 @@ UObject SpawnMagazine(UObject player, UObject cls, const FVector& loc, const FQu
     return done ? done : actor;
 }
 
+bool LiveObject(UObject obj);
+
+// Magazine class per gun class, kept across levels so a new match doesn't
+// have to wait for (or take) the game's own magazine.
+std::map<std::string, UObject> g_mag_class_by_gun;
+
 void RefillPouch(game::Gun& gun, UObject player, const FVector& loc, const FQuat& rot) {
     if (!W.mag_class) {
         UObject m = 0;
         if (ue::GetProp(gun.Object(), "MagazineObj", m) && m) W.mag_class = ue::GetClass(m);
         else if (ue::GetProp(gun.Object(), "MagazineObj_Temp", m) && m) W.mag_class = ue::GetClass(m);
+        if (W.mag_class) {
+            g_mag_class_by_gun[gun.ClassName()] = W.mag_class;
+        } else {
+            auto known = g_mag_class_by_gun.find(gun.ClassName());
+            if (known != g_mag_class_by_gun.end() && LiveObject(known->second)) W.mag_class = known->second;
+        }
     }
+    if (W.mag_wait_until < 0.0) W.mag_wait_until = g_clock + 5.0;
     UObject mag = 0;
     if (W.mag_class) {
         mag = SpawnMagazine(player, W.mag_class, loc, rot);
         if (mag) log::Info("controls: spawned pouch magazine %s", ue::GetName(mag).c_str());
-    } else if (!gun.State().has_magazine) {
-        // Empty gun and no class known yet: the game's own step is safe here.
+    } else if (!gun.State().has_magazine && g_clock >= W.mag_wait_until) {
+        // The game normally gives the gun its magazine just after the level
+        // starts; only if it never does, borrow the game's own step. Taking
+        // it earlier races the game's own load-in, and the game later moves
+        // or destroys that magazine (pouch looks empty for seconds).
         gun.TakeNewMagazine();
         ue::GetProp(gun.Object(), "MagazineObj_Temp", mag);
         if (mag) W.mag_class = ue::GetClass(mag);
@@ -1188,7 +1205,7 @@ void RefillPouch(game::Gun& gun, UObject player, const FVector& loc, const FQuat
     if (mag) {
         W.pouch_mag = mag;
     } else {
-        W.refill_pouch_at = g_clock + 2.0;   // try again later
+        W.refill_pouch_at = g_clock + 0.25;   // try again shortly
     }
 }
 
