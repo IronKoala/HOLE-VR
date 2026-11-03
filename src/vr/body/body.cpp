@@ -6,7 +6,9 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <atomic>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <string>
@@ -457,6 +459,7 @@ struct ActiveGrip {
     UObject object = 0;
     hands::GrabKind kind = hands::GrabKind::kNone;
     bool have = false;          // a record is in use
+    bool pending = false;       // record found, its solve is running off the game thread
     bool from_file = false;
     gr::Record rec;
     FQuat hand_rot;             // hand bone in the object frame
@@ -975,6 +978,8 @@ void BuildRig(int side, const skel::Pose& refp) {
               check, r.ok ? "" : " (FAILED: no stored grips for this hand)");
 }
 
+void PrewarmGrips();  // below
+
 void CaptureReference() {
     G.engine.ResetAll();
     if (!G.engine.Read(&G.ref)) {
@@ -986,6 +991,7 @@ void CaptureReference() {
     refp.Init(G.engine.parent);
     refp.SetAllLocal(G.ref.data(), static_cast<int>(G.ref.size()));
     for (int side = 0; side < 2; ++side) BuildRig(side, refp);
+    PrewarmGrips();
     const Skeleton& k = G.skel;
     if (k.arms_ok[kR]) {
         double upper = Length(refp.C(k.lowerarm[kR]).translation - refp.C(k.upperarm[kR]).translation);
@@ -1111,7 +1117,9 @@ int g_slide_hold[2] = {kSlideOver, kSlideOver};
 
 bool PartBox(UObject comp, FVector* mn, FVector* mx, const char** how);
 
-bool SlideMarksWorld(UObject gun, const FQuat& gun_rot, FVector* sight, FVector* rear, FVector* front);
+// budget_ms: time this call may spend measuring the slide (< 0: finish now).
+bool SlideMarksWorld(UObject gun, const FQuat& gun_rot, FVector* sight, FVector* rear, FVector* front,
+                     double budget_ms = -1);
 
 int PickSlideHold(const hands::HandState& h, const hands::Pose& gun, UObject gun_actor) {
     const FQuat inv = gun.rotation.Inverse();
@@ -1165,11 +1173,9 @@ fingers::DepthFn DepthIn(const ActiveGrip& g) {
 }
 
 // Solves the fingers for the record's targets. tip = -1: all of them;
-// quick: refine from the current solution (live editing).
-void SolveGrip(int side, int only_tip, bool quick) {
-    perf::Scope t(g_perf_grip);
-    ActiveGrip& g = G.grip[side];
-    const HandRig& r = G.rig[side];
+// quick: refine from the current solution (live editing). Plain math on `g`
+// and `r` only, so it can run on a worker thread on copies.
+void SolveGripOn(ActiveGrip& g, const HandRig& r, int only_tip, bool quick, double finger_radius) {
     gr::HandInObject(g.rec, r.geo, &g.hand_rot, &g.hand_pos);
     fingers::DepthFn fn = DepthIn(g);
     for (int tip = 0; tip < gr::kTipCount; ++tip) {
@@ -1183,12 +1189,12 @@ void SolveGrip(int side, int only_tip, bool quick) {
             g.err[tip] = 0;
             g.clip[tip] = g.rec.outline.empty()
                               ? 0.0
-                              : fingers::FingerDepth(r.chain[f], a, fn, S.finger_radius);
+                              : fingers::FingerDepth(r.chain[f], a, fn, finger_radius);
             continue;
         }
         FVector target = g.hand_rot.Inverse().Rotate(g.rec.tip[tip] - g.hand_pos);
         g.tip_angles[tip] = fingers::Solve(r.chain[f], target, fingers::DefaultLimits(f == hand_pose::kThumb),
-                                           &g.err[tip], g.rec.outline.empty() ? nullptr : &fn, S.finger_radius,
+                                           &g.err[tip], g.rec.outline.empty() ? nullptr : &fn, finger_radius,
                                            &g.clip[tip], quick ? &g.tip_angles[tip] : nullptr);
     }
     g.palm_clip = 0;
@@ -1203,8 +1209,15 @@ void SolveGrip(int side, int only_tip, bool quick) {
     for (double a : {0.0, 0.25, 0.5, 0.75}) g.web_clip = std::max(g.web_clip, fn(tb + (ib - tb) * a));
 }
 
-void ReportGrip(int side, const char* why) {
-    const ActiveGrip& g = G.grip[side];
+void SolveGrip(int side, int only_tip, bool quick) {
+    perf::Scope t(g_perf_grip);
+    SolveGripOn(G.grip[side], G.rig[side], only_tip, quick, S.finger_radius);
+}
+
+void ReportGripOn(const ActiveGrip& g, const HandRig& r, const char* why);
+void ReportGrip(int side, const char* why) { ReportGripOn(G.grip[side], G.rig[side], why); }
+
+void ReportGripOn(const ActiveGrip& g, const HandRig& r, const char* why) {
     std::string tips, clips;
     double worst = g.palm_clip;
     const char* worst_name = "palm";
@@ -1226,7 +1239,6 @@ void ReportGrip(int side, const char* why) {
               g.palm_clip, worst < 0.3 ? " - clean" : "");
     // How the hand lines up with the object (gun: X = barrel): with a
     // straight wrist, the forearm runs along this direction.
-    const HandRig& r = G.rig[side];
     if (r.ok) {
         FVector fa = Normalize(g.hand_rot.Rotate(r.forearm_dir));
         log::Info("body: grip %s hand: wrist at (%.1f %.1f %.1f) cm; a straight wrist puts the forearm %.0f deg %s and "
@@ -1242,6 +1254,112 @@ void ReportGrip(int side, const char* why) {
 // up again costs nothing.
 std::map<std::string, ActiveGrip> g_grip_cache;
 std::string CacheKey(int side, const std::string& key) { return key + (side == kL ? "#L" : "#R"); }
+
+// ---- grip solves off the game thread ----
+// Solving a stored grip searches every fingertip that isn't posed joint by
+// joint against the object's outline: about 90 ms for the pistol. It ran on
+// the game thread the first time the gun was drawn, a freeze the owner
+// noticed (2026-11-03: "the game hitches when i grab my gun for the first
+// time"). The solve is plain math, so it runs on a worker thread on copies
+// of the grip and the hand rig; until it is in (a few frames) the hand
+// follows the controller. Saved gun grips are solved ahead, when the body is
+// set up, so normally the draw finds them ready. Results land in
+// g_grip_cache; all of this is touched on the game thread only, except
+// SolveJob::grip and ::ms, which the worker owns until `done`.
+struct SolveJob {
+    int side = 0;
+    std::string cache_key;
+    ActiveGrip grip;
+    HandRig rig;
+    double radius = 0;
+    double ms = 0;
+    std::atomic<bool> done{false};
+};
+std::vector<std::shared_ptr<SolveJob>> g_solve_jobs;
+
+// A solve worth taking off the game thread: some fingertip is solved
+// against an outline (posed fingers only get a depth check).
+bool LongSolve(const gr::Record& rec) {
+    if (rec.outline.empty()) return false;
+    for (int t = 0; t < gr::kTipCount; ++t)
+        if (!rec.posed[t]) return true;
+    return false;
+}
+
+DWORD WINAPI SolveWorker(LPVOID p) {
+    std::unique_ptr<std::shared_ptr<SolveJob>> hold(static_cast<std::shared_ptr<SolveJob>*>(p));
+    SolveJob& j = **hold;
+    const double t0 = perf::NowMs();
+    SolveGripOn(j.grip, j.rig, -1, false, j.radius);
+    j.ms = perf::NowMs() - t0;
+    j.done.store(true, std::memory_order_release);
+    return 0;
+}
+
+// Starts solving `g` (rec and key set) for `side`; true if it is solving
+// now (or already was).
+bool StartSolve(int side, const ActiveGrip& g) {
+    const std::string ck = CacheKey(side, g.key);
+    for (const auto& j : g_solve_jobs)
+        if (j->cache_key == ck) return true;
+    auto job = std::make_shared<SolveJob>();
+    job->side = side;
+    job->cache_key = ck;
+    job->grip = g;
+    job->grip.object = 0;
+    job->rig = G.rig[side];
+    job->radius = S.finger_radius;
+    auto* hold = new std::shared_ptr<SolveJob>(job);
+    HANDLE t = CreateThread(nullptr, 0, SolveWorker, hold, CREATE_SUSPENDED, nullptr);
+    if (!t) {
+        delete hold;
+        return false;
+    }
+    SetThreadPriority(t, THREAD_PRIORITY_BELOW_NORMAL);
+    ResumeThread(t);
+    CloseHandle(t);
+    g_solve_jobs.push_back(job);
+    return true;
+}
+
+// Game thread, once per tick: finished solves into the cache, and a hand
+// waiting for one takes it.
+void CollectSolves() {
+    for (size_t i = 0; i < g_solve_jobs.size();) {
+        SolveJob& j = *g_solve_jobs[i];
+        if (!j.done.load(std::memory_order_acquire)) {
+            ++i;
+            continue;
+        }
+        // A grip saved or loaded meanwhile wins over this older solve.
+        if (!g_grip_cache.count(j.cache_key)) {
+            j.grip.have = true;
+            j.grip.pending = false;
+            g_grip_cache[j.cache_key] = j.grip;
+            char why[96];
+            std::snprintf(why, sizeof(why), "solved in %.1f ms off the game thread", j.ms);
+            ReportGripOn(j.grip, j.rig, why);
+        }
+        g_solve_jobs.erase(g_solve_jobs.begin() + static_cast<std::ptrdiff_t>(i));
+    }
+    for (int side = 0; side < 2; ++side) {
+        ActiveGrip& g = G.grip[side];
+        if (!g.pending) continue;
+        auto it = g_grip_cache.find(CacheKey(side, g.key));
+        if (it == g_grip_cache.end()) {
+            bool running = false;
+            for (const auto& j : g_solve_jobs) running = running || j->cache_key == CacheKey(side, g.key);
+            if (!running) g.pending = false;  // the worker could not start: stays on the controller
+            continue;
+        }
+        const UObject object = g.object;
+        const hands::GrabKind kind = g.kind;
+        g = it->second;
+        g.object = object;
+        g.kind = kind;
+        g.pending = false;
+    }
+}
 
 // ---- built-in magazine hold ----
 // The magazine's outline in its own actor frame: the union of its parts'
@@ -1428,6 +1546,60 @@ bool DefaultMagRecord(int side, UObject mag, gr::Record* rec) {
     return true;
 }
 
+// The stored record for a grab: the built-in hold and/or the saved file, in
+// the hand's handedness. false: there is none (the hand stays on the
+// controller). `object` is only needed for magazines and old slide files.
+bool GripRecord(int side, hands::GrabKind kind, UObject object, const std::string& key, gr::Record* out,
+                bool* from_file) {
+    std::string text;
+    gr::Record rec;
+    bool have = false;
+    *from_file = false;
+    if (kind == hands::GrabKind::kGunGrip) {
+        rec = gr::DefaultPistol();
+        rec.name = key;
+        have = true;
+    }
+    const bool is_mag = kind == hands::GrabKind::kMagHeld || kind == hands::GrabKind::kMagInsert;
+    // No built-in magazine hold (the owner poses it in the editor): until a
+    // grip is saved, the hand stays as it is on the controller, and the
+    // editor starts from that.
+    static const bool builtin_mag = config::GetBool("body_mag_builtin_hold", false);
+    if (is_mag && builtin_mag && object && DefaultMagRecord(side, object, &rec)) {
+        rec.name = key;
+        have = true;
+    }
+    bool found = ReadText(RecordPath(key), &text);
+    // A slide grip saved before there were three slide holds: use it for any
+    // hold not posed yet.
+    if (!found && kind == hands::GrabKind::kSlideGrab && object) {
+        std::string cls = ue::GetName(ue::GetClass(object));
+        found = ReadText(RecordPath(cls + ".slide"), &text);
+    }
+    if (found) {
+        if (!have || is_mag) rec.right_hand = side == kR;
+        if (gr::Parse(text, &rec)) {
+            have = true;
+            *from_file = true;
+            if (kind == hands::GrabKind::kGunGrip && gr::HasOldPistolHand(rec)) {
+                // Saved before the hand was lined up with the barrel: keep the
+                // fingertips, take the new hand and outline.
+                gr::PistolHand(&rec);
+                rec.outline = gr::DefaultPistol().outline;
+                log::Info("body: grip %s had the old hand placement; moved the hand in line with the barrel "
+                          "(your fingertip positions are kept; tap Y in the editor to save it)",
+                          key.c_str());
+            }
+        } else {
+            log::Error("body: grip file %s.ini could not be read, using the built-in grip", key.c_str());
+        }
+    }
+    if (!have) return false;
+    if (rec.right_hand != (side == kR)) rec = gr::Mirror(rec);
+    *out = rec;
+    return true;
+}
+
 void LoadGrip(int side, const hands::HandGrab& grab, bool from_disk = false) {
     ActiveGrip& g = G.grip[side];
     g = ActiveGrip{};
@@ -1442,51 +1614,17 @@ void LoadGrip(int side, const hands::HandGrab& grab, bool from_disk = false) {
         g.kind = grab.kind;
         return;
     }
-    std::string text;
     gr::Record rec;
-    bool have = false;
-    if (grab.kind == hands::GrabKind::kGunGrip) {
-        rec = gr::DefaultPistol();
-        rec.name = g.key;
-        have = true;
-    }
-    const bool is_mag = grab.kind == hands::GrabKind::kMagHeld || grab.kind == hands::GrabKind::kMagInsert;
-    // No built-in magazine hold (the owner poses it in the editor): until a
-    // grip is saved, the hand stays as it is on the controller, and the
-    // editor starts from that.
-    static const bool builtin_mag = config::GetBool("body_mag_builtin_hold", false);
-    if (is_mag && builtin_mag && DefaultMagRecord(side, grab.object, &rec)) {
-        rec.name = g.key;
-        have = true;
-    }
-    bool found = ReadText(RecordPath(g.key), &text);
-    // A slide grip saved before there were three slide holds: use it for any
-    // hold not posed yet.
-    if (!found && grab.kind == hands::GrabKind::kSlideGrab) {
-        std::string cls = ue::GetName(ue::GetClass(grab.object));
-        found = ReadText(RecordPath(cls + ".slide"), &text);
-    }
-    if (found) {
-        if (!have || is_mag) rec.right_hand = side == kR;
-        if (gr::Parse(text, &rec)) {
-            have = true;
-            g.from_file = true;
-            if (grab.kind == hands::GrabKind::kGunGrip && gr::HasOldPistolHand(rec)) {
-                // Saved before the hand was lined up with the barrel: keep the
-                // fingertips, take the new hand and outline.
-                gr::PistolHand(&rec);
-                rec.outline = gr::DefaultPistol().outline;
-                log::Info("body: grip %s had the old hand placement; moved the hand in line with the barrel "
-                          "(your fingertip positions are kept; tap Y in the editor to save it)",
-                          g.key.c_str());
-            }
-        } else {
-            log::Error("body: grip file %s.ini could not be read, using the built-in grip", g.key.c_str());
-        }
-    }
-    if (!have) return;
-    if (rec.right_hand != (side == kR)) rec = gr::Mirror(rec);
+    bool from_file = false;
+    if (!GripRecord(side, grab.kind, grab.object, g.key, &rec, &from_file)) return;
     g.rec = rec;
+    g.from_file = from_file;
+    // A long solve goes to a worker thread (see SolveJob); the editor's
+    // "back to the saved grip" stays immediate.
+    if (!from_disk && LongSolve(g.rec) && StartSolve(side, g)) {
+        g.pending = true;
+        return;
+    }
     g.have = true;
     double t0 = perf::NowMs();
     SolveGrip(side, -1, false);
@@ -1494,6 +1632,30 @@ void LoadGrip(int side, const hands::HandGrab& grab, bool from_disk = false) {
     std::snprintf(why, sizeof(why), "solved in %.1f ms", perf::NowMs() - t0);
     ReportGrip(side, why);
     g_grip_cache[CacheKey(side, g.key)] = g;
+}
+
+// Saved gun grips solved ahead on the worker thread, once the hands are
+// rigged (body setup), so the first draw finds them ready.
+void PrewarmGrips() {
+    if (!S.grip_records) return;
+    WIN32_FIND_DATAW fd;
+    HANDLE f = FindFirstFileW(ModPath(L"grips\\*.grip.ini").c_str(), &fd);
+    if (f == INVALID_HANDLE_VALUE) return;
+    int started = 0;
+    do {
+        std::wstring file = fd.cFileName;
+        std::string key(file.begin(), file.end() - 4);  // drop ".ini"; grip files are named by class (ASCII)
+        for (int side : {kR, kL}) {
+            if (!G.rig[side].ok || g_grip_cache.count(CacheKey(side, key))) continue;
+            ActiveGrip g;
+            g.key = key;
+            g.kind = hands::GrabKind::kGunGrip;
+            if (!GripRecord(side, g.kind, 0, key, &g.rec, &g.from_file) || !LongSolve(g.rec)) continue;
+            if (StartSolve(side, g)) ++started;
+        }
+    } while (FindNextFileW(f, &fd));
+    FindClose(f);
+    if (started) log::Info("body: solving %d saved gun grip(s) ahead, off the game thread", started);
 }
 
 // ---- grip editor ----
@@ -2079,38 +2241,114 @@ bool TraceParts(const std::vector<UObject>& parts, const FVector& a, const FVect
 // centre line: rear and front end and the rear sight (the highest point of
 // the rear 3.5 cm). Stored in the slide component's space, so it follows
 // the slide as it moves.
+//
+// The rays are game traces, about 0.08 ms each, one per slide part (11 on
+// the pistol) per spot: 121 spots every 0.5 cm took about 110 ms in one
+// frame when the gun was first drawn (owner 2026-11-03: "the game hitches
+// when i grab my gun for the first time"). Now a 2 cm pass finds the slide,
+// then a 0.5 cm pass covers it from 1.5 cm past each end (every spot the old
+// scan could hit), and the work is spread over frames, about 1 ms each,
+// while the gun is in the hand. A slide grab before it is done finishes it
+// at once. Spots are kept as (along the barrel, up) from the slide origin
+// in the gun's axes, which doesn't change as the gun moves.
+constexpr int kSlideSpots = 121;  // x = -30 .. +30 cm in 0.5 cm steps
+double SlideSpotX(int i) { return -30.0 + 0.5 * i; }
+
 struct SlideShape {
     UObject gun = 0, slide = 0;
-    bool tried = false, ok = false;
+    bool tried = false, ok = false;  // tried: measuring finished (ok or not)
+    bool started = false;
     std::vector<UObject> parts;
     FVector sight, rear, front;  // slide component space
+    // While measuring:
+    std::vector<int> todo;          // spots still to trace
+    bool fine = false;              // the 0.5 cm pass is queued
+    std::vector<char> traced;       // per spot
+    std::vector<double> top;        // per spot: height of the hit, NaN = no hit
+    double ms = 0, last_ms = 0;
+    int rays = 0, frames = 0;
 } g_shape;
 
-bool MeasureSlide(UObject gun, const FQuat& gun_rot) {
-    if (g_shape.gun == gun && g_shape.tried) return g_shape.ok;
+bool MeasureSlideStart(UObject gun) {
     g_shape = SlideShape{};
     g_shape.gun = gun;
-    g_shape.tried = true;
-    if (!gun || !ue::GetProp(gun, "GunParts_Bolt(Slide)", g_shape.slide) || !g_shape.slide) return false;
+    g_shape.started = true;
+    if (!gun || !ue::GetProp(gun, "GunParts_Bolt(Slide)", g_shape.slide) || !g_shape.slide) {
+        g_shape.tried = true;
+        return false;
+    }
     g_shape.parts = SlideParts(g_shape.slide);
     if (g_shape.parts.empty()) {
         log::Warn("body: slide measure: the slide has no mesh parts to trace");
+        g_shape.tried = true;
         return false;
     }
+    g_shape.traced.assign(kSlideSpots, 0);
+    g_shape.top.assign(kSlideSpots, std::nan(""));
+    for (int i = kSlideSpots - 1; i >= 0; i -= 4) g_shape.todo.push_back(i);  // 2 cm pass, taken from the back
+    return true;
+}
+
+// budget_ms < 0: finish now. Returns true once measured.
+bool MeasureSlide(UObject gun, const FQuat& gun_rot, double budget_ms = -1) {
+    if (g_shape.gun == gun && g_shape.tried) return g_shape.ok;
+    if (g_shape.gun != gun || !g_shape.started) {
+        if (!MeasureSlideStart(gun)) return false;
+    } else {
+        // Picked up again after a while, or no longer the same slide (a gun
+        // freed and another made at the same address): start over rather
+        // than trace parts that may be gone.
+        UObject slide = 0;
+        if (perf::NowMs() - g_shape.last_ms > 2000.0 || !ue::GetProp(gun, "GunParts_Bolt(Slide)", slide) ||
+            slide != g_shape.slide) {
+            if (!MeasureSlideStart(gun)) return false;
+        }
+    }
+    const double t0 = perf::NowMs();
+    g_shape.last_ms = t0;
+    ++g_shape.frames;
     const Xf sw = ComponentToWorld(g_shape.slide);
     const FVector X = gun_rot.Rotate(FVector{1, 0, 0}), Z = gun_rot.Rotate(FVector{0, 0, 1});
+    int done_now = 0;
+    for (;;) {
+        if (g_shape.todo.empty()) {
+            if (g_shape.fine) break;
+            g_shape.fine = true;
+            int lo = kSlideSpots, hi = -1;
+            for (int i = 0; i < kSlideSpots; ++i)
+                if (!std::isnan(g_shape.top[i])) lo = std::min(lo, i), hi = std::max(hi, i);
+            if (hi < 0) break;
+            lo = std::max(0, lo - 3), hi = std::min(kSlideSpots - 1, hi + 3);
+            for (int i = hi; i >= lo; --i)
+                if (!g_shape.traced[i]) g_shape.todo.push_back(i);
+            continue;
+        }
+        if (budget_ms >= 0 && done_now > 0 && perf::NowMs() - t0 >= budget_ms) {
+            g_shape.ms += perf::NowMs() - t0;
+            return false;
+        }
+        const int i = g_shape.todo.back();
+        g_shape.todo.pop_back();
+        const double x = SlideSpotX(i);
+        FVector a = sw.translation + X * x + Z * 15.0, b = sw.translation + X * x - Z * 15.0, h;
+        g_shape.traced[i] = 1;
+        g_shape.rays += static_cast<int>(g_shape.parts.size());
+        ++done_now;
+        if (TraceParts(g_shape.parts, a, b, &h)) g_shape.top[i] = Dot(h - sw.translation, Z);
+    }
+    g_shape.ms += perf::NowMs() - t0;
+    g_shape.tried = true;
     double rear = 1e9, front = -1e9;
     std::vector<std::pair<double, double>> top;  // x along the barrel from the slide origin, z
-    for (double x = -30; x <= 30; x += 0.5) {
-        FVector a = sw.translation + X * x + Z * 15.0, b = sw.translation + X * x - Z * 15.0, h;
-        if (!TraceParts(g_shape.parts, a, b, &h)) continue;
-        double z = Dot(h - sw.translation, Z);
-        top.push_back({x, z});
+    for (int i = 0; i < kSlideSpots; ++i) {
+        if (std::isnan(g_shape.top[i])) continue;
+        const double x = SlideSpotX(i);
+        top.push_back({x, g_shape.top[i]});
         rear = std::min(rear, x);
         front = std::max(front, x);
     }
     if (top.size() < 6 || front - rear < 5.0 || front - rear > 50.0) {
-        log::Warn("body: slide measure: %zu of 121 rays hit %zu part(s); no slide shape", top.size(),
+        log::Warn("body: slide measure: %zu spots hit %zu part(s); no slide shape", top.size(),
                   g_shape.parts.size());
         return false;
     }
@@ -2128,13 +2366,15 @@ bool MeasureSlide(UObject gun, const FQuat& gun_rot) {
     g_shape.front = to_local(front, fz);
     g_shape.ok = true;
     log::Info("body: slide measured (%zu parts): %.1f cm long, rear end %.1f / front end %.1f cm along the barrel "
-              "from the slide origin, rear sight at %.1f, %.1f cm above the origin",
-              g_shape.parts.size(), front - rear, rear, front, sx, sz);
+              "from the slide origin, rear sight at %.1f, %.1f cm above the origin (%d rays over %d frame(s), "
+              "%.1f ms in all)",
+              g_shape.parts.size(), front - rear, rear, front, sx, sz, g_shape.rays, g_shape.frames, g_shape.ms);
     return true;
 }
 
-bool SlideMarksWorld(UObject gun, const FQuat& gun_rot, FVector* sight, FVector* rear, FVector* front) {
-    if (!MeasureSlide(gun, gun_rot)) return false;
+bool SlideMarksWorld(UObject gun, const FQuat& gun_rot, FVector* sight, FVector* rear, FVector* front,
+                     double budget_ms) {
+    if (!MeasureSlide(gun, gun_rot, budget_ms)) return false;
     const Xf sw = ComponentToWorld(g_shape.slide);
     if (sight) *sight = skel::Apply(sw, g_shape.sight);
     if (rear) *rear = skel::Apply(sw, g_shape.rear);
@@ -2227,7 +2467,7 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
             g_slide_hold[side] = PickSlideHold(h, gun, grab.object);
         LoadGrip(side, grab);
         g_free_slide[side].on = false;
-        if (grab.kind == hands::GrabKind::kSlideGrab && !g.have && ObjectFrame(grab, right_grab, &gun) &&
+        if (grab.kind == hands::GrabKind::kSlideGrab && !g.have && !g.pending && ObjectFrame(grab, right_grab, &gun) &&
             !BuildSlidePreset(side, h, gun, grab)) {
             const FQuat inv = gun.rotation.Inverse();
             g_free_slide[side] = {true, Normalized(inv * h.grip.rotation), inv.Rotate(h.grip.location - gun.location)};
@@ -2515,6 +2755,7 @@ void OnTick(UObject player, float dt_f) {
     G.pose.ClearChanged();
     ++G.frames;
 
+    CollectSolves();
     const hands::HandState live[2] = {hands::Get(hands::kLeft), hands::Get(hands::kRight)};
     hands::HandState hs[2] = {live[0], live[1]};
     hands::HandGrab grab[2] = {hands::GetGrab(hands::kLeft), hands::GetGrab(hands::kRight)};
@@ -2763,12 +3004,14 @@ bool GetSlot(Slot slot, hands::Pose* out) {
 bool SlideMarks(uintptr_t gun, FVector* rear_sight, FVector* rear_end, FVector* front_end) {
     const hands::HandGrab r = hands::GetGrab(hands::kRight);
     if (!gun) return false;
+    // Measured a little each frame (see SlideShape); until then, false.
+    static const double budget = config::GetFloat("slide_measure_ms_per_frame", 1.0f);
     if (g_shape.gun != gun || !g_shape.tried) {
         // Measure only with the gun frame from the hand that holds it.
         if (r.kind != hands::GrabKind::kGunGrip || r.object != gun) return false;
-        return SlideMarksWorld(gun, r.target.rotation, rear_sight, rear_end, front_end);
+        return SlideMarksWorld(gun, r.target.rotation, rear_sight, rear_end, front_end, budget);
     }
-    return SlideMarksWorld(gun, r.target.rotation, rear_sight, rear_end, front_end);
+    return SlideMarksWorld(gun, r.target.rotation, rear_sight, rear_end, front_end, budget);
 }
 
 bool GetAnchor(Anchor anchor, hands::Pose* out) {

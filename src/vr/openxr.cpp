@@ -830,15 +830,20 @@ perf::Counter g_perf_layers{"  wrist/laser layers"};
 perf::Counter g_perf_end{"  xrEndFrame"};
 
 // Headset frames the game missed: display times of consecutive frames we
-// sent that are more than one display period apart. Guarded by g_frame_mutex.
+// sent that are more than one display period apart. Written under
+// g_frame_mutex (RunFrame, KeepAliveFrame); the counts are atomics so the
+// report can read them without that lock. The report runs on whichever thread
+// reports, and taking g_frame_mutex there froze the game (2026-11-03): the
+// render thread reported from inside RunFrame and waited on itself.
 XrTime g_last_display_time = 0;
-long long g_sent = 0, g_missed = 0, g_missed_runs = 0;
-XrDuration g_display_period = 0;
+std::atomic<long long> g_sent{0}, g_missed{0}, g_missed_runs{0};
+std::atomic<XrDuration> g_display_period{0};
 
 void CountDisplaySlot(const XrFrameState& fs) {
     if (fs.predictedDisplayPeriod > 0) g_display_period = fs.predictedDisplayPeriod;
-    if (g_last_display_time && g_display_period > 0 && fs.predictedDisplayTime > g_last_display_time) {
-        long long slots = (fs.predictedDisplayTime - g_last_display_time + g_display_period / 2) / g_display_period;
+    const XrDuration period = g_display_period.load();
+    if (g_last_display_time && period > 0 && fs.predictedDisplayTime > g_last_display_time) {
+        long long slots = (fs.predictedDisplayTime - g_last_display_time + period / 2) / period;
         if (slots > 1 && slots < 1000) {
             g_missed += slots - 1;
             ++g_missed_runs;
@@ -849,16 +854,12 @@ void CountDisplaySlot(const XrFrameState& fs) {
 }
 
 std::string HeadsetReport(double span_s) {
-    long long sent, missed, runs;
-    double hz;
-    {
-        std::lock_guard<std::mutex> lock(g_frame_mutex);
-        sent = g_sent;
-        missed = g_missed;
-        runs = g_missed_runs;
-        hz = g_display_period > 0 ? 1e9 / static_cast<double>(g_display_period) : 0.0;
-        g_sent = g_missed = g_missed_runs = 0;
-    }
+    // No lock (see above): each count is taken and reset on its own.
+    const long long sent = g_sent.exchange(0);
+    const long long missed = g_missed.exchange(0);
+    const long long runs = g_missed_runs.exchange(0);
+    const XrDuration period = g_display_period.load();
+    const double hz = period > 0 ? 1e9 / static_cast<double>(period) : 0.0;
     if (!sent) return {};
     char buf[300];
     std::snprintf(buf, sizeof(buf),
@@ -1000,7 +1001,9 @@ void RunFrame() {
     Proc<PFN_xrEndFrame>("xrEndFrame")(g_session, &ei);
     step(g_perf_end);
     MarkFrameDone();
-    perf::MaybeReport();
+    // No perf::MaybeReport() here: RunFrame runs inside g_frame_mutex, and the
+    // report lines must never be called with it held. OnPresent reports once
+    // the lock is released.
 }
 
 // Re-sends the last frame while the game is stalled (shader compiles, level
@@ -1137,9 +1140,13 @@ void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* back_buffer) {
     if (!g_qpc_freq.QuadPart) QueryPerformanceFrequency(&g_qpc_freq);
     if (!g_keepalive_started.exchange(true) && config::GetBool("keep_alive", true))
         std::thread(KeepAliveLoop).detach();
-    std::lock_guard<std::mutex> lock(g_frame_mutex);
-    PollEvents();
-    if (g_running) RunFrame();
+    {
+        std::lock_guard<std::mutex> lock(g_frame_mutex);
+        PollEvents();
+        if (g_running) RunFrame();
+    }
+    // After the frame lock is released (see RunFrame).
+    perf::MaybeReport();
 }
 
 void SetEyeTexture(ID3D12Resource* texture) { g_eye_texture = texture; }
