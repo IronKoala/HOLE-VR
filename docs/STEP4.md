@@ -120,11 +120,36 @@ dump of the shipping game (`hole-vr/dump/game_classes.txt`).
   death screen's kill shot came out pure white and its orange buttons pale
   yellow (headset picture, 2026-11-03 10:08 run), while the same menus looked
   right in lit rooms. The menus and the HUD are tinted down by as many stops as
-  the exposure is above the brightest place seen in the run (never above
-  `menu_exposure_ref`, 0), at least `menu_brightness_min` (0.1), times
-  `menu_brightness` (1). `menu_follow_exposure=0` turns it off. Each menu that
-  opens logs a `menus drawn at ... brightness` line with the exposure settings
-  of every camera and post-process object.
+  the exposure is above `menu_full_brightness_at` (-1), at least
+  `menu_dimmest` (0.03), times `menu_brightness` (1).
+  `menu_follow_exposure=0` turns it off. Each menu that opens logs a
+  `menus drawn at ... brightness` line with the exposure settings of every
+  camera and post-process object. The first version only dimmed past the
+  brightest place seen in the run (`menu_exposure_ref=0`,
+  `menu_brightness_min=0.1`; those lines stay in players' ini files, unread).
+  That wasn't enough (11:00 run): the exposure is about +1.1 stops in lit rooms
+  (bias 11, physical camera EV100 9.9) and +2.6 in the dark death area (bias
+  12.5), and the headset picture showed the panels about four times too bright
+  even in lit rooms (the level select's brown Enter button came out yellow; a
+  panel value of 0.55 showed as 0.94). Measured against the panel pictures,
+  the menus look like their own colours at about 0.4 of a 1:1 exposure, so the
+  reference is -1 stops: about 0.23 brightness in lit rooms, 0.08 in the dark.
+- **Parts moved clear of pictures** (`SeparateParts`, `WidenRowGaps`;
+  `menu_move_parts_apart`). Two overlaps the owner kept seeing are in the
+  game's own layout, not from bigger text: the level select's left column
+  (LEVEL, OFFICE, Return Home) runs 15 px under the divider line beside the
+  preview, and the credits' names row runs over the bottom of the logo, with
+  only 30 px between one name and the next role. Once a menu's texts fit,
+  each text that crosses a picture it isn't inside (at least 40x40, or a
+  divider line at most 6 px thin) moves the widget it belongs to, just below
+  the one it shares with the picture, the shortest way clear by its render
+  translation: left, right, up or down, at most 120 layout pixels, 16 px clear
+  of the picture and of everything else, and on the screen. Parts lined up on
+  one edge in the same box move with it (a column stays a column). Rows of
+  three or more texts and nothing else get gaps under twice the text height
+  widened to that (gaps of 4 px or less are a role and its name, kept). The
+  menu is measured for its zoom three frames later, at the new layout. Skipped
+  on the death screen. Each move is logged (`ran into ...: moved`).
 - **Kill shot** (`WatchDeathScreen`). The death screen's WidgetSwitcher page is
   watched; on each change the kill shot view (`UIP_DeadReview`) is described in
   the log (what hides it, its pictures and where they come from, the

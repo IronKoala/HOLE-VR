@@ -216,13 +216,22 @@ const Block kBlocks[] = {
      "; world, so they got brightened too (death screen washed out). 1 = dim the\n"
      "; menus and HUD by the same amount so they look the same everywhere\n"
      "menu_follow_exposure=1\n"
-     "; Game exposure (stops) below which the menus are never dimmed; the\n"
-     "; brightest place seen in a run counts too\n"
-     "menu_exposure_ref=0\n"
      "; All arm menus and the HUD, times this (1 = as the game draws them)\n"
-     "menu_brightness=1\n"
+     "menu_brightness=1\n"},
+    {"menu_full_brightness_at",
+     "\n"
+     "; Game exposure (stops) at which the arm menus keep their own colours;\n"
+     "; each stop brighter halves them. Lit rooms are about +1.1, dark areas\n"
+     "; about +2.6 (higher = brighter menus everywhere, lower = dimmer)\n"
+     "menu_full_brightness_at=-1\n"
      "; Never dimmer than this\n"
-     "menu_brightness_min=0.1\n"},
+     "menu_dimmest=0.03\n"},
+    {"menu_move_parts_apart",
+     "\n"
+     "; 1 = a column or row of a menu that runs into a picture or divider line\n"
+     "; is moved clear of it (level select, credits), and rows of names get\n"
+     "; wider gaps\n"
+     "menu_move_parts_apart=1\n"},
     {"hole_buzz",
      "\n"
      "; 1 = both hands tick softly each second while the hole in the floor counts\n"
