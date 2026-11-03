@@ -31,6 +31,11 @@ constexpr double kWorstGapMs = 5000;
 // Lone dots (CountDots): a strip with this many more in one eye than the
 // other is saved, with the whole picture at full size from the next strips.
 constexpr int kDotStripEvent = 60;
+// Ordinary pictures put 4 to 10% of their lone dots on any one cell of the
+// 8x4 grid (2026-11-03 runs in the base); the dots in the owner's 10:47
+// screenshot put 27% there even after the monitor's rescale. Below this
+// share a strip is ordinary and spends none of the run's few pictures.
+constexpr float kDotEventShare = 0.15f;
 constexpr int kMaxDotEvents = 3;
 constexpr double kDotEventGapMs = 20000;
 constexpr int kMaxStrips = 64;
@@ -247,7 +252,8 @@ void CheckDots(const Job& j, const Band& band, double now) {
         }
         return;
     }
-    if (d.Odd() >= kDotStripEvent && g_dot_events < kMaxDotEvents && now - g_last_dot_event >= kDotEventGapMs) {
+    if (d.Odd() >= kDotStripEvent && GridShare(d.grid[d.Eye()]) >= kDotEventShare && g_dot_events < kMaxDotEvents &&
+        now - g_last_dot_event >= kDotEventGapMs) {
         g_last_dot_event = now;
         g_full_n = ++g_dot_events;
         log::Info("square watch: %d lone dots in the %s eye's strip %u rows down that the other eye doesn't have "

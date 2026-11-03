@@ -86,6 +86,13 @@ void AddRenderSuspects() {
     // Post-process materials (the game's own screen effects, e.g. its retro
     // look) work on the finished picture, per eye.
     AddCvar("r.PostProcessing.DisableMaterials", 1, false);
+    // Lumen reflections draw garbage into the right eye of a side-by-side
+    // stereo picture on newer NVIDIA drivers (Epic's UE-220474, UE 5.5,
+    // reproduced with -emulatestereo, which is how this mod renders). A
+    // level's own post-process settings can turn them on even though the
+    // game's default (r.ReflectionMethod 2) is screen space reflections, so
+    // this kill switch goes first; it wins over any level setting.
+    AddCvar("r.Lumen.Reflections.Allow", 0, true);
     // Lumen global illumination as a whole, then its parts.
     AddCvar("r.Lumen.DiffuseIndirect.Allow", 0, false, "lumen");
     AddCvar("r.Lumen.ScreenProbeGather.IntegrationTileClassification", 0, true, "", "lumen");
@@ -101,6 +108,28 @@ void AddRenderSuspects() {
     AddCvar("r.AmbientOcclusionLevels", 0, false);
     AddCvar("r.BloomQuality", 0, false);
     AddCvar("r.PostProcessAAQuality", 0, false);
+}
+
+// How close the picture came to starting the test, once every 30 s when it
+// came anywhere near, so a run where the dots showed but stayed under the
+// trigger still says how many there were.
+int g_closest = 0, g_closest_eye = 0;
+float g_closest_share = 0.f;
+double g_closest_since = -1;
+void NoteClosest(const square_watch::Sweep& sw, double now) {
+    if (g_closest_since < 0) g_closest_since = now;
+    if (sw.Odd() > g_closest) {
+        g_closest = sw.Odd();
+        g_closest_eye = sw.Eye();
+        g_closest_share = sw.grid_share[sw.Eye()];
+    }
+    if (now - g_closest_since < 30000) return;
+    if (g_closest >= g_trigger / 3)
+        log::Info("square test: most lone dots in one eye beyond the other in the last 30 s: %d (%s eye, %.0f%% on "
+                  "one cell of an 8x4 grid; the test starts at %d)",
+                  g_closest, g_closest_eye ? "right" : "left", 100.f * g_closest_share, g_trigger);
+    g_closest = 0;
+    g_closest_since = now;
 }
 
 bool Alive(const Suspect& s) {
@@ -416,6 +445,7 @@ void Tick(UObject player, float) {
                 return;
             }
             g_strong = sw.Odd() >= g_trigger ? g_strong + 1 : 0;
+            NoteClosest(sw, now);
             if (g_strong < kStrongSweeps) return;
             g_eye = sw.Eye();
             log::Info("square test: %d lone dots in the %s eye, %d in the %s eye (%.0f%% on one cell of an 8x4 "

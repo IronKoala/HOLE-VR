@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <iterator>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -126,6 +127,34 @@ Field g_exp_physical{"bOverride_AutoExposureApplyPhysicalCameraExposure", "AutoE
 Field g_exp_fstop{"bOverride_DepthOfFieldFstop", "DepthOfFieldFstop"};
 Field g_exp_shutter{"bOverride_CameraShutterSpeed", "CameraShutterSpeed"};
 Field g_exp_iso{"bOverride_CameraISO", "CameraISO"};
+// Read only, for the white squares hunt (2026-11-03): the reflections and
+// global illumination each post-process source asks for. A level's own
+// settings override r.ReflectionMethod, so the log line "reflection method 2"
+// alone doesn't say whether Lumen reflections run in a level.
+struct LightField {
+    const char* label;
+    const char* override;
+    const char* value;
+    const char* const* names;  // enum value names, or nullptr for a float
+    int name_count;
+    int32_t value_offset = -1;
+    int32_t flag_offset = -1;
+    uint8_t flag_mask = 0;
+};
+const char* const kReflectionNames[] = {"none", "Lumen", "screen space"};
+const char* const kGiNames[] = {"none", "Lumen", "screen space", "plugin"};
+const char* const kRayLightingNames[] = {"default", "surface cache", "hit lighting"};
+LightField g_light[] = {
+    {"reflections", "bOverride_ReflectionMethod", "ReflectionMethod", kReflectionNames, 3},
+    {"GI", "bOverride_DynamicGlobalIlluminationMethod", "DynamicGlobalIlluminationMethod", kGiNames, 4},
+    {"Lumen reflection quality", "bOverride_LumenReflectionQuality", "LumenReflectionQuality", nullptr, 0},
+    {"Lumen GI quality", "bOverride_LumenFinalGatherQuality", "LumenFinalGatherQuality", nullptr, 0},
+    {"Lumen reflection lighting", "bOverride_LumenRayLightingMode", "LumenRayLightingMode", kRayLightingNames, 3},
+    {"SSR intensity", "bOverride_ScreenSpaceReflectionIntensity", "ScreenSpaceReflectionIntensity", nullptr, 0},
+    {"SSR quality", "bOverride_ScreenSpaceReflectionQuality", "ScreenSpaceReflectionQuality", nullptr, 0},
+};
+// Background thread (Apply) only: what was last logged for each source.
+std::unordered_map<UObject, std::string> g_light_logged;
 bool g_pause_ready = false;
 std::atomic<bool> g_pause_on{false};
 int32_t g_dof_focal_offset = -1;  // the "no depth of field" fix's value
@@ -200,6 +229,40 @@ void ForceNeutral(uintptr_t settings) {
     }
 }
 
+// "reflections Lumen, Lumen reflection quality 0.25" for the settings this
+// source turns on (its bOverride_ flags), or "" when it sets none of them.
+std::string DescribeLighting(uintptr_t settings) {
+    std::string out;
+    char buf[96];
+    for (const LightField& f : g_light) {
+        if (f.value_offset < 0 || f.flag_offset < 0) continue;
+        if (!(mem::ReadOr<uint8_t>(settings + f.flag_offset) & f.flag_mask)) continue;
+        if (f.names) {
+            const int v = mem::ReadOr<uint8_t>(settings + f.value_offset, 255);
+            if (v < f.name_count) std::snprintf(buf, sizeof(buf), "%s %s", f.label, f.names[v]);
+            else std::snprintf(buf, sizeof(buf), "%s %d", f.label, v);
+        } else {
+            std::snprintf(buf, sizeof(buf), "%s %.2f", f.label, mem::ReadOr<float>(settings + f.value_offset, -1.f));
+        }
+        if (!out.empty()) out += ", ";
+        out += buf;
+    }
+    return out;
+}
+
+// Logs a source's lighting settings when they first show or change.
+void NoteLighting(UObject obj, uintptr_t settings) {
+    std::string what = DescribeLighting(settings);
+    auto it = g_light_logged.find(obj);
+    if (it != g_light_logged.end() && it->second == what) return;
+    if (g_light_logged.size() > 512) g_light_logged.clear();
+    const bool first = it == g_light_logged.end();
+    g_light_logged[obj] = what;
+    if (what.empty() && first) return;  // sets none of them: nothing to say
+    log::Info("render fixes: %s (%s) asks for %s", ue::GetName(obj).c_str(), ue::GetName(ue::GetClass(obj)).c_str(),
+              what.empty() ? "no reflection or GI settings of its own any more" : what.c_str());
+}
+
 Kind Classify(UObject cls) {
     Kind k;
     if (g_cls_camera && refl::IsChildOf(cls, g_cls_camera)) k.settings_offset = g_camera_settings;
@@ -260,6 +323,22 @@ bool Init() {
         log::Info("render fixes: %d of 6 exposure settings readable (method %s, bias %s, physical camera %s)", found,
                   g_exp_method.value_offset >= 0 ? "yes" : "no", g_exp_bias.value_offset >= 0 ? "yes" : "no",
                   g_exp_physical.value_offset >= 0 ? "yes" : "no");
+    }
+
+    {
+        int found = 0;
+        for (LightField& f : g_light) {
+            refl::PropertyInfo flag = refl::FindProperty(pp_struct, f.override);
+            refl::PropertyInfo val = refl::FindProperty(pp_struct, f.value);
+            if (!flag.valid() || !flag.bool_mask || !val.valid()) continue;
+            const bool is_byte = val.type == "ByteProperty" || val.type == "EnumProperty";
+            if (f.names ? !is_byte || val.element_size != 1 : val.type != "FloatProperty") continue;
+            f.flag_offset = flag.offset;
+            f.flag_mask = flag.bool_mask;
+            f.value_offset = val.offset;
+            ++found;
+        }
+        log::Info("render fixes: %d of %zu reflection and GI settings readable", found, std::size(g_light));
     }
 
     int enabled = 0;
@@ -347,6 +426,7 @@ void Apply() {
                 std::lock_guard<std::mutex> lock(g_write_mutex);
                 ForceNeutral(obj + k.settings_offset);
             }
+            NoteLighting(obj, obj + k.settings_offset);
             targets.push_back({obj, mem::ReadOr<int32_t>(obj + ue::off::kObjIndex, -1), k.settings_offset});
             if (k.settings_offset == g_camera_settings) ++c.cameras;
             else if (k.settings_offset == g_pp_component_settings) ++c.components;
