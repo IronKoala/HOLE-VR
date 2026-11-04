@@ -2362,13 +2362,17 @@ void PlaceTimerShape(const PressButton& b, UObject comp, const FVector& local_ce
 
 void PlaceTimerCap(const PressButton& b, double depth) {
     if (!b.cap_comp) return;
-    const FVector at{b.center_l.X, b.center_l.Y, b.bottom_l + b.base_h + b.cap_h * 0.5 - depth};
-    PlaceTimerShape(b, b.cap_comp, at, FVector{b.cap_d, b.cap_d, b.cap_h});
+    // A dome: a sphere centred on the base's top, its lower half inside the
+    // base (and the table under it).
+    const FVector at{b.center_l.X, b.center_l.Y, b.bottom_l + b.base_h - depth};
+    PlaceTimerShape(b, b.cap_comp, at, FVector{b.cap_d, b.cap_d, b.cap_h * 2.0});
 }
 
 // Rest pose known: hide the game's one-piece timer and draw base + cap.
-// Proportions are a first guess from its 18 x 18 x 19 cm box: base the
-// lower 60 %, cap 65 % of the width. On any failure the old squash stays.
+// Matched to the owner's 2026-11-04 picture of the game's own timer
+// (capture-timer-original.bmp): a light blue square block, half the height,
+// with a red dome about 80 % of its width on top. On any failure the old
+// squash stays.
 void RebuildTimerShapes(PressButton& b) {
     const PressPart& p = b.parts[0];
     const FVector sc{std::fabs(b.rest.scale.X), std::fabs(b.rest.scale.Y), std::fabs(b.rest.scale.Z)};
@@ -2376,11 +2380,11 @@ void RebuildTimerShapes(PressButton& b) {
     if (w < 2 || d < 2 || h < 4) return;
     b.center_l = FVector{(p.mn.X + p.mx.X) * 0.5 * sc.X, (p.mn.Y + p.mx.Y) * 0.5 * sc.Y, 0};
     b.bottom_l = p.mn.Z * sc.Z;
-    b.base_h = h * 0.6;
+    b.base_h = h * 0.5;
     b.cap_h = h - b.base_h;
-    b.cap_d = std::fmin(w, d) * 0.65;
-    b.base_comp = MakeTimerShape(b.actor, "StaticMesh /Engine/BasicShapes/Cube.Cube", 0.03f, 0.03f, 0.035f);
-    b.cap_comp = b.base_comp ? MakeTimerShape(b.actor, "StaticMesh /Engine/BasicShapes/Cylinder.Cylinder", 0.7f, 0.02f, 0.02f) : 0;
+    b.cap_d = std::fmin(w, d) * 0.8;
+    b.base_comp = MakeTimerShape(b.actor, "StaticMesh /Engine/BasicShapes/Cube.Cube", 0.06f, 0.42f, 0.75f);
+    b.cap_comp = b.base_comp ? MakeTimerShape(b.actor, "StaticMesh /Engine/BasicShapes/Sphere.Sphere", 0.45f, 0.012f, 0.02f) : 0;
     if (!b.base_comp || !b.cap_comp) {
         log::Warn("controls: range timer: could not build the base and red cap; the whole timer squashes instead");
         b.base_comp = b.cap_comp = 0;
@@ -2392,7 +2396,7 @@ void RebuildTimerShapes(PressButton& b) {
     ue::Call vis(p.comp, "SetVisibility");
     vis.Set("bNewVisibility", false).Set("bPropagateToChildren", false);
     vis.Invoke();
-    log::Info("controls: range timer rebuilt: base %.1f x %.1f x %.1f cm, red cap %.1f cm wide, %.1f cm tall; only the cap sinks",
+    log::Info("controls: range timer rebuilt: blue base %.1f x %.1f x %.1f cm, red dome %.1f cm wide, %.1f cm tall; only the dome sinks",
               w, d, b.base_h, b.cap_d, b.cap_h);
 }
 
@@ -2680,8 +2684,19 @@ void SprintControl(UObject player, const input::HandInput& l) {
         ue::GetProp(player, "Gait", gait);
         ue::Call v(player, "GetVelocity");
         const FVector vel = v.Invoke() ? v.Result<FVector>() : FVector{};
-        log::Info("controls: sprint check: game gait %d (2 = sprinting), speed %.0f cm/s, stick %.2f", gait,
-                  std::sqrt(vel.X * vel.X + vel.Y * vel.Y), mag);
+        // The game may only sprint when moving roughly where the view
+        // (control rotation) faces: log that angle too.
+        FRotator ctrl{};
+        ue::Call gc(player, "GetController");
+        if (UObject c = gc.Invoke() ? gc.Result<UObject>() : 0) {
+            ue::Call r(c, "GetControlRotation");
+            if (r.Invoke()) ctrl = r.Result<FRotator>();
+        }
+        double off = std::atan2(vel.Y, vel.X) / kDegToRad - ctrl.Yaw;
+        while (off > 180) off -= 360;
+        while (off < -180) off += 360;
+        log::Info("controls: sprint check: game gait %d (2 = sprinting), speed %.0f cm/s, stick %.2f, moving %.0f deg "
+                  "off the view's facing", gait, std::sqrt(vel.X * vel.X + vel.Y * vel.Y), mag, off);
     }
 }
 
