@@ -65,6 +65,52 @@ Box Grow(const Box& b, double cm) {
     return {FVector{b.lo.X - cm, b.lo.Y - cm, b.lo.Z - cm}, FVector{b.hi.X + cm, b.hi.Y + cm, b.hi.Z + cm}};
 }
 
+double SegmentBoxGap(const FVector& o, const FVector& d, double len, const Box& b, double* t_at) {
+    // Through the box: the slab test gives where the segment enters.
+    double t0 = 0.0, t1 = len;
+    const double oo[3] = {o.X, o.Y, o.Z}, dd[3] = {d.X, d.Y, d.Z};
+    const double lo[3] = {b.lo.X, b.lo.Y, b.lo.Z}, hi[3] = {b.hi.X, b.hi.Y, b.hi.Z};
+    bool through = true;
+    for (int k = 0; k < 3 && through; ++k) {
+        if (std::fabs(dd[k]) < 1e-12) {
+            if (oo[k] < lo[k] || oo[k] > hi[k]) through = false;
+            continue;
+        }
+        double a = (lo[k] - oo[k]) / dd[k], c = (hi[k] - oo[k]) / dd[k];
+        if (a > c) std::swap(a, c);
+        t0 = std::fmax(t0, a);
+        t1 = std::fmin(t1, c);
+        if (t0 > t1) through = false;
+    }
+    if (through) {
+        if (t_at) *t_at = t0;
+        return 0.0;
+    }
+    // Beside it: the distance to a box along a line is convex, so a golden
+    // section search finds the closest point.
+    auto at = [&](double t) { return DistToBox(FVector{o.X + d.X * t, o.Y + d.Y * t, o.Z + d.Z * t}, b); };
+    const double g = 0.6180339887498949;
+    double a = 0.0, c = len;
+    double x1 = c - g * (c - a), x2 = a + g * (c - a);
+    double f1 = at(x1), f2 = at(x2);
+    for (int i = 0; i < 60 && c - a > 0.01; ++i) {
+        if (f1 <= f2) {
+            c = x2, x2 = x1, f2 = f1;
+            x1 = c - g * (c - a), f1 = at(x1);
+        } else {
+            a = x1, x1 = x2, f1 = f2;
+            x2 = a + g * (c - a), f2 = at(x2);
+        }
+    }
+    double t = 0.5 * (a + c), best = at(t);
+    for (const double e : {0.0, len}) {
+        const double f = at(e);
+        if (f < best) best = f, t = e;
+    }
+    if (t_at) *t_at = t;
+    return best;
+}
+
 Box ScaledBox(const FVector& mn, const FVector& mx, const FVector& s) {
     auto axis = [](double a, double b, double k, double* lo, double* hi) {
         *lo = std::fmin(a * k, b * k);

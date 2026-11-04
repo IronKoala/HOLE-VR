@@ -8,6 +8,7 @@
 // the ability to just place my hand on the door handle". No body-motion
 // gestures (project rule): resting the hand on the thing is the whole action.
 
+#include <cmath>
 #include <string>
 #include <vector>
 
@@ -43,6 +44,20 @@ Box Grow(const Box& b, double cm);
 // A world point in a frame at `origin` turned by `rot`.
 inline FVector ToFrame(const FQuat& rot, const FVector& origin, const FVector& world) {
     return rot.Inverse().Rotate(world - origin);
+}
+
+// Aim assist for the trigger (owner 2026-11-04: opening boxes with the
+// trigger "still really unreliable"; ten presses at boxes about 1 m away all
+// missed, because only an exact hit on a small dome at the box's base
+// counted). The closest the aim segment from `o` along unit `d`, `len` long,
+// comes to box `b`: returns the gap in cm (0 when the segment goes through
+// the box) and in *t_at how far along the segment that is (where it enters,
+// when it goes through).
+double SegmentBoxGap(const FVector& o, const FVector& d, double len, const Box& b, double* t_at);
+// A gap `gap` cm beside the aim, `t` cm out, is inside the aim cone: within
+// `cone_deg` of the aim seen from the hand, or within `min_cm` of it.
+inline bool InAimCone(double gap, double t, double cone_deg, double min_cm) {
+    return gap <= std::fmax(min_cm, std::tan(cone_deg * 3.14159265358979323846 / 180.0) * std::fmax(t, 0.0));
 }
 
 // The box of a mesh's own bounds [mn, mx] under a component scale (negative

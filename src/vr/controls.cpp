@@ -17,6 +17,7 @@
 #include "core/config.h"
 #include "core/log.h"
 #include "core/memory.h"
+#include "core/perf.h"
 #include "game/game.h"
 #include "game/gun.h"
 #include "game/weapon_custom.h"
@@ -41,6 +42,8 @@
 #include "vr/ui_panel.h"
 #include "vr/openxr.h"
 #include "vr/stereo.h"
+#include "vr/view_lead_math.h"
+#include "vr/world_menu.h"
 
 namespace holevr::vr::controls {
 namespace {
@@ -827,15 +830,79 @@ bool LearnGunFrame(UObject g, const FVector& actor_loc, const FQuat& actor_rot, 
     return true;
 }
 
-
-// Keeps the gun out of walls, like Half-Life: Alyx: a trace from the head to
-// the muzzle; when it hits something the whole gun is pulled back along that
-// line so the muzzle rests at the surface (the hand on the gun follows it).
-// Returns the offset to add to the gun's location.
 struct TArrayRaw {
     const UObject* data;
     int32_t num, max;
 };
+
+// The gun's wall push, for the 10 s log line (WallPushReport). Leaf lock:
+// nothing else is taken while it is held.
+struct WallPushLog {
+    long long frames = 0;       // frames the gun was held and checked
+    long long pushed = 0;       // frames it was pushed out of something
+    double push_max = 0;        // largest push, cm
+    long long jumps = 0;        // frames the push changed by over 3 cm
+    double jump_max = 0;        // largest change from one frame to the next, cm
+    long long eyes_inside = 0;  // frames the eyes were inside something (no push)
+    std::string worst_what;     // what the largest push was against
+};
+std::mutex g_push_log_mutex;
+WallPushLog g_push_log;
+
+std::string WallPushReport(double) {
+    WallPushLog w;
+    {
+        std::lock_guard<std::mutex> lock(g_push_log_mutex);
+        w = g_push_log;
+        g_push_log = {};
+    }
+    if (w.pushed == 0 && w.eyes_inside == 0) return {};
+    char b[400];
+    std::snprintf(b, sizeof(b),
+                  "gun wall push: the held gun was pushed out of something in %lld of %lld frames (most %.1f cm, "
+                  "against %s); the push changed by over 3 cm in a frame %lld times (worst %.1f cm); eyes inside "
+                  "something (no push) %lld frames",
+                  w.pushed, w.frames, w.push_max, w.worst_what.empty() ? "nothing" : w.worst_what.c_str(), w.jumps,
+                  w.jump_max, w.eyes_inside);
+    return b;
+}
+
+// One line from the eyes to `to` against the world. True with the first
+// surface's point and normal (and what it belongs to); false when the way
+// is clear. *eyes_inside: the line started inside something.
+bool EyeLine(UObject ksl, UObject gps, UObject player, const FVector& from, const FVector& to,
+             const std::vector<UObject>& ignore, FVector* at, FVector* normal, UObject* what, bool* eyes_inside) {
+    TArrayRaw arr{ignore.data(), static_cast<int32_t>(ignore.size()), static_cast<int32_t>(ignore.size())};
+    ue::Call t(ksl, "LineTraceSingle");
+    t.Set("WorldContextObject", player).Set("Start", from).Set("End", to)
+        .Set("TraceChannel", uint8_t{0}).Set("bTraceComplex", false).Set("ActorsToIgnore", arr)
+        .Set("bIgnoreSelf", true);
+    if (!t.Invoke() || !t.Result<bool>()) return false;
+    int32_t hit_size = 0;
+    uint8_t* hit = t.Raw("OutHit", &hit_size);
+    if (!hit) return false;
+    ue::Call b(gps, "BreakHitResult");
+    int32_t in_size = 0;
+    uint8_t* in = b.Raw("Hit", &in_size);
+    if (!in || in_size != hit_size) return false;
+    std::memcpy(in, hit, static_cast<size_t>(hit_size));
+    if (!b.Invoke() || !b.Get<bool>("bBlockingHit")) return false;
+    if (b.Get<bool>("bInitialOverlap")) {
+        *eyes_inside = true;
+        return false;
+    }
+    *at = b.Get<FVector>("ImpactPoint");
+    *normal = b.Get<FVector>("ImpactNormal");
+    *what = b.Get<UObject>("HitActor");
+    return true;
+}
+
+// Keeps the held gun out of walls, like Half-Life: Alyx: the line from the
+// eyes to the muzzle finds what is in the way, and the whole gun moves out of
+// it along that surface (view_lead::WallPushOut; the hand on the gun follows
+// it), so against a wall it slides along it instead of coming back toward the
+// face. Twice, for a corner between two surfaces. Returns the offset to add
+// to the gun's location.
 FVector WallPushback(UObject gun, const FQuat& frame, const FVector& grip) {
     if (!g_set.wall_collision) return FVector{};
     // Looked up once: FindObject is a full object scan, too slow per frame.
@@ -850,31 +917,55 @@ FVector WallPushback(UObject gun, const FQuat& frame, const FVector& grip) {
     hands::Pose head;
     UObject player = game::Player();
     if (!ksl || !gps || !player || !hands::Head(&head)) return FVector{};
-    FVector muzzle = grip + frame.Rotate(FVector{W.muzzle_dist, 0, 0});
-    UObject ignore[3] = {gun, W.held_mag, W.pouch_mag};
-    int32_t n = 1 + (W.held_mag ? 1 : 0);
-    if (W.pouch_mag) ignore[n++] = W.pouch_mag;
-    TArrayRaw arr{ignore, n, n};
-    ue::Call t(ksl, "LineTraceSingle");
-    t.Set("WorldContextObject", player).Set("Start", head.location).Set("End", muzzle)
-        .Set("TraceChannel", uint8_t{0}).Set("bTraceComplex", false).Set("ActorsToIgnore", arr)
-        .Set("bIgnoreSelf", true);
-    if (!t.Invoke() || !t.Result<bool>()) return FVector{};
-    int32_t hit_size = 0;
-    uint8_t* hit = t.Raw("OutHit", &hit_size);
-    if (!hit) return FVector{};
-    ue::Call b(gps, "BreakHitResult");
-    int32_t in_size = 0;
-    uint8_t* in = b.Raw("Hit", &in_size);
-    if (!in || in_size != hit_size) return FVector{};
-    std::memcpy(in, hit, static_cast<size_t>(hit_size));
-    if (!b.Invoke() || !b.Get<bool>("bBlockingHit")) return FVector{};
-    FVector at = b.Get<FVector>("Location");
-    FVector dir = Norm(muzzle - head.location);
-    // Muzzle rests 1 cm short of the surface.
-    double back = DotV(muzzle - at, dir) + 1.0;
-    if (back <= 0) return FVector{};
-    return dir * -back;
+    const FVector muzzle = grip + frame.Rotate(FVector{W.muzzle_dist, 0, 0});
+    // Not the gun or what the hands hold, and not the forearm menu or wrist
+    // HUD (they sit in front of the eyes whenever the left wrist is up).
+    std::vector<UObject> ignore{gun};
+    if (W.held_mag) ignore.push_back(W.held_mag);
+    if (W.pouch_mag) ignore.push_back(W.pouch_mag);
+    const hands::HandGrab left = hands::GetGrab(hands::kLeft);
+    if (left.object && left.object != gun) ignore.push_back(left.object);
+    if (UObject holder = static_cast<UObject>(world_menu::PanelHolder())) ignore.push_back(holder);
+    constexpr double kClearanceCm = 1.0, kMaxPushCm = 40.0;
+    FVector push;
+    bool eyes_inside = false;
+    UObject what = 0;
+    for (int pass = 0; pass < 2; ++pass) {
+        FVector at, normal;
+        UObject hit_what = 0;
+        if (!EyeLine(ksl, gps, player, head.location, muzzle + push, ignore, &at, &normal, &hit_what, &eyes_inside))
+            break;
+        const FVector more = view_lead::WallPushOut(muzzle + push, at, normal, kClearanceCm, kMaxPushCm);
+        if (Len(more) < 0.01) break;
+        push = push + more;
+        if (!what) what = hit_what;
+    }
+    if (Len(push) > kMaxPushCm) push = push * (kMaxPushCm / Len(push));
+    // For the log.
+    static FVector s_last;
+    static double s_last_clock = -1;
+    const bool follows = s_last_clock >= 0 && g_clock - s_last_clock < 0.1;
+    const double step = follows ? Len(push - s_last) : 0.0;
+    s_last = push;
+    s_last_clock = g_clock;
+    const double size = Len(push);
+    bool most = false;
+    {
+        std::lock_guard<std::mutex> lock(g_push_log_mutex);
+        ++g_push_log.frames;
+        if (eyes_inside) ++g_push_log.eyes_inside;
+        if (size > 0) ++g_push_log.pushed;
+        if (step > 3.0) ++g_push_log.jumps;
+        if (step > g_push_log.jump_max) g_push_log.jump_max = step;
+        most = size > g_push_log.push_max;
+        if (most) g_push_log.push_max = size;
+    }
+    if (most) {
+        const std::string name = what ? ue::GetName(what) : std::string("something");
+        std::lock_guard<std::mutex> lock(g_push_log_mutex);
+        if (g_push_log.push_max == size) g_push_log.worst_what = name;
+    }
+    return push;
 }
 
 // Rifle stock: finds the back end of the gun (the butt pad) from the
@@ -2431,13 +2522,14 @@ void HandInteract(UObject player, int hand) {
     if (!hands::GetInteraction(static_cast<hands::Hand>(hand)).AllowsControls()) return;
     // One interact per 0.5 s across both hands: some things (the hole's
     // countdown) toggle on each Interact, so a two-hand press cancelled itself.
+    // Only after something was used: a press that found nothing doesn't
+    // hold up the next try.
     static double s_last = -10.0;
     if (g_clock - s_last < 0.5) {
         log::Info("controls: interact (%s hand) ignored, %.2f s after the last one",
                   hand == input::kLeft ? "left" : "right", g_clock - s_last);
         return;
     }
-    s_last = g_clock;
     UObject game_target = 0;
     ue::GetProp(player, "InteractTarget", game_target);
     if (game_target && !LiveObject(game_target)) game_target = 0;
@@ -2446,17 +2538,18 @@ void HandInteract(UObject player, int hand) {
         if (a && LiveObject(a)) ignore.push_back(a);
     const touch::Pick pick = touch::PickForHand(player, hand, ignore);
     const char* side = hand == input::kLeft ? "left" : "right";
-    input::Haptic(static_cast<input::Hand>(hand), 0.2f, 0.02f);
     const UObject target = pick.actor ? pick.actor : game_target;
     if (!target) {
+        // No buzz: a press that buzzes did something.
         log::Info("controls: interact (%s hand): nothing touched, pointed at or looked at", side);
         return;
     }
     if (touch::RecentlyUsed(target, 0.8)) {
-        log::Info("controls: interact (%s hand) on %s skipped: a touch used it a moment ago", side,
-                  ue::GetName(target).c_str());
+        log::Info("controls: interact (%s hand) on %s skipped: used a moment ago", side, ue::GetName(target).c_str());
         return;
     }
+    s_last = g_clock;
+    input::Haptic(static_cast<input::Hand>(hand), 0.35f, 0.04f);
     char why[96];
     std::snprintf(why, sizeof(why), "%s hand trigger, %s", side, pick.actor ? pick.how : "looking at");
     touch::InteractThroughGame(player, target, why);
@@ -4716,6 +4809,7 @@ void Init() {
     LoadMagSeats();
     config::AddChangeListener(&ReloadSettings);
     game::AddTickListener(&OnTick);
+    perf::AddReportLine(&WallPushReport);
     log::Info("controls: ready (%s turn, move by %s)", g_set.smooth_turn ? "smooth" : "snap",
               g_set.move_with_hand ? "hand" : "head");
 }

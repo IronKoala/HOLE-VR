@@ -584,6 +584,18 @@ const Block kBlocks[] = {
      "; 1 = log what each kind of thing is made of and save its game code in\n"
      "; dump/script (once a run), to improve this feature.\n"
      "touch_interact_study=1\n"},
+    {"touch_interact_point_cone_deg",
+     "\n"
+     "; --- Trigger interact aim ---\n"
+     "; The trigger with an empty hand uses, in order: what the hand touches or is\n"
+     "; within trigger_near_cm of; what it points at exactly; the thing nearest the\n"
+     "; aim within point_cone_deg (or point_min_cm) of it, not through a wall; then\n"
+     "; where you look.\n"
+     "touch_interact_trigger_near_cm=8\n"
+     "touch_interact_point_cone_deg=8\n"
+     "touch_interact_point_min_cm=6\n"
+     "; 1 = log where each item that appears during a level goes (first 80 a level).\n"
+     "touch_interact_loot_log=1\n"},
     {"drinks_by_hand",
      "\n"
      "; --- Drink machine by hand (hub) ---\n"
