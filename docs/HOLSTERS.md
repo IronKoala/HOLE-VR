@@ -96,8 +96,34 @@ Settings (hole-vr.ini): `holster_pistol`, `holster_pistol_grip_toggle`,
 - `holster: moved the pistol holster to your chest, (...) cm, N cm from its centre, at the angle you held it`
   after placing one, then `holster: saved to holsters.ini`.
 
-## Later: rifle slots
+## Rifle holster (owner, 2026-11-04: "place it behind my right shoulder")
 
-`HolsterId::kRifle` (chest anchor, across the back) and `kRifleMag` (belt
-front) are defined but disabled. Rifles (`BP_AR_*`) have no holster yet and
-stay in the hand as before; the pouch holds the current gun's magazines.
+The game hangs the rifle on `WeaponLocation_Back`, which with the VR body put
+its grip about 42 cm behind the headset; the owner's log shows about 20 right
+squeezes 27-58 cm from it before one took it. `HolsterId::kRifle` is now a
+real holster:
+
+- Default: on the chest anchor, (-14, 14, 6) cm (behind the right shoulder),
+  zone 18 cm. Hanging (`interact::RifleBackFrame`, 30 degrees): grip up at the
+  shoulder, muzzle down the back toward the left, receiver top against the
+  back so the grip and magazine stick out behind you.
+- Taking it: squeeze the right grip anywhere in the zone (rifle carry's
+  `right_on_rifle_grip`, as well as the old 14 cm from the grip). The left hand
+  can still take it by the handguard. A light buzz when the free right hand
+  reaches the zone.
+- Putting it away: everything that used to send the rifle back to the game's
+  spot (left hand lets go, drawing the pistol) now flies it to the holster.
+  With the holster on the rifle stays detached from the game's spot; the late
+  tick places it after the body pose (`PlaceRifleInHolster`), whether or not it
+  is the current gun. `RifleSpotPose` returns `RifleHolsterPose`; `PlaceRifle`
+  no longer calls `ReattachRifle` while the holster is on.
+- Moving it: VR tab > Move holsters, then during the 5 s countdown hold the
+  rifle in the right hand where you want it, at the angle you want.
+- `holster_rifle=0` goes back to the game's own spot. Settings
+  `holster_rifle_forward_cm`, `_right_cm`, `_up_cm`, `_radius_cm`.
+- Log: `holster: rifle resting in its holster on your chest, grab spot N cm
+  from the headset`, `rifle carry: right grab ... inside the rifle holster zone`,
+  `holster: moved the rifle holster to ...`.
+
+Still to come: `kRifleMag` (rifle magazine slot). The pouch holds the current
+gun's magazines and is moved only with the pistol out.

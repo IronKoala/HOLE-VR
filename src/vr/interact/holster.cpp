@@ -71,11 +71,13 @@ HolsterSpot DefaultSpot(HolsterId id) {
             s.hand = 0;
             break;
         case HolsterId::kRifle:
-            // Not built yet: rifle across the back.
-            s.enabled = false;
+            // Behind the right shoulder (owner, 2026-11-04): where the right
+            // hand reaches back over the shoulder for the rifle's grip. Rides
+            // on the chest so it follows the torso. A wide zone, since you
+            // reach for it without seeing it.
             s.anchor = HolsterAnchor::kChest;
-            s.offset = FVector{-16, 0, 4};
-            s.radius = 16.0;
+            s.offset = FVector{-14, 14, 6};
+            s.radius = 18.0;
             s.hand = 1;
             break;
         case HolsterId::kRifleMag:
@@ -223,6 +225,17 @@ FQuat PistolHolsterFrame(const FQuat& body_rot, double cant_deg) {
     const FVector top{std::cos(c), 0, -std::sin(c)};      // slide toward the front
     const FVector right{0, 1, 0};                         // the gun's right side faces out
     return body_rot * FromAxes(barrel, right, top);
+}
+
+FQuat RifleBackFrame(const FQuat& anchor_rot, double slant_deg) {
+    const double a = slant_deg * kDegToRad;
+    // Anchor frame: X forward, Y right, Z up. The grip at the right shoulder,
+    // the muzzle down the back and toward the left; the receiver's top lies
+    // against the back, so the grip and magazine stick out behind you.
+    const FVector barrel{0, -std::sin(a), -std::cos(a)};
+    const FVector top{1, 0, 0};
+    const FVector right = Cross(top, barrel);
+    return anchor_rot * FromAxes(barrel, right, top);
 }
 
 FQuat MagPouchGunFrame(const FQuat& body_rot, double rake_deg) {
