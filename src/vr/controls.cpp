@@ -648,6 +648,7 @@ struct WeaponState {
     FQuat edit_gun_rot;
     bool have_stock = false;
     bool shouldered = false;
+    double shouldered_at = -1;    // g_clock when the blend reached full
     double shoulder_blend = 0;    // 0 hands only .. 1 pivoting from the shoulder
     FVector gun_set_loc;          // where HoldGun put the gun this frame
     // Holster: the pistol lives on the right hip and the right grip holds it.
@@ -1071,6 +1072,39 @@ bool AimingEye(FVector* out) {
     return true;
 }
 
+// Owner 2026-11-04: "the next time i shoulder the rifle can you take a
+// screen shot from my right eye". After the rifle has sat on the shoulder
+// for a second, saves what the headset shows (capture-shoulder-N.bmp, both
+// eyes) and logs where the aiming eye is relative to the sights, at most
+// three times a run, 8 s apart.
+void ShoulderCapture(const FQuat& hand, const FVector& grip_w) {
+    static int taken = 0;
+    static double next_at = 0;
+    if (W.shoulder_blend < 1.0) {
+        W.shouldered_at = -1;
+        return;
+    }
+    if (W.shouldered_at < 0) W.shouldered_at = g_clock;
+    if (taken >= 3 || g_clock < next_at || g_clock - W.shouldered_at < 1.0) return;
+    FVector eye;
+    hands::Pose head;
+    if (!AimingEye(&eye) || !hands::Head(&head)) return;
+    ++taken;
+    next_at = g_clock + 8.0;
+    char tag[32];
+    std::snprintf(tag, sizeof(tag), "shoulder-%d", taken);
+    xr::RequestCapture(tag);
+    // The eye in the gun frame (X barrel, Y right, Z up, from the grip).
+    const FVector e = hand.Inverse().Rotate(eye - grip_w);
+    const FVector rel = e - W.ads_local;
+    const FVector fwd = head.rotation.Rotate(FVector{1, 0, 0});
+    const FVector bore = hand.Rotate(FVector{1, 0, 0});
+    const double off = std::acos(std::fmax(-1.0, std::fmin(1.0, DotV(fwd, bore)))) * 180.0 / 3.14159265358979;
+    log::Info("controls: shoulder picture %d: aiming eye is %.1f cm behind the sight point, %.1f right, %.1f up of it; "
+              "sight point (%.1f %.1f %.1f) from the grip; butt at %.1f; head looks %.0f deg off the barrel",
+              taken, -rel.X, rel.Y, rel.Z, W.ads_local.X, W.ads_local.Y, W.ads_local.Z, W.stock_local.X, off);
+}
+
 // Where the butt goes when the aiming eye looks down the sights: the
 // shoulder pocket, worked out from the headset and the gun's own geometry.
 bool ShoulderPocket(FVector* out) {
@@ -1171,6 +1205,7 @@ void HoldGun(game::Gun& gun, const hands::HandState& rh) {
                 grip_w = grip_w + (gs - grip_w) * W.shoulder_blend;
             }
         }
+        ShoulderCapture(hand, grip_w);
     } else {
         W.shouldered = false;
         W.shoulder_blend = 0;
