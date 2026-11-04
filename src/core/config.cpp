@@ -566,6 +566,18 @@ const Block kBlocks[] = {
      "workbench_snap_cm=5\n"
      "; Walk this far from a pistol lying on a table and it goes back to the holster (m).\n"
      "workbench_walk_away_m=3\n"},
+    {"workbench_zone",
+     "\n"
+     "; Once the workbench is bought: a see-through green box stands on the edge of\n"
+     "; its table where you walk up to it; let go of the pistol in it and it is held\n"
+     "; there upright. 1 = on. Its size (cm), how far out from the table edge it\n"
+     "; sits (0 = centred on the edge) and how high above the table top.\n"
+     "workbench_zone=1\n"
+     "workbench_zone_width_cm=34\n"
+     "workbench_zone_height_cm=26\n"
+     "workbench_zone_depth_cm=14\n"
+     "workbench_zone_out_cm=0\n"
+     "workbench_zone_lift_cm=2\n"},
     {"touch_interact",
      "\n"
      "; --- Touch interact: rest an empty hand on a thing ---\n"

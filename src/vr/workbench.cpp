@@ -56,6 +56,11 @@ struct Settings {
     double walk_away_cm = 300.0;
     double bench_reach_cm = 250.0;  // unlocked bench: let go this close to it to lay the gun down
     double rest_cm = 1.7;           // grab point above the table when the pistol lies on its side
+    // The green zone at the unlocked bench (cm): size along the table edge,
+    // height, depth; how far it sits out from the edge (0 = centred on it)
+    // and above the table top; how far outside it a let-go still counts.
+    bool zone = true;
+    double zone_w = 34.0, zone_h = 26.0, zone_d = 14.0, zone_out = 0.0, zone_lift = 2.0, zone_margin = 8.0;
 } S;
 
 // ---------------------------------------------------------------- engine helpers
@@ -367,6 +372,7 @@ struct Session {
     FVector anchor;     // where the gun was laid down
     FVector along;      // barrel direction, flat
     FVector toward;     // from the gun toward the player, flat
+    FVector row;        // middle of the row of spare parts on the table
     double surface_z = 0;
     std::vector<FName> owned;
     bool dirty = false; // the table needs laying out again
@@ -561,7 +567,7 @@ void LayOutTable() {
         }
         l.rest_rot = rot;
         l.have_rest = true;
-        FVector spot = T.anchor + T.toward * 14.0 + T.along * ((i - (n - 1) * 0.5) * 9.0);
+        FVector spot = T.row + T.along * ((i - (n - 1) * 0.5) * 9.0);
         double surface = T.surface_z;
         FVector at, normal;
         std::string what;
@@ -605,10 +611,220 @@ void StartSession(UObject gun, const FVector& anchor, const FQuat& frame, double
     to.Z = 0;
     to = to - T.along * Dot(to, T.along);
     T.toward = Len(to) > 1.0 ? Norm(to) : Norm(Cross(FVector{0, 0, 1}, T.along));
+    T.row = anchor + T.toward * 14.0;
     T.surface_z = surface_z;
     custom::Purchased(custom::GameInstance(L.player), &T.owned);
     for (auto& l : g_table) l.have_rest = false;
     T.dirty = true;
+}
+
+// ---------------------------------------------------------------- the green zone
+std::string ListParts(UObject gun);
+
+// Owner 2026-11-04 at the bought bench: "its really hard to reach the table
+// (it was modeled for flatscreen after all)". A see-through green (#00FF8D)
+// box stands upright on the edge of the bench's table, on the side you walk
+// up to. Let go of the pistol inside it and it is held there upright (grip
+// down, barrel along the edge), like in a vise; the spare parts lie on the
+// table right behind it. Placed once per hub visit, the first time you come
+// near the bench; only used once the workbench is bought.
+struct Zone {
+    bool placed = false;
+    bool failed = false;
+    FVector center;     // world
+    FVector along;      // the table edge, flat
+    FVector out;        // from the table toward you, flat
+    double table_z = 0;
+    UObject actor = 0;
+    bool shown = false;
+} Z;
+
+// The bench's table (its DS_Workbench mesh) as a flat box in the world.
+struct TableBox {
+    FVector c, ax, ay;
+    double hx = 0, hy = 0, top = 0;
+};
+
+FVector Flatten(const FVector& v) { return Norm(FVector{v.X, v.Y, 0}); }
+
+bool BenchTable(TableBox* t) {
+    UObject comp = 0, sm = 0;
+    if (!LiveObject(L.bench) || !ue::GetProp(L.bench, "DS_Workbench", comp) || !comp) return false;
+    if (!ue::GetProp(comp, "StaticMesh", sm) || !sm) return false;
+    ue::Call b(sm, "GetBoundingBox");
+    if (!b.Invoke()) return false;
+    int32_t size = 0;
+    const uint8_t* raw = b.Raw("ReturnValue", &size);
+    if (!raw || size < 48) return false;
+    double v[6];
+    std::memcpy(v, raw, sizeof(v));
+    const Xf x = ComponentToWorld(comp);
+    const FVector a{v[0] * x.scale.X, v[1] * x.scale.Y, v[2] * x.scale.Z};
+    const FVector c{v[3] * x.scale.X, v[4] * x.scale.Y, v[5] * x.scale.Z};
+    const FVector lo{std::min(a.X, c.X), std::min(a.Y, c.Y), std::min(a.Z, c.Z)};
+    const FVector hi{std::max(a.X, c.X), std::max(a.Y, c.Y), std::max(a.Z, c.Z)};
+    if (hi.X - lo.X < 20 || hi.Y - lo.Y < 20) return false;
+    t->c = x.translation + x.rotation.Rotate((lo + hi) * 0.5);
+    t->ax = Flatten(x.rotation.Rotate(FVector{1, 0, 0}));
+    t->ay = Flatten(x.rotation.Rotate(FVector{0, 1, 0}));
+    t->hx = (hi.X - lo.X) * 0.5;
+    t->hy = (hi.Y - lo.Y) * 0.5;
+    t->top = t->c.Z + (hi.Z - lo.Z) * 0.5;
+    return true;
+}
+
+// Puts the zone on the edge of the table nearest `head`, at the point of that
+// edge nearest it (kept inside the edge).
+void PlaceZone(const FVector& head) {
+    TableBox t;
+    if (!BenchTable(&t)) {
+        if (!Z.failed) log::Warn("workbench: could not read the bench's table (DS_Workbench), no green zone");
+        Z.failed = true;
+        return;
+    }
+    const FVector d = head - t.c;
+    const double u = Dot(d, t.ax), v = Dot(d, t.ay);
+    // The side you stand at: the one you are furthest outside of.
+    const bool x_side = std::fabs(u) - t.hx > std::fabs(v) - t.hy;
+    const FVector out = x_side ? t.ax * (u >= 0 ? 1.0 : -1.0) : t.ay * (v >= 0 ? 1.0 : -1.0);
+    const FVector along = x_side ? t.ay : t.ax;
+    const double depth = x_side ? t.hx : t.hy, half = x_side ? t.hy : t.hx;
+    const double room = std::max(0.0, half - S.zone_w * 0.5);
+    const double s = std::clamp(x_side ? v : u, -room, room);
+    const FVector edge = t.c + out * depth + along * s;
+    // The table top just inside that edge (things lying on it are fine).
+    double top = t.top;
+    std::vector<UObject> ignore{L.player};
+    AddAttached(L.player, &ignore);
+    FVector at, normal;
+    std::string what;
+    const FVector probe = edge - out * 6.0;
+    if (TraceDown(L.player, FVector{probe.X, probe.Y, t.top + 40}, FVector{probe.X, probe.Y, t.top - 80}, ignore, &at,
+                  &normal, &what) &&
+        normal.Z > 0.7)
+        top = at.Z;
+    Z.placed = true;
+    Z.out = out;
+    Z.along = along;
+    Z.table_z = top;
+    Z.center = edge + out * S.zone_out;
+    Z.center.Z = top + S.zone_lift + S.zone_h * 0.5;
+    log::Info("workbench: green zone at (%.0f %.0f %.0f), on the table edge you stand at (%.0f cm along it from its "
+              "middle, %.0f cm long); table %.0f x %.0f cm, top at %.0f (traced %s); you are %.0f cm from it",
+              Z.center.X, Z.center.Y, Z.center.Z, s, half * 2, t.hx * 2, t.hy * 2, top, what.empty() ? "nothing" :
+              what.c_str(), Flat(head, Z.center));
+}
+
+bool InZone(const FVector& p, double margin) {
+    const FVector d = p - Z.center;
+    return Z.placed && std::fabs(Dot(d, Z.along)) <= S.zone_w * 0.5 + margin &&
+           std::fabs(Dot(d, Z.out)) <= S.zone_d * 0.5 + margin && std::fabs(d.Z) <= S.zone_h * 0.5 + margin;
+}
+
+// The see-through box: a plain engine cube with the engine's see-through
+// widget material (one-sided, unlit), tinted #00FF8D.
+UObject MakeZoneActor() {
+    static UObject sma = ue::FindObject("Class /Script/Engine.StaticMeshActor");
+    static UObject cube = ue::FindObject("StaticMesh /Engine/BasicShapes/Cube.Cube");
+    static UObject white = ue::FindObject("Texture2D /Engine/EngineResources/WhiteSquareTexture.WhiteSquareTexture");
+    static UObject base = [] {
+        UObject m = 0;
+        UObject cdo = ue::FindObject("WidgetComponent /Script/UMG.Default__WidgetComponent");
+        if (cdo) ue::GetProp(cdo, "TranslucentMaterial_OneSided", m);
+        return m;
+    }();
+    if (!sma || !cube) {
+        log::Warn("workbench: green zone: engine cube not found (actor class %s, cube %s)", sma ? "ok" : "missing",
+                  cube ? "ok" : "missing");
+        return 0;
+    }
+    UObject a = SpawnActor(L.player, sma, Z.center, FQuat{});
+    UObject comp = 0;
+    if (!a || !ue::GetProp(a, "StaticMeshComponent", comp) || !comp) {
+        if (a) DestroyActor(a);
+        log::Warn("workbench: green zone: could not make its actor");
+        return 0;
+    }
+    ue::Call mob(comp, "SetMobility");
+    mob.Set("NewMobility", uint8_t{2});
+    mob.Invoke();
+    ue::Call sm(comp, "SetStaticMesh");
+    sm.Set("NewMesh", cube);
+    sm.Invoke();
+    ue::Call col(comp, "SetCollisionEnabled");
+    col.Set("NewType", uint8_t{0});
+    col.Invoke();
+    ue::Call sh(comp, "SetCastShadow");
+    sh.Set("NewCastShadow", false);
+    sh.Invoke();
+    bool tinted = false;
+    FName tint{}, from_tex{}, slate{};
+    if (base && ue::names::Find("TintColorAndOpacity", &tint)) {
+        ue::Call mid(comp, "CreateDynamicMaterialInstance");
+        mid.Set("ElementIndex", int32_t{0}).Set("SourceMaterial", base);
+        UObject m = mid.Invoke() ? mid.Result<UObject>() : 0;
+        if (m) {
+            // #00FF8D in linear colour, see-through.
+            struct { float r, g, b, a; } c{0.0f, 1.0f, 0.266f, 0.3f};
+            ue::Call v(m, "SetVectorParameterValue");
+            v.Set("ParameterName", tint).Set("Value", c);
+            tinted = v.Invoke();
+            if (ue::names::Find("OpacityFromTexture", &from_tex)) {
+                ue::Call f(m, "SetScalarParameterValue");
+                f.Set("ParameterName", from_tex).Set("Value", 0.0f);
+                f.Invoke();
+            }
+            if (white && ue::names::Find("SlateUI", &slate)) {
+                ue::Call tx(m, "SetTextureParameterValue");
+                tx.Set("ParameterName", slate).Set("Value", white);
+                tx.Invoke();
+            }
+        }
+    }
+    ue::Call sc(a, "SetActorScale3D");
+    sc.Set("NewScale3D", FVector{S.zone_w / 100.0, S.zone_d / 100.0, S.zone_h / 100.0});
+    sc.Invoke();
+    SetActorPose(a, Z.center, FromAxes(Z.along, Z.out, FVector{0, 0, 1}));
+    log::Info("workbench: green zone made (%s, %s; white texture %s)", ue::GetName(a).c_str(),
+              tinted ? "see-through green" : "NOT tinted: plain cube", white ? "found" : "not found");
+    return a;
+}
+
+void ShowZone(bool show) {
+    if (show && !LiveObject(Z.actor)) {
+        Z.actor = MakeZoneActor();
+        Z.shown = true;
+        if (!Z.actor) {
+            Z.failed = true;
+            return;
+        }
+    }
+    if (!Z.actor || show == Z.shown) return;
+    SetHidden(Z.actor, !show);
+    Z.shown = show;
+}
+
+// Let go inside the zone: the pistol is held there upright, barrel along the
+// edge the way it pointed, grip down; the spare parts lie on the table just
+// behind it.
+void ParkInZone(UObject gun, const FQuat& frame) {
+    const FVector up{0, 0, 1};
+    const FVector x = Z.along * (Dot(frame.Rotate(FVector{1, 0, 0}), Z.along) >= 0 ? 1.0 : -1.0);
+    const FVector y = Cross(up, x);
+    P.on = true;
+    P.gun = gun;
+    P.frame = FromAxes(x, y, up);
+    // The hand's grip point sits behind and below the middle of the gun:
+    // put it there so the gun itself fills the box.
+    P.spot = Z.center - x * 5.0 - up * 4.0;
+    P.surface_z = Z.table_z;
+    StartSession(gun, P.spot, P.frame, Z.table_z);
+    T.toward = Z.out;
+    T.row = Z.center - Z.out * (S.zone_d * 0.5 + 8.0);
+    T.row.Z = Z.table_z;
+    log::Info("workbench: pistol held upright in the green zone at (%.0f %.0f %.0f), barrel %s along the edge; it "
+              "carries %s",
+              P.spot.X, P.spot.Y, P.spot.Z, Dot(x, Z.along) > 0 ? "one way" : "the other way", ListParts(gun).c_str());
 }
 
 // ---------------------------------------------------------------- grabbing
@@ -1139,6 +1355,7 @@ void OnTick(UObject player, float dt) {
     if (player != L.player) {
         EndSession("new level", true);
         L = Level();
+        Z = Zone{};  // its actor went with the level
         L.player = player;
         g_claim[0] = g_claim[1] = Claim{};
     }
@@ -1159,6 +1376,17 @@ void OnTick(UObject player, float dt) {
     CheckFacility();
     if (!S.enabled) return;
 
+    // The green zone at the bought bench: placed the first time you come
+    // within 3 m of the bench, shown while you are within 4 m of it.
+    if (S.zone && L.unlocked && !Z.failed) {
+        hands::Pose head;
+        if (hands::Head(&head)) {
+            if (!Z.placed && Flat(head.location, L.bench_loc) < 300.0) PlaceZone(head.location);
+            if (Z.placed) ShowZone(Flat(head.location, Z.center) < 400.0);
+        }
+    } else if (Z.shown) {
+        ShowZone(false);
+    }
     // The parked gun went away (switched weapon, the game replaced it).
     if (P.on && (!LiveObject(P.gun) || CurrentGun() != P.gun)) EndSession("the pistol is gone from the table");
     if (T.on && (!LiveObject(T.gun) || CurrentGun() != T.gun)) EndSession("weapon changed");
@@ -1224,7 +1452,17 @@ bool ParkedGun(UObject gun, FVector* spot, FQuat* frame) {
 bool TryPark(UObject gun, const FQuat& frame, const FVector& hand) {
     P.on = false;
     if (!S.enabled || !L.player || (!L.bench && !L.facility) || !gun) return false;
-    if (L.unlocked) {
+    if (L.unlocked && S.zone) {
+        // The bought bench: only the green zone.
+        hands::Pose head;
+        if (!Z.placed && !Z.failed && hands::Head(&head)) PlaceZone(head.location);
+        if (Z.placed) {
+            if (!InZone(hand, S.zone_margin)) return false;
+            ParkInZone(gun, frame);
+            return true;
+        }
+        if (Flat(hand, L.bench_loc) > S.bench_reach_cm) return false;
+    } else if (L.unlocked) {
         if (Flat(hand, L.bench_loc) > S.bench_reach_cm) return false;
     } else if (!S.tables_before_unlock) {
         return false;
@@ -1306,6 +1544,12 @@ void Init() {
     S.grab_cm = config::GetFloat("workbench_grab_cm", 3.0f);
     S.snap_cm = config::GetFloat("workbench_snap_cm", 5.0f);
     S.walk_away_cm = config::GetFloat("workbench_walk_away_m", 3.0f) * 100.0;
+    S.zone = config::GetBool("workbench_zone", true);
+    S.zone_w = config::GetFloat("workbench_zone_width_cm", 34.0f);
+    S.zone_h = config::GetFloat("workbench_zone_height_cm", 26.0f);
+    S.zone_d = config::GetFloat("workbench_zone_depth_cm", 14.0f);
+    S.zone_out = config::GetFloat("workbench_zone_out_cm", 0.0f);
+    S.zone_lift = config::GetFloat("workbench_zone_lift_cm", 2.0f);
     game::AddTickListener(&OnTick);
 }
 
