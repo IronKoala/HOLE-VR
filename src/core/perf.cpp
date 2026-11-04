@@ -1,14 +1,20 @@
 #include "core/perf.h"
 
+#include <cstdio>
+#include <cstring>
 #include <mutex>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "core/log.h"
 
 namespace holevr::perf {
 namespace {
 std::mutex g_mutex;
-Counter* g_counters[48];
+// The default features currently register 51 distinct counters.
+constexpr int kMaxCounters = 64;
+Counter* g_counters[kMaxCounters];
 int g_count = 0;
 ReportFn g_lines[8];
 int g_line_count = 0;
@@ -17,8 +23,11 @@ double g_interval_s = 10.0;
 }  // namespace
 
 void Register(Counter* c) {
+    if (!c) return;
     std::lock_guard<std::mutex> lock(g_mutex);
-    if (g_count < 48) g_counters[g_count++] = c;
+    for (int i = 0; i < g_count; ++i)
+        if (g_counters[i] == c) return;
+    if (g_count < kMaxCounters) g_counters[g_count++] = c;
 }
 
 void AddReportLine(ReportFn fn) {
@@ -36,6 +45,7 @@ void SetReportInterval(double seconds) {
 void MaybeReport() {
     double now = NowMs();
     std::string line;
+    std::vector<std::string> chunks;
     ReportFn lines[8];
     int line_count = 0;
     double span_s;
@@ -59,6 +69,14 @@ void MaybeReport() {
                                     worst, n / span_s);
             if (c->per_second_total && len > 0 && len < static_cast<int>(sizeof(buf)))
                 std::snprintf(buf + len, sizeof(buf) - len, " = %.1f ms/s", total / span_s);
+            // log::Info has a 2048-byte message buffer. One large report
+            // routinely lost its final counters (171 of 175 reports in the
+            // 2026-11-03 run). Split only between complete counter records.
+            constexpr size_t kMaxPayload = 1800;
+            if (!line.empty() && line.size() + std::strlen(buf) > kMaxPayload) {
+                chunks.push_back(std::move(line));
+                line.clear();
+            }
             line += buf;
         }
         line_count = g_line_count;
@@ -69,7 +87,8 @@ void MaybeReport() {
     // while they waited froze the game on 2026-11-03: the render thread, inside
     // the frame lock, reported and asked for the frame lock again. Only the
     // thread that claimed this report (g_last_report above) gets here.
-    log::Info("perf:%s", line.c_str());
+    if (!line.empty()) chunks.push_back(std::move(line));
+    for (const std::string& chunk : chunks) log::Info("perf:%s", chunk.c_str());
     for (int i = 0; i < line_count; ++i) {
         std::string extra = lines[i](span_s);
         if (!extra.empty()) log::Info("%s", extra.c_str());
