@@ -11,6 +11,7 @@ add_library(hole_vr SHARED
     src/core/log.cpp
     src/core/config.cpp
     src/core/ini_edit.cpp
+    src/core/builtin_files.cpp
     src/core/memory.cpp
     src/core/perf.cpp
     src/core/process_metrics.cpp
@@ -90,6 +91,17 @@ add_custom_target(hole_vr_build_id
 add_dependencies(hole_vr hole_vr_build_id)
 target_include_directories(hole_vr PRIVATE ${HOLEVR_GENERATED_DIR})
 
+# Built-in files (defaults/README.md): every file under defaults/ goes into the
+# DLL and is written to a player's hole-vr folder when missing there.
+file(GLOB_RECURSE HOLEVR_DEFAULT_FILES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/defaults/*)
+set(HOLEVR_BUILTIN_CPP ${HOLEVR_GENERATED_DIR}/generated_builtin_files.cpp)
+add_custom_command(OUTPUT ${HOLEVR_BUILTIN_CPP}
+    COMMAND ${CMAKE_COMMAND} -DSRC_DIR=${CMAKE_SOURCE_DIR}/defaults -DOUT=${HOLEVR_BUILTIN_CPP}
+            -P ${CMAKE_SOURCE_DIR}/cmake/embed_files.cmake
+    DEPENDS ${HOLEVR_DEFAULT_FILES} ${CMAKE_SOURCE_DIR}/cmake/embed_files.cmake
+    VERBATIM)
+target_sources(hole_vr PRIVATE ${HOLEVR_BUILTIN_CPP})
+
 if(MINGW)
     target_compile_options(hole_vr PRIVATE -O2 -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -Wno-cast-function-type)
     # Static runtime so players need no extra DLLs next to the game.
@@ -99,12 +111,42 @@ else()
     set_property(TARGET hole_vr PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
 endif()
 
-# ---- Installer: HOLE-VR-Setup.exe with dxgi.dll embedded ----
-set(DXGI_DLL "${CMAKE_BINARY_DIR}/dxgi.dll")
+# ---- Release dxgi.dll: the same DLL without its debug data ----
+# build/dxgi.dll keeps its debug data (function names, line tables) so crash
+# addresses can be read. Players get build/release/dxgi.dll, about 2 MB
+# smaller; the part taken out is kept beside it as build/release/dxgi.debug
+# (addr2line -e dxgi.debug reads crash addresses from it).
+set(HOLEVR_RELEASE_DIR ${CMAKE_BINARY_DIR}/release)
+set(HOLEVR_RELEASE_DLL ${HOLEVR_RELEASE_DIR}/dxgi.dll)
+if(MINGW)
+    if(NOT CMAKE_OBJCOPY)
+        find_program(CMAKE_OBJCOPY NAMES x86_64-w64-mingw32-objcopy objcopy REQUIRED)
+    endif()
+    if(NOT CMAKE_STRIP)
+        find_program(CMAKE_STRIP NAMES x86_64-w64-mingw32-strip strip REQUIRED)
+    endif()
+    add_custom_command(OUTPUT ${HOLEVR_RELEASE_DLL} ${HOLEVR_RELEASE_DIR}/dxgi.debug
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${HOLEVR_RELEASE_DIR}
+        COMMAND ${CMAKE_OBJCOPY} --only-keep-debug $<TARGET_FILE:hole_vr> ${HOLEVR_RELEASE_DIR}/dxgi.debug
+        COMMAND ${CMAKE_STRIP} --strip-all -o ${HOLEVR_RELEASE_DLL} $<TARGET_FILE:hole_vr>
+        DEPENDS hole_vr
+        VERBATIM)
+else()
+    # MSVC keeps debug data in a separate .pdb already.
+    add_custom_command(OUTPUT ${HOLEVR_RELEASE_DLL}
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${HOLEVR_RELEASE_DIR}
+        COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:hole_vr> ${HOLEVR_RELEASE_DLL}
+        DEPENDS hole_vr
+        VERBATIM)
+endif()
+add_custom_target(hole_vr_release ALL DEPENDS ${HOLEVR_RELEASE_DLL})
+
+# ---- Installer: HOLE-VR-Setup.exe with the release dxgi.dll embedded ----
+set(DXGI_DLL "${HOLEVR_RELEASE_DLL}")
 set(SETUP_MANIFEST "${CMAKE_SOURCE_DIR}/installer/setup.manifest")
 configure_file(installer/setup.rc.in ${CMAKE_BINARY_DIR}/setup.rc @ONLY)
 add_executable(hole_vr_setup WIN32 installer/setup.cpp ${CMAKE_BINARY_DIR}/setup.rc)
-add_dependencies(hole_vr_setup hole_vr)
+add_dependencies(hole_vr_setup hole_vr_release)
 set_source_files_properties(${CMAKE_BINARY_DIR}/setup.rc PROPERTIES
     OBJECT_DEPENDS "${DXGI_DLL};${SETUP_MANIFEST}")
 target_include_directories(hole_vr_setup PRIVATE src)
@@ -113,7 +155,8 @@ target_compile_definitions(hole_vr_setup PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UN
 target_link_libraries(hole_vr_setup PRIVATE comctl32 shell32 ole32 version advapi32 user32)
 if(MINGW)
     target_compile_options(hole_vr_setup PRIVATE -O2 -Wall -Wextra -Wno-missing-field-initializers -municode)
-    target_link_options(hole_vr_setup PRIVATE -municode -static -static-libgcc -static-libstdc++)
+    # -s: the installer ships to players, so no debug data in it either.
+    target_link_options(hole_vr_setup PRIVATE -municode -static -static-libgcc -static-libstdc++ -s)
 else()
     set_property(TARGET hole_vr_setup PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
     # setup.rc already embeds the supplied manifest, including Common Controls
