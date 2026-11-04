@@ -242,4 +242,17 @@ double CameraHeight::Update(double rel_cm, bool crouched, bool crouch_press, boo
     return extra_;
 }
 
+double WallFade(const FVector& eye, const FVector& impact, const FVector& normal, double start, double full,
+                double* gap) {
+    const double len = std::sqrt(normal.X * normal.X + normal.Y * normal.Y + normal.Z * normal.Z);
+    if (len < 0.5 || start <= full) {
+        if (gap) *gap = start;
+        return 0.0;
+    }
+    const FVector d = eye - impact;
+    const double h = (d.X * normal.X + d.Y * normal.Y + d.Z * normal.Z) / len;
+    if (gap) *gap = h;
+    return std::clamp((start - h) / (start - full), 0.0, 1.0);
+}
+
 }  // namespace holevr::vr::comfort

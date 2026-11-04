@@ -235,7 +235,33 @@ static void TestCameraHeight() {
     EXPECT(std::fabs(h.Standing() - 152) < 0.01);
 }
 
+// The head-in-wall fade measures the eyes' distance from the surface along
+// its normal (outside review 2026-11-04, finding 5).
+static void TestWallFade() {
+    double gap = 0;
+    // The review's case: wall at X=0 facing -X, the sweep touched it at
+    // (0, 16.7); the eyes are 11 cm from the wall, 30 cm to the side. Along
+    // the sweep this went fully black; along the normal it is about 31%.
+    const double oblique = WallFade(FVector{-11, 30, 0}, FVector{0, 16.667, 0}, FVector{-1, 0, 0}, 15, 2, &gap);
+    EXPECT(std::fabs(gap - 11.0) < 1e-9);
+    EXPECT(std::fabs(oblique - 4.0 / 13.0) < 1e-9);
+    // Straight on with the same clearance: the same fade.
+    const double straight = WallFade(FVector{-11, 0, 0}, FVector{0, 0, 0}, FVector{-1, 0, 0}, 15, 2);
+    EXPECT(std::fabs(straight - oblique) < 1e-9);
+    // Further than the start: nothing; at the full distance and past the
+    // surface: black. A normal that isn't unit length works the same.
+    EXPECT(WallFade(FVector{-20, 5, 0}, FVector{0, 0, 0}, FVector{-1, 0, 0}, 15, 2) == 0.0);
+    EXPECT(WallFade(FVector{-2, 5, 0}, FVector{0, 0, 0}, FVector{-1, 0, 0}, 15, 2) == 1.0);
+    EXPECT(WallFade(FVector{1, 5, 0}, FVector{0, 0, 0}, FVector{-1, 0, 0}, 15, 2, &gap) == 1.0 && gap < 0.0);
+    EXPECT(std::fabs(WallFade(FVector{-11, 30, 0}, FVector{0, 0, 0}, FVector{-3, 0, 0}, 15, 2) - oblique) < 1e-9);
+    // A floor (normal up) and a sloped surface work the same way.
+    EXPECT(std::fabs(WallFade(FVector{40, -7, 8.5}, FVector{0, 0, 0}, FVector{0, 0, 1}, 15, 2) - 0.5) < 1e-9);
+    // No usable normal: no fade.
+    EXPECT(WallFade(FVector{-1, 0, 0}, FVector{0, 0, 0}, FVector{0, 0, 0}, 15, 2) == 0.0);
+}
+
 int main() {
+    TestWallFade();
     TestTexture();
     TestLevels();
     TestSmoother();
