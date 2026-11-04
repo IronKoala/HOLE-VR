@@ -9,9 +9,8 @@ Code: `src/vr/drinks.cpp`. Settings: the `drinks_*` keys in hole-vr.ini.
 
 ## The game's machine
 
-From the class and object dumps (no bytecode yet; this build adds
-`LCBP_SkillUpgrade` to `dump_script_classes`, so the next run writes
-`dump/script/LCBP_SkillUpgrade*.txt`):
+From the class and object dumps and the machine's bytecode
+(`dump/script/LCBP_SkillUpgrade*.txt`, owner's run 2026-11-04):
 
 - `LCBP_SkillUpgradeNew_C` in `Area000_Home` (actor `LCBP_SkillUpgradeNew_C_2`):
   the machine. Meshes `Home_VendingMachine_Button01..06` (the yellow squares),
@@ -29,7 +28,12 @@ From the class and object dumps (no bytecode yet; this build adds
 
 The owner's 09:18 run (logs/run-1524) bought and drank with the trigger
 interact: a switch, then the slot 3.7 s later. So the game buys on a switch's
-interact and drinks on the slot's interact.
+interact and drinks on the slot's interact. The bytecode agrees: the slot's
+`Interact` calls the machine's `DrinkCan()` when the slot has a can
+(`!IsEmptySlot`) and is open (`IsOpenSlot`). `BuyCan` picks the can mesh by
+drink row (`Home__Can_MaxHP_UP` and five more) and sets it on `Can`; after a
+drink `Can` gets no mesh at all (`SetStaticMesh(none)`), which is why the
+game's can shows "no mesh" afterwards.
 
 ## What the mod does
 
@@ -48,8 +52,21 @@ key does it: the thing's `InteractInOverlay`, the player's `InteractTarget` and
    game still thinks a can is waiting. The can lies through the fist like the
    controller's handle (grip pose +X, little finger to thumb), top at the thumb.
 3. **Open**: a fingertip of the other hand within `drinks_tab_reach_cm` of the
-   tab opens it (the tab is a small engine shape on the can's top; it flips up
-   and a dark opening shows).
+   middle of the can model's own tab opens it (owner 2026-11-04: the tab you
+   open should be the soda can tab on the model, not a separate one). The can
+   is one solid mesh, so its tab can't lift; a dark opening shows by the tab's
+   nose instead. How the tab is found: once per can model, while the can comes
+   out of the machine, a hidden copy of it (query-only collision that ignores
+   every channel, so only our rays hit it) gets about 150 rays straight down
+   onto its top, 8 a frame (about 0.6 ms). The lid is the commonest height;
+   the tab is the raised patch over the middle (cells raised by the rim's
+   slope don't count); its ring end reaches further than its nose, so the
+   opening is on the nose side, half way to the rim, or in a dent if the model
+   has one. The can is turned in the hand so the opening faces you, where the
+   old tab's opening was (`drinks_can_opening_deg` turns it further). A can
+   taken before its top was measured is measured at once. If the model has no
+   raised tab (a flat top), a finger on the middle of the top opens it and no
+   opening is drawn.
 4. **Drink**: the open can's top within `drinks_mouth_radius_cm` of the mouth
    (from the eyes: `drinks_mouth_forward_cm` ahead, `drinks_mouth_down_cm` down),
    tipped at least `drinks_pour_tilt_deg` from upright, for
@@ -71,12 +88,16 @@ trigger, and an interact would drink it the flat way).
 - `drinks: <hand> hand's index finger pressed button N (...), through the game's interact`
 - `drinks: <hand> hand's ... is X cm in front of button N's face (presses within Y)`: a finger that stopped short.
 - `drinks: machine: slot ..., the game's can VISIBLE at ...` and `the game's can is at rest at ...`
-- `drinks: <hand> hand took the can (...)`, `opened the tab`, `started pouring`, `DRANK the can ... slot interact ran`
+- `drinks: the can model's top (<mesh>): N of M rays hit ...; its own tab found ...`, then the tab's size and
+  place and a small map of the top (`#` tab, `+` other raised, `^` raised by the rim, `o` lid, `-` dent,
+  `.` no hit; x to the right, y up), and the model's material slots.
+- `drinks: <hand> hand took the can (...)`, `opened the can's own tab`, `started pouring`, `DRANK the can ... slot interact ran`
 - `drinks: can at the mouth? top X cm from it (needs N), tipped D deg (needs N)`: for tuning the mouth.
 - `drinks: after the drink the game's can is VISIBLE/hidden`: what the game did with its own can.
 
 ## Not done yet
 
 - Hand pose around the can: the hand closes as for an empty grip.
-- The game's bytecode for the machine (next run's dump) will say what
-  `Interact` on the switch and slot really do; the flow above may change with it.
+- The model's tab can't lift (one mesh). If the log shows the can model with a
+  material slot of its own for the tab, a second copy showing only that slot
+  could lift it.

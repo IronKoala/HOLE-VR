@@ -43,8 +43,8 @@ struct Settings {
     double grab_cm = 10.0;        // grip this close to the can's middle takes it
     double hold_along_cm = 1.5;   // can middle ahead of the fist centre, along the fist
     double hold_in_cm = 1.2;      // can middle this far further from the palm than the controller's handle
-    double opening_deg = 0.0;     // turns the tab and opening around the can
-    double tab_reach_cm = 2.0;    // fingertip this close to the tab opens it
+    double opening_deg = 0.0;     // turns the can around in the hand (its tab and opening with it)
+    double tab_reach_cm = 2.0;    // fingertip this close to the model's tab opens it
     double mouth_forward_cm = 4.0;
     double mouth_down_cm = 10.0;
     double mouth_radius_cm = 11.0;
@@ -89,6 +89,9 @@ FVector Norm(const FVector& v) {
     return l > 1e-6 ? v * (1.0 / l) : FVector{0, 0, 1};
 }
 double Dot(const FVector& a, const FVector& b) { return a.X * b.X + a.Y * b.Y + a.Z * b.Z; }
+FVector Cross(const FVector& a, const FVector& b) {
+    return {a.Y * b.Z - a.Z * b.Y, a.Z * b.X - a.X * b.Z, a.X * b.Y - a.Y * b.X};
+}
 double Axis(const FVector& v, int k) { return k == 0 ? v.X : k == 1 ? v.Y : v.Z; }
 FVector Unit(int k) { return k == 0 ? FVector{1, 0, 0} : k == 1 ? FVector{0, 1, 0} : FVector{0, 0, 1}; }
 
@@ -361,17 +364,59 @@ struct Machine {
     bool hiding_game_can = false;
 } M;
 
-struct Held {
-    bool on = false;
-    int hand = -1;
-    UObject comp = 0, tab = 0, hole = 0;
-    FVector mn, mx;             // can mesh box, component space (unscaled)
+// The can's size and how its mesh lies, from the game's can component.
+struct CanGeom {
     FVector scale{1, 1, 1};
     FQuat to_mesh{0, 0, 0, 1};  // mesh space -> can frame (Z = its axis)
     double height = 12, radius = 3.3;
     FVector mid_mesh;           // box middle, mesh space, scaled
+    int long_axis = 2;
+};
+
+// The can model's own pull tab (owner 2026-11-04: "the "tab" that you open i
+// want it to be the soda can tab that's on the model"). The can is one solid
+// mesh, so its tab can't lift: it is found once per can model with rays
+// straight down onto the top of a hidden copy (while the can comes out of the
+// machine), and a fingertip on it opens the can. Can space: x and y across
+// the top, z up the can's axis, from the middle of the top of the can's box.
+struct TabShape {
+    std::string mesh;
+    bool hits = false;          // the rays found the top
+    bool found = false;         // a raised tab on it
+    bool dent = false;          // a dent in the lid: the model's opening
+    int rays = 0, hit_count = 0, tab_cells = 0, dent_cells = 0, frames = 0;
+    double ms = 0;
+    double lid = -0.3;          // the lid's height (below the box top: negative)
+    FVector tab{0, 0, -0.3};    // the tab's middle (x, y) at its top (z)
+    double tab_len = 0, tab_wid = 0;
+    FVector open;               // the drinking hole's middle; z = the lid there
+    FVector open_dir{1, 0, 0};  // unit, from the can's middle toward the hole
+    double roll_deg = 0;        // turns the can so the hole faces you
+};
+std::vector<TabShape> g_tabs;   // one per can model, kept for the session
+
+struct TabScan {
+    bool on = false;
+    UObject probe = 0;          // hidden copy of the can, upright, rays only
+    std::string mesh;
+    CanGeom g;
+    FVector top;                // the probe's top middle (world)
+    double step = 0.3;
+    int n = 0, half = 0;        // cells per side, cells from the middle
+    std::vector<double> h;      // height from the top per cell; NaN: no hit
+    std::vector<char> inside;   // the cell is on the lid (inside the rim)
+    size_t next = 0;
+    int frames = 0, rays = 0;
+    double ms = 0;
+} g_scan;
+
+struct Held {
+    bool on = false;
+    int hand = -1;
+    UObject comp = 0, hole = 0;
+    CanGeom g;
+    TabShape tab;               // the model's tab (found or not)
     bool opened = false;
-    double tab_t = 0;           // 0 closed .. 1 open
     bool tab_armed = false;     // the other hand's fingers were away from the tab first
     double pour = 0, next_gulp = 0, next_diag = 0;
     bool pouring = false;
@@ -382,7 +427,7 @@ struct Held {
 } H;
 
 struct Loose {
-    UObject comp = 0, tab = 0, hole = 0;
+    UObject comp = 0, hole = 0;
     double age = 0;
     FVector start;
     bool checked = false;
@@ -396,11 +441,12 @@ void ResetLevel(UObject player) {
     // the game's can again. A new level: its objects are gone with it, so
     // they are only forgotten, never touched.
     if (M.actor && ue::IsLive(M.actor)) {
-        for (UObject c : {H.comp, H.tab, H.hole}) DestroyComp(c);
+        for (UObject c : {H.comp, H.hole, g_scan.probe}) DestroyComp(c);
         for (const Loose& l : g_loose)
-            for (UObject c : {l.comp, l.tab, l.hole}) DestroyComp(c);
+            for (UObject c : {l.comp, l.hole}) DestroyComp(c);
         if ((H.on || M.hiding_game_can) && M.can && ue::IsLive(M.can)) SetHiddenInGame(M.can, false);
     }
+    g_scan = TabScan{};
     M = Machine{};
     M.player = player;
     H = Held{};
@@ -710,6 +756,313 @@ void WatchGameCan() {
     }
 }
 
+// ---------------------------------------------------------------- the can's own tab
+// The can's size and how its mesh lies (the mesh's long side is the can's axis).
+bool MeasureCan(UObject can, UObject* mesh_out, CanGeom* g) {
+    UObject mesh = 0;
+    FVector mn, mx;
+    if (!can || !ue::GetProp(can, "StaticMesh", mesh) || !mesh || !StaticMeshBox(can, &mn, &mx)) return false;
+    g->scale = AbsScale(ComponentToWorld(can));
+    const FVector ext = Mul(mx - mn, g->scale);
+    const int k = ext.Z >= ext.X && ext.Z >= ext.Y ? 2 : ext.X >= ext.Y ? 0 : 1;
+    g->long_axis = k;
+    // to_mesh turns mesh space into can space (can Z = its axis): a mesh
+    // long on X turns -90 deg about Y (X -> Z), one long on Y +90 about X (Y -> Z).
+    g->to_mesh = k == 2 ? FQuat{0, 0, 0, 1} : k == 0 ? AxisAngle(FVector{0, 1, 0}, -kPi * 0.5)
+                                                     : AxisAngle(FVector{1, 0, 0}, kPi * 0.5);
+    g->height = Axis(ext, k);
+    g->radius = 0.25 * (Axis(ext, (k + 1) % 3) + Axis(ext, (k + 2) % 3));
+    g->mid_mesh = Mul((mn + mx) * 0.5, g->scale);
+    *mesh_out = mesh;
+    return true;
+}
+
+// Where the can mesh goes for a can frame (rotation can_rot: X, Y across the
+// top, Z up the can) with its box middle at `mid`.
+Xf CanXf(const CanGeom& g, const FQuat& can_rot, const FVector& mid) {
+    Xf t;
+    t.rotation = can_rot * g.to_mesh;
+    t.scale = g.scale;
+    t.translation = mid - t.rotation.Rotate(g.mid_mesh);
+    return t;
+}
+
+const TabShape* FindTab(const std::string& mesh) {
+    for (const TabShape& t : g_tabs)
+        if (t.mesh == mesh) return &t;
+    return nullptr;
+}
+
+double Now() {
+    LARGE_INTEGER f, c;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return static_cast<double>(c.QuadPart) / static_cast<double>(f.QuadPart);
+}
+
+// A hidden copy of the can, upright inside the machine, that only our rays
+// can hit (query-only collision that ignores every channel, like the slide
+// parts in vr/body: nothing in the game can touch it).
+bool StartScan(UObject mesh, const std::string& name, const CanGeom& g) {
+    g_scan = TabScan{};
+    UObject probe = MakeMeshCopy(M.actor, mesh);
+    if (!probe) return false;
+    SetHiddenInGame(probe, true);
+    ue::Call rr(probe, "SetCollisionResponseToAllChannels");
+    rr.Set("NewResponse", uint8_t{0});   // ignore
+    rr.Invoke();
+    ue::Call ce(probe, "SetCollisionEnabled");
+    ce.Set("NewType", uint8_t{1});       // query only
+    ce.Invoke();
+    SetWorldXf(probe, CanXf(g, FQuat{0, 0, 0, 1}, M.center));
+    g_scan.on = true;
+    g_scan.probe = probe;
+    g_scan.mesh = name;
+    g_scan.g = g;
+    g_scan.top = M.center + FVector{0, 0, g.height * 0.5};
+    // The lid inside the rim, in a grid about 0.3 cm apart (about 160 rays).
+    const double R = g.radius * 0.82;
+    g_scan.step = std::clamp(R / 7.0, 0.2, 0.5);
+    g_scan.half = static_cast<int>(std::ceil(R / g_scan.step));
+    g_scan.n = 2 * g_scan.half + 1;
+    const size_t cells = static_cast<size_t>(g_scan.n) * g_scan.n;
+    g_scan.h.assign(cells, std::nan(""));
+    g_scan.inside.assign(cells, 0);
+    for (size_t k = 0; k < cells; ++k) {
+        const double x = (static_cast<int>(k % g_scan.n) - g_scan.half) * g_scan.step;
+        const double y = (static_cast<int>(k / g_scan.n) - g_scan.half) * g_scan.step;
+        g_scan.inside[k] = x * x + y * y <= R * R;
+    }
+    return true;
+}
+
+// Up to `budget` rays (about 0.08 ms each).
+void ScanSome(int budget) {
+    if (!g_scan.on) return;
+    if (!ue::IsLive(g_scan.probe)) {
+        g_scan.on = false;
+        return;
+    }
+    const double t0 = Now();
+    while (g_scan.next < g_scan.h.size() && budget > 0) {
+        const size_t k = g_scan.next++;
+        if (!g_scan.inside[k]) continue;
+        --budget;
+        ++g_scan.rays;
+        const double x = (static_cast<int>(k % g_scan.n) - g_scan.half) * g_scan.step;
+        const double y = (static_cast<int>(k / g_scan.n) - g_scan.half) * g_scan.step;
+        const FVector p = g_scan.top + FVector{x, y, 0};
+        ue::Call t(g_scan.probe, "K2_LineTraceComponent");
+        if (!t.Valid()) {
+            g_scan.next = g_scan.h.size();
+            break;
+        }
+        t.Set("TraceStart", p + FVector{0, 0, 1.5}).Set("TraceEnd", p - FVector{0, 0, 3.0}).Set("bTraceComplex", true);
+        if (t.Invoke() && t.Result<bool>()) g_scan.h[k] = t.Get<FVector>("HitLocation").Z - g_scan.top.Z;
+    }
+    g_scan.ms += (Now() - t0) * 1000.0;
+}
+
+// Groups of touching cells (side by side) of one kind.
+std::vector<std::vector<int>> Groups(const std::vector<char>& kind, char want, int n) {
+    std::vector<std::vector<int>> out;
+    std::vector<char> seen(kind.size(), 0);
+    for (int s = 0; s < static_cast<int>(kind.size()); ++s) {
+        if (kind[s] != want || seen[s]) continue;
+        std::vector<int> g{s}, stack{s};
+        seen[s] = 1;
+        while (!stack.empty()) {
+            const int k = stack.back();
+            stack.pop_back();
+            const int i = k % n, j = k / n;
+            const int nb[4][2] = {{i - 1, j}, {i + 1, j}, {i, j - 1}, {i, j + 1}};
+            for (const auto& q : nb) {
+                if (q[0] < 0 || q[1] < 0 || q[0] >= n || q[1] >= n) continue;
+                const int m = q[1] * n + q[0];
+                if (kind[m] != want || seen[m]) continue;
+                seen[m] = 1;
+                g.push_back(m);
+                stack.push_back(m);
+            }
+        }
+        out.push_back(std::move(g));
+    }
+    return out;
+}
+
+// Reads the model's top from the rays: the lid is the commonest height; the
+// tab is the raised patch over the middle (its rivet is at the middle, its
+// ring end reaches further out than its nose); a dent is the opening, if the
+// model has one, else the opening is on the nose side, half way to the rim.
+// Logs a small map of the top, x to the right, y up (# tab, + other raised,
+// ^ raised by the rim, o lid, - dent, . no hit).
+void FinishScan(bool cache_failures) {
+    TabShape s;
+    s.mesh = g_scan.mesh;
+    s.frames = g_scan.frames;
+    s.ms = g_scan.ms;
+    s.rays = g_scan.rays;
+    const int n = g_scan.n, half = g_scan.half;
+    const double st = g_scan.step, r = g_scan.g.radius;
+    auto cx = [&](int k) { return (k % n - half) * st; };
+    auto cy = [&](int k) { return (k / n - half) * st; };
+    std::vector<double> hv;
+    for (size_t k = 0; k < g_scan.h.size(); ++k)
+        if (g_scan.inside[k] && !std::isnan(g_scan.h[k])) hv.push_back(g_scan.h[k]);
+    s.hit_count = static_cast<int>(hv.size());
+    s.hits = s.hit_count >= 8;
+    std::vector<char> kind(g_scan.h.size(), ' ');
+    std::vector<int> tab_group;
+    if (s.hits) {
+        std::nth_element(hv.begin(), hv.begin() + hv.size() / 2, hv.end());
+        s.lid = hv[hv.size() / 2];
+        // Raised or dented: more than 0.3 mm off the lid, or more than the
+        // lid's own spread if it is curved.
+        for (double& v : hv) v = std::fabs(v - s.lid);
+        std::nth_element(hv.begin(), hv.begin() + hv.size() / 2, hv.end());
+        const double thr = std::fmax(0.03, 2.5 * hv[hv.size() / 2]);
+        for (size_t k = 0; k < g_scan.h.size(); ++k) {
+            if (!g_scan.inside[k]) continue;
+            const double h = g_scan.h[k];
+            const bool rim = cx(static_cast<int>(k)) * cx(static_cast<int>(k)) +
+                                 cy(static_cast<int>(k)) * cy(static_cast<int>(k)) > 0.74 * 0.74 * r * r;
+            // Raised by the rim is the rim's slope ('^'), not the tab.
+            kind[k] = std::isnan(h) ? '.' : h > s.lid + thr ? (rim ? '^' : '+') : h < s.lid - thr ? '-' : 'o';
+        }
+        // The tab: the raised patch with the most cells near the middle.
+        int best_near = 0;
+        for (auto& g : Groups(kind, '+', n)) {
+            int middle = 0;
+            for (int k : g) middle += cx(k) * cx(k) + cy(k) * cy(k) <= 0.25 * r * r;
+            if (g.size() < 3 || middle < 1) continue;
+            if (middle > best_near || (middle == best_near && g.size() > tab_group.size())) {
+                best_near = middle;
+                tab_group = g;
+            }
+        }
+        FVector c{};
+        double cxx = 0, cyy = 0, cxy = 0;
+        if (!tab_group.empty()) {
+            s.found = true;
+            s.tab_cells = static_cast<int>(tab_group.size());
+            double top = -1e9;
+            for (int k : tab_group) {
+                c = c + FVector{cx(k), cy(k), 0};
+                top = std::fmax(top, g_scan.h[k]);
+                kind[k] = '#';
+            }
+            c = c * (1.0 / tab_group.size());
+            for (int k : tab_group) {
+                const double dx = cx(k) - c.X, dy = cy(k) - c.Y;
+                cxx += dx * dx;
+                cyy += dy * dy;
+                cxy += dx * dy;
+            }
+            s.tab = FVector{c.X, c.Y, top};
+            const double a = 0.5 * std::atan2(2 * cxy, cxx - cyy);
+            const FVector major{std::cos(a), std::sin(a), 0}, minor{-std::sin(a), std::cos(a), 0};
+            double lo = 1e9, hi = -1e9, lo2 = 1e9, hi2 = -1e9;
+            for (int k : tab_group) {
+                const FVector p{cx(k), cy(k), 0};
+                lo = std::fmin(lo, Dot(p, major));
+                hi = std::fmax(hi, Dot(p, major));
+                lo2 = std::fmin(lo2, Dot(p, minor));
+                hi2 = std::fmax(hi2, Dot(p, minor));
+            }
+            s.tab_len = hi - lo + st;
+            s.tab_wid = hi2 - lo2 + st;
+            // From the ring end toward the nose: the opening's side.
+            const double off = std::sqrt(c.X * c.X + c.Y * c.Y);
+            s.open_dir = off > 0.1 * r ? FVector{-c.X / off, -c.Y / off, 0} : major;
+        }
+        // The model's own opening: a dent in the lid, on the nose side.
+        std::vector<int> dent;
+        for (auto& g : Groups(kind, '-', n)) {
+            if (g.size() < 3) continue;
+            FVector d{};
+            for (int k : g) d = d + FVector{cx(k), cy(k), 0};
+            d = d * (1.0 / g.size());
+            if (s.found && Dot(d, s.open_dir) <= 0 && std::sqrt(c.X * c.X + c.Y * c.Y) > 0.1 * r) continue;
+            if (g.size() > dent.size()) dent = g;
+        }
+        if (!dent.empty()) {
+            s.dent = true;
+            s.dent_cells = static_cast<int>(dent.size());
+            FVector d{};
+            for (int k : dent) d = d + FVector{cx(k), cy(k), 0};
+            s.open = d * (1.0 / dent.size());
+            const double l = std::sqrt(s.open.X * s.open.X + s.open.Y * s.open.Y);
+            if (l > 0.1 * r) s.open_dir = FVector{s.open.X / l, s.open.Y / l, 0};
+        } else {
+            s.open = s.open_dir * (0.5 * r);
+        }
+        // The hole lies on the lid: the highest lid cell under it.
+        double z = -1e9;
+        for (size_t k = 0; k < g_scan.h.size(); ++k) {
+            if (kind[k] != 'o' && kind[k] != '-') continue;
+            const double dx = cx(static_cast<int>(k)) - s.open.X, dy = cy(static_cast<int>(k)) - s.open.Y;
+            if (dx * dx + dy * dy <= 0.09 * r * r) z = std::fmax(z, g_scan.h[k]);
+        }
+        s.open.Z = z > -1e8 ? z : s.lid;
+        if (!s.found) s.tab = FVector{0, 0, s.lid};
+        if (s.found || s.dent) s.roll_deg = -std::atan2(s.open_dir.Y, s.open_dir.X) * kRadToDeg;
+    }
+    log::Info("drinks: the can model's top (%s): %d of %d rays hit in %d frames, %.1f ms; lid %.2f cm below the rim; "
+              "%s; %s%s",
+              s.mesh.c_str(), s.hit_count, s.rays, s.frames, s.ms, -s.lid,
+              s.found ? "its own tab found" : s.hits ? "NO raised tab (flat top or a drawn one)" : "the rays found nothing",
+              s.dent ? "the opening is a dent in it" : s.found ? "the opening goes on the tab's nose side" : "no opening",
+              s.found || s.dent ? "" : ": a fingertip anywhere on the top opens it");
+    if (s.found)
+        log::Info("drinks:   tab %d cells, %.1f x %.1f cm, middle (%.2f %.2f) cm from the can's middle, %.2f cm above the "
+                  "lid; opening at (%.2f %.2f); the can turns %.0f deg in the hand so the opening faces you",
+                  s.tab_cells, s.tab_len, s.tab_wid, s.tab.X, s.tab.Y, s.tab.Z - s.lid, s.open.X, s.open.Y, s.roll_deg);
+    if (s.hits) {
+        for (int j = n - 1; j >= 0; --j) {
+            std::string row;
+            for (int i = 0; i < n; ++i) row += kind[j * n + i];
+            log::Info("drinks:   top |%s|", row.c_str());
+        }
+    }
+    // Material slots: one of its own would let the real tab lift one day.
+    if (ue::IsLive(g_scan.probe)) {
+        ue::Call nm(g_scan.probe, "GetNumMaterials");
+        const int32_t count = nm.Invoke() ? nm.Result<int32_t>() : -1;
+        std::string names;
+        for (int32_t i = 0; i < count && i < 8; ++i) {
+            ue::Call gm(g_scan.probe, "GetMaterial");
+            gm.Set("ElementIndex", i);
+            const UObject m = gm.Invoke() ? gm.Result<UObject>() : 0;
+            names += (i ? ", " : "") + (m ? ue::GetName(m) : std::string("none"));
+        }
+        log::Info("drinks:   the can model has %d material slot(s): %s", count, names.c_str());
+    }
+    DestroyComp(g_scan.probe);
+    if (s.hits || cache_failures) g_tabs.push_back(s);
+    g_scan = TabScan{};
+}
+
+// While a can is in the machine: measure its model's top a few rays a frame.
+void TendScan() {
+    if (g_scan.on) {
+        if (++g_scan.frames <= 1) return;   // the copy's collision settles first
+        ScanSome(8);
+        if (g_scan.next >= g_scan.h.size() || !g_scan.on) FinishScan(true);
+        return;
+    }
+    static std::string failed;
+    if (!M.can || !ue::IsLive(M.can)) return;
+    UObject mesh = 0;
+    if (!ue::GetProp(M.can, "StaticMesh", mesh) || !mesh) return;
+    const std::string name = ue::GetName(mesh);
+    if (name == failed || FindTab(name)) return;
+    CanGeom g;
+    if (!MeasureCan(M.can, &mesh, &g) || !StartScan(mesh, name, g)) {
+        failed = name;
+        log::Warn("drinks: could not measure the top of the can model %s", name.c_str());
+    }
+}
+
 // This frame's can frame from the hand. The can lies through the fist like
 // the controller's handle: +X of the grip pose runs through the closed fist
 // from the little finger to the thumb (OpenXR grip -Z), so the top is at the
@@ -720,79 +1073,71 @@ void CanFrame(const hands::HandState& hs) {
     H.az = Norm(r.Rotate(FVector{1, 0, 0}));
     FVector ax = r.Rotate(FVector{0, 0, 1});
     FVector ay = r.Rotate(FVector{0, -1, 0});
-    if (S.opening_deg != 0) {
-        const FQuat roll = AxisAngle(H.az, S.opening_deg * kDegToRad);
+    const double roll_deg = S.opening_deg + H.tab.roll_deg;
+    if (roll_deg != 0) {
+        const FQuat roll = AxisAngle(H.az, roll_deg * kDegToRad);
         ax = roll.Rotate(ax);
         ay = roll.Rotate(ay);
     }
     H.ax = Norm(ax);
     H.ay = Norm(ay);
     H.mid = hs.grip.location + H.az * S.hold_along_cm - hs.palm_normal * S.hold_in_cm;
-    H.top = H.mid + H.az * (H.height * 0.5);
+    H.top = H.mid + H.az * (H.g.height * 0.5);
 }
+
+// A point in can space (see TabShape) on the can in the hand.
+FVector CanPoint(const FVector& c) { return H.top + H.ax * c.X + H.ay * c.Y + H.az * c.Z; }
 
 void PlaceHeld() {
     const FQuat can_rot = FromAxes(H.ax, H.ay, H.az);
-    Xf t;
-    t.rotation = can_rot * H.to_mesh;
-    t.scale = H.scale;
-    t.translation = H.mid - t.rotation.Rotate(H.mid_mesh);
-    SetWorldXf(H.comp, t);
-    // Tab: lies on the top, its nose toward the opening (+X); it opens by
-    // lifting its ring end about a hinge at the nose.
-    const double tab_len = 1.9, tab_w = 1.2, tab_th = 0.15;
-    const FVector rest_mid = H.top + H.ax * (H.radius * 0.05) + H.az * (tab_th * 0.5 + 0.05);
-    const FVector hinge = rest_mid + H.ax * (tab_len * 0.5);
-    const FQuat lift = AxisAngle(H.ay, H.tab_t * 70.0 * kDegToRad);
-    if (H.tab) {
-        Xf tt;
-        tt.rotation = lift * can_rot;
-        tt.translation = hinge + lift.Rotate(rest_mid - hinge);
-        tt.scale = FVector{tab_len / 100.0, tab_w / 100.0, tab_th / 100.0};
-        SetWorldXf(H.tab, tt);
-    }
-    if (H.hole) {
+    SetWorldXf(H.comp, CanXf(H.g, can_rot, H.mid));
+    // The drinking hole, once open: a thin dark patch on the lid by the tab's
+    // nose (the tab itself is the model's own and stays as it is).
+    if (H.hole && H.opened) {
+        const FVector u = Norm(H.ax * H.tab.open_dir.X + H.ay * H.tab.open_dir.Y);
         Xf ht;
-        ht.rotation = can_rot;
-        ht.translation = H.top + H.ax * (H.radius * 0.55) + H.az * 0.04;
-        ht.scale = FVector{1.5 / 100.0, 1.1 / 100.0, 0.06 / 100.0};
+        ht.rotation = FromAxes(u, Cross(H.az, u), H.az);
+        ht.translation = CanPoint(H.tab.open) + H.az * 0.015;
+        ht.scale = FVector{0.42 * H.g.radius / 100.0, 0.56 * H.g.radius / 100.0, 0.02 / 100.0};
         SetWorldXf(H.hole, ht);
     }
 }
 
 void TakeCan(int h, const hands::HandState& hs) {
     UObject mesh = 0;
-    ue::GetProp(M.can, "StaticMesh", mesh);
-    FVector mn, mx;
-    if (!mesh || !StaticMeshBox(M.can, &mn, &mx)) {
+    CanGeom g;
+    if (!MeasureCan(M.can, &mesh, &g)) {
         log::Warn("drinks: the game's can has no mesh to copy");
         return;
     }
-    const Xf gt = ComponentToWorld(M.can);
+    const std::string name = ue::GetName(mesh);
+    if (!FindTab(name)) {
+        // Taken before its top was measured: finish that now (a short hitch).
+        if (!g_scan.on || g_scan.mesh != name) {
+            DestroyComp(g_scan.probe);
+            StartScan(mesh, name, g);
+        }
+        if (g_scan.on) {
+            ScanSome(1 << 20);
+            FinishScan(false);
+        }
+    }
+    const TabShape* ts = FindTab(name);
     H = Held{};
     H.hand = h;
-    H.scale = AbsScale(gt);
-    H.mn = mn;
-    H.mx = mx;
-    // The mesh's long side is the can's axis (Z for a normal mesh).
-    const FVector ext = Mul(mx - mn, H.scale);
-    const int k = ext.Z >= ext.X && ext.Z >= ext.Y ? 2 : ext.X >= ext.Y ? 0 : 1;
-    // to_mesh turns mesh space into can space (can Z = its axis): a mesh
-    // long on X turns -90 deg about Y (X -> Z), one long on Y +90 about X (Y -> Z).
-    H.to_mesh = k == 2 ? FQuat{0, 0, 0, 1} : k == 0 ? AxisAngle(FVector{0, 1, 0}, -kPi * 0.5)
-                                                    : AxisAngle(FVector{1, 0, 0}, kPi * 0.5);
-    H.height = Axis(ext, k);
-    H.radius = 0.25 * (Axis(ext, (k + 1) % 3) + Axis(ext, (k + 2) % 3));
-    H.mid_mesh = Mul((mn + mx) * 0.5, H.scale);
+    H.g = g;
+    if (ts) H.tab = *ts;
+    H.tab.mesh = name;
     H.comp = MakeMeshCopy(M.actor, mesh);
     if (!H.comp) {
         log::Warn("drinks: could not make the can for the hand");
         H = Held{};
         return;
     }
-    H.tab = MakeShape(M.actor, 0.62f, 0.62f, 0.65f);
-    H.hole = MakeShape(M.actor, 0.01f, 0.01f, 0.01f);
-    if (H.hole) SetHiddenInGame(H.hole, true);
+    if (H.tab.found || H.tab.dent) {
+        H.hole = MakeShape(M.actor, 0.01f, 0.01f, 0.01f);
+        if (H.hole) SetHiddenInGame(H.hole, true);
+    }
     H.on = true;
     SetHiddenInGame(M.can, true);
     CanFrame(hs);
@@ -800,14 +1145,15 @@ void TakeCan(int h, const hands::HandState& hs) {
     PlaceHeld();
     input::Haptic(static_cast<input::Hand>(h), 0.5f, 0.05f);
     log::Info("drinks: %s hand took the can (%s, %.1f cm tall, %.1f cm wide, long side %c) out of the slot, %.1f cm from "
-              "its middle; the game's can stays in the slot, hidden. Open the tab with the other hand's finger.",
-              HandName(h), ue::GetName(mesh).c_str(), H.height, H.radius * 2, "XYZ"[k],
-              Len(hs.grip.location - M.can_mid));
+              "its middle; the game's can stays in the slot, hidden. %s",
+              HandName(h), name.c_str(), g.height, g.radius * 2, "XYZ"[g.long_axis],
+              Len(hs.grip.location - M.can_mid),
+              H.tab.found ? "Touch the can's own tab with the other hand's finger to open it."
+                          : "Its tab wasn't found on the model: a finger of the other hand on the top opens it.");
 }
 
 void PutBack(const char* why) {
     DestroyComp(H.comp);
-    DestroyComp(H.tab);
     DestroyComp(H.hole);
     if (M.can && ue::IsLive(M.can)) SetHiddenInGame(M.can, false);
     log::Info("drinks: the can went back into the slot (%s)%s", why, H.opened ? "; it was opened, not drunk" : "");
@@ -817,12 +1163,10 @@ void PutBack(const char* why) {
 void DropEmpty() {
     Loose l;
     l.comp = H.comp;
-    l.tab = H.tab;
     l.hole = H.hole;
     l.start = H.mid;
-    // Tab and opening ride on the can now.
-    for (UObject child : {H.tab, H.hole}) {
-        if (!child) continue;
+    // The opening rides on the can now.
+    if (UObject child = H.hole) {
         ue::Call at(child, "K2_AttachToComponent");
         at.Set("Parent", H.comp).Set("SocketName", g_none).Set("LocationRule", uint8_t{1})
             .Set("RotationRule", uint8_t{1}).Set("ScaleRule", uint8_t{1}).Set("bWeldSimulatedBodies", false);
@@ -847,7 +1191,6 @@ void DropEmpty() {
               physics ? "; it falls" : "; no physics profile, it goes away");
     if (!physics) {
         DestroyComp(H.comp);
-        DestroyComp(H.tab);
         DestroyComp(H.hole);
     } else {
         g_loose.push_back(l);
@@ -870,7 +1213,6 @@ void HoldCan(UObject player, float dt) {
     const hands::HandState hs = hands::Get(static_cast<hands::Hand>(H.hand));
     if (!ue::IsLive(H.comp)) {
         log::Info("drinks: the can in the hand went away");
-        DestroyComp(H.tab);
         DestroyComp(H.hole);
         if (!H.drunk && M.can && ue::IsLive(M.can)) SetHiddenInGame(M.can, false);
         H = Held{};
@@ -902,12 +1244,13 @@ void HoldCan(UObject player, float dt) {
         return;
     }
 
-    // The tab: a fingertip of the other hand on it.
+    // The model's own tab: a fingertip of the other hand on it (on the middle
+    // of the top if the model's tab wasn't found).
     const int other = 1 - H.hand;
     if (!H.opened) {
         Tip tips[5];
         const int n = HandTips(other, tips);
-        const FVector tab = H.top + H.ax * (H.radius * 0.05) + H.az * 0.1;
+        const FVector tab = CanPoint(H.tab.tab);
         double best = 1e9;
         int finger = -1;
         for (int t = 0; t < n; ++t) {
@@ -922,12 +1265,15 @@ void HoldCan(UObject player, float dt) {
             H.opened = true;
             input::Haptic(static_cast<input::Hand>(other), 0.6f, 0.05f);
             input::Haptic(static_cast<input::Hand>(H.hand), 0.35f, 0.05f);
-            if (H.hole) SetHiddenInGame(H.hole, false);
-            log::Info("drinks: the %s hand's %s opened the tab (%.1f cm from it). Tip the can at your mouth to drink.",
-                      HandName(other), FingerName(finger), std::fmax(best, 0.0));
+            if (H.hole) {
+                PlaceHeld();
+                SetHiddenInGame(H.hole, false);
+            }
+            log::Info("drinks: the %s hand's %s opened the can's %s (%.1f cm from it). Tip the can at your mouth to "
+                      "drink.",
+                      HandName(other), FingerName(finger), H.tab.found ? "own tab" : "top", std::fmax(best, 0.0));
         }
     }
-    if (H.opened && H.tab_t < 1.0) H.tab_t = std::fmin(1.0, H.tab_t + dt / 0.12);
     PlaceHeld();
 
     // Pouring: the open can's top at the mouth, tipped.
@@ -975,7 +1321,6 @@ void TendLoose(float dt) {
         }
         if (!gone && l.age >= S.empty_can_s) {
             DestroyComp(l.comp);
-            DestroyComp(l.tab);
             DestroyComp(l.hole);
             gone = true;
         }
@@ -996,6 +1341,8 @@ void OnTick(UObject player, float dt) {
     const UObject found = g_found.load();
     if (found != M.actor) {
         if (M.actor && H.on && ue::IsLive(M.actor)) PutBack("the machine changed");
+        if (M.actor && ue::IsLive(M.actor)) DestroyComp(g_scan.probe);
+        g_scan = TabScan{};
         const UObject keep_player = M.player;
         M = Machine{};
         M.player = keep_player;
@@ -1007,6 +1354,7 @@ void OnTick(UObject player, float dt) {
     if (!ue::IsLive(M.actor)) {
         M.actor = 0;
         H = Held{};
+        g_scan = TabScan{};
         g_loose.clear();
         return;
     }
@@ -1015,6 +1363,7 @@ void OnTick(UObject player, float dt) {
         SetUpMachine();
     }
     TendLoose(dt);
+    TendScan();
     if (H.on) {
         HoldCan(player, dt);
     }
