@@ -24,6 +24,7 @@
 #include "vr/input.h"
 #include "vr/math.h"
 #include "vr/workbench_rules.h"
+#include "vr/world_menu.h"
 
 namespace holevr::vr::workbench {
 namespace {
@@ -60,7 +61,7 @@ struct Settings {
     // height, depth; how far it sits out from the edge (0 = centred on it)
     // and above the table top; how far outside it a let-go still counts.
     bool zone = true;
-    double zone_w = 34.0, zone_h = 26.0, zone_d = 14.0, zone_out = 0.0, zone_lift = 2.0, zone_margin = 8.0;
+    double zone_w = 34.0, zone_h = 26.0, zone_d = 14.0, zone_out = 4.0, zone_lift = 2.0, zone_margin = 8.0;
 } S;
 
 // ---------------------------------------------------------------- engine helpers
@@ -628,7 +629,18 @@ std::string ListParts(UObject gun);
 // down, barrel along the edge), like in a vise; the spare parts lie on the
 // table right behind it. Placed once per hub visit, the first time you come
 // near the bench; only used once the workbench is bought.
+// The owner's 2026-11-04 run: the bench's table (DS_Workbench) is 111 x 244
+// cm, top at 90 cm; the game's own display pistol (HG) lies 28 cm in from
+// the long side the owner stood at, and they laid the pistol 24-42 cm in
+// from that edge, the hand at full reach just past it.
+struct TableBox {
+    FVector c, ax, ay;
+    double hx = 0, hy = 0, top = 0;
+};
+
 struct Zone {
+    bool have_table = false;
+    TableBox t;
     bool placed = false;
     bool failed = false;
     FVector center;     // world
@@ -640,11 +652,6 @@ struct Zone {
 } Z;
 
 // The bench's table (its DS_Workbench mesh) as a flat box in the world.
-struct TableBox {
-    FVector c, ax, ay;
-    double hx = 0, hy = 0, top = 0;
-};
-
 FVector Flatten(const FVector& v) { return Norm(FVector{v.X, v.Y, 0}); }
 
 bool BenchTable(TableBox* t) {
@@ -673,20 +680,43 @@ bool BenchTable(TableBox* t) {
     return true;
 }
 
-// Puts the zone on the edge of the table nearest `head`, at the point of that
-// edge nearest it (kept inside the edge).
+// How far `p` is outside the table, flat (0 over it).
+double OutsideTable(const TableBox& t, const FVector& p) {
+    const FVector d = p - t.c;
+    const double du = std::max(0.0, std::fabs(Dot(d, t.ax)) - t.hx), dv = std::max(0.0, std::fabs(Dot(d, t.ay)) - t.hy);
+    return std::hypot(du, dv);
+}
+
+// Puts the zone on the table's front edge (the side the game's own display
+// pistol lies toward, which is where you stand to use the bench; if that
+// can't be read, the side nearest you), at the point of that edge nearest
+// you, kept inside the edge.
 void PlaceZone(const FVector& head) {
-    TableBox t;
-    if (!BenchTable(&t)) {
-        if (!Z.failed) log::Warn("workbench: could not read the bench's table (DS_Workbench), no green zone");
-        Z.failed = true;
-        return;
+    if (!Z.have_table) {
+        Z.have_table = BenchTable(&Z.t);
+        if (!Z.have_table) {
+            if (!Z.failed) log::Warn("workbench: could not read the bench's table (DS_Workbench), no green zone");
+            Z.failed = true;
+            return;
+        }
     }
+    const TableBox& t = Z.t;
     const FVector d = head - t.c;
     const double u = Dot(d, t.ax), v = Dot(d, t.ay);
-    // The side you stand at: the one you are furthest outside of.
-    const bool x_side = std::fabs(u) - t.hx > std::fabs(v) - t.hy;
-    const FVector out = x_side ? t.ax * (u >= 0 ? 1.0 : -1.0) : t.ay * (v >= 0 ? 1.0 : -1.0);
+    bool x_side = std::fabs(u) - t.hx > std::fabs(v) - t.hy;
+    double sign = (x_side ? u : v) >= 0 ? 1.0 : -1.0;
+    const char* how = "the side nearest you";
+    UObject hg = 0;
+    if (ue::GetProp(L.bench, "HG", hg) && hg) {
+        const FVector p = ComponentToWorld(hg).translation - t.c;
+        const double hu = Dot(p, t.ax) / t.hx, hv = Dot(p, t.ay) / t.hy;
+        if (std::max(std::fabs(hu), std::fabs(hv)) > 0.2) {
+            x_side = std::fabs(hu) >= std::fabs(hv);
+            sign = (x_side ? hu : hv) >= 0 ? 1.0 : -1.0;
+            how = "the front, where the game's display pistol lies";
+        }
+    }
+    const FVector out = (x_side ? t.ax : t.ay) * sign;
     const FVector along = x_side ? t.ay : t.ax;
     const double depth = x_side ? t.hx : t.hy, half = x_side ? t.hy : t.hx;
     const double room = std::max(0.0, half - S.zone_w * 0.5);
@@ -709,10 +739,10 @@ void PlaceZone(const FVector& head) {
     Z.table_z = top;
     Z.center = edge + out * S.zone_out;
     Z.center.Z = top + S.zone_lift + S.zone_h * 0.5;
-    log::Info("workbench: green zone at (%.0f %.0f %.0f), on the table edge you stand at (%.0f cm along it from its "
-              "middle, %.0f cm long); table %.0f x %.0f cm, top at %.0f (traced %s); you are %.0f cm from it",
-              Z.center.X, Z.center.Y, Z.center.Z, s, half * 2, t.hx * 2, t.hy * 2, top, what.empty() ? "nothing" :
-              what.c_str(), Flat(head, Z.center));
+    log::Info("workbench: green zone at (%.0f %.0f %.0f) on the table's edge at %s, %.0f cm along it from its middle "
+              "(edge %.0f cm long); table %.0f x %.0f cm, top at %.0f (traced %s); you are %.0f cm from it",
+              Z.center.X, Z.center.Y, Z.center.Z, how, s, half * 2, t.hx * 2, t.hy * 2, top,
+              what.empty() ? "nothing" : what.c_str(), Flat(head, Z.center));
 }
 
 bool InZone(const FVector& p, double margin) {
@@ -784,7 +814,8 @@ UObject MakeZoneActor() {
     ue::Call sc(a, "SetActorScale3D");
     sc.Set("NewScale3D", FVector{S.zone_w / 100.0, S.zone_d / 100.0, S.zone_h / 100.0});
     sc.Invoke();
-    SetActorPose(a, Z.center, FromAxes(Z.along, Z.out, FVector{0, 0, 1}));
+    const FVector up{0, 0, 1};
+    SetActorPose(a, Z.center, FromAxes(Z.along, Cross(up, Z.along), up));
     log::Info("workbench: green zone made (%s, %s; white texture %s)", ue::GetName(a).c_str(),
               tinted ? "see-through green" : "NOT tinted: plain cube", white ? "found" : "not found");
     return a;
@@ -820,7 +851,7 @@ void ParkInZone(UObject gun, const FQuat& frame) {
     P.surface_z = Z.table_z;
     StartSession(gun, P.spot, P.frame, Z.table_z);
     T.toward = Z.out;
-    T.row = Z.center - Z.out * (S.zone_d * 0.5 + 8.0);
+    T.row = Z.center - Z.out * (S.zone_out + 7.0);  // on the table, 7 cm in from its edge
     T.row.Z = Z.table_z;
     log::Info("workbench: pistol held upright in the green zone at (%.0f %.0f %.0f), barrel %s along the edge; it "
               "carries %s",
@@ -1377,12 +1408,22 @@ void OnTick(UObject player, float dt) {
     if (!S.enabled) return;
 
     // The green zone at the bought bench: placed the first time you come
-    // within 3 m of the bench, shown while you are within 4 m of it.
+    // within 1.2 m of its table, shown while you are within 4 m of it.
     if (S.zone && L.unlocked && !Z.failed) {
         hands::Pose head;
         if (hands::Head(&head)) {
-            if (!Z.placed && Flat(head.location, L.bench_loc) < 300.0) PlaceZone(head.location);
-            if (Z.placed) ShowZone(Flat(head.location, Z.center) < 400.0);
+            if (!Z.have_table) {
+                Z.have_table = BenchTable(&Z.t);
+                if (!Z.have_table) {
+                    log::Warn("workbench: could not read the bench's table (DS_Workbench), no green zone");
+                    Z.failed = true;
+                }
+            }
+            if (!Z.placed && Z.have_table && OutsideTable(Z.t, head.location) < 120.0) PlaceZone(head.location);
+            // Hidden while a menu is on the forearm: the menus switch off the
+            // depth test of the engine's widget material, which this box's
+            // material shares, so it would show through walls then.
+            if (Z.placed) ShowZone(Flat(head.location, Z.center) < 400.0 && !world_menu::MenuUp());
         }
     } else if (Z.shown) {
         ShowZone(false);
@@ -1452,17 +1493,17 @@ bool ParkedGun(UObject gun, FVector* spot, FQuat* frame) {
 bool TryPark(UObject gun, const FQuat& frame, const FVector& hand) {
     P.on = false;
     if (!S.enabled || !L.player || (!L.bench && !L.facility) || !gun) return false;
-    if (L.unlocked && S.zone) {
-        // The bought bench: only the green zone.
+    if (L.unlocked && S.zone && !Z.failed) {
+        // The bought bench: only the green zone (if it could be shown).
         hands::Pose head;
-        if (!Z.placed && !Z.failed && hands::Head(&head)) PlaceZone(head.location);
-        if (Z.placed) {
+        if (!Z.placed && hands::Head(&head)) PlaceZone(head.location);
+        if (Z.placed && LiveObject(Z.actor)) {
             if (!InZone(hand, S.zone_margin)) return false;
             ParkInZone(gun, frame);
             return true;
         }
-        if (Flat(hand, L.bench_loc) > S.bench_reach_cm) return false;
-    } else if (L.unlocked) {
+    }
+    if (L.unlocked) {
         if (Flat(hand, L.bench_loc) > S.bench_reach_cm) return false;
     } else if (!S.tables_before_unlock) {
         return false;
@@ -1548,7 +1589,7 @@ void Init() {
     S.zone_w = config::GetFloat("workbench_zone_width_cm", 34.0f);
     S.zone_h = config::GetFloat("workbench_zone_height_cm", 26.0f);
     S.zone_d = config::GetFloat("workbench_zone_depth_cm", 14.0f);
-    S.zone_out = config::GetFloat("workbench_zone_out_cm", 0.0f);
+    S.zone_out = config::GetFloat("workbench_zone_out_cm", 4.0f);
     S.zone_lift = config::GetFloat("workbench_zone_lift_cm", 2.0f);
     game::AddTickListener(&OnTick);
 }
