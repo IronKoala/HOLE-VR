@@ -139,6 +139,7 @@ struct Settings {
     bool virtual_stock = true;
     double stock_snap = 12.0;      // cm from the shoulder pocket to lock on
     double stock_release = 20.0;   // cm the hands must pull it away to let go
+    double eye_relief = 7.0;       // sight to eye when shouldered, cm
     double stock_forward = 0.0;    // move the shoulder pocket, cm (head frame)
     double stock_right = 0.0;
     double stock_up = 0.0;
@@ -205,6 +206,7 @@ void LoadSettings() {
     g_set.stock_snap = config::GetFloat("rifle_stock_snap_cm", 12.f);
     g_set.stock_release = config::GetFloat("rifle_stock_release_cm", 20.f);
     g_set.stock_forward = config::GetFloat("rifle_stock_forward_cm", 0.f);
+    g_set.eye_relief = config::GetFloat("rifle_eye_relief_cm", 7.f);
     g_set.stock_right = config::GetFloat("rifle_stock_right_cm", 0.f);
     g_set.stock_up = config::GetFloat("rifle_stock_up_cm", 0.f);
     g_set.right_eye = config::GetInt("dominant_eye_right", 1) != 0;
@@ -710,6 +712,8 @@ FQuat Nlerp(const FQuat& a, FQuat b, double t) {
 }
 
 void MeasureStock(UObject g, const FVector& actor_loc, const FQuat& actor_rot, const FVector& grip, UObject sight);
+bool MeshBoxInFrame(UObject c, const FQuat& frame_inv, const FVector& grip_w, FVector* lo, FVector* hi);
+std::vector<UObject> MeshComponents(UObject actor);
 
 // Shortest rotation taking direction a onto direction b (both unit length).
 FQuat FromTo(const FVector& a, const FVector& b) {
@@ -978,6 +982,18 @@ void MeasureStock(UObject g, const FVector& actor_loc, const FQuat& actor_rot, c
     const FQuat inv = actor_rot.Inverse();
     double min_x = 0;
     int counted = 0;
+    // GetLocalBounds reads empty on this game's parts (owner run 2026-11-04:
+    // "0 parts", stock assumed); the static meshes' own boxes don't.
+    {
+        const FQuat frame_inv = (actor_rot * W.gun_frame).Inverse();
+        const FVector grip_w = actor_loc + actor_rot.Rotate(grip);
+        for (UObject c : MeshComponents(g)) {
+            FVector lo, hi;
+            if (!MeshBoxInFrame(c, frame_inv, grip_w, &lo, &hi)) continue;
+            if (lo.X < min_x) min_x = lo.X;
+            ++counted;
+        }
+    }
     static UObject prim_class = 0;
     if (!prim_class) prim_class = ue::FindObject("Class /Script/Engine.PrimitiveComponent");
     ue::Call list(g, "K2_GetComponentsByClass");
@@ -989,6 +1005,7 @@ void MeasureStock(UObject g, const FVector& actor_loc, const FQuat& actor_rot, c
     for (int i = 0; i < arr.num && i < 128; ++i) {
         UObject c = mem::ReadOr<uintptr_t>(arr.data + i * sizeof(uintptr_t), 0);
         if (!c) continue;
+        if (counted) break;   // measured from the mesh boxes above
         ue::Call b(c, "GetLocalBounds");
         if (!b.Invoke()) continue;
         ue::Vec3d mn = b.Get<ue::Vec3d>("Min"), mx = b.Get<ue::Vec3d>("Max");
@@ -1029,6 +1046,9 @@ bool ShoulderPocket(FVector* out) {
     // the eye-to-butt distance in a human range (12-30 cm).
     FVector d = W.stock_local - W.ads_local;
     d.X = std::fmax(-30.0, std::fmin(-12.0, d.X));
+    // The eye sits a little behind the rear sight, not inside it (owner
+    // 2026-11-04: "the rear sight is basically in my eyeball").
+    d.X += g_set.eye_relief;
     d = d + FVector{g_set.stock_forward, g_set.stock_right, g_set.stock_up};
     *out = eye + head.rotation.Rotate(d);
     return true;
