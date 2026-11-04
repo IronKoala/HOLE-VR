@@ -53,10 +53,27 @@ static void TestDecideFromRifle() {
     // Only one hand on the rifle: a squeeze at the holster still draws the pistol.
     in.left_support = false;
     EXPECT(Decide(in) == CarryAction::kDrawPistol);
-    // ...but letting go of a one-handed rifle does nothing (it stays in the hand).
+    // Letting go of a one-handed rifle puts it back in its holster (owner,
+    // second AR run: "i cant let go of the rifle")...
     in.right_at_pistol_holster = false;
     in.right_grip_pressed = false;
     in.right_grip_released = true;
+    EXPECT(Decide(in) == CarryAction::kRightPutsAway);
+    // ...in toggle mode on the next squeeze...
+    in.right_toggle = true;
+    EXPECT(Decide(in) == CarryAction::kNone);
+    in.right_grip_released = false;
+    in.right_grip_pressed = true;
+    EXPECT(Decide(in) == CarryAction::kRightPutsAway);
+    in.right_toggle = false;
+    in.right_grip_pressed = false;
+    // ...and with the setting off it stays in the hand, as before.
+    in.right_grip_released = true;
+    in.right_puts_away = false;
+    EXPECT(Decide(in) == CarryAction::kNone);
+    // No release, nothing happens.
+    in.right_puts_away = true;
+    in.right_grip_released = false;
     EXPECT(Decide(in) == CarryAction::kNone);
 }
 

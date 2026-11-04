@@ -8,7 +8,9 @@ sidearm.
 First headset run with the AR: 2026-11-03 21:01 (owner's local time; build
 399a3d0). Carry, pistol draw and fly-back worked. The foregrip didn't feel
 right, so it now has three grip points (below), and a relaxed squeeze no longer
-drops the rifle. Those two changes are not headset-tested yet.
+drops the rifle. Second run, 2026-11-03 22:02 (build e7b0fa9): the three points
+were in the wrong places, and the rifle couldn't be let go with the right hand
+alone. Both are changed (below) and not headset-tested yet.
 
 ## How it plays
 
@@ -16,9 +18,12 @@ drops the rifle. Those two changes are not headset-tested yet.
   grip. Let go of the right grip: the left hand keeps the rifle where it is.
   Then reach to the pistol holster and squeeze: the game switches to the
   pistol and it comes out in the right hand. You can also squeeze at the
-  pistol holster straight away without letting go first (rifles stay in the
-  right hand whether or not the grip is held, so this is the way when you
-  were not holding the right grip).
+  pistol holster straight away without letting go first.
+- **Letting go of the rifle in the right hand alone** (no left hand on it):
+  it flies back to its holster (or the game's spot on the back) and stays
+  the game's current weapon, like the pistol going back by itself. Squeeze on
+  it there to take it again, or squeeze at the pistol holster to draw the
+  pistol. `rifle_right_let_go=0` keeps the old way (it stays in the hand).
 - **Pistol out, rifle on the back.** Reach for the rifle's handguard where
   the game hangs it (on the back) and squeeze the left grip: the rifle comes
   into the left hand, lying along the hand (barrel the way the hand points,
@@ -44,39 +49,50 @@ drops the rifle. Those two changes are not headset-tested yet.
 
 Owner, 2026-11-04, after the first AR run: "I only want the grip points, one in
 front of the magwell, one behind the flashlight and one where the picatinny
-rail ends." A left squeeze on the handguard now takes the nearest of three
-points along the barrel, both for the two-hand hold and for the rifle in the
-left hand alone:
+rail ends." After the second run (04:17 UTC), the first layout was wrong: "i
+want one just behind the flash light one where the picatinny rail ends (the
+picatinny that the scope will go on not the forward one) and one just in front
+of the mag". A left squeeze on the gun takes the nearest of three points
+(along the barrel and in height), both for the two-hand hold and for the rifle
+in the left hand alone. Back to front:
 
-| Point | Where (gun frame, X along the barrel) | Pose file |
+| Point | Where (gun frame: X along the barrel, Z up) | Pose file |
 | --- | --- | --- |
-| in front of the magwell | 4.5 cm ahead of the handguard's back end or the lower receiver's front, whichever is further forward | `grips/BP_AR_C.support-magwell.ini` |
-| behind the light | 4.5 cm behind the rear end of a light or laser fitted on the handguard; halfway between the other two when there is none, or no room behind it | `grips/BP_AR_C.support-light.ini` |
-| at the end of the rail | 4.5 cm behind the front end of the picatinny rails on the handguard (the handguard's own front end if no rail is found) | `grips/BP_AR_C.support-railend.ini` |
+| in front of the magazine | 3 cm ahead of the front of the magazine in the gun, at the handguard's left face, 8 cm under the handguard (not under the magazine's bottom). Magazine out: where it last was; never seen: 2 cm behind the lower receiver's front | `grips/BP_AR_C.support-mag.ini` |
+| where the scope rail ends | on the handguard at the front end of the top rail the scope goes on (`*PicatinnyRail_TopRear*`, or the rearmost of two or more `*Top*` rails); halfway along the handguard if there is none | `grips/BP_AR_C.support-scoperail.ini` (until posed: the light's pose) |
+| behind the light | on the handguard, 4.5 cm behind the rear end of a light or laser fitted on it; the handguard's front end when there is none | `grips/BP_AR_C.support-light.ini` |
 
-Every point sits on the handguard's left side (2.5 cm outside it), level with
-its middle. That is where the owner's left controller was in the first run,
-about 5 cm left of the bore. The parts are found by component name
-(`*Handguard*`, `*Rail*` on the handguard, `*LowerRec*`, or `*Receiver*` on a
-shotgun) and an installed part of category 12 (light or laser, from the gun's
+Where the owner reached in the second run: X 13 to 17 and Z -3 to 5 for the
+magazine point (the handguard's bottom is at 8.7), X 32 to 40 and Z 8 to 14 for
+the light. The two handguard points sit on its left side (2.5 cm outside it),
+level with its middle. A point closer than 4.5 cm to another is dropped (a
+short handguard has room for fewer).
+
+The parts are found by component name: `*Handguard*`, `*Rail*`, `*LowerRec*`
+(or `*Receiver*` on a shotgun), the game's `MagazineObj` while it is seated,
+and an installed part of category 12 (light or laser, from the gun's
 `WeaponParts`). Their sizes come from `StaticMesh.GetBoundingBox`, in the gun
 frame. They are measured again at most every 2 s on a grab, because parts can
 change at the workbench. When no handguard is found, the hand holds wherever
 it grabbed, as before.
 
 The drawn hand goes to the point, and each point has its own pose in the grip
-editor. Until a point is posed, the older `BP_AR_C.support.ini` pose is used
-for it. The barrel is still steered by where the controller grabbed, so taking
-a point never turns the gun. The grab zone ends 4 cm past the rail, so a grab
-on the bare barrel does nothing.
+editor. The second run's `support-magwell` and `support-railend` poses were
+made for the old places, so they are no longer used (the files stay). Until a
+point is posed, the older `BP_AR_C.support.ini` pose is used for it. The barrel
+is still steered by where the controller grabbed, so taking a point never
+turns the gun. The grab zone ends 4 cm past the rail, so a grab on the bare
+barrel does nothing.
 
 Letting go: in the first run the two-hand hold ended after 0.3 to 3 s about 30
 times ("support hand off the handguard"), and the right hand kept letting go
 of the rifle while aiming. The grip button releases under 0.35. A hand that
 holds the rifle now lets go only when its squeeze stays under 0.20 for 0.12 s:
 the support hand, the left hand holding the rifle alone, and the right hand
-on a rifle the left hand also holds. Tracking loss under 0.25 s doesn't end
-the two-hand hold.
+on the rifle. In the second run every let-go read 0.00, so an open hand lets
+go at once. Tracking loss under 0.25 s doesn't end the two-hand hold. After
+the grip editor or a menu, only a squeeze held at that moment counts as
+holding, so the editor's own squeezes don't let go of the rifle.
 
 ## Settings (hole-vr.ini, group `rifle_left_hand_carry`)
 
@@ -87,7 +103,8 @@ the two-hand hold.
 | `rifle_carry_pitch_deg`, `_yaw_deg`, `_roll_deg` | 0 | rifle turned in the left hand when picked up (+ pitch tips the muzzle up) |
 | `rifle_grip_reach_cm` | 14 | how close the right hand must squeeze to the rifle's grip to take it |
 | `rifle_grip_points` (own group) | 1 | 0: the hand holds wherever it grabs (no grip points) |
-| `rifle_grip_point_inset_cm` | 4.5 | how far the middle of the hand sits from the magwell, the light and the rail end |
+| `rifle_grip_point_inset_cm` | 4.5 | how far the middle of the hand sits behind the light |
+| `rifle_right_let_go` (own group) | 1 | 0: the rifle stays in the right hand when it lets go alone |
 
 ## Game side
 
@@ -126,15 +143,20 @@ Tests: `g++ -std=c++20 -Isrc tests/test_rifle_carry.cpp src/vr/interact/rifle_ca
 - `rifle carry: the game hangs the rifle on <component> (...); its grip is N cm
   below, N cm behind and N cm right/left of the headset`: where to reach.
 - `grip points: BP_AR_C (in the right hand | in the left hand alone): points in
-  front of the magwell (x y z), behind the light (x y z), at the end of the rail
-  (x y z); parts: handguard X a..b Y .. Z ..; rails end at N; magwell (lower
-  receiver) front at N; <light class> X a..b`: what was measured, logged when it
-  changes. `no handguard part found` = the old free grab.
+  front of the magazine (x y z), where the scope rail ends (x y z), behind the
+  light (x y z); parts: handguard X a..b Y .. Z ..; rails: <name> X a..b Z c..d,
+  ...; scope rail <name> ends at N; handguard rails end at N; lower receiver X
+  a..b Z c..d; magazine <class> X a..b Y .. Z ..; <light class> X a..b Y .. Z ..`:
+  what was measured, logged when it changes. "(no scope rail: halfway)", "(no
+  light: the handguard's front)", "(no magazine measured)" say which fallback was
+  used. `no handguard part found` = the old free grab.
 - `controls: left grab at gun-frame (x y z), <point name> | off the handguard`
   (two-hand hold) and `rifle carry: left grab at rifle-frame (x y z), <point
   name> | off the handguard` (rifle not in the right hand).
 - `controls: support hand off the handguard after N s (why)`: the squeeze
   (and the lowest it got while held), tracking lost, charging handle, magazine.
+- `rifle carry: right hand let go of the rifle (...); it goes back to its holster`:
+  the right hand alone opened.
 - `rifle carry: left hand picked up the rifle ...`, `right hand let go ...`,
   `drawing the pistol ...`, `left hand let go ...`, `right hand took the rifle's grip`
 - `rifle carry: asked the game to switch to the pistol`, then `the game switched
@@ -143,8 +165,9 @@ Tests: `g++ -std=c++20 -Isrc tests/test_rifle_carry.cpp src/vr/interact/rifle_ca
 
 ## Open
 
-- Grip points and the softer let-go are untested in the headset. Check the
-  `grip points:` line against where the three points should be.
+- The second layout of grip points and the right-hand let-go are untested in
+  the headset. The scope rail and magazine boxes have never been logged yet:
+  check the `grip points:` line's `rails:` and `magazine` parts.
 - The rifle angle in the left hand when picked up from the back is a guess
   (barrel along the controller's pointing direction); the `rifle_carry_*_deg`
   keys tune it.

@@ -1598,11 +1598,15 @@ bool GripRecord(int side, hands::GrabKind kind, UObject object, const std::strin
         std::string cls = ue::GetName(ue::GetClass(object));
         found = ReadText(RecordPath(cls + ".slide"), &text);
     }
-    // A support grip saved before there were grip points: use it for any
-    // point not posed yet.
+    // A grip point not posed yet: the scope rail's end takes the pose behind
+    // the light (the same hold on the handguard, a little further back);
+    // any point takes the support grip saved before there were grip points.
     if (!found && kind == hands::GrabKind::kSupportGrip && object && key.find(".support-") != std::string::npos) {
         std::string cls = ue::GetName(ue::GetClass(object));
-        found = ReadText(RecordPath(cls + ".support"), &text);
+        const std::string scope = std::string(".support-") + interact::PointKey(interact::kPointScopeRail);
+        if (key.size() >= scope.size() && key.compare(key.size() - scope.size(), scope.size(), scope) == 0)
+            found = ReadText(RecordPath(cls + ".support-" + interact::PointKey(interact::kPointLight)), &text);
+        if (!found) found = ReadText(RecordPath(cls + ".support"), &text);
     }
     if (found) {
         if (!have || is_mag) rec.right_hand = side == kR;

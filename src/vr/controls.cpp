@@ -167,7 +167,8 @@ struct Settings {
     // Support hand on three grip points (vr/interact/grip_points.h), not
     // wherever it grabs.
     bool grip_points = true;
-    double grip_point_inset = 4.5;        // hand centre this far in from the magwell, light and rail end, cm
+    double grip_point_inset = 4.5;        // hand centre this far behind the light, cm
+    bool rifle_right_let_go = true;       // the right hand alone letting go sends the rifle to its holster
 };
 Settings g_set;
 
@@ -232,6 +233,7 @@ void LoadSettings() {
     g_set.rifle_grip_reach = config::GetFloat("rifle_grip_reach_cm", 14.f);
     g_set.grip_points = config::GetBool("rifle_grip_points", true);
     g_set.grip_point_inset = std::clamp(config::GetFloat("rifle_grip_point_inset_cm", 4.5f), 0.f, 10.f);
+    g_set.rifle_right_let_go = config::GetBool("rifle_right_let_go", true);
     LoadHolsterSpots();
 }
 
@@ -2020,14 +2022,38 @@ std::string Lower(std::string s) {
     return s;
 }
 
+// The short name of a gun part for the log: "AR_Truss556_98_PicatinnyRail_TopRear"
+// -> "PicatinnyRail_TopRear".
+std::string PartShortName(const std::string& name) {
+    const size_t k = name.find("PicatinnyRail");
+    return k == std::string::npos ? name : name.substr(k);
+}
+
+// The box round the visible meshes of an actor (a magazine, a light) in the
+// gun frame; big helper meshes (a light's beam cone) are skipped.
+bool ActorBoxInFrame(UObject actor, const FQuat& inv, const FVector& grip_w, FVector* blo, FVector* bhi) {
+    bool have = false;
+    for (UObject c : MeshComponents(actor)) {
+        FVector lo, hi;
+        if (!MeshBoxInFrame(c, inv, grip_w, &lo, &hi)) continue;
+        if (hi.X - lo.X > 30 || hi.Y - lo.Y > 30 || hi.Z - lo.Z > 30) continue;
+        if (!have) *blo = lo, *bhi = hi;
+        *blo = FVector{std::min(blo->X, lo.X), std::min(blo->Y, lo.Y), std::min(blo->Z, lo.Z)};
+        *bhi = FVector{std::max(bhi->X, hi.X), std::max(bhi->Y, hi.Y), std::max(bhi->Z, hi.Z)};
+        have = true;
+    }
+    return have;
+}
+
 // Measures the parts; `found` lists what was used, for the log.
 interact::GunParts MeasureGunParts(UObject g, const FQuat& frame_w, const FVector& grip_w, std::string* found) {
     interact::GunParts parts;
     const FQuat inv = frame_w.Inverse();
-    struct Rail { FVector lo, hi; };
+    struct Rail { std::string name; FVector lo, hi; };
     std::vector<Rail> rails;
     bool have_lower = false, have_receiver = false;
     double receiver_front = 0;
+    FVector lower_lo, lower_hi;
     std::string names;
     char buf[200];
     for (UObject c : MeshComponents(g)) {
@@ -2049,9 +2075,11 @@ interact::GunParts MeasureGunParts(UObject g, const FQuat& frame_w, const FVecto
                      lo.X, hi.X, lo.Y, hi.Y, lo.Z, hi.Z);
             names += buf;
         } else if (n.find("rail") != std::string::npos) {
-            rails.push_back({lo, hi});
+            rails.push_back({name, lo, hi});
         } else if (n.find("lowerrec") != std::string::npos) {
             parts.magwell_front = have_lower ? std::max(parts.magwell_front, hi.X) : hi.X;
+            lower_lo = have_lower ? FVector{std::min(lower_lo.X, lo.X), 0, std::min(lower_lo.Z, lo.Z)} : lo;
+            lower_hi = have_lower ? FVector{std::max(lower_hi.X, hi.X), 0, std::max(lower_hi.Z, hi.Z)} : hi;
             have_lower = true;
         } else if ((n.find("receiver") != std::string::npos || n.find("reciver") != std::string::npos) &&
                    n.find("upper") == std::string::npos) {
@@ -2059,16 +2087,52 @@ interact::GunParts MeasureGunParts(UObject g, const FQuat& frame_w, const FVecto
             have_receiver = true;
         }
     }
+    // The rail the scope goes on (owner, second AR run: "the picatinny that
+    // the scope will go on, not the forward one"): the AR's top rear rail;
+    // on another gun the rearmost rail named "top".
+    int scope = -1;
+    for (size_t i = 0; i < rails.size(); ++i) {
+        const std::string n = Lower(rails[i].name);
+        if (n.find("toprear") != std::string::npos || n.find("top_rear") != std::string::npos) {
+            scope = static_cast<int>(i);
+            break;
+        }
+    }
+    if (scope < 0) {
+        for (size_t i = 0; i < rails.size(); ++i) {
+            if (Lower(rails[i].name).find("top") == std::string::npos) continue;
+            if (scope < 0 || rails[i].lo.X < rails[scope].lo.X) scope = static_cast<int>(i);
+        }
+        // Only one top rail: it runs the gun's length, it doesn't end on the handguard.
+        int tops = 0;
+        for (const Rail& r : rails) tops += Lower(r.name).find("top") != std::string::npos;
+        if (tops < 2) scope = -1;
+    }
+    for (size_t i = 0; i < rails.size(); ++i) {
+        const Rail& r = rails[i];
+        snprintf(buf, sizeof(buf), "%s %s X %.1f..%.1f Z %.1f..%.1f", i == 0 ? "; rails:" : ",",
+                 PartShortName(r.name).c_str(), r.lo.X, r.hi.X, r.lo.Z, r.hi.Z);
+        names += buf;
+    }
+    if (scope >= 0) {
+        parts.have_scope_rail = true;
+        parts.scope_rail_front = rails[scope].hi.X;
+        snprintf(buf, sizeof(buf), "; scope rail %s ends at %.1f", PartShortName(rails[scope].name).c_str(),
+                 parts.scope_rail_front);
+        names += buf;
+    }
     if (parts.have_handguard) {
-        // The rails on the handguard (not the receiver's top rail).
-        for (const Rail& r : rails) {
+        // The other rails on the handguard: where its front end is.
+        for (size_t i = 0; i < rails.size(); ++i) {
+            const Rail& r = rails[i];
+            if (static_cast<int>(i) == scope) continue;
             const double mid = 0.5 * (r.lo.X + r.hi.X);
             if (mid < parts.hg_lo.X - 1.0 || mid > parts.hg_hi.X + 1.0) continue;
             parts.rail_front = parts.have_rails ? std::max(parts.rail_front, r.hi.X) : r.hi.X;
             parts.have_rails = true;
         }
         if (parts.have_rails) {
-            snprintf(buf, sizeof(buf), "; rails end at %.1f", parts.rail_front);
+            snprintf(buf, sizeof(buf), "; handguard rails end at %.1f", parts.rail_front);
             names += buf;
         }
     }
@@ -2076,10 +2140,24 @@ interact::GunParts MeasureGunParts(UObject g, const FQuat& frame_w, const FVecto
     // handguard starts.
     if (!have_lower && have_receiver) parts.magwell_front = receiver_front;
     parts.have_magwell = have_lower || have_receiver;
-    if (parts.have_magwell) {
-        snprintf(buf, sizeof(buf), "; %s front at %.1f", have_lower ? "magwell (lower receiver)" : "receiver",
-                 parts.magwell_front);
+    if (have_lower) {
+        snprintf(buf, sizeof(buf), "; lower receiver X %.1f..%.1f Z %.1f..%.1f", lower_lo.X, lower_hi.X, lower_lo.Z,
+                 lower_hi.Z);
         names += buf;
+    } else if (have_receiver) {
+        snprintf(buf, sizeof(buf), "; receiver front at %.1f", parts.magwell_front);
+        names += buf;
+    }
+    // The magazine in the gun (the game's MagazineObj).
+    UObject mag = 0;
+    if (game::Gun(g).State().has_magazine && ue::GetProp(g, "MagazineObj", mag) && mag && LiveObject(mag)) {
+        parts.have_mag = ActorBoxInFrame(mag, inv, grip_w, &parts.mag_lo, &parts.mag_hi);
+        if (parts.have_mag) {
+            snprintf(buf, sizeof(buf), "; magazine %s X %.1f..%.1f Y %.1f..%.1f Z %.1f..%.1f",
+                     ue::GetName(ue::GetClass(mag)).c_str(), parts.mag_lo.X, parts.mag_hi.X, parts.mag_lo.Y,
+                     parts.mag_hi.Y, parts.mag_lo.Z, parts.mag_hi.Z);
+            names += buf;
+        }
     }
     // A light or laser fitted to the gun: the rearmost one on the handguard.
     for (const auto& part : game::custom::InstalledParts(g)) {
@@ -2088,20 +2166,10 @@ interact::GunParts MeasureGunParts(UObject g, const FQuat& frame_w, const FVecto
         const bool light = part.category == 12 || part.row.rfind("LIGHT_", 0) == 0 ||
                            lc.find("light") != std::string::npos || lc.find("laser") != std::string::npos;
         if (!light) continue;
-        bool have = false;
         FVector plo, phi;
-        for (UObject c : MeshComponents(part.actor)) {
-            FVector lo, hi;
-            if (!MeshBoxInFrame(c, inv, grip_w, &lo, &hi)) continue;
-            // Skip big helper meshes (a light's beam cone).
-            if (hi.X - lo.X > 30 || hi.Y - lo.Y > 30 || hi.Z - lo.Z > 30) continue;
-            if (!have) plo = lo, phi = hi;
-            plo = FVector{std::min(plo.X, lo.X), std::min(plo.Y, lo.Y), std::min(plo.Z, lo.Z)};
-            phi = FVector{std::max(phi.X, hi.X), std::max(phi.Y, hi.Y), std::max(phi.Z, hi.Z)};
-            have = true;
-        }
-        if (!have) continue;
-        snprintf(buf, sizeof(buf), "; %s X %.1f..%.1f", cls.c_str(), plo.X, phi.X);
+        if (!ActorBoxInFrame(part.actor, inv, grip_w, &plo, &phi)) continue;
+        snprintf(buf, sizeof(buf), "; %s X %.1f..%.1f Y %.1f..%.1f Z %.1f..%.1f", cls.c_str(), plo.X, phi.X, plo.Y,
+                 phi.Y, plo.Z, phi.Z);
         names += buf;
         if (parts.have_handguard && (plo.X < parts.hg_lo.X - 2.0 || plo.X > parts.hg_hi.X)) continue;
         if (!parts.have_light || plo.X < parts.light_rear) parts.light_rear = plo.X;
@@ -2116,6 +2184,8 @@ struct GripPointCache {
     double at = -1;
     interact::GripPoints pts;
     std::string logged;
+    bool have_mag = false;         // the last seated magazine's box (used while it is out)
+    FVector mag_lo, mag_hi;
 };
 // One per gun frame: 0 the gun in the right hand (its frame as HoldGun
 // measured it), 1 the rifle the left hand holds alone (rifle carry's frame).
@@ -2137,7 +2207,16 @@ const interact::GripPoints& GripPointsFor(int source, UObject g, const FQuat& fr
     if (c->at >= 0 && g_clock - c->at < 2.0) return c->pts;
     c->at = g_clock;
     std::string found;
-    const interact::GunParts parts = MeasureGunParts(g, frame_w, grip_w, &found);
+    interact::GunParts parts = MeasureGunParts(g, frame_w, grip_w, &found);
+    if (parts.have_mag) {
+        c->have_mag = true;
+        c->mag_lo = parts.mag_lo, c->mag_hi = parts.mag_hi;
+    } else if (c->have_mag) {
+        // Magazine out (reloading): the point stays where it was.
+        parts.have_mag = true;
+        parts.mag_lo = c->mag_lo, parts.mag_hi = c->mag_hi;
+        found += "; magazine out: where it was";
+    }
     c->pts = interact::MakeGripPoints(parts, muzzle_dist, g_set.grip_point_inset);
     std::string line;
     char buf[160];
@@ -2145,9 +2224,12 @@ const interact::GripPoints& GripPointsFor(int source, UObject g, const FQuat& fr
         for (int i = 0; i < interact::kPointCount; ++i) {
             if (!c->pts.have[i]) continue;
             const FVector& p = c->pts.p[i];
+            const char* how = "";
+            if (i == interact::kPointLight && !c->pts.light_found) how = " (no light: the handguard's front)";
+            if (i == interact::kPointScopeRail && !c->pts.scope_found) how = " (no scope rail: halfway)";
+            if (i == interact::kPointMag && !c->pts.mag_found) how = " (no magazine measured)";
             snprintf(buf, sizeof(buf), "%s %s%s (%.1f %.1f %.1f)", line.empty() ? "" : ",", interact::PointName(i),
-                     i == interact::kPointLight && !c->pts.light_found ? " (no light: halfway)" : "", p.X, p.Y,
-                     p.Z);
+                     how, p.X, p.Y, p.Z);
             line += buf;
         }
     }
@@ -3314,6 +3396,7 @@ struct RifleCarryState {
     interact::LongSqueeze squeeze;   // the left grip, while it holds the rifle alone (hold mode)
     bool right_held = false;         // the right grip squeezed and not let go since (LongSqueeze)
     interact::LongSqueeze right_squeeze;
+    double actions_at = -1;          // last frame the hand moves were read (not in the grip editor or a menu)
     // Where the rifle is kept when nobody holds it: the game's own spot
     // (learned from where the game hangs it; WeaponLocation_Back until then).
     UObject store_parent = 0;
@@ -4426,6 +4509,15 @@ void RifleCarry(UObject player, const hands::HandState& rh, const hands::HandSta
         in.left_grip_down = g_rc.carried ? g_rc.squeeze.Update(lin.grip_value, dt) : lin.grip_button.down;
         in.left_grip_pressed = lin.grip_button.pressed;
         in.right_grip_pressed = rin.grip_button.pressed;
+        // Back from the grip editor or a menu (the editor uses the grips to
+        // pose the hand): only a squeeze held now counts as still holding,
+        // and only a new let-go lets go.
+        if (g_rc.actions_at < 0 || g_clock - g_rc.actions_at > 0.25) {
+            g_rc.right_held = rin.grip_button.down;
+            g_rc.right_squeeze.Start();
+            g_rc.squeeze.Start();
+        }
+        g_rc.actions_at = g_clock;
         if (rin.grip_button.pressed) {
             g_rc.right_held = true;
             g_rc.right_squeeze.Start();
@@ -4435,6 +4527,7 @@ void RifleCarry(UObject player, const hands::HandState& rh, const hands::HandSta
         }
         in.toggle = g_set.grip_toggle;
         in.right_toggle = g_set.holster_toggle;
+        in.right_puts_away = g_set.rifle_right_let_go;
         FQuat frame;
         FVector grip;
         bool have_now = false;
@@ -4531,6 +4624,29 @@ void RifleCarry(UObject player, const hands::HandState& rh, const hands::HandSta
                     log::Info("rifle carry: right hand let go (its squeeze stayed under 0.20; lowest %.2f while "
                               "held); the left hand keeps the rifle, %s",
                               g_rc.right_squeeze.lowest, interact::PointName(g_rc.point));
+                break;
+            case A::kRightPutsAway:
+                // The rifle flies back to its holster (or the game's spot on
+                // the back) and stays the current weapon, as when the left
+                // hand lets go of it; the right hand takes it from there.
+                if (!W.have_pose) break;
+                g_rc.returning = true;
+                g_rc.ret_t = 0.0;
+                g_rc.ret_loc = W.gun_set_loc;
+                g_rc.ret_rot = W.actor_rot;
+                W.right_let_go = true;
+                W.in_hand = false;
+                W.two_hand = false;
+                W.have_support_point = false;
+                ReleaseTrigger(player);
+                input::Haptic(input::kRight, 0.2f, 0.02f);
+                if (g_set.holster_toggle)
+                    log::Info("rifle carry: right hand let go of the rifle (squeezed again); it goes back to its %s",
+                              RifleHolsterOn() ? "holster" : "spot on the back");
+                else
+                    log::Info("rifle carry: right hand let go of the rifle (its squeeze stayed under 0.20; lowest "
+                              "%.2f while held); it goes back to its %s",
+                              g_rc.right_squeeze.lowest, RifleHolsterOn() ? "holster" : "spot on the back");
                 break;
             case A::kDrawPistol:
                 if (in.right_has_rifle) {

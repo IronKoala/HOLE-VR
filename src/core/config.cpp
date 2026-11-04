@@ -408,13 +408,19 @@ const Block kBlocks[] = {
     {"rifle_grip_points",
      "\n"
      "; --- Where the left hand holds a rifle's handguard ---\n"
-     "; 1 = three grip points: in front of the magwell, behind the light, and at the\n"
-     "; end of the rail. The left hand takes the nearest one, and each has its own hand\n"
-     "; pose in the grip editor. 0 = the hand holds wherever it grabs.\n"
+     "; 1 = three grip points: just in front of the magazine, where the scope's top\n"
+     "; rail ends, and just behind the light. The left hand takes the nearest one, and\n"
+     "; each has its own hand pose in the grip editor. 0 = the hand holds wherever it grabs.\n"
      "rifle_grip_points=1\n"
-     "; How far the middle of the hand sits from the magwell, the light and the rail\n"
-     "; end (cm; half a hand's width).\n"
+     "; How far the middle of the hand sits behind the light (cm; half a hand's width).\n"
      "rifle_grip_point_inset_cm=4.5\n"},
+    {"rifle_right_let_go",
+     "\n"
+     "; --- Letting go of the rifle with the right hand ---\n"
+     "; 1 = open the right hand on the rifle (the left hand not on it) and the rifle\n"
+     "; goes back to its holster by itself, like the pistol. With the left hand on the\n"
+     "; handguard the left hand keeps it. 0 = the rifle stays in the right hand.\n"
+     "rifle_right_let_go=1\n"},
     {"fixed_height",
      "\n"
      "; 1 = your in-game height is always the character's, seated or standing\n"

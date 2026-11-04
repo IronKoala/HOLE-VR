@@ -47,12 +47,14 @@ struct CarryInput {
     bool right_at_pistol_holster = false;  // right hand in the pistol holster's zone
     bool toggle = false;            // grip toggle: squeeze again to let go (left hand)
     bool right_toggle = false;      // gun grip toggle: the right hand lets go of the rifle on a squeeze
+    bool right_puts_away = true;    // the right hand alone letting go sends the rifle to its holster
 };
 
 enum class CarryAction {
     kNone,
     kPickUp,          // left hand takes the rifle by the handguard from wherever it is
     kRightLetGo,      // both hands on the rifle and the right let go: the left keeps it
+    kRightPutsAway,   // only the right hand on the rifle and it let go: the rifle goes back to its holster
     kDrawPistol,      // rifle out, right grip at the pistol holster: switch to the pistol
     kRightTakesRifle, // right hand empty, right grip on the rifle's grip
     kLetGo,           // the left hand lets go of the rifle it holds alone

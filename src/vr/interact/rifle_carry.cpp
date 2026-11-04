@@ -18,6 +18,7 @@ const char* ActionName(CarryAction a) {
     switch (a) {
         case CarryAction::kPickUp: return "pick up";
         case CarryAction::kRightLetGo: return "right hand lets go";
+        case CarryAction::kRightPutsAway: return "right hand puts the rifle away";
         case CarryAction::kDrawPistol: return "draw pistol";
         case CarryAction::kRightTakesRifle: return "right hand takes the rifle";
         case CarryAction::kLetGo: return "left hand lets go";
@@ -45,8 +46,11 @@ CarryAction Decide(const CarryInput& in) {
     }
     if (in.right_has_rifle) {
         if (in.right_grip_pressed && in.right_at_pistol_holster) return CarryAction::kDrawPistol;
-        if (in.left_support && (in.right_toggle ? in.right_grip_pressed : in.right_grip_released))
-            return CarryAction::kRightLetGo;
+        const bool let_go = in.right_toggle ? in.right_grip_pressed : in.right_grip_released;
+        if (let_go && in.left_support) return CarryAction::kRightLetGo;
+        // Owner, second AR run: "i cant let go of the rifle". Like the
+        // pistol, it goes back to its holster by itself.
+        if (let_go && in.right_puts_away) return CarryAction::kRightPutsAway;
         return CarryAction::kNone;
     }
     if (in.left_grip_pressed && in.left_on_handguard && !in.left_busy && !in.left_support)
