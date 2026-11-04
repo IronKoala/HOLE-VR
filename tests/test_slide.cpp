@@ -269,6 +269,53 @@ int main() {
         EXPECT(s.Update(FVector{-14, 0, 2}, false, 0.011) == SlideEvent::kRacked);
         EXPECT(s.HandleTravel() == 0.0);
     }
+    {
+        // A squeeze held from seating a magazine does not grab the slide when
+        // the magazine leaves the hand (2026-11-03 run: 11 of 13 holds in the
+        // level began 8-15 ms after "magazine seated").
+        SqueezeGate g;
+        Slide s(Pistol());
+        const FVector at{-6, 0, 2};
+        s.AcceptNextPress(true);
+        EXPECT(s.Update(at, g.Update(false, false, true), 0.011) == SlideEvent::kNone);
+        // Squeeze at the pouch, magazine taken the same frame.
+        s.AcceptNextPress(false);
+        EXPECT(s.Update(FVector{0, 30, -20}, g.Update(true, true, true), 0.011) == SlideEvent::kNone);
+        for (int i = 0; i < 30; ++i) {
+            const bool down = g.Update(false, true, false);   // holding the magazine
+            EXPECT(!down);
+            s.AcceptNextPress(true);
+            EXPECT(s.Update(at, down, 0.011) == SlideEvent::kNone);
+        }
+        // Magazine seated, grip still down, hand at the slide: no grab.
+        for (int i = 0; i < 30; ++i) {
+            const bool down = g.Update(false, true, true);
+            EXPECT(!down);
+            EXPECT(g.Blocked());
+            s.AcceptNextPress(true);
+            EXPECT(s.Update(at, down, 0.011) == SlideEvent::kNone);
+        }
+        EXPECT(!s.Held());
+        // Open the hand, squeeze again: grabbed.
+        EXPECT(!g.Update(false, false, true));
+        EXPECT(!g.Blocked());
+        s.Update(at, false, 0.011);
+        EXPECT(s.Update(at, g.Update(true, true, true), 0.011) == SlideEvent::kGrabbed);
+        EXPECT(s.Update(at, g.Update(false, true, true), 0.011) == SlideEvent::kNone);
+        EXPECT(s.Held());
+    }
+    {
+        // Left grip squeezed before the pistol is drawn: drawing it does not
+        // grab the slide. A plain squeeze with the pistol in hand does.
+        SqueezeGate g;
+        EXPECT(!g.Update(true, true, false));
+        EXPECT(!g.Update(false, true, false));
+        EXPECT(!g.Update(false, true, true));
+        EXPECT(!g.Update(false, false, true));
+        EXPECT(g.Update(true, true, true));
+        EXPECT(g.Update(false, true, true));
+        EXPECT(!g.Update(false, false, true));
+    }
     std::printf(failures ? "%d failure(s)\n" : "all slide tests passed\n", failures);
     return failures ? EXIT_FAILURE : EXIT_SUCCESS;
 }

@@ -623,7 +623,9 @@ struct WeaponState {
         double needed_cm = 0;       // hand pull a full rack needs
         bool by_fingers = false;    // caught by the visible fingers' pinch, not the controller centre
         std::string pulls, grips;   // per frame, for the first holds
+        bool told_blocked = false;  // logged this squeeze's refused slide grab
     } sd;
+    interact::SqueezeGate slide_squeeze;  // only a fresh squeeze grabs the slide
 } W;
 
 double Len(const FVector& v) { return std::sqrt(v.X * v.X + v.Y * v.Y + v.Z * v.Z); }
@@ -1222,7 +1224,19 @@ void SlideHandling(game::Gun& gun, const hands::HandState& lh, const input::Hand
     }
 
     using interact::SlideEvent;
-    const bool grab_down = lin.grip_button.down && W.held_mag == 0 && in_hand;
+    // Only a squeeze that starts with the hand free grabs the slide: one
+    // still held from seating a magazine (or from before the pistol was in
+    // the other hand) does not, the hand opens and squeezes again.
+    const bool grab_down =
+        W.slide_squeeze.Update(lin.grip_button.pressed, lin.grip_button.down, W.held_mag == 0 && in_hand);
+    if (!W.slide_squeeze.Blocked()) {
+        W.sd.told_blocked = false;
+    } else if (!W.sd.told_blocked && !W.slide.Held() && (centre_in || fingers_in)) {
+        W.sd.told_blocked = true;
+        log::Info("controls: slide not grabbed: the hand is %s, but this squeeze began holding a magazine or "
+                  "before the pistol was in hand (squeeze %.2f); open the hand and squeeze again to grab it",
+                  centre_in ? "in the slide zone" : "at the rear sight by the fingers", lin.grip_value);
+    }
     SlideEvent e = W.slide.Update(hand, grab_down, dt);
     // Hold diagnostics: every frame while held, a summary when it ends.
     if (e == SlideEvent::kGrabbed) {
