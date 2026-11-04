@@ -115,6 +115,33 @@ private:
     SlideHoldStats stats_;
 };
 
+// Which squeezes of the grip may grab the slide: only one that starts (a
+// press) while the hand is free to grab it (no magazine in it, the pistol
+// in the other hand). A squeeze that started holding a magazine does not
+// become a slide grab when the magazine seats with the grip still down: the
+// hand has to open and squeeze again. Evidence: 2026-11-03 run on 5b0930b,
+// 11 of the 13 slide holds in the level began 8-15 ms after "magazine
+// seated", with the squeeze never let go; the drawn hand jumped 11-15 cm
+// onto the slide and the owner let go about 0.2 s later.
+class SqueezeGate {
+public:
+    // pressed / down: the grip this frame. free: the hand may grab now.
+    // Returns the grip as the slide should see it.
+    bool Update(bool pressed, bool down, bool free) {
+        if (pressed) ok_ = free;
+        else if (!down || !free) ok_ = false;   // once taken by a magazine, the squeeze stays spent
+        blocked_ = down && free && !ok_;
+        return down && free && ok_;
+    }
+    // The grip is down and the hand is free, but this squeeze began when it
+    // was not (holding a magazine, no pistol in the other hand).
+    bool Blocked() const { return blocked_; }
+
+private:
+    bool ok_ = false;
+    bool blocked_ = false;
+};
+
 double Dot(const FVector& a, const FVector& b);
 double Length(const FVector& a);
 
