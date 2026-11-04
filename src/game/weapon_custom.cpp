@@ -415,6 +415,23 @@ bool ApplyLoadout(UObject player, UObject gun, const std::vector<SavedPart>& par
     UObject meta_struct = Struct("UserDefinedStruct /Game/Weapons/Custom/Data/Str_WeaponCustomMetaData.Str_WeaponCustomMetaData");
     const int32_t o_list = meta_struct ? Member(meta_struct, "WeaponCustomPartsAndPath") : -1;
     if (o_meta < 0 || o_list < 0) return fail("gun metadata layout not found");
+    UObject wm = 0;
+    if (!ue::GetProp(player, "WeaponManager", wm) || !wm) return fail("no weapon manager");
+    // The weapon manager's RefreshWeaponSpec rebuilds every gun the player
+    // carries (primary, secondary, and the melee slot when it holds a gun),
+    // not only this one. A tube-fed gun empties its tube when it is rebuilt
+    // (ClearMagazine, then Init_MagazineCreate with LoadNum 0), and a gun
+    // with a magazine on its way in would take it. With such a gun carried,
+    // only this gun is rebuilt.
+    std::string other;
+    for (const char* slot : {"Obj_PrimaryWeapon", "Obj_SecondaryWeapon", "Obj_MeleeWeapon"}) {
+        UObject w = 0;
+        if (!ue::GetProp(wm, slot, w) || !w || w == gun || !ue::IsLive(w)) continue;
+        uint8_t mt = 0;
+        UObject tm = 0;
+        if ((ue::GetProp(w, "MagazineType", mt) && mt == 1) || (ue::GetProp(w, "MagazineObj_Temp", tm) && tm))
+            other = ue::GetName(w);
+    }
 
     if (!WriteSaved(gi, row, parts)) return fail("the game did not take the new list");
 
@@ -441,10 +458,21 @@ bool ApplyLoadout(UObject player, UObject gun, const std::vector<SavedPart>& par
         return fail("could not write the gun's metadata");
     std::memcpy(raw + o_list, &old, sizeof(Arr));
 
-    UObject wm = 0;
-    if (!ue::GetProp(player, "WeaponManager", wm) || !wm) return fail("no weapon manager");
-    ue::Call r(wm, "RefreshWeaponSpec");
-    if (!r.Invoke()) return fail("RefreshWeaponSpec did not run");
+    if (other.empty()) {
+        ue::Call r(wm, "RefreshWeaponSpec");
+        if (!r.Invoke()) return fail("RefreshWeaponSpec did not run");
+    } else {
+        // This gun alone (BPI_Gun RefreshGunSpec, what the manager calls on
+        // each gun), then what the player does on the manager's refresh
+        // broadcast (HUD light mode, barrel heat), run directly.
+        ue::Call r(gun, "RefreshGunSpec");
+        if (!r.Invoke()) return fail("RefreshGunSpec did not run");
+        ue::Call hud(player, "BndEvt__BP_Player_WeaponManager_K2Node_ComponentBoundEvent_10_RefreshWeapon__DelegateSignature");
+        if (hud.Valid()) hud.Invoke();
+        log::Info("weapon custom: only %s rebuilt; %s is carried too and rebuilding it would empty its tube or "
+                  "load a magazine that is on its way in",
+                  ue::GetName(gun).c_str(), other.c_str());
+    }
 
     // The hub's weapon racks show the guns with their parts (the menu
     // refreshes them too).
