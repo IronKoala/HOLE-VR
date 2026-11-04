@@ -78,7 +78,9 @@ dump of the shipping game (`hole-vr/dump/game_classes.txt`).
   after texts came into view), the panel's own 1920x1080 picture is saved as
   `hole-vr/panel-<menu>-<n>.exr` (OpenEXR: the panel's render target is half-float) through
   `KismetRenderingLibrary.ExportRenderTarget` (about 100 ms each);
-  the death screen saves one per page. Each costs a short hitch, so at most
+  the death screen saves one per page. Each holds the game thread for 81 to
+  112 ms (a visible hitch in the headset), so since the 2026-11-04 outside
+  review they are off unless `menu_snapshot_diagnostics=1`, and then at most
   `menu_snapshots` (2) per menu per run. The headset picture
   (`capture-forearm-<menu>.bmp`) now waits until you look at the arm.
 - **Panel placement** (`PanelOrigin`, 2026-11-03 evening). The panel keeps
