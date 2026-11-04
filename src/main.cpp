@@ -7,11 +7,13 @@
 
 #include "core/config.h"
 #include "core/log.h"
-#include "core/perf.h"
 #include "core/memory.h"
+#include "core/perf.h"
+#include "core/process_metrics.h"
 #include "game/game.h"
 #include "game/weapon_lab.h"
 #include "proxy/dxgi_proxy.h"
+#include "build_id.h"
 #include "version.h"
 #include "ue/dumper.h"
 #include "ue/script_dump.h"
@@ -45,7 +47,6 @@
 namespace {
 
 constexpr const char* kVersion = HOLEVR_VERSION_STR;
-HMODULE g_self = nullptr;
 
 std::wstring ModuleDir(HMODULE m) {
     wchar_t buf[MAX_PATH];
@@ -188,7 +189,7 @@ DWORD WINAPI InitThread(LPVOID) {
 
     // Development hotkeys. Polled rather than hooked so nothing here can
     // interfere with the game's own input.
-    bool dump_was_down = false, recenter_was_down = false, aa_was_down = false;
+    bool dump_was_down = false, recenter_was_down = false, aa_was_down = false, pair_was_down = false;
     // One automatic dump per launch once the game's own classes (weapons,
     // player) are loaded, so the class list always covers them without a
     // keypress (the start-up dump runs before any level and misses them).
@@ -225,10 +226,14 @@ DWORD WINAPI InitThread(LPVOID) {
         if (frame % 60 == 15) { perf::Scope t(bg_panel); vr::ui_panel::Maintain(); }
         if (frame % 15 == 7) { perf::Scope t(bg_menu); vr::world_menu::Scan(); }
         if (hooks) { perf::Scope t(bg_study); vr::menu_study::Poll(); }
+        if (frame % 60 == 45 && config::GetBool("process_metrics", true)) process_metrics::MaybeReport();
         bool ctrl = GetAsyncKeyState(VK_CONTROL) & 0x8000;
         bool dump = ctrl && (GetAsyncKeyState(VK_F9) & 0x8000);
         bool recenter = ctrl && (GetAsyncKeyState(VK_F8) & 0x8000);
         bool cycle_aa = ctrl && (GetAsyncKeyState(VK_F10) & 0x8000);
+        bool pair = ctrl && (GetAsyncKeyState(VK_F11) & 0x8000);
+        if (pair && !pair_was_down) vr::xr::RequestPairedCapture("manual");
+        pair_was_down = pair;
         if (hooks && cycle_aa && !aa_was_down) vr::cvars::CycleAntiAliasing();
         aa_was_down = cycle_aa;
         if (dump && !dump_was_down) {
@@ -254,7 +259,6 @@ bool IsTheGame() {
 
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
-        g_self = inst;
         DisableThreadLibraryCalls(inst);
         if (!holevr::proxy::LoadRealDxgi()) {
             MessageBoxW(nullptr, L"HOLE VR could not load the system dxgi.dll.", L"HOLE VR",
@@ -270,6 +274,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
             CreateDirectoryW(g_mod_dir.c_str(), nullptr);
             holevr::log::Init(g_mod_dir);
             holevr::log::Info("HOLE VR %s starting", kVersion);
+            holevr::log::Info("build: %s (compiled %s %s)", HOLEVR_BUILD_ID, __DATE__, __TIME__);
             holevr::config::Load(g_mod_dir);
             holevr::proxy::SetFactoryCallback(&holevr::vr::dxgi_hooks::OnFactoryCreated);
             holevr::vr::stereo::InstallCommandLineHook();

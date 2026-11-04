@@ -48,11 +48,6 @@ void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* back_buffer);
 
 // The texture the engine rendered both eyes into (left half / right half).
 void SetEyeTexture(ID3D12Resource* texture);
-void SetFallbackTexture(ID3D12Resource* texture);
-// The game window's back buffer for the frame being presented (state
-// PRESENT), with the desktop mirror and the game's menus/HUD on it. Only
-// valid during AddLayers/OnFrame on the present thread.
-ID3D12Resource* WindowTexture();
 
 struct EyeView {
     XrPosef pose;  // in tracking space
@@ -95,5 +90,13 @@ ID3D12Device* Device();
 // Saves the next picture sent to the headset (both eyes, half size) as
 // <mod folder>/capture-<tag>.bmp. For checking what the player sees.
 void RequestCapture(const char* tag);
+
+// Opt-in forensic capture: source before CopyEyes and both eye images after
+// CopyEyes, from one GPU submission. Full-resolution BMPs plus exact packed
+// pixel comparison/metadata. Only completed fences are read. Returns false
+// when disabled, another request is in flight, or the per-process limit is hit.
+// Automatic detections request the NEXT copied frame, not the detected strip's
+// earlier frame. Runtime composition/reprojection is outside these captures.
+bool RequestPairedCapture(const char* tag);
 
 }  // namespace holevr::vr::xr

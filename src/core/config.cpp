@@ -590,6 +590,21 @@ const Block kBlocks[] = {
      "; empty can lies on the floor this long (s).\n"
      "drinks_hide_game_can_s=6\n"
      "drinks_empty_can_s=30\n"},
+    {"paired_capture_enabled",
+     "\n"
+     "; White squares (diagnostic): when the square watch sees dots in one eye, save\n"
+     "; the next frame's whole picture before the headset copy plus both copied eye\n"
+     "; pictures, and check the copies match it pixel for pixel. Ctrl+F11 asks for\n"
+     "; one by hand. At most paired_capture_limit per run (8 max). Each costs a\n"
+     "; short hitch, so 0 for performance comparisons. See docs/WHITE_SQUARE_CAPTURE.md.\n"
+     "paired_capture_enabled=1\n"
+     "paired_capture_limit=3\n"
+     "paired_capture_on_dots=1\n"},
+    {"process_metrics",
+     "\n"
+     "; Every 30 s log the game process's memory, handles, CPU and disk use (game\n"
+     "; and mod together: a rise alone is not proof the mod leaks).\n"
+     "process_metrics=1\n"},
 };
 
 std::string Trim(const std::string& s) {

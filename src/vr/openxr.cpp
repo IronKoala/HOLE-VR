@@ -7,13 +7,17 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
 
+#include "build_id.h"
 #include "core/config.h"
 #include "core/log.h"
 #include "core/perf.h"
+#include "version.h"
+#include "vr/frame_capture.h"
 #include "vr/square_watch.h"
 #include "vr/swapchain_hold.h"
 
@@ -625,6 +629,8 @@ ID3D12Resource* g_readback = nullptr;
 UINT64 g_readback_size = 0;
 D3D12_PLACED_SUBRESOURCE_FOOTPRINT g_readback_fp{};
 std::string g_readback_tag;  // set while a readback is in this frame's commands
+UINT64 g_readback_fence = 0;
+DXGI_FORMAT g_readback_format = DXGI_FORMAT_UNKNOWN;
 
 float Channel(uint32_t px, DXGI_FORMAT f, int c) {
     switch (f) {
@@ -678,18 +684,18 @@ void WriteBmp(std::string tag, std::vector<uint8_t> data, D3D12_PLACED_SUBRESOUR
 }
 
 // Records a copy of `source` into the readback buffer when a capture is due.
-void RecordCapture(ID3D12Resource* source) {
-    g_readback_tag.clear();
+bool RecordCapture(ID3D12Resource* source) {
+    if (!g_readback_tag.empty()) return false;  // previous submission still owns this buffer
     std::string tag;
     {
         std::lock_guard<std::mutex> lock(g_capture_mutex);
-        if (g_capture_tag.empty()) return;
+        if (g_capture_tag.empty()) return false;
         tag.swap(g_capture_tag);
     }
     D3D12_RESOURCE_DESC sd = source->GetDesc();
     if (sd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || sd.SampleDesc.Count != 1) {
         log::Warn("capture: source isn't a plain 2D texture, skipped");
-        return;
+        return false;
     }
     switch (sd.Format) {
         case DXGI_FORMAT_R10G10B10A2_UNORM: case DXGI_FORMAT_R10G10B10A2_TYPELESS:
@@ -698,7 +704,7 @@ void RecordCapture(ID3D12Resource* source) {
             break;
         default:
             log::Warn("capture: format %d not supported, skipped", static_cast<int>(sd.Format));
-            return;
+            return false;
     }
     UINT64 total = 0;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
@@ -719,7 +725,7 @@ void RecordCapture(ID3D12Resource* source) {
         if (FAILED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST,
                                                      nullptr, IID_PPV_ARGS(&g_readback)))) {
             log::Warn("capture: could not create the readback buffer");
-            return;
+            return false;
         }
         g_readback_size = total;
     }
@@ -734,17 +740,18 @@ void RecordCapture(ID3D12Resource* source) {
     g_cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     g_readback_fp = fp;
     g_readback_tag = tag;
+    g_readback_format = sd.Format;
+    return true;
 }
 
-// After the frame's commands are submitted: waits for them and saves the picture.
-void FinishCapture(DXGI_FORMAT format) {
-    if (g_readback_tag.empty()) return;
+// Poll a completed submission. A timeout must never authorize mapping or
+// reusing the buffer: queued requests wait until this exact fence completes.
+void FinishCapture() {
+    if (g_readback_tag.empty() || !g_fence ||
+        !frame_capture::FenceReady(g_fence->GetCompletedValue(), g_readback_fence)) return;
     std::string tag;
     tag.swap(g_readback_tag);
-    if (g_fence->GetCompletedValue() < g_fence_value) {
-        g_fence->SetEventOnCompletion(g_fence_value, g_fence_event);
-        WaitForSingleObject(g_fence_event, 500);
-    }
+    g_readback_fence = 0;
     void* mapped = nullptr;
     D3D12_RANGE range{0, static_cast<SIZE_T>(g_readback_size)};
     if (FAILED(g_readback->Map(0, &range, &mapped)) || !mapped) {
@@ -755,13 +762,265 @@ void FinishCapture(DXGI_FORMAT format) {
                               static_cast<const uint8_t*>(mapped) + g_readback_size);
     D3D12_RANGE none{0, 0};
     g_readback->Unmap(0, &none);
-    std::thread(WriteBmp, tag, std::move(data), g_readback_fp, format).detach();
+    std::thread(WriteBmp, tag, std::move(data), g_readback_fp, g_readback_format).detach();
+}
+
+// ------------------------------------------------------- paired diagnostic --
+// One opt-in request at a time, at most eight per process. The source and both
+// eye copies are read back in ONE command list; the writer never maps a buffer
+// until that submission's exact fence has completed.
+std::mutex g_pair_capture_mutex;
+std::string g_pair_capture_request;
+unsigned g_pair_capture_serial = 0;
+std::atomic<bool> g_pair_capture_busy{false};
+
+struct PairImage {
+    ID3D12Resource* buffer = nullptr;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+    UINT64 bytes = 0;
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    std::vector<uint8_t> data;
+    frame_capture::Image View() const {
+        return {data.data(), data.size(), fp.Footprint.Width, fp.Footprint.Height, fp.Footprint.RowPitch};
+    }
+};
+struct PairCapture {
+    PairImage im[3];  // source-before, left-after, right-after
+    std::string name, tag;
+    uint64_t frame = 0;
+    UINT64 fence = 0, completed = 0;
+    XrTime display_time = 0;
+    XrResult end_result = XR_ERROR_RUNTIME_FAILURE;
+    bool end_known = false, signaled = false, from_engine = false;
+    UINT indices[2]{};
+    D3D12_RESOURCE_STATES source_state{};
+    DXGI_FORMAT swapchain_format = DXGI_FORMAT_UNKNOWN;
+    ~PairCapture() { for (auto& image : im) if (image.buffer) image.buffer->Release(); }
+};
+std::unique_ptr<PairCapture> g_pair_capture;
+
+int CaptureFormatFamily(DXGI_FORMAT f) {
+    switch (f) {
+        case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+        case DXGI_FORMAT_R8G8B8A8_TYPELESS: return 1;
+        case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+        case DXGI_FORMAT_B8G8R8A8_TYPELESS: return 2;
+        case DXGI_FORMAT_R10G10B10A2_UNORM: case DXGI_FORMAT_R10G10B10A2_TYPELESS: return 3;
+        default: return 0;
+    }
+}
+bool CaptureDescValid(const D3D12_RESOURCE_DESC& d) {
+    return d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.SampleDesc.Count == 1 &&
+           d.DepthOrArraySize == 1 && d.Width > 0 && d.Width <= 16384 && d.Height > 0 && d.Height <= 16384 &&
+           d.Width * d.Height <= frame_capture::kMaxSourcePixels && CaptureFormatFamily(d.Format) != 0;
+}
+bool MakePairReadback(const D3D12_RESOURCE_DESC& desc, PairImage& im) {
+    im.format = desc.Format;
+    g_device->GetCopyableFootprints(&desc, 0, 1, 0, &im.fp, nullptr, nullptr, &im.bytes);
+    if (!im.bytes || im.bytes > frame_capture::kMaxSourcePixels * 4 + 16384 * 256) return false;
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC bd{};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = im.bytes;
+    bd.Height = 1;
+    bd.DepthOrArraySize = 1;
+    bd.MipLevels = 1;
+    bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    return SUCCEEDED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd,
+        D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&im.buffer)));
+}
+void RecordPairImage(ID3D12Resource* texture, const PairImage& im) {
+    D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
+    dst.pResource = im.buffer;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint = im.fp;
+    src.pResource = texture;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    g_cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+}
+bool RecordPairBefore(ID3D12Resource* source, D3D12_RESOURCE_STATES source_state,
+                      const uint32_t indices[2], bool from_engine, XrTime display_time) {
+    std::string tag;
+    unsigned serial = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_pair_capture_mutex);
+        if (g_pair_capture_request.empty()) return false;
+        tag.swap(g_pair_capture_request);
+        serial = g_pair_capture_serial;
+    }
+    try {
+        auto c = std::make_unique<PairCapture>();
+        ID3D12Resource* images[] = {source, g_swapchains[0].images[indices[0]].texture,
+                                   g_swapchains[1].images[indices[1]].texture};
+        D3D12_RESOURCE_DESC desc[3] = {images[0]->GetDesc(), images[1]->GetDesc(), images[2]->GetDesc()};
+        bool valid = CaptureDescValid(desc[0]) && CaptureDescValid(desc[1]) && CaptureDescValid(desc[2]);
+        valid = valid && !(desc[0].Width & 1) && desc[1].Width == desc[0].Width / 2 &&
+                desc[2].Width == desc[1].Width && desc[0].Height == desc[1].Height &&
+                desc[1].Height == desc[2].Height &&
+                CaptureFormatFamily(desc[0].Format) == CaptureFormatFamily(desc[1].Format) &&
+                CaptureFormatFamily(desc[1].Format) == CaptureFormatFamily(desc[2].Format);
+        if (!valid || !MakePairReadback(desc[0], c->im[0]) ||
+            !MakePairReadback(desc[1], c->im[1]) || !MakePairReadback(desc[2], c->im[2])) {
+            log::Warn("paired capture: skipped unsupported/oversized image or failed readback allocation");
+            g_pair_capture_busy = false;
+            return false;
+        }
+        c->tag = tag;
+        c->frame = g_frames + 1;
+        c->display_time = display_time;
+        c->from_engine = from_engine;
+        c->source_state = source_state;
+        c->swapchain_format = g_swapchain_format;
+        c->indices[0] = indices[0]; c->indices[1] = indices[1];
+        SYSTEMTIME now{};
+        GetLocalTime(&now);
+        char name[200];
+        std::snprintf(name, sizeof(name), "pair-%04u%02u%02u-%02u%02u%02u-p%lu-%u-f%llu-%s",
+                      now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond,
+                      static_cast<unsigned long>(GetCurrentProcessId()), serial,
+                      static_cast<unsigned long long>(c->frame), tag.c_str());
+        c->name = name;
+        RecordPairImage(source, c->im[0]);  // source is already COPY_SOURCE
+        g_pair_capture = std::move(c);
+        return true;
+    } catch (...) {
+        log::Warn("paired capture: allocation failed; request dropped");
+        g_pair_capture_busy = false;
+        return false;
+    }
+}
+void RecordPairAfter(const uint32_t indices[2]) {
+    // Existing CopyEyes epilogue still restores COPY_DEST -> RENDER_TARGET.
+    // Restore COPY_DEST here so its assumptions and held-image state stay true.
+    for (int eye = 0; eye < 2; ++eye) {
+        ID3D12Resource* im = g_swapchains[eye].images[indices[eye]].texture;
+        auto barrier = Transition(im, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        g_cmd->ResourceBarrier(1, &barrier);
+        RecordPairImage(im, g_pair_capture->im[eye + 1]);
+        std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+        g_cmd->ResourceBarrier(1, &barrier);
+    }
+}
+bool WritePairBmp(const std::wstring& path, const PairImage& im) {
+    const auto view = im.View();
+    if (!frame_capture::ValidImage(view)) return false;
+    const uint32_t row_bytes = (view.width * 3 + 3) & ~3u;
+    uint8_t header[54]{};
+    auto put32 = [&](size_t at, uint32_t value) { std::memcpy(header + at, &value, 4); };
+    header[0] = 'B'; header[1] = 'M'; header[26] = 1; header[28] = 24;
+    put32(2, 54 + row_bytes * view.height); put32(10, 54); put32(14, 40);
+    put32(18, view.width); put32(22, view.height);
+    std::vector<uint8_t> row(row_bytes);
+    FILE* f = _wfopen(path.c_str(), L"wb");
+    if (!f) return false;
+    bool ok = fwrite(header, 1, sizeof(header), f) == sizeof(header);
+    for (uint32_t y = view.height; ok && y > 0; --y) {
+        const uint8_t* src = view.data + size_t(y - 1) * view.row_pitch;
+        for (uint32_t x = 0; x < view.width; ++x) {
+            uint32_t pixel;
+            std::memcpy(&pixel, src + size_t(x) * 4, 4);
+            for (int channel = 0; channel < 3; ++channel)
+                row[x * 3 + 2 - channel] = static_cast<uint8_t>(
+                    std::clamp(Channel(pixel, im.format, channel), 0.f, 1.f) * 255.f + 0.5f);
+        }
+        ok = fwrite(row.data(), 1, row.size(), f) == row.size();
+    }
+    if (fclose(f) != 0) ok = false;
+    return ok;
+}
+void WritePair(std::unique_ptr<PairCapture> c) {
+    try {
+        // Ownership arrives only after PollPairedCapture proves the submission
+        // complete. Keep full-image allocation/readback off the Present thread.
+        for (auto& im : c->im) {
+            im.data.resize(static_cast<size_t>(im.bytes));
+            void* mapped = nullptr;
+            const D3D12_RANGE read{0, static_cast<SIZE_T>(im.bytes)}, none{0,0};
+            if (FAILED(im.buffer->Map(0, &read, &mapped)) || !mapped) {
+                log::Warn("paired capture: completed buffer could not be mapped; request dropped");
+                c.reset();
+                g_pair_capture_busy = false;
+                return;
+            }
+            std::memcpy(im.data.data(), mapped, im.data.size());
+            im.buffer->Unmap(0, &none);
+            im.buffer->Release();
+            im.buffer = nullptr;
+        }
+        const auto left = frame_capture::CompareEye(c->im[0].View(), c->im[1].View(), 0);
+        const auto right = frame_capture::CompareEye(c->im[0].View(), c->im[2].View(), 1);
+        const std::wstring base = config::Dir() + L"\\" + std::wstring(c->name.begin(), c->name.end());
+        const wchar_t* suffix[] = {L"-source-before.bmp", L"-left-after.bmp", L"-right-after.bmp"};
+        bool saved[3]{};
+        for (int i = 0; i < 3; ++i) saved[i] = WritePairBmp(base + suffix[i], c->im[i]);
+        FILE* f = _wfopen((base + L"-metadata.txt").c_str(), L"wb");
+        if (f) {
+            std::fprintf(f, "build_id=%s\nversion=%s\ncompiled=%s %s\ntag=%s\nframe=%llu\ndisplay_time=%lld\n"
+                "source_kind=%s\nsource_state_before=%u\nswapchain_format=%u\n"
+                "left_image_index=%u\nright_image_index=%u\nfence_target=%llu\nfence_completed=%llu\n"
+                "xr_end_frame_result=%d\n"
+                "stages=source before eye copies; left/right after eye copies, before image release\n"
+                "pairing=all three GPU readbacks recorded in the same submitted command list\n"
+                "comparison=exact encoded 32-bit pixels; row padding excluded\n"
+                "bmp=full resolution, RGB converted to 8-bit preview; exact comparison uses original packed pixels\n"
+                "limit=one capture in flight, at most eight requests per process, source at most 16M pixels\n"
+                "scope=does not capture later composition layers, runtime reprojection, or headset display\n",
+                HOLEVR_BUILD_ID, HOLEVR_VERSION_STR, __DATE__, __TIME__, c->tag.c_str(),
+                static_cast<unsigned long long>(c->frame), static_cast<long long>(c->display_time),
+                c->from_engine ? "engine-eye-texture" : "window-backbuffer",
+                static_cast<unsigned>(c->source_state), static_cast<unsigned>(c->swapchain_format),
+                c->indices[0], c->indices[1], static_cast<unsigned long long>(c->fence),
+                static_cast<unsigned long long>(c->completed), static_cast<int>(c->end_result));
+            for (int i = 0; i < 3; ++i)
+                std::fprintf(f, "image%d_width=%u\nimage%d_height=%u\nimage%d_format=%u\nimage%d_pitch=%u\nimage%d_saved=%d\n",
+                    i,c->im[i].fp.Footprint.Width,i,c->im[i].fp.Footprint.Height,
+                    i,static_cast<unsigned>(c->im[i].format),i,c->im[i].fp.Footprint.RowPitch,i,saved[i]?1:0);
+            const frame_capture::Difference differences[] = {left,right};
+            for (int eye = 0; eye < 2; ++eye) {
+                const auto& d = differences[eye];
+                std::fprintf(f, "eye%d_comparison_valid=%d\neye%d_pixels=%llu\neye%d_different_pixels=%llu\n"
+                    "eye%d_first_difference=%u,%u\neye%d_first_source_pixel=0x%08x\neye%d_first_copied_pixel=0x%08x\n",
+                    eye,d.valid?1:0,eye,static_cast<unsigned long long>(d.pixels),
+                    eye,static_cast<unsigned long long>(d.different),eye,d.first_x,d.first_y,
+                    eye,d.source_pixel,eye,d.copied_pixel);
+            }
+            const bool metadata_ok = !ferror(f);
+            const int close_result = fclose(f);
+            if (!metadata_ok || close_result != 0) log::Warn("paired capture: metadata write failed");
+        } else log::Warn("paired capture: could not write metadata");
+        log::Info("paired capture: %s: exact different pixels left=%llu right=%llu, comparisons %s; BMPs %d/%d/%d",
+            c->name.c_str(), static_cast<unsigned long long>(left.different),
+            static_cast<unsigned long long>(right.different), left.valid && right.valid ? "valid" : "INVALID",
+            saved[0]?1:0,saved[1]?1:0,saved[2]?1:0);
+    } catch (...) {
+        log::Warn("paired capture: CPU readback/write failed");
+    }
+    c.reset();
+    g_pair_capture_busy = false;
+}
+void PollPairedCapture() {
+    if (!g_pair_capture || !g_pair_capture->fence || !g_pair_capture->signaled || !g_pair_capture->end_known) return;
+    const UINT64 completed = g_fence->GetCompletedValue();
+    if (!frame_capture::FenceReady(completed, g_pair_capture->fence)) return;
+    g_pair_capture->completed = completed;
+    try {
+        // No full-frame allocation or memcpy on Present. The worker owns every
+        // resource until it has mapped, compared, written and released it.
+        std::thread(WritePair, std::move(g_pair_capture)).detach();
+    } catch (...) {
+        log::Warn("paired capture: CPU allocation/writer startup failed");
+        g_pair_capture.reset();  // all GPU work is complete at this point
+        g_pair_capture_busy = false;
+    }
 }
 
 // Copies both halves of the eye texture into the acquired swapchain images.
 // False when nothing was submitted: the caller keeps the images and tries
 // again next frame.
-bool CopyEyes(ID3D12Resource* source, D3D12_RESOURCE_STATES src_state, const uint32_t image_index[2]) {
+bool CopyEyes(ID3D12Resource* source, D3D12_RESOURCE_STATES src_state, const uint32_t image_index[2],
+              bool from_engine, XrTime display_time) {
     const int slot = g_frame_slot;
     if (g_fence->GetCompletedValue() < g_allocator_fence_value[slot]) {
         perf::Scope t(g_perf_fence);
@@ -792,7 +1051,8 @@ bool CopyEyes(ID3D12Resource* source, D3D12_RESOURCE_STATES src_state, const uin
                    D3D12_RESOURCE_STATE_COPY_DEST),
     };
     g_cmd->ResourceBarrier(3, before);
-    RecordCapture(source);
+    const bool legacy_recorded = RecordCapture(source);
+    const bool pair_recorded = RecordPairBefore(source, src_state, image_index, from_engine, display_time);
     square_watch::Record(g_device, g_cmd, source);
     for (int eye = 0; eye < 2; ++eye) {
         const Swapchain& sc = g_swapchains[eye];
@@ -807,6 +1067,7 @@ bool CopyEyes(ID3D12Resource* source, D3D12_RESOURCE_STATES src_state, const uin
         D3D12_BOX box{eye * sc.width, 0, 0, eye * sc.width + sc.width, sc.height, 1};
         g_cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
     }
+    if (pair_recorded) RecordPairAfter(image_index);
     D3D12_RESOURCE_BARRIER after[3];
     for (int i = 0; i < 3; ++i) {
         after[i] = before[i];
@@ -821,15 +1082,26 @@ bool CopyEyes(ID3D12Resource* source, D3D12_RESOURCE_STATES src_state, const uin
         g_slot_has_ts[slot] = true;
     }
     if (FAILED(g_cmd->Close())) {
+        if (legacy_recorded) g_readback_tag.clear();
+        if (pair_recorded) {
+            g_pair_capture.reset();  // this command list was never submitted
+            g_pair_capture_busy = false;
+        }
         ++g_copy_errors;
         return false;
     }
     ID3D12CommandList* lists[] = {g_cmd};
     g_queue->ExecuteCommandLists(1, lists);
-    g_queue->Signal(g_fence, ++g_fence_value);
+    const HRESULT signal_result = g_queue->Signal(g_fence, ++g_fence_value);
     g_allocator_fence_value[slot] = g_fence_value;
     square_watch::Submitted(g_fence, g_fence_value);
-    FinishCapture(source->GetDesc().Format);
+    if (legacy_recorded) g_readback_fence = SUCCEEDED(signal_result) ? g_fence_value : UINT64_MAX;
+    if (pair_recorded) {
+        g_pair_capture->fence = g_fence_value;
+        g_pair_capture->signaled = SUCCEEDED(signal_result);
+    }
+    if (FAILED(signal_result))
+        log::Warn("capture/copy: queue fence signal failed; pending readbacks retained, never mapped or reused");
     return true;
 }
 
@@ -1167,7 +1439,7 @@ void RunFrame() {
         step(g_perf_images);
         if (ok) {
             const uint32_t index[2] = {g_swapchains[0].held.index, g_swapchains[1].held.index};
-            ok = CopyEyes(source, src_state, index);
+            ok = CopyEyes(source, src_state, index, from_engine, fs.predictedDisplayTime);
         }
         step(g_perf_copy);
         // Only images that now hold this frame's pictures are released. Any
@@ -1232,7 +1504,11 @@ void RunFrame() {
     ei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
     ei.layerCount = static_cast<uint32_t>(layers.size());
     ei.layers = layers.data();
-    Proc<PFN_xrEndFrame>("xrEndFrame")(g_session, &ei);
+    const XrResult end_result = Proc<PFN_xrEndFrame>("xrEndFrame")(g_session, &ei);
+    if (g_pair_capture && g_pair_capture->frame == g_frames) {
+        g_pair_capture->end_result = end_result;
+        g_pair_capture->end_known = true;
+    }
     step(g_perf_end);
     MarkFrameDone();
     // No perf::MaybeReport() here: RunFrame runs inside g_frame_mutex, and the
@@ -1364,6 +1640,8 @@ void RecommendedEyeSize(uint32_t* width, uint32_t* height) {
 void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* back_buffer) {
     g_present_ms = perf::NowMs();
     g_fallback_texture = back_buffer;
+    FinishCapture();
+    PollPairedCapture();
     if (!g_instance_ready || g_session_failed || !queue) return;
     if (!g_session) {
         if (!CreateSession(queue)) {
@@ -1384,8 +1662,6 @@ void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* back_buffer) {
 }
 
 void SetEyeTexture(ID3D12Resource* texture) { g_eye_texture = texture; }
-void SetFallbackTexture(ID3D12Resource* texture) { g_fallback_texture = texture; }
-ID3D12Resource* WindowTexture() { return g_fallback_texture; }
 
 XrDuration PredictAhead() { return g_ahead_ns.load(); }
 
@@ -1447,6 +1723,27 @@ void RequestCapture(const char* tag) {
     std::lock_guard<std::mutex> lock(g_capture_mutex);
     g_capture_tag = tag ? tag : "frame";
     log::Info("capture: next headset picture will be saved as capture-%s.bmp", g_capture_tag.c_str());
+}
+
+bool RequestPairedCapture(const char* tag) {
+    if (!config::GetBool("paired_capture_enabled", false)) return false;
+    std::lock_guard<std::mutex> lock(g_pair_capture_mutex);
+    if (g_pair_capture_busy.load()) return false;
+    const unsigned limit = static_cast<unsigned>(std::clamp(config::GetInt("paired_capture_limit", 3), 1, 8));
+    if (g_pair_capture_serial >= limit) return false;
+    std::string safe;
+    if (tag) for (const unsigned char ch : std::string(tag)) {
+        if (safe.size() >= 40) break;
+        safe.push_back((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                      (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' ? static_cast<char>(ch) : '_');
+    }
+    if (safe.empty()) safe = "manual";
+    g_pair_capture_request = safe;
+    ++g_pair_capture_serial;
+    g_pair_capture_busy = true;
+    log::Info("paired capture: request %u/%u (%s); next successfully copied frame, source plus both eye images",
+              g_pair_capture_serial, limit, safe.c_str());
+    return true;
 }
 
 }  // namespace holevr::vr::xr

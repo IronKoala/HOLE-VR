@@ -13,6 +13,7 @@ add_library(hole_vr SHARED
     src/core/ini_edit.cpp
     src/core/memory.cpp
     src/core/perf.cpp
+    src/core/process_metrics.cpp
     src/ue/names.cpp
     src/ue/objects.cpp
     src/ue/reflection.cpp
@@ -71,17 +72,29 @@ add_library(hole_vr SHARED
 )
 
 target_include_directories(hole_vr PRIVATE src third_party/openxr/include)
-target_link_libraries(hole_vr PRIVATE dxgi d3d12 dxguid)
+target_link_libraries(hole_vr PRIVATE dxgi d3d12 dxguid psapi)
 # The game loads dxgi.dll from its own folder first, so we ship as dxgi.dll.
 set_target_properties(hole_vr PROPERTIES OUTPUT_NAME "dxgi" PREFIX "")
 target_compile_definitions(hole_vr PRIVATE __USE_MINGW_ANSI_STDIO=1 WIDL_EXPLICIT_AGGREGATE_RETURNS WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+
+# The build id (src/build_id.h): the git revision, regenerated at every build.
+# -DHOLEVR_BUILD_ID=... overrides it (letters, digits, dot, underscore, + or -).
+set(HOLEVR_BUILD_ID "" CACHE STRING "Build id override (default: the git revision)")
+set(HOLEVR_GENERATED_DIR ${CMAKE_BINARY_DIR}/generated)
+add_custom_target(hole_vr_build_id
+    COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${HOLEVR_GENERATED_DIR}/generated_build_id.h
+            -DOVERRIDE=${HOLEVR_BUILD_ID} -P ${CMAKE_SOURCE_DIR}/cmake/build_id.cmake
+    BYPRODUCTS ${HOLEVR_GENERATED_DIR}/generated_build_id.h
+    VERBATIM)
+add_dependencies(hole_vr hole_vr_build_id)
+target_include_directories(hole_vr PRIVATE ${HOLEVR_GENERATED_DIR})
 
 if(MINGW)
     target_compile_options(hole_vr PRIVATE -O2 -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -Wno-cast-function-type)
     # Static runtime so players need no extra DLLs next to the game.
     target_link_options(hole_vr PRIVATE -static -static-libgcc -static-libstdc++ -Wl,--kill-at)
 else()
-    target_compile_options(hole_vr PRIVATE /O2 /W4 /permissive-)
+    target_compile_options(hole_vr PRIVATE /O2 /W4 /permissive- /EHsc)
     set_property(TARGET hole_vr PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
 endif()
 
@@ -102,4 +115,7 @@ if(MINGW)
     target_link_options(hole_vr_setup PRIVATE -municode -static -static-libgcc -static-libstdc++)
 else()
     set_property(TARGET hole_vr_setup PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
+    # setup.rc already embeds the supplied manifest, including Common Controls
+    # and DPI settings; an additional linker-generated manifest has the same ID.
+    target_link_options(hole_vr_setup PRIVATE /MANIFEST:NO)
 endif()

@@ -15,6 +15,7 @@
 #include "core/log.h"
 #include "core/perf.h"
 #include "game/game.h"
+#include "vr/openxr.h"
 #include "vr/render_fixes.h"
 #include "vr/square_watch_math.h"
 
@@ -256,6 +257,8 @@ void CheckDots(const Job& j, const Band& band, double now) {
         now - g_last_dot_event >= kDotEventGapMs) {
         g_last_dot_event = now;
         g_full_n = ++g_dot_events;
+        if (config::GetBool("paired_capture_on_dots", true))
+            xr::RequestPairedCapture("dots-next-frame");
         log::Info("square watch: %d lone dots in the %s eye's strip %u rows down that the other eye doesn't have "
                   "(%d vs %d; %.0f%% of them on one cell of an 8x4 grid); saving it as capture-dots-%d-strip.bmp and "
                   "the whole picture at full size as capture-dots-%d.bmp",
