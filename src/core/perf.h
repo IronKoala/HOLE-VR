@@ -28,9 +28,14 @@ struct Counter {
     // thousands of times a frame, where the average alone hides the cost.
     bool per_second_total = false;
     void Add(double ms) {
-        total.store(total.load() + ms);
-        if (ms > worst.load()) worst.store(ms);
-        count.fetch_add(1);
+        // Some counters receive calls from several engine threads. A
+        // load/store pair loses simultaneous samples (or restores a total
+        // that the reporter just cleared). Keep each update atomic.
+        total.fetch_add(ms, std::memory_order_relaxed);
+        double observed = worst.load(std::memory_order_relaxed);
+        while (ms > observed &&
+               !worst.compare_exchange_weak(observed, ms, std::memory_order_relaxed)) {}
+        count.fetch_add(1, std::memory_order_relaxed);
     }
 };
 
