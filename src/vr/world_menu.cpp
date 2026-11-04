@@ -76,7 +76,8 @@ struct Settings {
     float text_min_px = 32.f;     // ...and small print at least this big (layout pixels)...
     float text_max_px = 64.f;     // ...but no text grown past this (titles are big already)...
     float text_max_scale = 2.5f;  // ...nor more than this many times the game's size
-    int snapshots = 2;            // pictures of each menu's panel per run, to check its layout (0 = off)
+    int snapshots = 2;            // maximum pictures per menu when diagnostic exports are enabled
+    bool snapshot_exports = false; // panel pictures at all (each holds the game thread ~0.1 s)
     bool fit_shape = true;        // a tall narrow menu gets a tall panel of the same area (FitContent)
     float fit_min_zoom = 1.3f;    // menus filling the whole screen still get at least this zoom
     bool follow_exposure = true;  // dim the menus as much as the game brightens dark areas
@@ -2141,7 +2142,7 @@ bool TextStep(Panel& p) {
         p.quiet_check = false;
         return true;
     }
-    int grown = 0, measured = 0, waiting = 0, small = 0, small_grown = 0;
+    int grown = 0, measured = 0, waiting = 0, small_count = 0, small_grown = 0;
     double sum = 0;
     float base_min = 1e9f, base_max = 0;
     for (const auto& t : p.texts) {
@@ -2152,7 +2153,7 @@ bool TextStep(Panel& p) {
         if (t.measured) ++measured;
         else if (!t.grown) ++waiting;
         if (t.measured && t.base < S.text_min_px) {
-            ++small;
+            ++small_count;
             if (t.base * t.scale >= S.text_min_px * 0.85f) ++small_grown;
         }
         base_min = std::min(base_min, t.base);
@@ -2163,7 +2164,7 @@ bool TextStep(Panel& p) {
               "where a text didn't fit, %d rounds, last %.1f ms",
               p.name.c_str(), p.quiet_check ? " (looked again)" : "", grown, p.texts.size(),
               grown ? sum / grown : 1.0, p.texts.empty() ? 0.f : base_min,
-              base_max, small_grown, small, S.text_min_px, measured, waiting, p.text_pulled, p.text_round,
+              base_max, small_grown, small_count, S.text_min_px, measured, waiting, p.text_pulled, p.text_round,
               perf::NowMs() - t0);
     if (!p.quiet_check) LogTexts(p);
     p.quiet_check = false;
@@ -2262,6 +2263,11 @@ struct FStringView {
 std::unordered_map<std::string, int> g_snapshots;
 
 void SnapshotPanel(const Panel& p, const std::string& tag) {
+    // ExportRenderTarget synchronously reads back and encodes on the game
+    // thread (81-112 ms in the 2026-11-03 runs, e.g. "picture of its panel:
+    // taken ... 81 ms"). Layout exports are opt-in, including for older INIs
+    // that already contain menu_snapshots=2 (outside review, 2026-11-04).
+    if (!S.snapshot_exports) return;
     if (S.snapshots <= 0 || !L.krl || !Alive(p.comp, p.comp_index)) return;
     const std::string key = p.name + tag;
     int& n = g_snapshots[key];
@@ -4123,6 +4129,7 @@ void Init() {
     S.text_max_px = std::clamp(config::GetFloat("menu_text_max_px", 64.f), 10.f, 200.f);
     S.text_max_scale = std::clamp(config::GetFloat("menu_text_max_scale", 2.5f), 1.f, 4.f);
     S.snapshots = std::clamp(config::GetInt("menu_snapshots", 2), 0, 10);
+    S.snapshot_exports = config::GetBool("menu_snapshot_diagnostics", false);
     S.hud = config::GetBool("hud_on_forearm", true);
     S.hud_size = std::clamp(config::GetFloat("hud_forearm_size", 1.f), 0.3f, 3.f);
     S.hud_look_deg = std::clamp(config::GetFloat("hud_forearm_look_deg", 50.f), 10.f, 90.f);

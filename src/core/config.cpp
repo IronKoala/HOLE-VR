@@ -201,9 +201,14 @@ const Block kBlocks[] = {
      "menu_text_min_px=32\n"
      "menu_text_max_px=64\n"
      "menu_text_max_scale=2.5\n"
-     "; Pictures of each menu's panel saved beside the log per run, to check its\n"
-     "; layout (each costs a short hitch when taken; 0 = off)\n"
+     "; At most this many pictures of each menu's panel per run, when\n"
+     "; menu_snapshot_diagnostics=1\n"
      "menu_snapshots=2\n"},
+    {"menu_snapshot_diagnostics",
+     "\n"
+     "; 1 = save pictures of menu panels beside the log (EXR), to check their\n"
+     "; layout. Each one holds the game up for about 0.1 s (a visible hitch)\n"
+     "menu_snapshot_diagnostics=0\n"},
     {"menu_fit_min_zoom",
      "\n"
      "; Menus that fill the whole screen (death screen, Options, credits, task\n"

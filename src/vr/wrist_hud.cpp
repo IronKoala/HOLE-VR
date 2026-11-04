@@ -191,7 +191,7 @@ struct Canvas {
     HDC dc = nullptr;
     HBITMAP bmp = nullptr;
     uint32_t* pixels = nullptr;  // BGRA, top-down
-    HFONT big = nullptr, small = nullptr;
+    HFONT big = nullptr, small_font = nullptr;
 } C;
 
 bool InitCanvas() {
@@ -210,7 +210,7 @@ bool InitCanvas() {
     SelectObject(C.dc, C.bmp);
     C.big = CreateFontW(-120, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0,
                         L"Segoe UI");
-    C.small = CreateFontW(-44, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0,
+    C.small_font = CreateFontW(-44, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0,
                           L"Segoe UI");
     SetBkMode(C.dc, TRANSPARENT);
     return true;
@@ -239,7 +239,7 @@ void Draw(const Status& st, std::vector<uint32_t>& out) {
         Text(buf, C.big, st.jammed ? red : empty ? amber : white, RECT{16, 0, 330, 150}, DT_LEFT | DT_VCENTER);
         if (st.capacity > 0 && st.has_magazine) {
             swprintf(buf, 32, L"/ %d", st.capacity);
-            Text(buf, C.small, grey, RECT{330, 60, 500, 130}, DT_LEFT | DT_VCENTER);
+            Text(buf, C.small_font, grey, RECT{330, 60, 500, 130}, DT_LEFT | DT_VCENTER);
         }
     }
     if (st.has_gun) {
@@ -250,7 +250,7 @@ void Draw(const Status& st, std::vector<uint32_t>& out) {
         else if (st.chamber == 0) hint = L"Chamber empty – rack it";
     }
     if (!hint.empty())
-        Text(hint, C.small, st.jammed ? red : amber, RECT{16, 140, 500, 190}, DT_LEFT | DT_VCENTER);
+        Text(hint, C.small_font, st.jammed ? red : amber, RECT{16, 140, 500, 190}, DT_LEFT | DT_VCENTER);
     // Health bar.
     if (st.max_hp > 0) {
         double f = std::clamp(st.hp / st.max_hp, 0.0, 1.0);
