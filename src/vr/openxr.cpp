@@ -31,6 +31,7 @@ XrInstance g_instance = XR_NULL_HANDLE;
 XrSystemId g_system = XR_NULL_SYSTEM_ID;
 XrSession g_session = XR_NULL_HANDLE;
 XrSpace g_space = XR_NULL_HANDLE;
+bool g_standing_space = false;
 XrSessionState g_state = XR_SESSION_STATE_UNKNOWN;
 std::atomic<bool> g_running{false};
 std::atomic<bool> g_instance_ready{false};
@@ -1138,6 +1139,7 @@ bool CreateSession(ID3D12CommandQueue* queue) {
                  !config::GetBool("seated_space", false);
     XrReferenceSpaceCreateInfo rci{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
     rci.referenceSpaceType = stage ? XR_REFERENCE_SPACE_TYPE_STAGE : XR_REFERENCE_SPACE_TYPE_LOCAL;
+    g_standing_space = stage;
     rci.poseInReferenceSpace.orientation.w = 1.0f;
     XR_CHECK(Proc<PFN_xrCreateReferenceSpace>("xrCreateReferenceSpace")(g_session, &rci, &g_space));
 
@@ -1718,6 +1720,8 @@ XrInstance Instance() { return g_instance; }
 XrSession Session() { return g_session; }
 XrSpace TrackingSpace() { return g_space; }
 ID3D12Device* Device() { return g_device; }
+
+bool StandingSpace() { return g_standing_space; }
 
 void RequestCapture(const char* tag) {
     std::lock_guard<std::mutex> lock(g_capture_mutex);

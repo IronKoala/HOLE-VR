@@ -35,6 +35,8 @@
 #include "vr/body/slide_pose.h"
 #include "vr/hands.h"
 #include "vr/input.h"
+#include "vr/openxr.h"
+#include "vr/stereo.h"
 #include "vr/interact/holster.h"
 
 namespace holevr::vr::body {
@@ -558,6 +560,15 @@ void LoadMeasure() {
         M.have = true;
         M.arm_scale = s;
         log::Info("body: arm scale %.3f from your measurement", s);
+    }
+    // Owner 2026-11-04: the arm measure also measures your height (you
+    // stand straight for it): the standing eye height the view and real
+    // crouch count from. Only in the standing space, whose floor is fixed.
+    double eye_cm = 0;
+    p = std::strstr(text.c_str(), "standing_eye_height_cm=");
+    if (p && std::sscanf(p + 23, "%lf", &eye_cm) == 1 && eye_cm > 80 && eye_cm < 230 && xr::StandingSpace()) {
+        stereo::SetStandingEyeHeight(eye_cm / 100.0);
+        log::Info("body: standing eye height %.0f cm from your measurement", eye_cm);
     }
 }
 
@@ -2182,17 +2193,32 @@ void StepMeasure(const hands::HandState hs[2], const FVector& shoulder_centre, c
     }
     double scale = std::clamp(scale_sum * 0.5, 0.8, 1.35);
     double spread = Length(hs[0].grip.location - hs[1].grip.location);
-    char text[256];
+    // Height: the headset's height over the floor while standing straight.
+    double eye_cm = 0;
+    {
+        xr::EyeView v[2];
+        if (xr::StandingSpace() && xr::LatestViews(v))
+            eye_cm = 50.0 * (v[0].pose.position.y + v[1].pose.position.y);
+    }
+    char text[320];
     std::snprintf(text, sizeof(text),
                   "; Written by the arm measure (left stick click 2 s, arms out). Delete to measure again.\n"
-                  "arm_scale=%.3f\nreach_left_cm=%.1f\nreach_right_cm=%.1f\nhand_span_cm=%.1f\n",
-                  scale, reach[0], reach[1], spread);
+                  "arm_scale=%.3f\nreach_left_cm=%.1f\nreach_right_cm=%.1f\nhand_span_cm=%.1f\n"
+                  "standing_eye_height_cm=%.1f\n",
+                  scale, reach[0], reach[1], spread, eye_cm);
     WriteText(ModPath(L"body-measure.ini"), text);
     M.have = true;
     M.arm_scale = scale;
     log::Info("body: measured your arms: shoulder to hand left %.0f cm, right %.0f cm, hand span %.0f cm -> arm scale "
               "%.3f (saved)",
               reach[0], reach[1], spread, scale);
+    if (eye_cm > 80 && eye_cm < 230) {
+        stereo::SetStandingEyeHeight(eye_cm / 100.0);
+        log::Info("body: measured your standing eye height: %.0f cm over the floor (about %.0f cm tall; saved)", eye_cm,
+                  eye_cm + 11.0);
+    } else {
+        log::Info("body: height not measured (%s)", xr::StandingSpace() ? "headset height out of range" : "seated space");
+    }
     input::Haptic(input::kLeft, 0.8f, 0.2f);
     input::Haptic(input::kRight, 0.8f, 0.2f);
 }

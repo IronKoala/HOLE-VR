@@ -2607,6 +2607,8 @@ struct GameActionState {
     double sprint_idle_since = -1; // stick in the deadzone since
     bool sprint_moved = false;     // stick left the deadzone since sprint on
     bool sprint_checked = false;   // gait checked after sprint on
+    int saved_rot_mode = -1;       // ALS rotation mode before the sprint (-1: not changed)
+    bool rot_mode_forced_logged = false;
     double y_down_at = -1;
     double melee_ready_at = 0;
     double melee_release_at = -1;
@@ -3408,11 +3410,41 @@ void SendSprint(UObject player, bool on) {
     }
 }
 
+// The game's locomotion (ALS) only sprints when the move is within about
+// 50 degrees of the game's aim direction, which lags where you look in VR
+// (owner 2026-11-04 run: every sprint moved 60-90 deg off it and stayed at
+// gait 1). For the sprint, switch it to its "face where you move" mode, in
+// which any direction can sprint; you move where the headset looks.
+uint8_t RotationMode(UObject player) {
+    uint8_t m = 255;
+    ue::GetProp(player, "RotationMode", m);
+    return m;
+}
+void SetRotationMode(UObject player, uint8_t mode) {
+    ue::Call c(player, "BPI_Set_RotationMode");
+    c.Set("NewRotationMode", mode);
+    c.Invoke();
+}
+void SprintRotationOn(UObject player) {
+    if (!config::GetBool("sprint_any_direction", true)) return;
+    const uint8_t m = RotationMode(player);
+    if (m > 2 || m == 0) return;   // unknown, or already velocity direction
+    GA.saved_rot_mode = m;
+    SetRotationMode(player, 0);
+    log::Info("controls: sprint: the game's rotation mode %d -> 0 (face where you move) for the sprint", m);
+}
+void SprintRotationOff(UObject player) {
+    if (GA.saved_rot_mode < 0) return;
+    SetRotationMode(player, static_cast<uint8_t>(GA.saved_rot_mode));
+    GA.saved_rot_mode = -1;
+}
+
 void StopSprint(UObject player, const char* why) {
     if (!GA.sprinting) return;
     GA.sprinting = false;
     g_sprint_full = false;
     SendSprint(player, false);
+    SprintRotationOff(player);
     log::Info("controls: sprint off (%s, after %.1f s)", why, g_clock - GA.sprint_on_at);
 }
 
@@ -3428,6 +3460,7 @@ void SprintControl(UObject player, const input::HandInput& l) {
             GA.sprint_idle_since = -1;
             GA.sprint_moved = mag >= g_set.deadzone;
             GA.sprint_checked = false;
+            SprintRotationOn(player);
             SendSprint(player, true);
             log::Info("controls: sprint on (left stick click; stick at %.2f; game toggle-sprint option %s)", mag,
                       ReadBoolProp(player, "ToggleSprint") == 1 ? "on" : "off");
@@ -3443,6 +3476,15 @@ void SprintControl(UObject player, const input::HandInput& l) {
         if (!waiting_for_push && g_clock - GA.sprint_idle_since >= 0.35) StopSprint(player, "stopped");
     }
     // Diagnostic: 0.6 s into a sprint, is the character really sprinting?
+    if (GA.saved_rot_mode >= 0 && RotationMode(player) != 0) {
+        // The game set its own mode back (aiming, weapon change): again.
+        if (!GA.rot_mode_forced_logged) {
+            GA.rot_mode_forced_logged = true;
+            log::Info("controls: sprint: the game changed its rotation mode back to %d; setting 0 again",
+                      RotationMode(player));
+        }
+        SetRotationMode(player, 0);
+    }
     if (GA.sprinting && !GA.sprint_checked && GA.sprint_moved && g_clock - GA.sprint_on_at > 0.6) {
         GA.sprint_checked = true;
         uint8_t gait = 255;
@@ -3461,7 +3503,8 @@ void SprintControl(UObject player, const input::HandInput& l) {
         while (off > 180) off -= 360;
         while (off < -180) off += 360;
         log::Info("controls: sprint check: game gait %d (2 = sprinting), speed %.0f cm/s, stick %.2f, moving %.0f deg "
-                  "off the view's facing", gait, std::sqrt(vel.X * vel.X + vel.Y * vel.Y), mag, off);
+                  "off the view's facing, rotation mode %d", gait, std::sqrt(vel.X * vel.X + vel.Y * vel.Y), mag, off,
+                  RotationMode(player));
     }
 }
 

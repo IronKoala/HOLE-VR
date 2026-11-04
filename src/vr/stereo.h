@@ -63,5 +63,9 @@ void CharacterAtTickEnd(const view_lead::Anchors& now);
 // would be, from the next frame on. Real-height mode uses it to give back
 // the game camera's own crouch drop. Thread-safe.
 void SetViewRaiseCm(double cm);
+// Your measured standing eye height (tracking space, metres above the
+// floor): the height the fixed-height modes and real crouch count from,
+// instead of wherever the head was at the last recentre. Thread-safe.
+void SetStandingEyeHeight(double floor_to_eye_m);
 
 }  // namespace holevr::vr::stereo

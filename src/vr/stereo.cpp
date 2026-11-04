@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -86,6 +87,8 @@ bool g_have_frame_views = false;
 std::atomic<bool> g_recenter{true};
 FVector g_origin_m;
 double g_origin_yaw = 0.0;
+std::atomic<double> g_standing_eye_m{0.0};   // 0: not measured
+std::atomic<bool> g_standing_apply{false};
 
 // Logs the first time each hook runs, so a log shows which engine paths are live.
 #define HOLEVR_FIRST_CALL(name)                                  \
@@ -487,6 +490,7 @@ void HookCalcOffset(void* self, int32_t view_index, FRotator* rotation, float en
         }
     }
 
+    const bool recentered_now = g_recenter.load();
     if (g_recenter.exchange(false)) {
         const XrVector3f& a = views[0].pose.position;
         const XrVector3f& b = views[1].pose.position;
@@ -494,6 +498,16 @@ void HookCalcOffset(void* self, int32_t view_index, FRotator* rotation, float en
         const XrQuaternionf& q = views[0].pose.orientation;
         g_origin_yaw = YawOf(XrToUeQuat(q.x, q.y, q.z, q.w));
         log::Info("stereo: recentered (yaw %.1f)", g_origin_yaw);
+    }
+    if (recentered_now || g_standing_apply.exchange(false)) {
+        const double y = g_standing_eye_m.load();
+        if (y > 0.5 && y < 2.5) {
+            const double before = g_origin_m.Z;
+            g_origin_m.Z = XrToUePosition(0, static_cast<float>(y), 0, 1.0).Z;
+            log::Info("stereo: standing eye height %.0f cm from your measurement (the head was %.0f cm %s it at the "
+                      "recentre)", y * 100.0, std::fabs(before - g_origin_m.Z) * 100.0,
+                      before >= g_origin_m.Z ? "above" : "below");
+        }
     }
 
     const XrPosef& pose = views[view_index].pose;
@@ -794,6 +808,10 @@ bool Install() {
 }
 
 void Recenter() { g_recenter = true; }
+void SetStandingEyeHeight(double floor_to_eye_m) {
+    g_standing_eye_m = floor_to_eye_m;
+    g_standing_apply = true;
+}
 
 void SetGameFrameCallback(void (*fn)()) { g_frame_callback.store(fn); }
 

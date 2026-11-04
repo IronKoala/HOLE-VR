@@ -65,6 +65,9 @@ XrDuration PredictAhead();
 // The eye views of the picture being prepared (same as ViewsForNewPicture).
 // Returns false until tracking is running.
 bool LatestViews(EyeView out[2]);
+// True when tracking is in the standing (room-scale, floor-level) space, so
+// heights are measured from the floor and the same from run to run.
+bool StandingSpace();
 // Game thread, once per picture as it starts drawing: the eye views predicted
 // for the headset frame that picture will be shown in.
 bool ViewsForNewPicture(EyeView out[2]);
