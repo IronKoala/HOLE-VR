@@ -1,7 +1,8 @@
 # VR body: full-body IK and hand grips (version 2)
 
 Code: `src/vr/body/`. `body.cpp` is the engine glue; everything else is pure
-logic with tests (`tests/test_body.cpp`, `tests/test_grip.cpp`):
+logic with tests (`tests/test_body.cpp`, `tests/test_grip.cpp`,
+`tests/test_joint_limits.cpp`):
 
 | File | What it does |
 |---|---|
@@ -9,6 +10,7 @@ logic with tests (`tests/test_body.cpp`, `tests/test_grip.cpp`):
 | `finger_solve.*` | Fingers solved once to fingertip targets, within joint limits, keeping out of the object's outline |
 | `grip_record.*` | Stored grips (Into the Radius 1 format), the built-in pistol grip, file format, mirroring, clip depth |
 | `grip_editor.*` | In-headset grip editor state machine |
+| `joint_limits.*` | Human ranges for posed finger joints, and fitting old poses to them |
 | `ik_math.*` | Vectors, rotations, two-bone solver |
 | `hand_pose.*` | Simple finger curls for empty hands and objects without a stored grip |
 | `grip_probe.*` | The old ray scan of a gun, no longer used at runtime; kept as a measuring tool |
@@ -107,10 +109,11 @@ and grabs on its side while `hands::EditorHand() >= 0`).
 
 - **Finger joints**: a small ball sits on every finger joint (15: base,
   middle and tip joint of each finger). Squeeze grip on one and turn the
-  controller: that joint turns with it in all three axes (pitch, yaw,
-  roll), the rest of the finger follows. Once a finger has been turned it
-  keeps exactly those joint angles (saved as `pose_<finger>=` lines, four
-  numbers per joint); it is no longer solved to a fingertip target.
+  controller: that joint turns with it the way a real joint can (see
+  "Joint ranges" below), the rest of the finger follows. Once a finger has
+  been turned it keeps exactly those joint angles (saved as
+  `pose_<finger>=` lines, four numbers per joint); it is no longer solved
+  to a fingertip target.
 - **Magazine**: a big ball sits on the magazine. Squeeze it and move/turn
   the controller: the magazine moves and turns in the hand (the hand stays
   where it is on its controller while editing).
@@ -127,6 +130,50 @@ and grabs on its side while `hands::EditorHand() >= 0`).
 - **Tap Y** to save, **click the left stick** to undo to the saved grip,
   **hold Y 1 s** to save and finish. Grips are saved per object class in
   `hole-vr/grips/<Class>.<grip|mag|slide-rear-flat|slide-rear-pinch|slide-front-flat|support>.ini`.
+
+## Joint ranges
+
+The owner asked for anatomically accurate posing (2026-11-04: "humans cant
+bend our last 2 finger joints side to side"). `joint_limits.*` splits each
+joint's turn about the joint's own axes (the same axes the fingertip solver
+curls about, measured from the skeleton, so it does not depend on how the
+bones are rolled) into curl, sideways bend and roll, and keeps each in a
+human range:
+
+| Joint | Curl (deg, 0 = straight) | Sideways | Roll |
+|---|---|---|---|
+| Finger base (MCP) | -30 to 90 (middle, ring 95; pinky 100) | index 22, middle 18, ring 18, pinky 28; 35% of that when fully curled | 10 |
+| Finger middle (PIP) | -5 to 105 | none | none |
+| Finger tip (DIP) | -15 to 90 | none | none |
+| Thumb base (CMC) | -30 to 50, from the reference pose | 35 | 20 (turning toward the fingers) |
+| Thumb middle (MCP) | -15 to 65 | 10, half when curled | 8 |
+| Thumb tip (IP) | -25 to 80 | none | none |
+
+Curl ranges are anatomical; the reference pose is already a little curled,
+so each range is shifted by the bend measured there (logged once per hand:
+`body: <hand> hand joint limits on: reference pose bends ...`). The tip
+joint's bend can't be measured (the chain's fingertip carries on from the
+middle bone) and counts as straight.
+
+- **Editor**: a dragged joint takes only the part of the controller's turn
+  the joint can make (a middle or tip joint follows just the curl), and
+  stops at the end of its range with a light tick on the editing
+  controller.
+- **Saved poses** made before the ranges are fitted when loaded: every
+  joint is brought into range and the knuckle (and for the thumb, its base)
+  makes up what a middle or tip joint can't do, so the finger's joints and
+  fingertip stay as near where they were posed as the ranges allow. The log
+  line `body: grip <key>: posed fingers fitted to human joint ranges, ...`
+  says how far each finger moved and what was taken out. The file is only
+  rewritten when the grip is saved in the editor; the first time a file is
+  fitted, a copy of it as posed is kept in
+  `hole-vr/grips/before-joint-limits/`. A pose already in range is never
+  touched.
+- Grips that aren't posed joint by joint (the built-in pistol grip) are
+  solved as before: the solver already only curls the middle and tip
+  joints.
+- `hand_joint_limits=0` turns it all off (free three-axis joints, saved
+  poses used exactly as stored).
 
 ## Body
 
@@ -162,6 +209,6 @@ defaults get new names): `body_turn_threshold_deg`, `body_turn_toward_hands`,
 `body_max_arm_stretch_unmeasured`, `body_shoulder_below_eyes_cm`,
 `body_shoulder_behind_eyes_cm`, `body_forearm_roll_share`,
 `body_forearm_twist_bone_share`, `body_elbow_follow_hand`,
-`body_elbow_relieves_wrist`, `hand_grip_records`, `hand_finger_radius_cm`,
+`body_elbow_relieves_wrist`, `hand_grip_records`, `hand_joint_limits`, `hand_finger_radius_cm`,
 `body_fit_log`. Version 1 keys (scan, palm seat, contact, grip offsets) are
 ignored.

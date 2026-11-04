@@ -10,6 +10,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <unordered_map>
 #include <string>
 #include <vector>
@@ -30,6 +31,7 @@
 #include "vr/body/hand_walls.h"
 #include "vr/body/hand_pose.h"
 #include "vr/body/ik_math.h"
+#include "vr/body/joint_limits.h"
 #include "vr/body/skeleton.h"
 #include "vr/interact/grip_points.h"
 #include "vr/body/slide_pose.h"
@@ -47,6 +49,7 @@ using ue::UObject;
 using namespace ik;
 using skel::Xf;
 namespace gr = grip_record;
+namespace jl = joint_limits;
 
 constexpr uint8_t kComponentSpace = 1;  // EBoneSpaces::ComponentSpace
 constexpr uint8_t kSnapToTarget = 2;    // EAttachmentRule::SnapToTarget
@@ -78,6 +81,7 @@ struct Settings {
     double elbow_follow_hand = 0.7;
     bool elbow_relieves_wrist = true;
     bool grip_records = true;
+    bool joint_limits = true;      // posed finger joints keep to human ranges (joint_limits.h)
     double finger_radius = 0.5;
     bool editor_markers = true;
     double joint_ball = 2.6;       // joint grab ball diameter, cm
@@ -122,6 +126,7 @@ void LoadSettings() {
     S.elbow_follow_hand = std::clamp<double>(config::GetFloat("body_elbow_follow_hand", 0.7f), 0.0, 2.0);
     S.elbow_relieves_wrist = config::GetBool("body_elbow_relieves_wrist", true);
     S.grip_records = config::GetBool("hand_grip_records", true);
+    S.joint_limits = config::GetBool("hand_joint_limits", true);
     S.finger_radius = config::GetFloat("hand_finger_radius_cm", 0.5f);
     S.editor_markers = config::GetBool("hand_editor_show_grab_points", true);
     S.joint_ball = std::clamp<double>(config::GetFloat("hand_editor_joint_ball_cm", 2.6f), 0.5, 6.0);
@@ -465,6 +470,9 @@ struct HandRig {
     FVector palm_centre;  // hand space
     FVector forearm_dir;  // reference: elbow -> wrist, in hand space
     FVector palm_h, across_h;
+    // Human joint ranges for posed fingers, per finger and joint (joint_limits.h).
+    jl::Axes axes[hand_pose::kFingerCount][3];
+    jl::Limits limits[hand_pose::kFingerCount][3];
 };
 
 // The grip a hand is using right now.
@@ -996,6 +1004,23 @@ void BuildRig(int side, const skel::Pose& refp) {
     }
     double check = Dot(Normalize(Cross(r.geo.across, r.palm_h)), r.geo.fingers);
     r.ok = r.frame.valid && (side == kR ? check > 0.5 : check < -0.5);
+    // Joint ranges: anatomical, shifted by how bent each joint already is in
+    // the reference pose.
+    std::string bends;
+    for (int f = 0; f < hand_pose::kFingerCount; ++f) {
+        double ref[3];
+        jl::ReferenceBends(r.chain[f], f == hand_pose::kThumb, ref);
+        char buf[48];
+        std::snprintf(buf, sizeof(buf), "%s%.0f/%.0f/%.0f", f ? ", " : "", ref[0] * kRadToDeg, ref[1] * kRadToDeg,
+                      ref[2] * kRadToDeg);
+        bends += buf;
+        for (int n = 0; n < 3; ++n) {
+            r.axes[f][n] = jl::JointAxes(r.chain[f], n);
+            r.limits[f][n] = jl::Relative(jl::Human(f, n), ref[n]);
+        }
+    }
+    log::Info("body: %s hand joint limits %s: reference pose bends (deg, base/middle/tip, thumb..pinky) %s",
+              side == kL ? "left" : "right", S.joint_limits ? "on" : "OFF (hand_joint_limits=0)", bends.c_str());
     log::Info("body: %s hand: middle knuckle %.1f cm from the wrist, fingers %.1f %.1f %.1f %.1f %.1f cm "
               "(thumb..pinky), handedness %.2f%s",
               side == kL ? "left" : "right", Length(mcp_m), lengths[0], lengths[1], lengths[2], lengths[3], lengths[4],
@@ -1036,6 +1061,15 @@ int TipFinger(int tip) {
         case gr::kRing: return hand_pose::kRing;
         default: return hand_pose::kPinky;
     }
+}
+
+// Keeps posed finger t of a record to human joint ranges, as close to its
+// shape as they allow (joint_limits.h: the middle and tip joints only curl,
+// the knuckles spread a little and barely roll).
+jl::FitReport LimitPosedFinger(const HandRig& r, gr::Record* rec, int t) {
+    if (!S.joint_limits || !r.ok || !rec->posed[t]) return {};
+    const int f = TipFinger(t);
+    return jl::Fit(r.chain[f], r.axes[f], r.limits[f], rec->joint[t]);
 }
 
 bool IsGrab(hands::GrabKind k) {
@@ -1587,6 +1621,50 @@ bool DefaultMagRecord(int side, UObject mag, gr::Record* rec) {
 // The stored record for a grab: the built-in hold and/or the saved file, in
 // the hand's handedness. false: there is none (the hand stays on the
 // controller). `object` is only needed for magazines and old slide files.
+// Poses saved before the joint ranges (2026-11-04) may bend joints in ways
+// a hand can't: they are fitted to the ranges when loaded, keeping each
+// finger's shape as near as the ranges allow. The file is only rewritten
+// when the grip is saved in the editor; the first time a file needs fitting,
+// a copy of it as it was is kept in grips\before-joint-limits\.
+void LimitRecord(int side, const std::string& key, gr::Record* rec, const std::string* file_text) {
+    if (!S.joint_limits || !G.rig[side].ok) return;
+    static const char* joint_name[3] = {"base", "middle", "tip"};
+    std::string what;
+    double worst = 0;
+    for (int t = 0; t < gr::kTipCount; ++t) {
+        jl::FitReport rep = LimitPosedFinger(G.rig[side], rec, t);
+        if (!rep.changed) continue;
+        worst = std::max(worst, rep.moved_cm);
+        std::string parts;
+        for (int j = 0; j < 3; ++j) {
+            if (rep.side_deg[j] < 1 && rep.twist_deg[j] < 1 && rep.flex_deg[j] < 1) continue;
+            char buf[96];
+            std::snprintf(buf, sizeof(buf), "%s%s: %.0f sideways, %.0f roll, %.0f curl", parts.empty() ? "" : "; ",
+                          joint_name[j], rep.side_deg[j], rep.twist_deg[j], rep.flex_deg[j]);
+            parts += buf;
+        }
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), " | %s moved %.1f cm", gr::TipName(t), rep.moved_cm);
+        what += buf;
+        if (!parts.empty()) what += " (deg taken out: " + parts + ")";
+    }
+    if (what.empty()) return;
+    static std::set<std::string> logged;
+    if (logged.insert(key + (side == kL ? "#L" : "#R")).second)
+        log::Info("body: grip %s: posed fingers fitted to human joint ranges, furthest joint or fingertip moved %.1f cm%s",
+                  key.c_str(), worst, what.c_str());
+    if (!file_text) return;
+    const std::wstring dir = ModPath(L"grips\\before-joint-limits");
+    const std::wstring path = dir + L"\\" + Widen(key) + L".ini";
+    if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) return;
+    CreateDirectoryW(dir.c_str(), nullptr);
+    if (WriteText(path, *file_text))
+        log::Info("body: grip %s: the file as it was posed is kept in grips\\before-joint-limits\\%s.ini",
+                  key.c_str(), key.c_str());
+    else
+        log::Error("body: could not copy grips\\%s.ini to grips\\before-joint-limits", key.c_str());
+}
+
 bool GripRecord(int side, hands::GrabKind kind, UObject object, const std::string& key, gr::Record* out,
                 bool* from_file) {
     std::string text;
@@ -1674,6 +1752,7 @@ bool GripRecord(int side, hands::GrabKind kind, UObject object, const std::strin
     }
     if (!have) return false;
     if (rec.right_hand != (side == kR)) rec = gr::Mirror(rec);
+    LimitRecord(side, key, &rec, *from_file ? &text : nullptr);
     *out = rec;
     return true;
 }
@@ -1950,6 +2029,7 @@ const char* kJointName[] = {"base", "middle", "tip"};
 // Drag state for joints and the object (grip_editor handles the palm).
 struct JointDrag {
     int finger = -1, joint = -1, tip = -1;
+    bool at_limit = false;  // the joint is against the end of its human range
     FQuat joint_world0, ctrl_rot0;
     Xf obj_in_hand0, ctrl_in_hand0;
 } g_drag;
@@ -2032,6 +2112,7 @@ void UpdateEditor(const hands::HandGrab grab[2], const hands::HandState hs[2], c
                 for (int j = 0; j < 3; ++j)
                     g.rec.joint[t][j] = Normalized(c.ref[j].rotation.Inverse() * fingers::LocalRotation(c, j, G.cur[side][f]));
                 g.rec.posed[t] = true;
+                LimitPosedFinger(G.rig[side], &g.rec, t);
             }
             g.have = true;
             g.object = grab[side].object;
@@ -2058,6 +2139,7 @@ void UpdateEditor(const hands::HandGrab grab[2], const hands::HandState hs[2], c
         g_drag.tip = FingerTip(g_drag.finger, sc.index_state);
         g_drag.joint_world0 = g_joint_world[side][g_drag.finger][g_drag.joint].rotation;
         g_drag.ctrl_rot0 = live[ctrl].grip.rotation;
+        g_drag.at_limit = false;
         // From now on this finger is posed joint by joint: start from what it shows.
         const int t = g_drag.tip;
         if (!g.rec.posed[t]) {
@@ -2065,6 +2147,7 @@ void UpdateEditor(const hands::HandGrab grab[2], const hands::HandState hs[2], c
             for (int j = 0; j < 3; ++j)
                 g.rec.joint[t][j] = Normalized(c.ref[j].rotation.Inverse() * fingers::LocalRotation(c, j, g.tip_angles[t]));
             g.rec.posed[t] = true;
+            LimitPosedFinger(rig, &g.rec, t);
         }
     }
     if (out.started && out.grabbed == grip_editor::kObjectItem) {
@@ -2086,7 +2169,18 @@ void UpdateEditor(const hands::HandGrab grab[2], const hands::HandState hs[2], c
         fingers::Fk(c, a, jx, nullptr);
         FQuat parent = n == 0 ? FQuat{} : jx[n - 1].rotation;
         FQuat want_local = Normalized(parent.Inverse() * want_h);
-        g.rec.joint[t][n] = Normalized(c.ref[n].rotation.Inverse() * want_local);
+        FQuat turn = Normalized(c.ref[n].rotation.Inverse() * want_local);
+        if (S.joint_limits) {
+            // Only the turns a real joint makes: the middle and tip joints
+            // follow just the curl part of the controller's turn, the knuckle
+            // also spreads a little, and every joint stops at the end of its
+            // human range with a light tick.
+            bool at_limit = false;
+            turn = jl::Clamp(rig.axes[f][n], rig.limits[f][n], turn, &at_limit);
+            if (at_limit && !g_drag.at_limit) out.haptic = std::max(out.haptic, 0.35f);
+            g_drag.at_limit = at_limit;
+        }
+        g.rec.joint[t][n] = turn;
         SolveGrip(side, t, true);
     } else if (out.grabbed == grip_editor::kObjectItem) {
         // The magazine moves and turns with the controller, relative to the hand.
