@@ -104,11 +104,37 @@ Nothing changes in play. On each launch:
   hub weapon racks' `Refresh`. Then the gun's part actors are read back to
   check the slot really changed.
 
+### The green zone (owner 2026-11-04, bought bench)
+
+The bench's table (`DS_Workbench`, owner's run): 111 x 244 cm, top at 90 cm.
+The game's display pistol (`HG`) lies 28 cm in from the long side the owner
+stood at, and they laid the pistol 14-32 cm in from that edge, hand at full
+reach. The owner: "its really hard to reach the table ... the area where you
+let go of the gun? color it (#00FF8D) with see through opacity, and bring it
+closer to the end of the table and stand it upright".
+
+- A see-through green box (engine cube, the engine's one-sided see-through
+  widget material tinted #00FF8D at 30 %) stands upright on the front edge of
+  the table: 34 cm along the edge, 26 cm high, 14 cm deep, its middle 4 cm out
+  past the edge, 2 cm above the top (`workbench_zone_*`). The front is the
+  side the game's `HG` display pistol lies toward; along that edge it is put
+  where you are the first time you come within 1.2 m of the table, once per
+  hub visit. Hidden while a menu is on the forearm (the menus switch off the
+  depth test of the widget material it shares).
+- Once the workbench is bought, letting go of the pistol inside the box (8 cm
+  margin) holds it there upright: grip down, barrel along the edge the way it
+  pointed. Let go anywhere else and it goes back to the holster. Spare parts
+  lie in a row on the table 7 cm in from the edge, behind the pistol.
+- With the owner's logged geometry the box lands at about (144 -175 105),
+  where their left hand was when they reached the bench (144 -176 101).
+
 ### Log lines to check
 
 - `workbench: bench LCBP_WeaponCustom_..._CAT_N in this level at (...), ... cm from the player (N found); facility HF_WPSWC_C_1`
   (before it is bought: `workbench: facility HF_WPSWC_C_1 in this level, no bench in it ...`)
 - `workbench: workbench locked|UNLOCKED (facility state N, bench at ...)`
+- `workbench: green zone at (...) on the table's edge at the front, where the game's display pistol lies, ...` and `workbench: green zone made (..., see-through green; white texture found)`
+- `workbench: pistol held upright in the green zone at (...), barrel ... along the edge; it carries ...`
 - Bought this session: `workbench: the workbench is bought (facility state 2) but its bench was not found yet; looking again`, then the bench line above.
 - `workbench study: LCBP_WeaponCustom_... at (...) yaw ...` and its `DS_Workbench` / `DS_ToolBox` / `Plane` / `HG` / `Ammo` boxes (where the real bench's top is)
 - `workbench: pistol laid on <actor> at (...), right side up; it carries ...`
