@@ -131,11 +131,60 @@ static void TestTouch() {
     EXPECT(StepTouch(d, 0.0, 0.81, touch, leave, hold));
 }
 
+// Outside review, finding 6: losing tracking (or a menu, or a busy hand) with
+// the hand still on a door must not count as leaving it.
+static void TestUnknown() {
+    const double touch = 1.5, leave = 5.5, hold = 0.2;
+    const double tick = 1.0 / 72.0;
+    // Rest on the handle, fire once, keep resting past the 1 s cooldown, lose
+    // tracking for one tick, come back at the same place: no second fire.
+    TouchState s;
+    int fires = 0;
+    double t = 0.0;
+    fires += StepTouch(s, 20, t, touch, leave, hold);
+    for (t = tick; t < 3.0; t += tick) fires += StepTouch(s, 0.0, t, touch, leave, hold);
+    EXPECT(fires == 1);
+    StepUnknown(s);
+    t += tick;
+    for (const double end = t + 2.0; t < end; t += tick) fires += StepTouch(s, 0.0, t, touch, leave, hold);
+    EXPECT(fires == 1);
+    // Longer gaps (menu open for seconds) do not either.
+    for (int i = 0; i < 300; ++i) StepUnknown(s);
+    for (const double end = t + 2.0; t < end; t += tick) fires += StepTouch(s, 0.0, t, touch, leave, hold);
+    EXPECT(fires == 1);
+    // A real leave and return still works.
+    fires += StepTouch(s, 10.0, t, touch, leave, hold);
+    t += tick;
+    for (const double end = t + 0.5; t < end; t += tick) fires += StepTouch(s, 0.0, t, touch, leave, hold);
+    EXPECT(fires == 2);
+
+    // A rest in progress when tracking drops starts again: no fire on the
+    // first tick back, a full rest is needed.
+    TouchState r;
+    EXPECT(!StepTouch(r, 20, 0.00, touch, leave, hold));
+    EXPECT(!StepTouch(r, 0.0, 0.10, touch, leave, hold));
+    StepUnknown(r);
+    EXPECT(!StepTouch(r, 0.0, 0.40, touch, leave, hold));
+    EXPECT(!StepTouch(r, 0.0, 0.55, touch, leave, hold));
+    EXPECT(StepTouch(r, 0.0, 0.61, touch, leave, hold));
+
+    // Unknown before the thing was ever seen: the first real sample decides,
+    // so a hand already on it when it is first seen still waits for a leave.
+    TouchState f;
+    StepUnknown(f);
+    EXPECT(!StepTouch(f, 0.0, 0.0, touch, leave, hold));
+    EXPECT(!StepTouch(f, 0.0, 1.0, touch, leave, hold));
+    EXPECT(!StepTouch(f, 10.0, 1.1, touch, leave, hold));
+    EXPECT(!StepTouch(f, 0.0, 1.2, touch, leave, hold));
+    EXPECT(StepTouch(f, 0.0, 1.41, touch, leave, hold));
+}
+
 int main() {
     TestClassify();
     TestBox();
     TestDoor();
     TestTouch();
+    TestUnknown();
     if (failures) {
         std::printf("%d failure(s)\n", failures);
         return 1;
