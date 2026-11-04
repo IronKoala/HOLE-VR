@@ -38,6 +38,13 @@ constexpr const char* kBenchClass =
 // behind a yellow sign until bought.
 constexpr const char* kFacilityClass = "BlueprintGeneratedClass /Game/GamePlay/LevelComponents/HF_WPSWC.HF_WPSWC_C";
 constexpr uint8_t kFacilityUnlocked = 2;  // FacilityState: 0 empty, 1 yellow sign, 2 unlocked (CBP_N_ children)
+// Once bought, the facility spawns LCBPGroup_WPSWC (long tables, parts shop)
+// as its CBP_2_Unlocked child, and the group spawns the bench as its
+// LCBP_WeaponCustom child. Before that the only object of the bench's class
+// is the group Blueprint's child-actor template
+// (LCBP_WeaponCustom_GEN_VARIABLE_LCBP_WeaponCustom_C_CAT): same class, but
+// not in any level, at the world origin. The search below skips it.
+constexpr int kBenchSearches = 15;  // a bought bench not found yet: look again (2 s apart)
 
 // ---------------------------------------------------------------- settings
 struct Settings {
@@ -294,10 +301,12 @@ struct Level {
     UObject player = 0;
     double age = 0;
     bool searched = false;
-    UObject bench = 0;
-    UObject facility = 0;
+    UObject bench = 0;     // the bench actor in this level (0 until the workbench is bought)
+    UObject facility = 0;  // the hub facility it belongs to (only in the hub)
     int facility_state = -1;
     bool unlocked = false;
+    int searches = 0;
+    bool logged_missing = false;
     FVector bench_loc;
     double next_state_check = 0;
     bool studied = false;
@@ -309,7 +318,8 @@ struct Level {
 } L;
 
 std::atomic<int> g_search_state{0};  // 0 idle, 1 running, 2 done
-std::atomic<UObject> g_found_bench{0}, g_found_facility{0}, g_search_for{0};
+std::atomic<UObject> g_found_facility{0}, g_search_for{0};
+std::vector<UObject> g_found_benches;  // written by the search thread before g_search_state = 2
 // Hub classes: freed when you leave the hub and loaded again at a new address
 // when you come back, so kept as ObjectRefs (only the search thread uses them).
 ue::ObjectRef g_bench_class(kBenchClass, 2.0), g_facility_class(kFacilityClass, 2.0);
@@ -889,15 +899,36 @@ void Release(int h) {
 }
 
 // ---------------------------------------------------------------- per frame
+// Actors of `cls` that are really in a level: never the class default object
+// or a Blueprint's template (archetype), and owned by a Level when the Level
+// class is known.
+std::vector<UObject> FindInLevels(UObject cls, UObject level_cls, size_t max) {
+    constexpr uint32_t kClassDefaultObject = 0x10, kArchetypeObject = 0x20;  // EObjectFlags
+    std::vector<UObject> out;
+    if (!cls) return out;
+    ue::objects::ForEach([&](int, UObject o) {
+        if (out.size() >= max) return;
+        if (mem::ReadOr<uint32_t>(o + ue::off::kObjFlags, 0) & (kClassDefaultObject | kArchetypeObject)) return;
+        if (!ue::reflection::IsChildOf(ue::GetClass(o), cls)) return;
+        if (level_cls && ue::GetClass(ue::GetOuter(o)) != level_cls) return;
+        out.push_back(o);
+    });
+    return out;
+}
+
 void SearchLevel(UObject player) {
     if (L.searched || L.age <= 4.0 || g_search_state.load() != 0) return;
     L.searched = true;
+    ++L.searches;
     g_search_for = player;
     g_search_state = 1;
     if (HANDLE t = CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
+            // Engine class: never freed, so kept as it is.
+            static const UObject level_cls = ue::FindObject("Class /Script/Engine.Level");
             const UObject bench_cls = g_bench_class.Get(), facility_cls = g_facility_class.Get();
-            g_found_bench = bench_cls ? ue::FindFirstInstance(bench_cls) : 0;
-            g_found_facility = facility_cls ? ue::FindFirstInstance(facility_cls) : 0;
+            g_found_benches = FindInLevels(bench_cls, level_cls, 8);
+            const std::vector<UObject> f = FindInLevels(facility_cls, level_cls, 1);
+            g_found_facility = f.empty() ? 0 : f[0];
             g_search_state = 2;
             return 0;
         }, nullptr, 0, nullptr))
@@ -906,16 +937,57 @@ void SearchLevel(UObject player) {
         g_search_state = 0;
 }
 
+// Picks the bench from the search: placed somewhere (not at the origin), and
+// the one nearest the workbench facility if there are several.
+void TakeSearch(UObject player) {
+    const UObject before = L.bench;
+    L.facility = g_found_facility.load();
+    L.bench = 0;
+    const FVector fac = L.facility ? ActorLocation(L.facility) : FVector{};
+    double best = 0;
+    for (UObject b : g_found_benches) {
+        if (!LiveObject(b)) continue;
+        const FVector at = ActorLocation(b);
+        if (Len(at) <= 1.0) continue;
+        const double d = L.facility ? Len(at - fac) : 0.0;
+        if (!L.bench || d < best) {
+            L.bench = b;
+            best = d;
+        }
+    }
+    if (L.bench && L.bench != before) {
+        const FVector b = ActorLocation(L.bench);
+        log::Info("workbench: bench %s in this level at (%.0f %.0f %.0f), %.0f cm from the player (%zu found); "
+                  "facility %s",
+                  ue::GetName(L.bench).c_str(), b.X, b.Y, b.Z, Len(b - ActorLocation(player)),
+                  g_found_benches.size(), L.facility ? ue::GetName(L.facility).c_str() : "not found");
+    } else if (!L.bench && L.facility && L.searches == 1) {
+        log::Info("workbench: facility %s in this level, no bench in it (the bench appears once the workbench "
+                  "is bought)",
+                  ue::GetName(L.facility).c_str());
+    }
+}
+
 void CheckFacility() {
     if (L.age < L.next_state_check) return;
     L.next_state_check = L.age + 2.0;
-    if (!LiveObject(L.bench)) return;
-    L.bench_loc = ActorLocation(L.bench);
+    if (L.bench && !LiveObject(L.bench)) L.bench = 0;
+    L.bench_loc = L.bench ? ActorLocation(L.bench) : FVector{};
     uint8_t st = 0xFF;
     const bool have = L.facility && LiveObject(L.facility) && ue::GetProp(L.facility, "FacilityState", st);
     const int state = have ? st : -1;
-    // A locked bench is parked at the world origin.
-    const bool unlocked = state == kFacilityUnlocked && Len(L.bench_loc) > 1.0;
+    const bool unlocked = state == kFacilityUnlocked && L.bench && Len(L.bench_loc) > 1.0;
+    // Bought, but its bench not found yet (bought just now, or spawned after
+    // the first search): look again.
+    if (state == kFacilityUnlocked && !L.bench && L.searches < kBenchSearches && g_search_state.load() == 0) {
+        L.searched = false;
+        if (!L.logged_missing) {
+            L.logged_missing = true;
+            log::Info("workbench: the workbench is bought (facility state %d) but its bench was not found yet; "
+                      "looking again",
+                      state);
+        }
+    }
     if (state != L.facility_state || unlocked != L.unlocked) {
         L.facility_state = state;
         L.unlocked = unlocked;
@@ -1075,20 +1147,12 @@ void OnTick(UObject player, float dt) {
     CheckLight(player);
     SearchLevel(player);
     if (g_search_state.load() == 2) {
+        if (g_search_for.load() == player) TakeSearch(player);
         g_search_state = 0;
-        if (g_search_for.load() == player) {
-            L.bench = g_found_bench.load();
-            L.facility = g_found_facility.load();
-        }
-        if (L.bench) {
-            const FVector b = ActorLocation(L.bench);
-            log::Info("workbench: %s in this level at (%.0f %.0f %.0f), %.0f cm from the player; facility %s",
-                      ue::GetName(L.bench).c_str(), b.X, b.Y, b.Z, Len(b - ActorLocation(player)),
-                      L.facility ? ue::GetName(L.facility).c_str() : "not found");
-        }
     }
-    if (!L.bench) return;
-    if (S.study && !L.studied && L.age > 6.0) {
+    // Only in the hub: the workbench facility, or its bench.
+    if (!L.bench && !L.facility) return;
+    if (S.study && !L.studied && L.bench && L.age > 6.0) {
         L.studied = true;
         custom::Study(player, L.bench);
     }
@@ -1159,7 +1223,7 @@ bool ParkedGun(UObject gun, FVector* spot, FQuat* frame) {
 
 bool TryPark(UObject gun, const FQuat& frame, const FVector& hand) {
     P.on = false;
-    if (!S.enabled || !L.player || !L.bench || !gun) return false;
+    if (!S.enabled || !L.player || (!L.bench && !L.facility) || !gun) return false;
     if (L.unlocked) {
         if (Flat(hand, L.bench_loc) > S.bench_reach_cm) return false;
     } else if (!S.tables_before_unlock) {

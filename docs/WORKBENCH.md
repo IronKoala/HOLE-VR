@@ -51,8 +51,14 @@ Nothing changes in play. On each launch:
   `SubSP_SlideMuzzle`), sight `[3]` (never empty), light `[7]` (may be empty).
 - The bench is part of the hub facility `HF_WPSWC_C` (base
   `LCBP_HomeFacilityBase_C`, `FacilityState` 0 empty / 1 yellow sign / 2
-  unlocked; bought at its `LCBP_YellowSign_C`). While locked, the bench actor
-  sits at the world origin.
+  unlocked; bought at its `LCBP_YellowSign_C`). Once bought, the facility's
+  `CBP_2_Unlocked` child is `LCBPGroup_WPSWC_C` (long tables, parts shop,
+  and the bench as its `LCBP_WeaponCustom` child actor). Before that the only
+  object of the bench's class is that group's child-actor template
+  (`LCBP_WeaponCustom_GEN_VARIABLE_LCBP_WeaponCustom_C_CAT`): not in any
+  level, at the world origin. Build 2 took that template for the bench, so
+  it would never have seen the real one; the search now skips class
+  defaults and templates and keeps only actors owned by a Level.
 - From the bytecode (`dump/script`):
   - The menu (`UIM_WeaponCustom_C.SelectParts`) replaces or adds one entry
     `{part, [slot index]}` in the saved list; taking a part off writes the
@@ -100,7 +106,11 @@ Nothing changes in play. On each launch:
 
 ### Log lines to check
 
+- `workbench: bench LCBP_WeaponCustom_..._CAT_N in this level at (...), ... cm from the player (N found); facility HF_WPSWC_C_1`
+  (before it is bought: `workbench: facility HF_WPSWC_C_1 in this level, no bench in it ...`)
 - `workbench: workbench locked|UNLOCKED (facility state N, bench at ...)`
+- Bought this session: `workbench: the workbench is bought (facility state 2) but its bench was not found yet; looking again`, then the bench line above.
+- `workbench study: LCBP_WeaponCustom_... at (...) yaw ...` and its `DS_Workbench` / `DS_ToolBox` / `Plane` / `HG` / `Ammo` boxes (where the real bench's top is)
 - `workbench: pistol laid on <actor> at (...), right side up; it carries ...`
 - `workbench: on the table beside the HG001: LIGHT_HG_LIGHT, ...`
 - `workbench: left hand took LIGHT_HG_LIGHT off the HG001 (slot SP_LightAndLaser_Down)`
