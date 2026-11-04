@@ -23,6 +23,7 @@
 #include "vr/hands.h"
 #include "vr/input.h"
 #include "vr/math.h"
+#include "vr/workbench_rules.h"
 
 namespace holevr::vr::workbench {
 namespace {
@@ -736,11 +737,41 @@ std::string ListParts(UObject gun) {
     return s.empty() ? "none" : s;
 }
 
-// The game rebuilt the gun's parts: a part the other hand has taken off (and
-// not settled yet) is a new actor now, shown again. Hide that one instead.
+// Is the part in this hand still the gun's own part in the slot it came
+// from (the saved list says so)? If the list can't be read, its hidden part
+// still being on the gun decides.
+bool HeldStillFitted(const Held& hd) {
+    if (!hd.from_gun) return false;
+    std::vector<custom::SavedPart> saved;
+    if (!custom::Saved(custom::GameInstance(L.player), T.weapon_row, &saved)) return LiveObject(hd.gun_part);
+    return rules::StillFitted(saved, hd.from_slot, hd.name);
+}
+
+// Another part was fitted where the held one came from: the held one is a
+// loose part now. Letting it go away from the gun puts it on the table
+// instead of emptying the slot (which would take the new part off again).
+void Disown(Held& hd, int h) {
+    if (LiveObject(hd.gun_part)) SetHidden(hd.gun_part, false);
+    log::Info("workbench: %s in the %s hand is no longer on the gun (another part was fitted in its slot); "
+              "it counts as a loose part now",
+              hd.row.c_str(), HandName(h));
+    hd.from_gun = false;
+    hd.gun_part = 0;
+    hd.from_slot = -1;
+}
+
+// The game rebuilt the gun's parts: a part a hand has taken off (and not
+// settled yet) is a new actor now, shown again. Hide that one instead; if
+// another part took its slot, the one in the hand is not the gun's any more.
 void RehideHeld(UObject gun) {
-    for (auto& hd : g_held) {
-        if (!hd.active || !hd.from_gun || LiveObject(hd.gun_part)) continue;
+    for (int h = 0; h < 2; ++h) {
+        Held& hd = g_held[h];
+        if (!hd.active || !hd.from_gun) continue;
+        if (!HeldStillFitted(hd)) {
+            Disown(hd, h);
+            continue;
+        }
+        if (LiveObject(hd.gun_part)) continue;
         hd.gun_part = 0;
         for (const auto& in : custom::InstalledParts(gun))
             if (in.path.size() == 1 && in.path[0] == hd.from_slot && in.row == hd.row) {
@@ -789,16 +820,25 @@ void Release(int h) {
     Held hd = g_held[h];
     g_held[h] = Held{};
     if (!hd.active) return;
+    // Taken off the gun, but another part has been fitted there since.
+    if (hd.from_gun && !HeldStillFitted(hd)) Disown(hd, h);
     UObject gun = TargetGun();
     const custom::PartRow* row = Part(hd.row);
     const std::vector<custom::Slot> slots = gun ? PartSlots(gun) : std::vector<custom::Slot>{};
-    if (hd.snapped >= 0 && gun && row) {
-        if (hd.from_gun && hd.snapped == hd.from_slot) {
-            if (LiveObject(hd.gun_part)) SetHidden(hd.gun_part, false);
-            DestroyActor(hd.actor);
-            log::Info("workbench: %s put back on (nothing changed)", hd.row.c_str());
-            return;
-        }
+    const custom::Slot* from = hd.from_gun ? SlotByIndex(slots, hd.from_slot) : nullptr;
+    rules::LetGoFacts f;
+    f.from_gun = hd.from_gun;
+    f.from_slot = hd.from_slot;
+    f.snapped = row ? hd.snapped : -1;
+    f.have_gun = gun != 0;
+    f.slot_can_be_empty = from && from->can_be_empty;
+    switch (rules::DecideLetGo(f)) {
+    case rules::LetGo::kPutBack:
+        if (LiveObject(hd.gun_part)) SetHidden(hd.gun_part, false);
+        DestroyActor(hd.actor);
+        log::Info("workbench: %s put back on (nothing changed)", hd.row.c_str());
+        return;
+    case rules::LetGo::kFit: {
         // Fitted: the game makes its own part actor; ours goes.
         char what[160];
         snprintf(what, sizeof(what), "fit %s in %s", hd.row.c_str(), hd.snapped_name.c_str());
@@ -812,14 +852,7 @@ void Release(int h) {
         ReturnHeld(h, "(the game did not take it)");
         return;
     }
-    if (hd.from_gun) {
-        const custom::Slot* s = SlotByIndex(slots, hd.from_slot);
-        if (!gun || !s || !s->can_be_empty) {
-            g_held[h] = hd;
-            ReturnHeld(h, s && !s->can_be_empty ? "on the gun: the game always needs a part there" : "on the gun");
-            input::Haptic(static_cast<input::Hand>(h), 0.2f, 0.08f);
-            return;
-        }
+    case rules::LetGo::kEmptySlot: {
         FName empty;
         if (!ue::names::Find("Empty", &empty)) {
             g_held[h] = hd;
@@ -827,7 +860,7 @@ void Release(int h) {
             return;
         }
         char what[160];
-        snprintf(what, sizeof(what), "take %s off %s", hd.row.c_str(), s->name.c_str());
+        snprintf(what, sizeof(what), "take %s off %s", hd.row.c_str(), from->name.c_str());
         if (Commit(gun, hd.from_slot, empty, what)) {
             // The game destroyed its part; ours goes on the table.
             Loose l;
@@ -842,6 +875,14 @@ void Release(int h) {
         g_held[h] = hd;
         ReturnHeld(h, "on the gun (the game did not take it off)");
         return;
+    }
+    case rules::LetGo::kBackOnGun:
+        g_held[h] = hd;
+        ReturnHeld(h, from && !from->can_be_empty ? "on the gun: the game always needs a part there" : "on the gun");
+        input::Haptic(static_cast<input::Hand>(h), 0.2f, 0.08f);
+        return;
+    case rules::LetGo::kToTable:
+        break;
     }
     g_held[h] = hd;
     ReturnHeld(h, "on the table");

@@ -93,10 +93,12 @@ UObject PartClass(const PartRow& part);
 // saved list (SetSaveData_WeaponCustomSaveData, which also saves the game),
 // gives the gun the metadata the game builds from it
 // (GetSaveData_WeaponCustomMetaData), then runs the weapon manager's
-// RefreshWeaponSpec, which has each gun rebuild its parts and stats from its
-// metadata (BP_GunBase_C.InitializeWeapon). Same gun actor, magazine and
-// chamber. Then refreshes the hub's weapon racks like the menu. False (with
-// *why) if the game refused a step. Game thread.
+// RefreshWeaponSpec, which has each carried gun rebuild its parts and stats
+// from its metadata (BP_GunBase_C.InitializeWeapon). Same gun actor, magazine
+// and chamber. While another carried gun would lose its load in a rebuild
+// (tube-fed, or a magazine on its way in), only this gun is rebuilt. Then
+// refreshes the hub's weapon racks like the menu. False (with *why) if the
+// game refused a step. Game thread.
 bool ApplyLoadout(UObject player, UObject gun, const std::vector<SavedPart>& parts, std::string* why);
 
 // Logs the workbench, the guns' slots and parts, the save data and what the
