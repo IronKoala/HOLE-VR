@@ -1180,7 +1180,12 @@ std::string RecordKey(int side, const hands::HandGrab& grab) {
     std::string cls = grab.object ? ue::GetName(ue::GetClass(grab.object)) : "unknown";
     switch (grab.kind) {
         case hands::GrabKind::kGunGrip: return cls + ".grip";
-        case hands::GrabKind::kSlideGrab: return cls + ".slide-" + kSlideHoldKey[g_slide_hold[side]];
+        // A rifle's charging handle (grab.point = kPointChargingHandle): one
+        // pose for each hand (owner, 2026-11-04: "one for left hand, one for
+        // right hand, at the rear of the charging handle").
+        case hands::GrabKind::kSlideGrab:
+            if (grab.point >= 0) return cls + ".charging-" + (side == kL ? "left" : "right");
+            return cls + ".slide-" + kSlideHoldKey[g_slide_hold[side]];
         // One pose per grip point on the handguard (vr/interact/grip_points.h).
         case hands::GrabKind::kSupportGrip:
             return grab.point >= 0 ? cls + ".support-" + interact::PointKey(grab.point) : cls + ".support";
@@ -1594,9 +1599,31 @@ bool GripRecord(int side, hands::GrabKind kind, UObject object, const std::strin
     bool found = ReadText(RecordPath(key), &text);
     // A slide grip saved before there were three slide holds: use it for any
     // hold not posed yet.
-    if (!found && kind == hands::GrabKind::kSlideGrab && object) {
+    if (!found && kind == hands::GrabKind::kSlideGrab && object && key.find(".charging-") == std::string::npos) {
         std::string cls = ue::GetName(ue::GetClass(object));
         found = ReadText(RecordPath(cls + ".slide"), &text);
+    }
+    // The left hand on a rifle's charging handle, not posed yet: a slide
+    // hold posed on it before it had a pose per hand (owner, 2026-11-04
+    // 04:56 UTC: BP_AR_C.slide-rear-pinch-behind), moved from the old grab
+    // point to the new one so the hand stays where it was posed on the gun.
+    FVector shift{};
+    bool shifted = false;
+    const std::string charging_left = ".charging-left";
+    if (!found && kind == hands::GrabKind::kSlideGrab && object && side == kL && key.size() >= charging_left.size() &&
+        key.compare(key.size() - charging_left.size(), charging_left.size(), charging_left) == 0 &&
+        hands::ChargingHandleShift(object, &shift)) {
+        std::string cls = ue::GetName(ue::GetClass(object));
+        for (int h : {kSlideBehind, kSlideRear, kSlideOver, kSlideFront}) {
+            const std::string old_key = cls + ".slide-" + kSlideHoldKey[h];
+            if (!ReadText(RecordPath(old_key), &text)) continue;
+            found = shifted = true;
+            log::Info("body: %s not posed yet: using %s, posed on the old grab point (the grab point moved (%.1f "
+                      "%.1f %.1f) cm in the gun frame; the hand stays where it was posed; tap Y in the grip editor "
+                      "to save it as %s)",
+                      key.c_str(), old_key.c_str(), shift.X, shift.Y, shift.Z, key.c_str());
+            break;
+        }
     }
     // A grip point not posed yet: the scope rail's end takes the pose behind
     // the light (the same hold on the handguard, a little further back);
@@ -1613,6 +1640,14 @@ bool GripRecord(int side, hands::GrabKind kind, UObject object, const std::strin
         if (gr::Parse(text, &rec)) {
             have = true;
             *from_file = true;
+            if (shifted) {
+                // Positions are relative to the grab point: the new point is
+                // `shift` from the old one.
+                rec.name = key;
+                rec.knuckle = rec.knuckle - shift;
+                for (FVector& t : rec.tip) t = t - shift;
+                for (gr::OutlineBox& b : rec.outline) b.centre = b.centre - shift;
+            }
             if (kind == hands::GrabKind::kGunGrip && gr::HasOldPistolHand(rec)) {
                 // Saved before the hand was lined up with the barrel: keep the
                 // fingertips, take the new hand and outline.
@@ -1915,8 +1950,11 @@ void UpdateEditor(const hands::HandGrab grab[2], const hands::HandState hs[2], c
     const hands::EditButtons b = hands::GetEditButtons();
     // Which grip: a magazine or the slide in the left hand first (the right
     // controller edits), else the gun in the right hand (the left edits).
+    // The right hand on a rifle's charging handle (the left holds the rifle
+    // by itself) comes first: the left controller edits it.
     int side = -1;
-    if (IsGrab(grab[kL].kind) && grab[kL].kind != hands::GrabKind::kGunGrip) side = kL;
+    if (grab[kR].kind == hands::GrabKind::kSlideGrab) side = kR;
+    else if (IsGrab(grab[kL].kind) && grab[kL].kind != hands::GrabKind::kGunGrip) side = kL;
     else if (grab[kR].kind == hands::GrabKind::kGunGrip) side = kR;
     if (g_editor.Active() && (side != g_edit_side || side < 0 || G.grip[side].object != grab[side].object)) {
         log::Info("body: grip editor stopped (the held object changed)");
@@ -2717,16 +2755,28 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
     if (grab.object != g.object || grab.kind != g.kind || grab.point != g.point) {
         if (g_editor.Active() && g_edit_side == side) StopEditor();
         hands::Pose gun;
-        if (grab.kind == hands::GrabKind::kSlideGrab && ObjectFrame(grab, right_grab, &gun)) {
+        // The pistol's slide holds are picked by where and how the hand
+        // grabbed; a charging handle has one pose per hand instead.
+        const bool charging = grab.kind == hands::GrabKind::kSlideGrab && grab.point >= 0;
+        if (grab.kind == hands::GrabKind::kSlideGrab && !charging && ObjectFrame(grab, right_grab, &gun)) {
             g_slide_hold[side] = PickSlideHold(h, gun, grab.object);
             if (g_slide_hold[side] == kSlideRear) g_slide_hold[side] = PickRearPinch(side, h, gun, grab);
         }
         LoadGrip(side, grab);
         g_free_slide[side].on = false;
+        // Not posed yet: the hand stays where the controller grabbed (the
+        // pistol builds a pinch or overhand from the slide's shape first).
         if (grab.kind == hands::GrabKind::kSlideGrab && !g.have && !g.pending && ObjectFrame(grab, right_grab, &gun) &&
-            !BuildSlidePreset(side, h, gun, grab)) {
+            (charging || !BuildSlidePreset(side, h, gun, grab))) {
             const FQuat inv = gun.rotation.Inverse();
             g_free_slide[side] = {true, Normalized(inv * h.grip.rotation), inv.Rotate(h.grip.location - gun.location)};
+        }
+        if (charging) {
+            log::Info("body: %s hand on the charging handle: pose %s %s", side == kL ? "left" : "right",
+                      g.key.c_str(),
+                      g.have || g.pending ? (g.from_file ? "(saved)" : "(built in)")
+                                          : "not posed yet (the hand stays where it grabbed; pose it in the grip "
+                                            "editor)");
         }
     }
     // How far the drawn hand jumps from the controller onto the slide (2026-11-03:
@@ -2742,10 +2792,12 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
             FreeHand(side, h, h.grip.location, &free_rot, &free_pos);
             const double dq = std::fabs(free_rot.X * drawn_rot.X + free_rot.Y * drawn_rot.Y +
                                         free_rot.Z * drawn_rot.Z + free_rot.W * drawn_rot.W);
-            log::Info("body: slide %s hold drawn: the hand jumps %.1f cm and turns %.0f deg from the controller onto "
-                      "the slide",
-                      kSlideHoldName[g_slide_hold[side]], Length(drawn_fist - h.grip.location),
-                      2.0 * std::acos(std::min(1.0, dq)) * kRadToDeg);
+            log::Info("body: %s%s hold drawn: the hand jumps %.1f cm and turns %.0f deg from the controller onto "
+                      "the %s",
+                      grab.point >= 0 ? "" : "slide ",
+                      grab.point >= 0 ? "charging handle" : kSlideHoldName[g_slide_hold[side]],
+                      Length(drawn_fist - h.grip.location), 2.0 * std::acos(std::min(1.0, dq)) * kRadToDeg,
+                      grab.point >= 0 ? "handle" : "slide");
         }
     } else if (grab.kind != hands::GrabKind::kSlideGrab) {
         g_slide_jump_logged[side] = 0;

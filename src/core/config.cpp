@@ -421,6 +421,13 @@ const Block kBlocks[] = {
      "; goes back to its holster by itself, like the pistol. With the left hand on the\n"
      "; handguard the left hand keeps it. 0 = the rifle stays in the right hand.\n"
      "rifle_right_let_go=1\n"},
+    {"rifle_charging_handle_grab_cm",
+     "\n"
+     "; --- The rifle's charging handle ---\n"
+     "; Either hand grabs the charging handle at its rear end when it squeezes this\n"
+     "; close to it (cm). The right hand can do it while the left hand holds the rifle\n"
+     "; by the handguard. Each hand has its own pose in the grip editor.\n"
+     "rifle_charging_handle_grab_cm=9\n"},
     {"fixed_height",
      "\n"
      "; 1 = your in-game height is always the character's, seated or standing\n"

@@ -94,6 +94,34 @@ go at once. Tracking loss under 0.25 s doesn't end the two-hand hold. After
 the grip editor or a menu, only a squeeze held at that moment counts as
 holding, so the editor's own squeezes don't let go of the rifle.
 
+## Charging handle (both hands)
+
+Owner, 2026-11-04 05:26 UTC: "the charging handle? i want to grab points for
+it, one for left hand, one for right hand, at the rear of the charging
+handle." In the run before (22:54 to 22:56 local) the left hand's grabs
+reached 4 to 9 cm behind the old grab point (the handle part's origin), and
+the drawn hand kept changing between the pistol's slide holds (rear pinch,
+overhand), jumping 8 to 12 cm and turning 66 to 69 degrees.
+
+- **Where.** Both hands grab the T at the back of the upper receiver: the
+  rear end of the charging handle's mesh (`*ChargingHandle*` static mesh, box
+  in the bolt's parent space), 1 cm in, at its middle. A squeeze within 9 cm
+  of it takes it (`rifle_charging_handle_grab_cm`). Without a mesh: the old
+  point. The handle moves back with the hand and pulls the bolt as before.
+- **Which hand.** The left hand while the right holds the rifle (as before).
+  The right hand while the left holds the rifle by itself: let go of the
+  grip with the right hand (the left keeps the rifle), then squeeze on the
+  charging handle. A right squeeze nearer the rifle's grip than the handle
+  takes the grip instead.
+- **Poses.** One per hand, no picking by angle: `grips/BP_AR_C.charging-left.ini`
+  and `grips/BP_AR_C.charging-right.ini`. Until the left one is posed, the
+  slide hold the owner posed on the AR at 22:56 (`BP_AR_C.slide-rear-pinch-behind`)
+  is used, moved onto the new grab point so the hand stays where it was posed
+  on the gun. Until the right one is posed, the hand stays where it grabbed.
+  To pose the right hand: right hand on the handle, hold left Y 1 s; the left
+  controller edits. Coming back from the editor with the left hand open, the
+  left hand keeps the rifle until it squeezes and lets go again.
+
 ## Settings (hole-vr.ini, group `rifle_left_hand_carry`)
 
 | Key | Default | Meaning |
@@ -105,6 +133,7 @@ holding, so the editor's own squeezes don't let go of the rifle.
 | `rifle_grip_points` (own group) | 1 | 0: the hand holds wherever it grabs (no grip points) |
 | `rifle_grip_point_inset_cm` | 4.5 | how far the middle of the hand sits behind the light |
 | `rifle_right_let_go` (own group) | 1 | 0: the rifle stays in the right hand when it lets go alone |
+| `rifle_charging_handle_grab_cm` (own group) | 9 | how close either hand must squeeze to the charging handle's rear end |
 
 ## Game side
 
@@ -157,6 +186,15 @@ Tests: `g++ -std=c++20 -Isrc tests/test_rifle_carry.cpp src/vr/interact/rifle_ca
   (and the lowest it got while held), tracking lost, charging handle, magazine.
 - `rifle carry: right hand let go of the rifle (...); it goes back to its holster`:
   the right hand alone opened.
+- `controls: charging handle <mesh> X a..b Y .. Z ..; both hands grab it at its
+  rear end (x y z), within N cm (...; the old grab point was (x y z))` and
+  `charging handle grab point is (x y z) from the old one, gun frame`.
+- `controls: right|left grab at slide-space (x y z), inside|outside the charging
+  handle zone`, `slide hold #N (right|left hand)`, `charging handle not grabbed:
+  the right hand squeezed nearer the rifle's grip`.
+- `body: right|left hand on the charging handle: pose BP_AR_C.charging-right|left
+  (saved) | not posed yet`, and `body: BP_AR_C.charging-left not posed yet: using
+  BP_AR_C.slide-rear-pinch-behind ...` for the carried-over pose.
 - `rifle carry: left hand picked up the rifle ...`, `right hand let go ...`,
   `drawing the pistol ...`, `left hand let go ...`, `right hand took the rifle's grip`
 - `rifle carry: asked the game to switch to the pistol`, then `the game switched
@@ -165,6 +203,7 @@ Tests: `g++ -std=c++20 -Isrc tests/test_rifle_carry.cpp src/vr/interact/rifle_ca
 
 ## Open
 
+- The charging handle points (both hands) are untested in the headset.
 - The second layout of grip points and the right-hand let-go are untested in
   the headset. The scope rail and magazine boxes have never been logged yet:
   check the `grip points:` line's `rails:` and `magazine` parts.
