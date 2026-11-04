@@ -89,8 +89,12 @@ levels. Each frame picks one part of it.
 - Head in a wall: a ball is swept from the body's middle at head height to
   the eyes. Its radius is where the fade begins (`head_wall_fade_start_cm`,
   15 cm, the "Wall fade starts" row). Where it stops, the eyes are that
-  close to a surface; the further on they go, the darker, until black
-  `head_wall_fade_full_cm` (2 cm) before the surface. The first version used
+  close to a surface; the closer they are to it, measured along the
+  surface's normal (comfort_math `WallFade`), the darker, until black
+  `head_wall_fade_full_cm` (2 cm) before the surface. Until 2026-11-04 the
+  distance was measured along the sweep, so leaning sideways along a wall
+  counted as getting closer (an outside review's example: eyes 11 cm from a
+  wall, 30 cm to the side, went fully black instead of about 31%). The first version used
   a line and only began fading 1 cm inside the wall (black 9 cm in), and
   the near clip plane is 1 cm, so the wall vanished and you saw through
   before it went dark (owner 2026-11-03 10:07: "the wall fade needs to kick

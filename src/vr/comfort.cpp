@@ -361,15 +361,11 @@ double HeadInWall(UObject player, const hands::Pose& head, double* gap) {
     if (!in || in_size != hit_size) return 0;
     std::memcpy(in, hit, static_cast<size_t>(hit_size));
     if (!b.Invoke() || !b.Get<bool>("bBlockingHit") || b.Get<bool>("bInitialOverlap")) return 0;
-    // The ball's centre where it touched: the eyes are wall_start from the
-    // surface there (head-on), and each cm further along brings them a cm
-    // closer.
-    FVector at = b.Get<FVector>("Location");
-    FVector past = head.location - at;
-    double depth = std::sqrt(past.X * past.X + past.Y * past.Y + past.Z * past.Z);
-    if (gap) *gap = S.wall_start - depth;
+    // How far the eyes are from the surface the ball touched, along its
+    // normal: going sideways along a wall doesn't bring them closer to it.
     WS.what = b.Get<UObject>("HitActor");
-    return std::clamp(depth / (S.wall_start - S.wall_full), 0.0, 1.0);
+    return comfort::WallFade(head.location, b.Get<FVector>("ImpactPoint"), b.Get<FVector>("ImpactNormal"),
+                             S.wall_start, S.wall_full, gap);
 }
 
 void OnTick(UObject player, float) {

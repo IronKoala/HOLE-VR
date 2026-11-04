@@ -44,6 +44,17 @@ Rect VignetteTile(int level);
 int FadeLevel(double opacity);
 Rect FadeBlock(int level);
 
+// ---- head in a wall ----
+// How dark the view goes (0..1) for eyes at `eye` near the surface the fade
+// sweep touched (its impact point, and its normal out of the surface): 0
+// while the eyes are `start` cm or more from it, black at `full` cm or
+// closer, measured along the normal. Measuring along the sweep instead
+// counted leaning sideways along a wall as getting closer (outside review
+// 2026-11-04: eyes 11 cm from a wall went fully black). *gap: the eyes'
+// distance from the surface, cm (below 0: past it).
+double WallFade(const FVector& eye, const FVector& impact, const FVector& normal, double start, double full,
+                double* gap = nullptr);
+
 // Follows a target quickly up and more slowly down (seconds to ~63%).
 struct Smoother {
     double value = 0.0;
