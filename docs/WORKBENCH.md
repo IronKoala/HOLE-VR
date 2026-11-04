@@ -113,13 +113,21 @@ reach. The owner: "its really hard to reach the table ... the area where you
 let go of the gun? color it (#00FF8D) with see through opacity, and bring it
 closer to the end of the table and stand it upright".
 
-- A see-through green box (engine cube, the engine's one-sided see-through
-  widget material tinted #00FF8D at 30 %) stands upright on the front edge of
-  the table: 34 cm along the edge, 26 cm high, 14 cm deep, its middle 4 cm out
-  past the edge, 2 cm above the top (`workbench_zone_*`). The front is the
+- A green box stands upright on the front edge of the table: 34 cm along the
+  edge, 52 cm high, 14 cm deep, its middle 4 cm out past the edge, 2 cm above
+  the top (`workbench_box_*`; the first build's `workbench_zone_*` keys are no
+  longer read). Owner 07:57: "make it twice as tall, in the center of it i want
+  100% visibility, the lines that make the box solid with a quickly gradual
+  decrease in its opacity, if my body isnt near the box i dont want to see it
+  at all". So its 12 edges are solid 0.6 cm lines, and each side has four rings
+  of 1 cm strips stepping inward at 50, 25, 12 and 5 % opacity. The middle of
+  every side is clear. It is drawn with engine cubes and the engine's one-sided
+  see-through widget material tinted #00FF8D, one instanced component per
+  opacity level (`rules::BoxFrame`, host-tested). It shows only while your head
+  is within 1 m of it. The front is the
   side the game's `HG` display pistol lies toward; along that edge it is put
   where you are the first time you come within 1.2 m of the table, once per
-  hub visit. Hidden while a menu is on the forearm (the menus switch off the
+  hub visit. Also hidden while a menu is on the forearm (the menus switch off the
   depth test of the widget material it shares).
 - Once the workbench is bought, letting go of the pistol inside the box (8 cm
   margin) holds it there upright: grip down, barrel along the edge the way it
@@ -133,7 +141,7 @@ closer to the end of the table and stand it upright".
 - `workbench: bench LCBP_WeaponCustom_..._CAT_N in this level at (...), ... cm from the player (N found); facility HF_WPSWC_C_1`
   (before it is bought: `workbench: facility HF_WPSWC_C_1 in this level, no bench in it ...`)
 - `workbench: workbench locked|UNLOCKED (facility state N, bench at ...)`
-- `workbench: green zone at (...) on the table's edge at the front, where the game's display pistol lies, ...` and `workbench: green zone made (..., see-through green; white texture found)`
+- `workbench: green zone at (...) on the table's edge at the front, where the game's display pistol lies, ...` and `workbench: green zone made (...): 12 edge lines, 96 fading strips, 34 x 14 x 52 cm, see-through green`
 - `workbench: pistol held upright in the green zone at (...), barrel ... along the edge; it carries ...`
 - Bought this session: `workbench: the workbench is bought (facility state 2) but its bench was not found yet; looking again`, then the bench line above.
 - `workbench study: LCBP_WeaponCustom_... at (...) yaw ...` and its `DS_Workbench` / `DS_ToolBox` / `Plane` / `HG` / `Ammo` boxes (where the real bench's top is)
