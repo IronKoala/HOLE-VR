@@ -28,7 +28,10 @@ the hand finally came within range of the box.
   handle.
   - The hand must come from outside and rest for 0.08 s (doors 0.2 s), so a
     hand brushing past does nothing. It must leave before it can touch the
-    same thing again.
+    same thing again. Only a hand seen away counts as leaving: lost tracking,
+    a menu or pause, or the hand holding something while it is on the thing
+    does not, and a rest cut short that way starts again (outside review
+    finding 6; `TestUnknown` in `tests/test_touch.cpp`).
   - An item that pops out of a box into the hand is not taken until the hand
     has left it once.
   - When the hand is on several things, the smallest wins, so an item lying on

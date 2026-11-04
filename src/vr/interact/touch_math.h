@@ -84,5 +84,11 @@ bool StepTouch(TouchState& s, double dist, double now, double touch_cm, double l
 // The hand touched something else (it fired there): this one waits until the
 // hand leaves it, so one touch never does two things.
 inline void Disarm(TouchState& s) { s.armed = false; }
+// Where the hand is is not known this tick (tracking lost, a menu or pause,
+// the hand busy holding something) and it is not plainly away. That is not a
+// leave: a touch already used stays used until the hand is seen away. A rest
+// in progress starts again, so the hand must rest the full time once it is
+// seen on the thing again.
+inline void StepUnknown(TouchState& s) { s.inside = false; }
 
 }  // namespace holevr::vr::touch

@@ -653,8 +653,19 @@ void OnTick(UObject player, float dt) {
             if (live && t.kind == Kind::kLoot) t.center = ActorLocation(t.actor) + t.center_off;
         }
         for (int h = 0; h < 2; ++h) {
+            // Plainly away: the thing is beyond arm's reach of the head, gone
+            // or turned off, or the tracked fist is far from it.
+            const bool away = !close_by || !live || !KindOn(t.kind) ||
+                              (hs[h].valid && Len(t.center - hs[h].grip.location) >= t.reach + 40.0);
+            if (!away && !hand_free[h]) {
+                // Tracking lost, a menu or pause, or the hand busy: where it
+                // is is not known. That is not a leave, so a door or box this
+                // hand already used does not go again when it comes back.
+                StepUnknown(t.st[h]);
+                continue;
+            }
             double d = 1e9;
-            if (close_by && live && hand_free[h] && KindOn(t.kind) && Len(t.center - hs[h].grip.location) < t.reach + 40.0) {
+            if (!away) {
                 if (!t.built) BuildParts(t);
                 d = HandDist(t, balls[h], nb[h], xfs);
             }
