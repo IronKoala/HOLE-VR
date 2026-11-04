@@ -186,4 +186,35 @@ void SettleStats::Add(const Settle& s) {
     if (o > off_max) off_max = o;
 }
 
+void LeadTrust::Update(const FVector& actual, const Leads& l, int pick, double off_cm, double on_cm) {
+    if (!trusted) ++off_frames;
+    if (pick < 0 || pick >= kKinds || !l.valid[pick]) return;
+    const double miss = Length(actual - l.move[pick]);
+    if (trusted && !(miss <= off_cm)) {
+        trusted = false;
+        ++stops;
+        if (miss > worst_miss) worst_miss = miss;
+    } else if (!trusted && miss <= on_cm) {
+        trusted = true;
+    }
+}
+
+void LeadTrust::ResetTotals() {
+    off_frames = 0;
+    stops = 0;
+    worst_miss = 0;
+}
+
+FVector WallPushOut(const FVector& muzzle, const FVector& impact, const FVector& normal, double clearance_cm,
+                    double max_cm) {
+    const double n_len = Length(normal);
+    if (!(n_len > 0.5)) return FVector{};
+    const FVector n = normal * (1.0 / n_len);
+    const FVector d = impact - muzzle;
+    const double depth = d.X * n.X + d.Y * n.Y + d.Z * n.Z;  // > 0: the muzzle is behind the surface
+    if (!(depth > 0.0)) return FVector{};
+    const double push = std::fmin(depth + clearance_cm, max_cm);
+    return n * push;
+}
+
 }  // namespace holevr::vr::view_lead

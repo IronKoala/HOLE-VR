@@ -210,7 +210,80 @@ static void TestSettle() {
            std::fabs(st.off_max - 8.5) < 1e-9);
 }
 
+// The extraction hole: the character falls 55.6 cm a frame while the game's
+// view holds still. The lead is applied once, found 55.6 cm off, and stopped,
+// so the hands stay with the view; it comes back once the fall ends.
+static void TestLeadTrust() {
+    LeadTrust t;
+    auto frame = [&](const FVector& predicted, const FVector& actual) {
+        Leads l;
+        l.valid[kCamera] = true;
+        l.move[kCamera] = predicted;
+        const FVector applied = t.trusted ? predicted : FVector{};
+        t.Update(actual, l, Pick(l, -1), 30.0, 10.0);
+        return Length(applied - actual);  // how far the hands end up off the view
+    };
+    // Walking and sprinting, misses up to 15 cm: never stopped.
+    for (int i = 0; i < 20; ++i) EXPECT(frame({4, 0, 0}, {4, 0, 0}) < 1e-9);
+    EXPECT(frame({7, 0, 0}, {7, 0, -15}) < 15.01);
+    EXPECT(t.trusted && t.stops == 0);
+    // The fall: off once, then with the view every frame.
+    EXPECT(std::fabs(frame({0, 0, -55.6}, {0, 0, 0}) - 55.6) < 1e-9);
+    EXPECT(!t.trusted && t.stops == 1 && std::fabs(t.worst_miss - 55.6) < 1e-9);
+    for (int i = 0; i < 50; ++i) EXPECT(frame({0, 0, -55.6}, {0, 0, 0}) < 1e-9);
+    EXPECT(!t.trusted && t.off_frames == 50);
+    // Landed: the prediction agrees again, and the lead is back the frame after.
+    EXPECT(frame({0, 0, 0}, {0, 0, 0}) < 1e-9);
+    EXPECT(t.trusted);
+    EXPECT(frame({4, 0, 0}, {4, 0, 0}) < 1e-9);
+    // A one-frame jump of the view (a teleport) stops it for one frame only.
+    frame({4, 0, 0}, {50, 0, 0});
+    EXPECT(!t.trusted);
+    frame({4, 0, 0}, {4, 0, 0});
+    EXPECT(t.trusted && t.stops == 2);
+    // No prediction at all: nothing learned.
+    Leads none;
+    t.Update({100, 0, 0}, none, -1, 30.0, 10.0);
+    EXPECT(t.trusted && t.stops == 2);
+    t.ResetTotals();
+    EXPECT(t.trusted && t.stops == 0 && t.off_frames == 0 && t.worst_miss == 0);
+}
+
+// The old push: back along the eyes-to-muzzle line to 1 cm short of where it
+// meets the wall plane y = wall_y (eyes on the y < wall_y side).
+static double OldPush(const FVector& eyes, const FVector& muzzle, double wall_y) {
+    const double t = (wall_y - eyes.Y) / (muzzle.Y - eyes.Y);
+    const FVector at = eyes + (muzzle - eyes) * t;
+    return Length(muzzle - at) + 1.0;
+}
+
+static void TestWallPush() {
+    // A wall straight ahead, the muzzle 3 cm in: back 4 cm, as before.
+    FVector p = WallPushOut({103, 0, 0}, {100, 0, 0}, {-1, 0, 0}, 1.0, 40.0);
+    EXPECT(Near(p, {-4, 0, 0}));
+    // Sprinting along a wall 6 cm beside the head, the muzzle 3 cm into it:
+    // out 4 cm sideways, where the old push came back almost 20 cm.
+    const FVector reach{55, 9, 0};
+    FVector eyes{0, 0, 0};
+    p = WallPushOut(eyes + reach, {36.7, 6, 0}, {0, -1, 0}, 1.0, 40.0);
+    EXPECT(Near(p, {0, -4, 0}));
+    EXPECT(OldPush(eyes, eyes + reach, 6.0) > 19.0);
+    // The head bobs 1 cm toward the wall: the push grows 1 cm, not 6.
+    const FVector eyes2{0, 1, 0};
+    const FVector p2 = WallPushOut(eyes2 + reach, {30, 6, 0}, {0, -1, 0}, 1.0, 40.0);
+    EXPECT(std::fabs(Length(p2 - p) - 1.0) < 1e-9);
+    EXPECT(OldPush(eyes2, eyes2 + reach, 6.0) - OldPush(eyes, eyes + reach, 6.0) > 6.0);
+    // Muzzle in front of the surface: nothing. A normal that isn't one: nothing.
+    EXPECT(Length(WallPushOut({99, 0, 0}, {100, 0, 0}, {-1, 0, 0}, 1.0, 40.0)) < 1e-12);
+    EXPECT(Length(WallPushOut({103, 0, 0}, {100, 0, 0}, {0, 0, 0}, 1.0, 40.0)) < 1e-12);
+    // At most max_cm; a normal of any length counts as its direction.
+    p = WallPushOut({200, 0, 0}, {100, 0, 0}, {-2, 0, 0}, 1.0, 40.0);
+    EXPECT(Near(p, {-40, 0, 0}));
+}
+
 int main() {
+    TestLeadTrust();
+    TestWallPush();
     TestSettle();
     TestGunShake();
     TestWalking();
