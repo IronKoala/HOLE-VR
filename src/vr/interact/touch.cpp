@@ -106,6 +106,55 @@ UObject Ksl() {
     return ksl;
 }
 
+struct TraceHit {
+    UObject actor = 0, comp = 0;
+    int objtype = -1;
+    FVector point;
+    double dist = 0;  // from the start, cm
+};
+// LineTraceSingle from `a` to `b` on `channel` (ETraceTypeQuery: 0 the
+// Visibility channel, 2 the game's interact channel), ignoring the player and
+// `ignore`. True on a blocking hit, described in *out.
+bool Trace(UObject player, const FVector& a, const FVector& b, uint8_t channel, const std::vector<UObject>& ignore,
+           TraceHit* out) {
+    if (!Ksl() || !Statics()) return false;
+    Arr arr{ignore.empty() ? 0 : reinterpret_cast<uintptr_t>(ignore.data()), static_cast<int32_t>(ignore.size()),
+            static_cast<int32_t>(ignore.size())};
+    ue::Call t(Ksl(), "LineTraceSingle");
+    t.Set("WorldContextObject", player).Set("Start", a).Set("End", b).Set("TraceChannel", channel)
+        .Set("bTraceComplex", false).Set("ActorsToIgnore", arr).Set("bIgnoreSelf", true);
+    if (!t.Invoke() || !t.Result<bool>()) return false;
+    int32_t hit_size = 0;
+    uint8_t* hit = t.Raw("OutHit", &hit_size);
+    if (!hit) return false;
+    ue::Call br(Statics(), "BreakHitResult");
+    int32_t in_size = 0;
+    uint8_t* in = br.Raw("Hit", &in_size);
+    if (!in || in_size != hit_size) return false;
+    std::memcpy(in, hit, static_cast<size_t>(hit_size));
+    if (!br.Invoke()) return false;
+    *out = TraceHit{};
+    out->actor = br.Get<UObject>("HitActor");
+    out->comp = br.Get<UObject>("HitComponent");
+    out->point = br.Get<FVector>("ImpactPoint");
+    out->dist = Len(out->point - a);
+    if (out->comp) {
+        ue::Call ot(out->comp, "GetCollisionObjectType");
+        if (ot.Invoke()) out->objtype = ot.Result<uint8_t>();
+    }
+    return true;
+}
+
+// The bottom of the player's capsule (the character's feet).
+bool PlayerFeet(UObject player, FVector* feet) {
+    UObject capsule = 0;
+    double hh = 0;
+    if (!ue::GetProp(player, "CapsuleComponent", capsule) || !capsule || !ReadNumber(capsule, "CapsuleHalfHeight", &hh))
+        return false;
+    *feet = CompToWorld(capsule).translation - FVector{0, 0, hh};
+    return true;
+}
+
 // ------------------------------------------------------------------ settings
 struct Settings {
     bool enabled = true, loot = true, containers = true, doors = true, study = true;
@@ -114,6 +163,10 @@ struct Settings {
     double hold = 0.08;      // the hand rests this long first, s
     double door_hold = 0.2;  // longer for doors (walking through a doorway)
     double again = 1.0;      // the same thing again (touch or trigger) after, s
+    // Trigger: a hand this close counts as touching; else the thing nearest
+    // the aim within point_cone degrees (or point_min cm) of it.
+    double trigger_near = 8.0, point_cone = 8.0, point_min = 6.0;
+    bool loot_log = true;    // where loot that appears goes (answers "no loot spawned")
     std::vector<std::string> extra_containers, skip;
     HandleZoneSettings handle;
 } S;
@@ -127,6 +180,10 @@ void LoadSettings() {
     S.reach = std::clamp<double>(config::GetFloat("touch_interact_reach_cm", 1.5f), 0.0, 15.0);
     S.hold = std::clamp<double>(config::GetFloat("touch_interact_hold_s", 0.08f), 0.0, 2.0);
     S.door_hold = std::clamp<double>(config::GetFloat("touch_interact_door_hold_s", 0.2f), 0.0, 2.0);
+    S.trigger_near = std::clamp<double>(config::GetFloat("touch_interact_trigger_near_cm", 8.0f), 0.0, 30.0);
+    S.point_cone = std::clamp<double>(config::GetFloat("touch_interact_point_cone_deg", 8.0f), 0.0, 30.0);
+    S.point_min = std::clamp<double>(config::GetFloat("touch_interact_point_min_cm", 6.0f), 0.0, 30.0);
+    S.loot_log = config::GetBool("touch_interact_loot_log", true);
     S.extra_containers = SplitList(config::GetString("touch_interact_extra_containers", ""));
     S.skip = SplitList(config::GetString("touch_interact_skip", ""));
     S.handle.height = std::clamp<double>(config::GetFloat("door_handle_height_cm", 100.0f), 40.0, 180.0);
@@ -153,6 +210,11 @@ struct Thing {
     std::vector<Part> parts;
     double volume = 0;
     TouchState st[2];
+    // Loot that appeared during the level (popped from a box or dropped):
+    // where it went, logged once it has settled.
+    double seen_at = -1;
+    FVector first_pos;
+    bool settle_logged = false;
 };
 
 struct Outcome {
@@ -173,6 +235,7 @@ struct LevelState {
     bool counted = false;
     std::map<UObject, double> used;
     std::vector<Outcome> outcomes;
+    int loot_lines = 0;
 } L;
 
 double g_clock = 0.0;
@@ -255,6 +318,80 @@ bool KindOn(Kind k) {
     }
 }
 
+// ---------------------------------------------------------------- loot log
+// Owner 2026-11-04 after a run: "no loot spawned, is this because of a bug
+// we made or because the game wasn't supposed to spawn loot?" The game did
+// spawn items from each box and fridge (the list grew after every one) but
+// none was ever picked up. These lines say where each new item goes.
+bool LootLine() { return S.loot_log && L.loot_lines++ < 80; }
+
+// "123 cm from you, 4 cm above your feet"
+std::string WhereFromPlayer(UObject player, const FVector& p) {
+    FVector feet;
+    if (!PlayerFeet(player, &feet)) return "(player not found)";
+    char buf[96];
+    std::snprintf(buf, sizeof(buf), "%.0f cm from you, %.0f cm above your feet",
+                  std::hypot(p.X - feet.X, p.Y - feet.Y), p.Z - feet.Z);
+    return buf;
+}
+
+void LogLootAppeared(UObject player, const Thing& t) {
+    if (!LootLine()) return;
+    log::Info("touch: loot: %s (%s) appeared %s (picked up by walking into it: %s)", t.name.c_str(), t.cls.c_str(),
+              WhereFromPlayer(player, t.first_pos).c_str(),
+              ReadFlag(t.actor, "IsToutchWithBody") == 1 ? "yes" : "no");
+}
+
+void LogLootSettled(UObject player, Thing& t) {
+    t.settle_logged = true;
+    if (!LootLine()) return;
+    const FVector now = ActorLocation(t.actor);
+    // Shown: its meshes visible (some items blink before they time out).
+    static UObject smc = ue::FindObject("Class /Script/Engine.StaticMeshComponent");
+    int shown = 0, meshes = 0;
+    if (smc) {
+        ue::Call list(t.actor, "K2_GetComponentsByClass");
+        list.Set("ComponentClass", smc);
+        int32_t size = 0;
+        const uint8_t* raw = list.Invoke() ? list.Raw("ReturnValue", &size) : nullptr;
+        Arr arr{};
+        if (raw && size >= 16) std::memcpy(&arr, raw, sizeof(Arr));
+        for (int32_t i = 0; i < arr.num && i < 16; ++i) {
+            const UObject c = mem::ReadOr<uintptr_t>(arr.data + i * 8ull);
+            if (!c) continue;
+            ++meshes;
+            ue::Call vis(c, "IsVisible");
+            if (vis.Invoke() && vis.Result<bool>() && ReadFlag(c, "bHiddenInGame") != 1) ++shown;
+        }
+    }
+    // Under the floor or inside something: solid just above it.
+    std::vector<UObject> none;
+    TraceHit up, down;
+    const bool roof = Trace(player, now, now + FVector{0, 0, 200}, 0, none, &up) && up.actor != t.actor;
+    const bool floor = Trace(player, now, now - FVector{0, 0, 500}, 0, none, &down) && down.actor != t.actor;
+    char above[64], below[64];
+    if (roof) std::snprintf(above, sizeof(above), "%.0f cm", up.dist);
+    else std::snprintf(above, sizeof(above), "nothing within 2 m");
+    if (floor) std::snprintf(below, sizeof(below), "%.0f cm", down.dist);
+    else std::snprintf(below, sizeof(below), "nothing within 5 m");
+    log::Info("touch: loot: %s after %.1f s is %s; moved %.0f cm sideways and %.0f cm up; %d of %d meshes shown%s; "
+              "solid above it: %s, floor below it: %s",
+              t.name.c_str(), g_clock - t.seen_at, WhereFromPlayer(player, now).c_str(),
+              std::hypot(now.X - t.first_pos.X, now.Y - t.first_pos.Y), now.Z - t.first_pos.Z, shown, meshes,
+              ReadFlag(t.actor, "bHidden") == 1 ? ", actor hidden" : "", above, below);
+}
+
+void LogLootGone(UObject player, const Thing& t) {
+    if (!LootLine()) return;
+    const auto it = L.used.find(t.actor);
+    const bool by_hand = it != L.used.end() && g_clock - it->second < 4.0;
+    log::Info("touch: loot: %s (%s) is gone%s: %s; last seen %s", t.name.c_str(), t.cls.c_str(),
+              t.seen_at >= 0 ? "" : " (it was there when the level loaded)",
+              by_hand ? "taken by your hand (touch or trigger)"
+                      : "not by the mod's touch or trigger (walked into, timed out, or fell out of the level)",
+              WhereFromPlayer(player, t.center - t.center_off).c_str());
+}
+
 // Every actor with the game's interact interface, merged into the list
 // (known ones keep their shapes and touch state).
 void RefreshList(UObject player) {
@@ -276,6 +413,7 @@ void RefreshList(UObject player) {
     L.list_buf = arr;
     std::unordered_map<UObject, size_t> old;
     for (size_t i = 0; i < L.things.size(); ++i) old[L.things[i].actor] = i;
+    std::vector<char> kept(L.things.size(), 0);
     std::vector<Thing> next;
     next.reserve(static_cast<size_t>(std::max(arr.num, 0)));
     int counts[5] = {};
@@ -284,7 +422,11 @@ void RefreshList(UObject player) {
         if (!a || a == player || !Live(a)) continue;
         auto it = old.find(a);
         if (it != old.end()) {
+            kept[it->second] = 1;
             next.push_back(std::move(L.things[it->second]));
+            Thing& k = next.back();
+            if (k.seen_at >= 0 && !k.settle_logged && g_clock - k.seen_at >= 2.5 && Live(k.actor))
+                LogLootSettled(player, k);
         } else {
             Thing t;
             t.actor = a;
@@ -300,10 +442,17 @@ void RefreshList(UObject player) {
                 t.reach = std::fmin(Len(e), 600.0);
             }
             t.center = loc + t.center_off;
+            if (t.kind == Kind::kLoot && L.counted) {
+                t.seen_at = g_clock;
+                t.first_pos = loc;
+                LogLootAppeared(player, t);
+            }
             next.push_back(std::move(t));
         }
         ++counts[static_cast<int>(next.back().kind)];
     }
+    for (size_t i = 0; i < kept.size(); ++i)
+        if (!kept[i] && L.things[i].kind == Kind::kLoot) LogLootGone(player, L.things[i]);
     L.things.swap(next);
     bool changed = !L.counted;
     for (int k = 0; k < 5; ++k) changed = changed || (counts[k] != L.counts[k] && k != static_cast<int>(Kind::kLoot));
@@ -593,7 +742,9 @@ void CheckOutcomes() {
         }
         std::string what;
         if (!Live(o.actor)) {
-            what = "it is gone (taken)";
+            what = o.kind == Kind::kContainer ? "it opened and the game removed it (a box goes once its loot is out)"
+                   : o.kind == Kind::kLoot    ? "it is gone (taken)"
+                                              : "it is gone";
         } else {
             const int open = ReadFlag(o.actor, "IsOpen"), take = ReadFlag(o.actor, "IsTake");
             if (open >= 0 && o.open >= 0 && open != o.open) what = open ? "it opened (IsOpen 0 -> 1)" : "it closed (IsOpen 1 -> 0)";
@@ -714,6 +865,9 @@ bool InteractThroughGame(UObject player, UObject target, const char* why) {
         focused = focus.Invoke();
         ue::SetProp(player, "InteractTarget", target);
     }
+    // Before the call: the game changes them inside it (a box sets IsOpen
+    // in its Interact), so reading them after said "already open".
+    const int open_before = ReadFlag(target, "IsOpen"), take_before = ReadFlag(target, "IsTake");
     ue::SetProp(player, "IsInteractReady", uint8_t{1});
     ue::Call c(player, "PlayerInput_Interact");
     const bool ok = c.Invoke();
@@ -730,8 +884,8 @@ bool InteractThroughGame(UObject player, UObject target, const char* why) {
         const UObject cls = ue::GetClass(target);
         o.cls = cls ? ue::GetName(cls) : "?";
     }
-    o.open = ReadFlag(target, "IsOpen");
-    o.take = ReadFlag(target, "IsTake");
+    o.open = open_before;
+    o.take = take_before;
     o.at = g_clock + 1.0;
     log::Info("touch: %s %s (%s, %s%s%s) through the game's interact%s%s", why, o.name.c_str(), o.cls.c_str(),
               KindName(o.kind), o.open < 0 ? "" : o.open ? ", open" : ", closed",
@@ -749,14 +903,18 @@ Pick PickForHand(UObject player, int hand, const std::vector<UObject>& ignore) {
         L.player = player;
     }
     if (L.things.empty() || g_clock >= L.next_list) RefreshList(player);
+    const char* side = hand == 0 ? "left" : "right";
     const hands::HandState hs = hands::Get(hand == 0 ? hands::kLeft : hands::kRight);
-    if (!hs.valid) return out;
+    if (!hs.valid) {
+        log::Info("touch: %s hand trigger: the hand isn't tracked right now", side);
+        return out;
+    }
     Ball balls[8];
     const int n = HandBalls(hand, hs, balls);
     std::unordered_map<UObject, Xf> xfs;
-    // Touching: anything the game can interact with but the drink machine
-    // (pressed and drunk by hand there), a bit more forgiving than a touch on
-    // its own, since the trigger says it's meant.
+    // Touching (or nearly: the trigger says it's meant): anything the game
+    // can interact with but the drink machine (pressed and drunk by hand
+    // there); the smallest wins.
     const Thing* best = nullptr;
     const Thing* nearest = nullptr;
     double nearest_d = 1e9;
@@ -770,7 +928,7 @@ Pick PickForHand(UObject player, int hand, const std::vector<UObject>& ignore) {
         if (c > t.reach + 40.0) continue;
         if (!t.built) BuildParts(t);
         const double d = HandDist(t, balls, n, xfs);
-        if (d <= S.reach + 3.0 && (!best || t.volume < best->volume)) best = &t;
+        if (d <= std::fmax(S.reach + 3.0, S.trigger_near) && (!best || t.volume < best->volume)) best = &t;
     }
     if (best) {
         out.actor = best->actor;
@@ -779,51 +937,92 @@ Pick PickForHand(UObject player, int hand, const std::vector<UObject>& ignore) {
         out.kind = KindName(best->kind);
         return out;
     }
-    // Pointing: the game's own interact trace (channel 2, the hit part's
-    // object type 16) from the hand instead of the eyes, as far as the game
-    // reaches when you look.
+    // Pointing exactly: the game's own interact trace (channel 2, the hit
+    // part's object type 16) from the hand instead of the eyes, as far as
+    // the game reaches when you look.
     double reach = 200.0;
     if (!ReadNumber(player, "InteractiveDistance", &reach) || reach < 50.0 || reach > 2000.0) reach = 200.0;
     const FVector o = hs.aim.location, d = hs.aim.rotation.Rotate(FVector{1, 0, 0});
-    if (Ksl() && Statics()) {
-        Arr arr{ignore.empty() ? 0 : reinterpret_cast<uintptr_t>(ignore.data()), static_cast<int32_t>(ignore.size()),
-                static_cast<int32_t>(ignore.size())};
-        ue::Call t(Ksl(), "LineTraceSingle");
-        t.Set("WorldContextObject", player).Set("Start", o).Set("End", o + d * reach).Set("TraceChannel", uint8_t{2})
-            .Set("bTraceComplex", false).Set("ActorsToIgnore", arr).Set("bIgnoreSelf", true);
-        int32_t hit_size = 0;
-        uint8_t* hit = nullptr;
-        if (t.Invoke() && t.Result<bool>()) hit = t.Raw("OutHit", &hit_size);
-        if (hit) {
-            ue::Call br(Statics(), "BreakHitResult");
-            int32_t in_size = 0;
-            uint8_t* in = br.Raw("Hit", &in_size);
-            if (in && in_size == hit_size) {
-                std::memcpy(in, hit, static_cast<size_t>(hit_size));
-                if (br.Invoke()) {
-                    const UObject actor = br.Get<UObject>("HitActor"), comp = br.Get<UObject>("HitComponent");
-                    int type = -1;
-                    if (comp) {
-                        ue::Call ot(comp, "GetCollisionObjectType");
-                        if (ot.Invoke()) type = ot.Result<uint8_t>();
-                    }
-                    if (const Thing* th = actor && type == 16 ? FindThing(actor) : nullptr) {
-                        out.actor = th->actor;
-                        out.how = "pointing at";
-                        out.cls = th->cls;
-                        out.kind = KindName(th->kind);
-                        return out;
-                    }
-                }
-            }
+    TraceHit hit;
+    if (Trace(player, o, o + d * reach, 2, ignore, &hit) && hit.objtype == 16) {
+        if (const Thing* th = FindThing(hit.actor)) {
+            out.actor = th->actor;
+            out.how = "pointing at";
+            out.cls = th->cls;
+            out.kind = KindName(th->kind);
+            return out;
         }
     }
+    // Pointing roughly: the thing whose shapes come closest to the aim, seen
+    // from the hand, inside a narrow cone and the game's reach, with nothing
+    // solid in between. Before this only an exact hit on the part the game's
+    // ray looks for counted (a box's is a dome round its base), and ten
+    // presses at boxes about 1 m away all missed (run 2026-11-03 20:44).
+    struct Cand {
+        const Thing* t;
+        double angle, at, gap;
+        FVector point;
+    };
+    std::vector<Cand> cands;
+    for (Thing& t : L.things) {
+        if (t.kind == Kind::kSkip || !Live(t.actor)) continue;
+        if (Len(t.center - o) > reach + t.reach) continue;
+        if (!t.built) BuildParts(t);
+        Cand c{&t, 1e9, 0, 0, {}};
+        for (const Part& p : t.parts) {
+            Xf xf;
+            if (p.comp) {
+                auto it = xfs.find(p.comp);
+                if (it == xfs.end()) it = xfs.emplace(p.comp, CompToWorld(p.comp)).first;
+                xf = it->second;
+            }
+            const FVector lo = p.comp ? ToFrame(xf.rotation, xf.translation, o) : o;
+            const FVector ld = p.comp ? xf.rotation.Inverse().Rotate(d) : d;
+            double at = 0;
+            const double gap = SegmentBoxGap(lo, ld, reach, p.box, &at);
+            if (!InAimCone(gap, at, S.point_cone, S.point_min)) continue;
+            const double ang = std::atan2(gap, std::fmax(at, 1.0)) * 180.0 / 3.14159265358979323846;
+            if (ang < c.angle - 0.25 || (ang <= c.angle + 0.25 && at < c.at)) {
+                // The nearest point of the part to the aim, back in the world.
+                const FVector q{lo.X + ld.X * at, lo.Y + ld.Y * at, lo.Z + ld.Z * at};
+                const FVector on{std::clamp(q.X, p.box.lo.X, p.box.hi.X), std::clamp(q.Y, p.box.lo.Y, p.box.hi.Y),
+                                 std::clamp(q.Z, p.box.lo.Z, p.box.hi.Z)};
+                c = Cand{&t, ang, at, gap, p.comp ? xf.rotation.Rotate(on) + xf.translation : on};
+            }
+        }
+        if (c.angle < 1e8) cands.push_back(c);
+    }
+    std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) {
+        if (std::fabs(a.angle - b.angle) > 0.5) return a.angle < b.angle;
+        return a.at < b.at;
+    });
+    int checked = 0;
+    for (const Cand& c : cands) {
+        if (++checked > 4) break;
+        // A wall, shelf or door in the way (the Visibility trace) stops it.
+        TraceHit wall;
+        const double to = Len(c.point - o);
+        if (to > 1.0 && Trace(player, o, c.point, 0, ignore, &wall) && wall.actor != c.t->actor &&
+            wall.dist < to - 4.0) {
+            log::Info("touch: %s hand trigger: %s (%s) is %.1f deg off the aim, %.0f cm out, but %s is in the way",
+                      side, c.t->name.c_str(), c.t->cls.c_str(), c.angle, c.at,
+                      wall.actor ? ue::GetName(wall.actor).c_str() : "something");
+            continue;
+        }
+        out.actor = c.t->actor;
+        out.how = "pointing near";
+        out.cls = c.t->cls;
+        out.kind = KindName(c.t->kind);
+        log::Info("touch: %s hand trigger: pointing %.1f deg off %s (%s), %.0f cm out (%zu things in the aim cone)",
+                  side, c.angle, c.t->name.c_str(), c.t->cls.c_str(), c.at, cands.size());
+        return out;
+    }
     static int s_diag = 0;
-    if (s_diag++ < 30)
+    if (s_diag++ < 40)
         log::Info("touch: the %s hand touches and points at nothing to interact with (%zu things here; nearest %s, "
-                  "%s, %.0f cm from the hand)",
-                  hand == 0 ? "left" : "right", L.things.size(), nearest ? nearest->name.c_str() : "none",
-                  nearest ? nearest->cls.c_str() : "-", nearest_d);
+                  "%s, %.0f cm from the hand; aim from (%.0f %.0f %.0f) along (%.2f %.2f %.2f))",
+                  side, L.things.size(), nearest ? nearest->name.c_str() : "none", nearest ? nearest->cls.c_str() : "-",
+                  nearest_d, o.X, o.Y, o.Z, d.X, d.Y, d.Z);
     return out;
 }
 

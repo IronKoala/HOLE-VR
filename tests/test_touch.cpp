@@ -179,12 +179,53 @@ static void TestUnknown() {
     EXPECT(StepTouch(f, 0.0, 1.41, touch, leave, hold));
 }
 
+// Trigger aim assist: the aim segment's closest approach to a box.
+static void TestAim() {
+    // A cardboard box like BP_DataBox_500_C (70 x 50 x 32 cm) on the floor,
+    // the hand 100 cm away at 100 cm up.
+    const Box box{FVector{-35, -25, 0}, FVector{35, 25, 32}};
+    const FVector hand{-135, 0, 100};
+    double t = -1;
+    // Aimed at its middle: through it, entering at its top or near face.
+    FVector to{0, 0, 16};
+    FVector d = to - hand;
+    double n = std::sqrt(d.X * d.X + d.Y * d.Y + d.Z * d.Z);
+    d = FVector{d.X / n, d.Y / n, d.Z / n};
+    EXPECT(Near(SegmentBoxGap(hand, d, 200, box, &t), 0.0));
+    EXPECT(t > 90 && t < n);
+    // Aimed 10 cm over its far top corner: a 10 cm-ish gap about 1.3 m out,
+    // inside an 8 degree cone (18 cm there) but not a 1 degree one.
+    to = FVector{35, 25, 42};
+    d = to - hand;
+    n = std::sqrt(d.X * d.X + d.Y * d.Y + d.Z * d.Z);
+    d = FVector{d.X / n, d.Y / n, d.Z / n};
+    const double gap = SegmentBoxGap(hand, d, 200, box, &t);
+    EXPECT(gap > 4 && gap < 10.5);
+    EXPECT(t > 100 && t < 200);
+    EXPECT(InAimCone(gap, t, 8, 6));
+    EXPECT(!InAimCone(gap, t, 1, 0));
+    // Aimed straight up: far from it.
+    EXPECT(SegmentBoxGap(hand, FVector{0, 0, 1}, 200, box, &t) > 100);
+    // Too short to reach it: the gap is from the segment's end.
+    EXPECT(Near(SegmentBoxGap(FVector{-100, 0, 16}, FVector{1, 0, 0}, 50, box, &t), 15.0, 1e-3));
+    EXPECT(Near(t, 50.0, 1e-3));
+    // Starting inside it: through at 0.
+    EXPECT(Near(SegmentBoxGap(FVector{0, 0, 10}, FVector{1, 0, 0}, 50, box, &t), 0.0));
+    EXPECT(Near(t, 0.0));
+    // Parallel to a face, beside it: exact gap.
+    EXPECT(Near(SegmentBoxGap(FVector{-100, 30, 16}, FVector{1, 0, 0}, 200, box, &t), 5.0, 1e-3));
+    // Close things get min_cm even at a tiny angle.
+    EXPECT(InAimCone(5.0, 10.0, 8, 6));
+    EXPECT(!InAimCone(7.0, 10.0, 8, 6));
+}
+
 int main() {
     TestClassify();
     TestBox();
     TestDoor();
     TestTouch();
     TestUnknown();
+    TestAim();
     if (failures) {
         std::printf("%d failure(s)\n", failures);
         return 1;
