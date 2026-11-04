@@ -15,6 +15,7 @@
 #include "core/log.h"
 #include "core/perf.h"
 #include "vr/square_watch.h"
+#include "vr/swapchain_hold.h"
 
 namespace holevr::vr::xr {
 namespace {
@@ -410,12 +411,24 @@ std::atomic<ID3D12Resource*> g_eye_texture{nullptr};
 // here instead: lower resolution, but it gets a picture into the headset.
 ID3D12Resource* g_fallback_texture = nullptr;
 uint64_t g_frames = 0, g_frames_engine = 0, g_frames_fallback = 0, g_frames_none = 0;
+// Frames where the eye pictures could not be copied this time, by reason
+// (render thread only; logged and reset with the 10 s stats line).
+uint64_t g_xr_acquire_errors = 0;  // xrAcquireSwapchainImage failed
+uint64_t g_xr_wait_timeouts = 0;   // xrWaitSwapchainImage ran out of time (100 ms)
+uint64_t g_xr_wait_errors = 0;     // xrWaitSwapchainImage failed
+uint64_t g_copy_gpu_busy = 0;      // our copy commands from 3 frames ago still on the GPU after 100 ms
+uint64_t g_copy_errors = 0;        // a D3D12 Reset/Close failed
+uint64_t g_frames_repeated = 0;    // frames that showed the last picture again instead
 DWORD g_last_stats = 0;
 
 struct Swapchain {
     XrSwapchain handle = XR_NULL_HANDLE;
     std::vector<XrSwapchainImageD3D12KHR> images;
     uint32_t width = 0, height = 0;
+    // The image we hold between xrAcquireSwapchainImage and
+    // xrReleaseSwapchainImage. It can stay held over several game frames (see
+    // vr/swapchain_hold.h).
+    HeldImage held;
 };
 Swapchain g_swapchains[2];
 DXGI_FORMAT g_swapchain_format = DXGI_FORMAT_UNKNOWN;
@@ -746,17 +759,29 @@ void FinishCapture(DXGI_FORMAT format) {
 }
 
 // Copies both halves of the eye texture into the acquired swapchain images.
+// False when nothing was submitted: the caller keeps the images and tries
+// again next frame.
 bool CopyEyes(ID3D12Resource* source, D3D12_RESOURCE_STATES src_state, const uint32_t image_index[2]) {
-    int slot = g_frame_slot;
-    g_frame_slot = (g_frame_slot + 1) % kFramesInFlight;
+    const int slot = g_frame_slot;
     if (g_fence->GetCompletedValue() < g_allocator_fence_value[slot]) {
         perf::Scope t(g_perf_fence);
-        g_fence->SetEventOnCompletion(g_allocator_fence_value[slot], g_fence_event);
-        WaitForSingleObject(g_fence_event, 100);
+        if (SUCCEEDED(g_fence->SetEventOnCompletion(g_allocator_fence_value[slot], g_fence_event)))
+            WaitForSingleObject(g_fence_event, 100);
     }
-    if (g_fence->GetCompletedValue() >= g_allocator_fence_value[slot]) ReadSlotTimestamps(slot);
-    g_allocators[slot]->Reset();
-    g_cmd->Reset(g_allocators[slot], nullptr);
+    // The allocator's commands from kFramesInFlight frames ago must be done on
+    // the GPU before it may be reset (D3D12 rule; resetting it earlier is
+    // undefined). If they are not done after 100 ms, skip this frame's copy and
+    // use the same slot next time.
+    if (g_fence->GetCompletedValue() < g_allocator_fence_value[slot]) {
+        ++g_copy_gpu_busy;
+        return false;
+    }
+    g_frame_slot = (slot + 1) % kFramesInFlight;
+    ReadSlotTimestamps(slot);
+    if (FAILED(g_allocators[slot]->Reset()) || FAILED(g_cmd->Reset(g_allocators[slot], nullptr))) {
+        ++g_copy_errors;
+        return false;
+    }
     if (g_ts_heap) g_cmd->EndQuery(g_ts_heap, D3D12_QUERY_TYPE_TIMESTAMP, slot * 2);
 
     D3D12_RESOURCE_BARRIER before[3] = {
@@ -795,7 +820,10 @@ bool CopyEyes(ID3D12Resource* source, D3D12_RESOURCE_STATES src_state, const uin
         g_slot_present_ms[slot] = g_present_ms;
         g_slot_has_ts[slot] = true;
     }
-    if (FAILED(g_cmd->Close())) return false;
+    if (FAILED(g_cmd->Close())) {
+        ++g_copy_errors;
+        return false;
+    }
     ID3D12CommandList* lists[] = {g_cmd};
     g_queue->ExecuteCommandLists(1, lists);
     g_queue->Signal(g_fence, ++g_fence_value);
@@ -1005,6 +1033,62 @@ std::string HeadsetReport(double span_s) {
     return buf;
 }
 
+// Acquires and waits for one image per eye, keeping any image already held
+// from an earlier frame (see vr/swapchain_hold.h for the rules).
+bool ReadyEyeImages() {
+    auto acquire = Proc<PFN_xrAcquireSwapchainImage>("xrAcquireSwapchainImage");
+    auto wait = Proc<PFN_xrWaitSwapchainImage>("xrWaitSwapchainImage");
+    for (int eye = 0; eye < 2; ++eye) {
+        Swapchain& sc = g_swapchains[eye];
+        XrResult result = XR_SUCCESS;
+        const ImageStep step = ReadyImage(
+            sc.held,
+            [&](uint32_t* index) {
+                XrSwapchainImageAcquireInfo ai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+                result = acquire(sc.handle, &ai, index);
+                return XR_SUCCEEDED(result);
+            },
+            [&] {
+                XrSwapchainImageWaitInfo wti{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+                wti.timeout = 100000000;  // 100 ms
+                result = wait(sc.handle, &wti);
+                // XR_TIMEOUT_EXPIRED passes XR_SUCCEEDED, so test it first.
+                if (result == XR_TIMEOUT_EXPIRED) return WaitResult::kTimeout;
+                return XR_SUCCEEDED(result) ? WaitResult::kReady : WaitResult::kError;
+            });
+        const char* which = eye ? "right" : "left";
+        switch (step) {
+            case ImageStep::kReady:
+                if (sc.held.index >= sc.images.size()) return false;  // never from a working runtime
+                continue;
+            case ImageStep::kTimeout:
+                if (g_xr_wait_timeouts++ == 0)
+                    log::Warn("OpenXR: the %s eye image was not free after 100 ms; trying the same image next frame",
+                              which);
+                return false;
+            case ImageStep::kWaitError:
+                if (g_xr_wait_errors++ == 0)
+                    log::Warn("OpenXR: waiting for the %s eye image failed (%d)", which, static_cast<int>(result));
+                return false;
+            case ImageStep::kAcquireError:
+                if (g_xr_acquire_errors++ == 0)
+                    log::Warn("OpenXR: acquiring the %s eye image failed (%d)", which, static_cast<int>(result));
+                return false;
+        }
+    }
+    return true;
+}
+
+// Call only once both held images have this frame's pictures copied in.
+void ReleaseEyeImages() {
+    auto release = Proc<PFN_xrReleaseSwapchainImage>("xrReleaseSwapchainImage");
+    for (Swapchain& sc : g_swapchains)
+        ReleaseWritten(sc.held, [&] {
+            XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+            release(sc.handle, &ri);
+        });
+}
+
 void RunFrame() {
     static bool registered = [] {
         perf::Register(&g_perf_game);
@@ -1079,26 +1163,25 @@ void RunFrame() {
         D3D12_RESOURCE_DESC sd = source->GetDesc();
         bool ok = (sd.Width == g_source_width && sd.Height == g_source_height && sd.Format == g_source_format) ||
                   CreateSwapchains(source);
-        uint32_t index[2] = {};
-        auto acquire = Proc<PFN_xrAcquireSwapchainImage>("xrAcquireSwapchainImage");
-        auto wait = Proc<PFN_xrWaitSwapchainImage>("xrWaitSwapchainImage");
-        auto release = Proc<PFN_xrReleaseSwapchainImage>("xrReleaseSwapchainImage");
-        int acquired = 0;
-        for (int eye = 0; ok && eye < 2; ++eye) {
-            XrSwapchainImageAcquireInfo ai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-            ok = XR_SUCCEEDED(acquire(g_swapchains[eye].handle, &ai, &index[eye]));
-            if (!ok) break;
-            ++acquired;
-            XrSwapchainImageWaitInfo wti{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
-            wti.timeout = 100000000;  // 100 ms
-            ok = XR_SUCCEEDED(wait(g_swapchains[eye].handle, &wti));
-        }
+        if (ok) ok = ReadyEyeImages();
         step(g_perf_images);
-        if (ok) ok = CopyEyes(source, src_state, index);
+        if (ok) {
+            const uint32_t index[2] = {g_swapchains[0].held.index, g_swapchains[1].held.index};
+            ok = CopyEyes(source, src_state, index);
+        }
         step(g_perf_copy);
-        for (int eye = 0; eye < acquired; ++eye) {
-            XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-            release(g_swapchains[eye].handle, &ri);
+        // Only images that now hold this frame's pictures are released. Any
+        // other held image stays with us for the next frame.
+        if (ok) ReleaseEyeImages();
+        if (!ok && g_have_last_layer) {
+            // Show the last picture again (as a missed frame would) rather
+            // than send no picture. The swapchains' last released images are
+            // still that picture, since nothing unwritten was released.
+            layer.space = g_space;
+            layer.viewCount = 2;
+            layer.views = g_last_views;
+            layers.push_back(reinterpret_cast<XrCompositionLayerBaseHeader*>(&layer));
+            ++g_frames_repeated;
         }
         if (ok) {
             for (int eye = 0; eye < 2; ++eye) {
@@ -1127,6 +1210,16 @@ void RunFrame() {
                   (unsigned long long)g_frames_fallback, (unsigned long long)g_frames_none,
                   g_keepalive_frames, g_eye_texture.load() ? "found" : "missing", have_rendered ? "yes" : "no",
                   g_max_gap_ms, g_hitches);
+        // Always logged, zeros included, so a run's log shows these were
+        // counted (no line would not tell "never happened" from "not looked at").
+        log::Info("OpenXR: last 10 s, eye copies missed: image waits timed out %llu, image wait errors %llu, "
+                  "image acquire errors %llu, GPU still busy with our copy from 3 frames ago %llu, "
+                  "D3D12 errors %llu; frames that showed the last picture again %llu",
+                  (unsigned long long)g_xr_wait_timeouts, (unsigned long long)g_xr_wait_errors,
+                  (unsigned long long)g_xr_acquire_errors, (unsigned long long)g_copy_gpu_busy,
+                  (unsigned long long)g_copy_errors, (unsigned long long)g_frames_repeated);
+        g_xr_wait_timeouts = g_xr_wait_errors = g_xr_acquire_errors = 0;
+        g_copy_gpu_busy = g_copy_errors = g_frames_repeated = 0;
         g_max_gap_ms = 0.0;
         g_last_stats = now;
     }

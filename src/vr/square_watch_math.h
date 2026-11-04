@@ -14,6 +14,13 @@
 
 namespace holevr::vr::square_watch {
 
+// Record clamps the final full-height readback strip upward so it stays inside
+// the texture. It overlaps the preceding strip and its origin is therefore
+// between regular strip boundaries. Round upward to retain its distinct slot.
+inline uint32_t SweepStripIndex(uint32_t y0, uint32_t rows) {
+    return rows ? y0 / rows + (y0 % rows != 0) : 0;
+}
+
 // A horizontal strip of the picture, both eyes side by side (left eye on the
 // left half), as brightness 0..1 per pixel, row by row.
 struct Band {

@@ -130,7 +130,26 @@ static void TestDotsInBothEyes() {
     EXPECT(d.Odd() == 0);
 }
 
+static void TestSweepStripIndex() {
+    // Record shifts the last 96-row strip upward for non-multiple heights.
+    // Every logical strip must still get a separate freshness slot, or
+    // LatestSweep can never report a complete sweep.
+    for (uint32_t height = 16; height <= 96 * 64; ++height) {
+        const uint32_t rows = height < 96 ? height : 96;
+        const uint32_t count = (height + rows - 1) / rows;
+        std::vector<int> visits(count, 0);
+        for (uint32_t i = 0; i < count; ++i) {
+            const uint32_t y0 = i * rows < height - rows ? i * rows : height - rows;
+            const uint32_t slot = SweepStripIndex(y0, rows);
+            EXPECT(slot < count);
+            if (slot < count) ++visits[slot];
+        }
+        for (int n : visits) EXPECT(n == 1);
+    }
+}
+
 int main() {
+    TestSweepStripIndex();
     TestDotGridInRightEye();
     TestPairsCountEdgesDont();
     TestDotsInBothEyes();

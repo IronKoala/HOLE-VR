@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <deque>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -152,15 +153,43 @@ bool Alive(const Suspect& s) {
 }
 
 // Game thread.
+// Why the last SwitchOff returned false.
+enum class Skip { kNone, kAlready, kUnreadable, kRefused, kGone } g_skip = Skip::kNone;
+
 bool SwitchOff(Suspect& s, UObject player) {
+    g_skip = Skip::kNone;
     switch (s.kind) {
-        case Kind::kCvar:
-            s.original = cvars::ReadIntNow(s.cvar, 0);
-            if (s.original == s.test_value) return false;  // already off: nothing to test
+        case Kind::kCvar: {
+            constexpr int kUnread = std::numeric_limits<int>::min();
+            const int was = cvars::ReadIntNow(s.cvar, kUnread);
+            if (was == kUnread) {
+                g_skip = Skip::kUnreadable;
+                return false;
+            }
+            s.original = was;
+            if (was == s.test_value) {  // already off: nothing to test
+                g_skip = Skip::kAlready;
+                return false;
+            }
             cvars::RunNow(s.cvar + " " + std::to_string(s.test_value), player);
+            // A console command alone is no evidence: the engine refuses a
+            // value set with lower priority than the one it has. Read it back.
+            const int now = cvars::ReadIntNow(s.cvar, kUnread);
+            if (now != s.test_value) {
+                cvars::RunNow(s.cvar + " " + std::to_string(was), player);
+                log::Info("square test: %s: asked for %d but it reads %d; not tested", s.cvar.c_str(), s.test_value,
+                          now);
+                g_skip = Skip::kRefused;
+                return false;
+            }
+            log::Info("square test: %s now reads %d (was %d)", s.cvar.c_str(), now, was);
             return true;
+        }
         case Kind::kWidget: {
-            if (!Alive(s)) return false;
+            if (!Alive(s)) {
+                g_skip = Skip::kGone;
+                return false;
+            }
             float op = 1.f;
             ue::GetProp(s.obj, "RenderOpacity", op);
             s.original_opacity = op;
@@ -169,7 +198,10 @@ bool SwitchOff(Suspect& s, UObject player) {
             return c.Invoke();
         }
         case Kind::kScreenComponent: {
-            if (!Alive(s)) return false;
+            if (!Alive(s)) {
+                g_skip = Skip::kGone;
+                return false;
+            }
             ue::Call v(s.obj, "IsVisible");
             s.original_visible = !v.Invoke() || v.Result<bool>();
             ue::Call c(s.obj, "SetVisibility");
@@ -503,11 +535,18 @@ void Tick(UObject player, float) {
             g_switched = SwitchOff(g_suspects[g_current], player);
             if (!g_switched) {
                 Suspect& s = g_suspects[g_current];
-                log::Info("square test: %s: skipped (%s)", s.label.c_str(),
-                          s.kind == Kind::kCvar ? "already at that value" : "gone");
-                if (s.kind == Kind::kCvar) {
+                const char* why = g_skip == Skip::kAlready      ? "already at that value"
+                                  : g_skip == Skip::kUnreadable ? "the setting can't be read"
+                                  : g_skip == Skip::kRefused    ? "the engine did not take the new value"
+                                  : g_skip == Skip::kGone       ? "gone"
+                                                                : "could not switch it";
+                log::Info("square test: %s: skipped (%s)", s.label.c_str(), why);
+                if (g_skip == Skip::kAlready) {
                     s.verdict = Suspect::kNoEffect;
                     s.results = "already " + std::to_string(s.original);
+                } else if (s.kind == Kind::kCvar) {
+                    s.verdict = Suspect::kUnsure;
+                    s.results = why;
                 }
                 g_current = -1;
                 g_since = now;  // the baseline just taken is still good

@@ -219,7 +219,7 @@ void AddToFull(const Job& j) {
 
 void CheckDots(const Job& j, const Band& band, double now) {
     const Dots d = CountDots(band, static_cast<int>(j.y0));
-    const int strip = static_cast<int>(j.y0 / std::max(1u, j.rows));
+    const int strip = static_cast<int>(SweepStripIndex(j.y0, j.rows));
     const int strips = static_cast<int>((j.full_h + j.rows - 1) / std::max(1u, j.rows));
     {
         std::lock_guard<std::mutex> lock(g_stats_mutex);
