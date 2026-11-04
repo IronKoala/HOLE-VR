@@ -536,6 +536,12 @@ struct WeaponState {
     int spawn_fail_logs = 0;
     int wait_logs = 0;
     double refill_pouch_at = 0; // when to put a new magazine in the pouch
+    // Magwell diagnostics (owner 2026-11-04: "i cannot reload the AR at all").
+    double magwell_log_at = 0;
+    bool magwell_point_logged = false;
+    UObject dropped_mag = 0;
+    FVector dropped_at;
+    double dropped_check_at = -1;
     bool have_frame = false;
     FQuat gun_frame;           // gun frame (X barrel, Z up) expressed in actor space
     double check_chamber_at = -1;
@@ -1537,6 +1543,16 @@ void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState& lh
     // B held at any moment while the slide is back far enough pushes the
     // lever up (pressed before or during the rack, released before the slide).
     // None of these work on a holstered pistol.
+    if (W.dropped_check_at > 0 && g_clock >= W.dropped_check_at) {
+        W.dropped_check_at = -1;
+        if (LiveObject(W.dropped_mag)) {
+            const FVector now = ActorLocation(W.dropped_mag);
+            log::Info("controls: dropped magazine %s moved %.0f cm down, %.0f cm in all, 0.8 s after the drop%s",
+                      ue::GetName(W.dropped_mag).c_str(), W.dropped_at.Z - now.Z, Len(now - W.dropped_at),
+                      Len(now - W.dropped_at) < 3.0 ? " (it is not falling: floating)" : "");
+        }
+        W.dropped_mag = 0;
+    }
     if (rin.secondary.down && W.slide.Held() && !W.lock_on_release && W.in_hand) {
         double len = gun.SlideBackLength() > 0.5 ? gun.SlideBackLength() : 4.7;
         double stop = gun.SlideStopLength() > 0 ? gun.SlideStopLength() / len : 0.75;
@@ -1711,14 +1727,34 @@ void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState& lh
             log::Info("controls: magazine seated: %s", gun.State().Describe().c_str());
             return;
         }
+        if (!W.magwell_point_logged) {
+            W.magwell_point_logged = true;
+            const FVector rel = W.frame_rot.Inverse().Rotate(seat - W.grip_world);
+            const FVector wup = ComponentToWorld(well).rotation.Rotate(FVector{0, 0, 1});
+            const FVector wup_g = W.frame_rot.Inverse().Rotate(wup);
+            log::Info("controls: %s magwell point %s at (%.1f %.1f %.1f) cm from the grip (forward, right, up); its up "
+                      "axis (%.2f %.2f %.2f) in the gun frame; seat %s",
+                      W.is_pistol ? "pistol" : "rifle", ue::GetName(well).c_str(), rel.X, rel.Y, rel.Z, wup_g.X,
+                      wup_g.Y, wup_g.Z, W.seat_learned ? "learned" : "not learned yet");
+        }
+        if (!W.mag_engaged && g_clock >= W.magwell_log_at && Len(p) < 35.0) {
+            W.magwell_log_at = g_clock + 0.5;
+            log::Info("controls: held magazine near the magwell: %.1f cm below it, %.1f cm off its axis, pointing %.0f deg "
+                      "off it (lines up within -4..%.0f below, %.1f off, %.0f deg)", along, lateral, aim_off_deg,
+                      W.is_pistol ? 14.0 : 16.0, W.is_pistol ? 5.5 : 7.5, W.is_pistol ? 40.0 : 60.0);
+        }
+        // A rifle's magwell is wider and its magazine is held more freely
+        // (owner 2026-11-04: "i cannot reload the AR at all"): more slack.
+        const double max_lat = W.is_pistol ? 5.5 : 7.5, max_aim = W.is_pistol ? 40.0 : 60.0;
+        const double max_below = W.is_pistol ? 14.0 : 16.0;
         if (!W.mag_engaged) {
-            if (along > -4.0 && along < 14.0 && lateral < 5.5 && aim_off_deg < 40.0) {
+            if (along > -4.0 && along < max_below && lateral < max_lat && aim_off_deg < max_aim) {
                 W.mag_engaged = true;
                 input::Haptic(input::kLeft, 0.25f, 0.02f);
                 log::Info("controls: magazine lined up with the magwell (%.1f cm below, %.1f off axis, %.0f deg)",
                           along, lateral, aim_off_deg);
             }
-        } else if (lateral > 7.0 || along > 17.0 || aim_off_deg > 50.0) {
+        } else if (lateral > max_lat + 1.5 || along > max_below + 3.0 || aim_off_deg > max_aim + 10.0) {
             W.mag_engaged = false;
         }
         if (W.mag_engaged) {
@@ -1752,9 +1788,12 @@ void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState& lh
         }
         ue::Call drop(W.held_mag, "DropMagazine");
         drop.Invoke();
+        W.dropped_mag = W.held_mag;
+        W.dropped_at = W.mag_shown;
+        W.dropped_check_at = g_clock + 0.8;
         W.held_mag = 0;
         W.refill_pouch_at = g_clock + 0.5;
-        log::Info("controls: dropped the held magazine");
+        log::Info("controls: dropped the held magazine %s", ue::GetName(W.dropped_mag).c_str());
     }
 }
 
