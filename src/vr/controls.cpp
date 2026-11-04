@@ -1039,22 +1039,33 @@ void Trigger(UObject player, game::Gun& gun, const input::HandInput& rin) {
         c.Set("Press Released", released);
         c.Invoke();
     };
+    // Input edges pile up between game ticks (vr/input), so one tick can
+    // carry a press and a release together, in either order. Outside review
+    // 2026-11-04: with release as an else-if after press, a quick tap sent
+    // only the press and left the game holding the trigger. Now: a press
+    // while the game still holds the trigger (release then press) first lets
+    // go; after the press, the game is let go whenever the trigger is up.
     if (rin.trigger_button.pressed) {
+        if (W.trigger_sent) {
+            send(true);
+            W.trigger_sent = false;
+        }
         if (W.dead_trigger) {
             log::Info("controls: dead trigger (dry fired, slide not moved since)");
-            return;
-        }
-        game::GunState st = gun.State();
-        const bool dry = st.chamber == 0 && !st.slide_locked;
-        send(false);
-        W.trigger_sent = true;
-        if (dry) {
-            W.dead_trigger = true;
-            input::Haptic(input::kRight, 0.25f, 0.02f);
         } else {
-            input::Haptic(input::kRight, 0.8f, 0.05f);
+            game::GunState st = gun.State();
+            const bool dry = st.chamber == 0 && !st.slide_locked;
+            send(false);
+            W.trigger_sent = true;
+            if (dry) {
+                W.dead_trigger = true;
+                input::Haptic(input::kRight, 0.25f, 0.02f);
+            } else {
+                input::Haptic(input::kRight, 0.8f, 0.05f);
+            }
         }
-    } else if (rin.trigger_button.released && W.trigger_sent) {
+    }
+    if (W.trigger_sent && !rin.trigger_button.down) {
         send(true);
         W.trigger_sent = false;
     }
