@@ -557,6 +557,7 @@ struct WeaponState {
     UObject dropped_mag = 0;
     FVector dropped_at;
     double dropped_check_at = -1;
+    int dropped_stage = 0;        // 0: first look 0.8 s after the drop; 1: after physics was forced on
     bool have_frame = false;
     FQuat gun_frame;           // gun frame (X barrel, Z up) expressed in actor space
     double check_chamber_at = -1;
@@ -1657,13 +1658,43 @@ void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState& lh
     // None of these work on a holstered pistol.
     if (W.dropped_check_at > 0 && g_clock >= W.dropped_check_at) {
         W.dropped_check_at = -1;
-        if (LiveObject(W.dropped_mag)) {
-            const FVector now = ActorLocation(W.dropped_mag);
-            log::Info("controls: dropped magazine %s moved %.0f cm down, %.0f cm in all, 0.8 s after the drop%s",
-                      ue::GetName(W.dropped_mag).c_str(), W.dropped_at.Z - now.Z, Len(now - W.dropped_at),
-                      Len(now - W.dropped_at) < 3.0 ? " (it is not falling: floating)" : "");
-        }
+        UObject mag = W.dropped_mag;
         W.dropped_mag = 0;
+        if (LiveObject(mag)) {
+            const FVector now = ActorLocation(mag);
+            const bool floating = Len(now - W.dropped_at) < 3.0;
+            log::Info("controls: dropped magazine %s moved %.0f cm down, %.0f cm in all, %.1f s after the drop%s",
+                      ue::GetName(mag).c_str(), W.dropped_at.Z - now.Z, Len(now - W.dropped_at),
+                      W.dropped_stage == 0 ? 0.8 : 1.8, floating ? " (it is not falling: floating)" : "");
+            if (floating && W.dropped_stage == 0) {
+                // Owner 2026-11-04: a dropped AR magazine hung in the air.
+                // The game's own drop step didn't turn its physics on: do it
+                // here, and look again in a second.
+                UObject root = 0;
+                ue::GetProp(mag, "RootComponent", root);
+                bool sim_ok = false;
+                if (root) {
+                    ue::Call ce(root, "SetCollisionEnabled");
+                    ce.Set("NewType", uint8_t{3});   // query and physics
+                    ce.Invoke();
+                    ue::Call sim(root, "SetSimulatePhysics");
+                    sim.Set("bSimulate", true);
+                    sim_ok = sim.Invoke();
+                }
+                log::Info("controls: turned physics on for the floating magazine (its root %s %s)",
+                          root ? ue::GetName(ue::GetClass(root)).c_str() : "none", sim_ok ? "took it" : "refused");
+                W.dropped_mag = mag;
+                W.dropped_at = now;
+                W.dropped_stage = 1;
+                W.dropped_check_at = g_clock + 1.0;
+            } else if (floating) {
+                // Still hanging there: take it away (the game removes dropped
+                // magazines after a few seconds anyway).
+                ue::Call d(mag, "K2_DestroyActor");
+                d.Invoke();
+                log::Info("controls: removed the magazine that kept floating");
+            }
+        }
     }
     if (rin.secondary.down && W.slide.Held() && !W.lock_on_release && W.in_hand) {
         double len = gun.SlideBackLength() > 0.5 ? gun.SlideBackLength() : 4.7;
@@ -1903,6 +1934,7 @@ void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState& lh
         W.dropped_mag = W.held_mag;
         W.dropped_at = W.mag_shown;
         W.dropped_check_at = g_clock + 0.8;
+        W.dropped_stage = 0;
         W.held_mag = 0;
         W.refill_pouch_at = g_clock + 0.5;
         log::Info("controls: dropped the held magazine %s", ue::GetName(W.dropped_mag).c_str());
@@ -4607,6 +4639,19 @@ void OnTick(UObject player, float dt) {
     game::Gun gun = game::Gun::Current(player);
     if (gun.Object() != W.gun) {
         RifleCarryBeforeGunChange(gun.Object());
+        // The spare magazines belong to the gun being put away: remove them,
+        // or each swap between rifle and pistol left one more behind in the
+        // air (owner 2026-11-04: "the mags duplicate").
+        int removed = 0;
+        for (UObject m : {W.pouch_mag, W.held_mag}) {
+            if (!LiveObject(m)) continue;
+            UObject in_gun = 0;
+            if (W.gun && LiveObject(W.gun) && ue::GetProp(W.gun, "MagazineObj", in_gun) && in_gun == m) continue;
+            ue::Call d(m, "K2_DestroyActor");
+            d.Invoke();
+            removed++;
+        }
+        if (removed) log::Info("controls: removed %d spare magazine(s) of the gun put away", removed);
         W = WeaponState();
         W.gun = gun.Object();
         if (gun.Valid()) {
@@ -4684,7 +4729,12 @@ void OnTick(UObject player, float dt) {
         ue::GetProp(gun.Object(), "MagazineObj", mag);
         if (well && mag == W.learn_mag) {
             FVector off = ActorLocation(mag) - ComponentToWorld(well).translation;
-            if (Len(off) < 15.0) {
+            // An AR magazine's origin sits further from its MagazinePoint
+            // than a pistol's (the 15 cm limit here kept the rifle from ever
+            // learning its seat, and the owner had to push the magazine
+            // through the trigger guard, 2026-11-04).
+            log::Info("controls: seated magazine sits %.1f cm from the magwell point", Len(off));
+            if (Len(off) < 45.0) {
                 FQuat inv = ActorRotation(gun.Object()).Inverse();
                 W.seat_offset = inv.Rotate(off);
                 W.seat_rot = inv * ActorRotation(mag);
