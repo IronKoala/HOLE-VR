@@ -89,6 +89,14 @@ CarryHold HoldFromGrab(const hands::Pose& hand, const FQuat& frame_rot, const FV
     return h;
 }
 
+CarryHold HoldAtPoint(const FVector& point, const FQuat& turn) {
+    CarryHold h;
+    h.support_local = point;
+    h.rot = Normalized(turn);
+    h.pos = h.rot.Rotate(point) * -1.0;
+    return h;
+}
+
 void PlaceFromHand(const hands::Pose& hand, const CarryHold& h, FQuat* frame_rot, FVector* grip_world) {
     *frame_rot = Normalized(hand.rotation * h.rot);
     *grip_world = hand.location + hand.rotation.Rotate(h.pos);

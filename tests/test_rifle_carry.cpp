@@ -200,6 +200,15 @@ static void TestPoses() {
     EXPECT(SameRot(f, at.rotation * turn));
     EXPECT(Near(g + f.Rotate(hg.support_local), at.location, 1e-6));
 
+    // At a grip point: that point is at the hand, the rifle lies along the
+    // hand turned by `turn`.
+    const FVector pt{25.5, -5, 10};
+    CarryHold hp = HoldAtPoint(pt, turn);
+    EXPECT(Near(hp.support_local, pt, 1e-12));
+    PlaceFromHand(at, hp, &f, &g);
+    EXPECT(SameRot(f, at.rotation * turn));
+    EXPECT(Near(g + f.Rotate(pt), at.location, 1e-6));
+
     // Actor from the gun frame: the frame and grip point come back out.
     const FQuat frame_in_actor = Rot(0, -90, 0);
     const FVector grip_rel{0, 3, -4};

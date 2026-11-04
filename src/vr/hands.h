@@ -36,6 +36,9 @@ struct HandGrab {
     GrabKind kind = GrabKind::kNone;
     uintptr_t object = 0;   // gun or magazine UObject
     Pose target;            // world transform the hand should take while attached
+    // kSupportGrip: which grip point on the handguard (vr/interact/grip_points.h;
+    // each has its own hand pose), -1 where the hand grabbed.
+    int point = -1;
 };
 HandGrab GetGrab(Hand hand);
 

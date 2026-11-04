@@ -5,9 +5,10 @@ pistol in the other". The rifle stays in the left hand by its handguard while
 the pistol is the gun that fires, like a soldier going from a rifle to a
 sidearm.
 
-Not headset-tested yet: the owner had not unlocked the rifle when this was
-built. Everything rifle-side below is untested until then; pistol-only play
-does not change.
+First headset run with the AR: 2026-11-03 21:01 (owner's local time; build
+399a3d0). Carry, pistol draw and fly-back worked. The foregrip didn't feel
+right, so it now has three grip points (below), and a relaxed squeeze no longer
+drops the rifle. Those two changes are not headset-tested yet.
 
 ## How it plays
 
@@ -35,9 +36,47 @@ does not change.
   the left hand holds puts it in both hands.
 - While the rifle is out, the pistol sits in its holster (not on the game's
   right-thigh spot), so it is drawn from where it always is.
-- The left hand's grab is a support grip on the rifle (`BP_AR_C.support`), so
-  a hand pose made in the grip editor for the handguard applies here too.
-  Without one, the hand stays where the controller is.
+- The left hand's grab is a support grip on the rifle, so a hand pose made in
+  the grip editor for the handguard applies here too (one per grip point,
+  below). Without one, the hand stays where the controller is.
+
+## Grip points (vr/interact/grip_points.*)
+
+Owner, 2026-11-04, after the first AR run: "I only want the grip points, one in
+front of the magwell, one behind the flashlight and one where the picatinny
+rail ends." A left squeeze on the handguard now takes the nearest of three
+points along the barrel, both for the two-hand hold and for the rifle in the
+left hand alone:
+
+| Point | Where (gun frame, X along the barrel) | Pose file |
+| --- | --- | --- |
+| in front of the magwell | 4.5 cm ahead of the handguard's back end or the lower receiver's front, whichever is further forward | `grips/BP_AR_C.support-magwell.ini` |
+| behind the light | 4.5 cm behind the rear end of a light or laser fitted on the handguard; halfway between the other two when there is none, or no room behind it | `grips/BP_AR_C.support-light.ini` |
+| at the end of the rail | 4.5 cm behind the front end of the picatinny rails on the handguard (the handguard's own front end if no rail is found) | `grips/BP_AR_C.support-railend.ini` |
+
+Every point sits on the handguard's left side (2.5 cm outside it), level with
+its middle. That is where the owner's left controller was in the first run,
+about 5 cm left of the bore. The parts are found by component name
+(`*Handguard*`, `*Rail*` on the handguard, `*LowerRec*`, or `*Receiver*` on a
+shotgun) and an installed part of category 12 (light or laser, from the gun's
+`WeaponParts`). Their sizes come from `StaticMesh.GetBoundingBox`, in the gun
+frame. They are measured again at most every 2 s on a grab, because parts can
+change at the workbench. When no handguard is found, the hand holds wherever
+it grabbed, as before.
+
+The drawn hand goes to the point, and each point has its own pose in the grip
+editor. Until a point is posed, the older `BP_AR_C.support.ini` pose is used
+for it. The barrel is still steered by where the controller grabbed, so taking
+a point never turns the gun. The grab zone ends 4 cm past the rail, so a grab
+on the bare barrel does nothing.
+
+Letting go: in the first run the two-hand hold ended after 0.3 to 3 s about 30
+times ("support hand off the handguard"), and the right hand kept letting go
+of the rifle while aiming. The grip button releases under 0.35. A hand that
+holds the rifle now lets go only when its squeeze stays under 0.20 for 0.12 s:
+the support hand, the left hand holding the rifle alone, and the right hand
+on a rifle the left hand also holds. Tracking loss under 0.25 s doesn't end
+the two-hand hold.
 
 ## Settings (hole-vr.ini, group `rifle_left_hand_carry`)
 
@@ -47,6 +86,8 @@ does not change.
 | `rifle_carry_fist_below_bore_cm` | 4 | bore height over the left fist when picked up from the back |
 | `rifle_carry_pitch_deg`, `_yaw_deg`, `_roll_deg` | 0 | rifle turned in the left hand when picked up (+ pitch tips the muzzle up) |
 | `rifle_grip_reach_cm` | 14 | how close the right hand must squeeze to the rifle's grip to take it |
+| `rifle_grip_points` (own group) | 1 | 0: the hand holds wherever it grabs (no grip points) |
+| `rifle_grip_point_inset_cm` | 4.5 | how far the middle of the hand sits from the magwell, the light and the rail end |
 
 ## Game side
 
@@ -84,7 +125,16 @@ Tests: `g++ -std=c++20 -Isrc tests/test_rifle_carry.cpp src/vr/interact/rifle_ca
 - `rifle carry: BP_AR_C measured: barrel along (...), muzzle N cm ahead ...`
 - `rifle carry: the game hangs the rifle on <component> (...); its grip is N cm
   below, N cm behind and N cm right/left of the headset`: where to reach.
-- `rifle carry: left grab at rifle-frame (x y z), inside/outside the handguard zone`
+- `grip points: BP_AR_C (in the right hand | in the left hand alone): points in
+  front of the magwell (x y z), behind the light (x y z), at the end of the rail
+  (x y z); parts: handguard X a..b Y .. Z ..; rails end at N; magwell (lower
+  receiver) front at N; <light class> X a..b`: what was measured, logged when it
+  changes. `no handguard part found` = the old free grab.
+- `controls: left grab at gun-frame (x y z), <point name> | off the handguard`
+  (two-hand hold) and `rifle carry: left grab at rifle-frame (x y z), <point
+  name> | off the handguard` (rifle not in the right hand).
+- `controls: support hand off the handguard after N s (why)`: the squeeze
+  (and the lowest it got while held), tracking lost, charging handle, magazine.
 - `rifle carry: left hand picked up the rifle ...`, `right hand let go ...`,
   `drawing the pistol ...`, `left hand let go ...`, `right hand took the rifle's grip`
 - `rifle carry: asked the game to switch to the pistol`, then `the game switched
@@ -93,7 +143,8 @@ Tests: `g++ -std=c++20 -Isrc tests/test_rifle_carry.cpp src/vr/interact/rifle_ca
 
 ## Open
 
-- Untested in the headset (rifle not unlocked).
+- Grip points and the softer let-go are untested in the headset. Check the
+  `grip points:` line against where the three points should be.
 - The rifle angle in the left hand when picked up from the back is a guess
   (barrel along the controller's pointing direction); the `rifle_carry_*_deg`
   keys tune it.

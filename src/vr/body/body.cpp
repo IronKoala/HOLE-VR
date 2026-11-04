@@ -31,6 +31,7 @@
 #include "vr/body/hand_pose.h"
 #include "vr/body/ik_math.h"
 #include "vr/body/skeleton.h"
+#include "vr/interact/grip_points.h"
 #include "vr/body/slide_pose.h"
 #include "vr/hands.h"
 #include "vr/input.h"
@@ -469,6 +470,7 @@ struct ActiveGrip {
     std::string key;            // file name without extension
     UObject object = 0;
     hands::GrabKind kind = hands::GrabKind::kNone;
+    int point = -1;             // support grip: which grip point (hands::HandGrab::point)
     bool have = false;          // a record is in use
     bool pending = false;       // record found, its solve is running off the game thread
     bool from_file = false;
@@ -1179,7 +1181,9 @@ std::string RecordKey(int side, const hands::HandGrab& grab) {
     switch (grab.kind) {
         case hands::GrabKind::kGunGrip: return cls + ".grip";
         case hands::GrabKind::kSlideGrab: return cls + ".slide-" + kSlideHoldKey[g_slide_hold[side]];
-        case hands::GrabKind::kSupportGrip: return cls + ".support";
+        // One pose per grip point on the handguard (vr/interact/grip_points.h).
+        case hands::GrabKind::kSupportGrip:
+            return grab.point >= 0 ? cls + ".support-" + interact::PointKey(grab.point) : cls + ".support";
         default: return cls + ".mag";
     }
 }
@@ -1594,6 +1598,12 @@ bool GripRecord(int side, hands::GrabKind kind, UObject object, const std::strin
         std::string cls = ue::GetName(ue::GetClass(object));
         found = ReadText(RecordPath(cls + ".slide"), &text);
     }
+    // A support grip saved before there were grip points: use it for any
+    // point not posed yet.
+    if (!found && kind == hands::GrabKind::kSupportGrip && object && key.find(".support-") != std::string::npos) {
+        std::string cls = ue::GetName(ue::GetClass(object));
+        found = ReadText(RecordPath(cls + ".support"), &text);
+    }
     if (found) {
         if (!have || is_mag) rec.right_hand = side == kR;
         if (gr::Parse(text, &rec)) {
@@ -1623,6 +1633,7 @@ void LoadGrip(int side, const hands::HandGrab& grab, bool from_disk = false) {
     g = ActiveGrip{};
     g.object = grab.object;
     g.kind = grab.kind;
+    g.point = grab.point;
     if (!S.grip_records || !G.rig[side].ok || !IsGrab(grab.kind) || !grab.object) return;
     g.key = RecordKey(side, grab);
     auto cached = g_grip_cache.find(CacheKey(side, g.key));
@@ -1630,6 +1641,7 @@ void LoadGrip(int side, const hands::HandGrab& grab, bool from_disk = false) {
         g = cached->second;
         g.object = grab.object;
         g.kind = grab.kind;
+        g.point = grab.point;
         return;
     }
     gr::Record rec;
@@ -2698,7 +2710,7 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
 
     // A new grab: load its stored grip.
     ActiveGrip& g = G.grip[side];
-    if (grab.object != g.object || grab.kind != g.kind) {
+    if (grab.object != g.object || grab.kind != g.kind || grab.point != g.point) {
         if (g_editor.Active() && g_edit_side == side) StopEditor();
         hands::Pose gun;
         if (grab.kind == hands::GrabKind::kSlideGrab && ObjectFrame(grab, right_grab, &gun)) {

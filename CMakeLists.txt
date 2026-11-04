@@ -42,6 +42,7 @@ add_library(hole_vr SHARED
     src/vr/teleport_math.cpp
     src/vr/interact/slide.cpp
     src/vr/interact/holster.cpp
+    src/vr/interact/grip_points.cpp
     src/vr/interact/rifle_carry.cpp
     src/vr/interact/touch_math.cpp
     src/vr/interact/touch.cpp

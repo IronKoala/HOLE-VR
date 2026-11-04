@@ -403,6 +403,16 @@ const Block kBlocks[] = {
      "rifle_carry_roll_deg=0\n"
      "; The right hand takes the rifle when it squeezes this close to its grip (cm).\n"
      "rifle_grip_reach_cm=14\n"},
+    {"rifle_grip_points",
+     "\n"
+     "; --- Where the left hand holds a rifle's handguard ---\n"
+     "; 1 = three grip points: in front of the magwell, behind the light, and at the\n"
+     "; end of the rail. The left hand takes the nearest one, and each has its own hand\n"
+     "; pose in the grip editor. 0 = the hand holds wherever it grabs.\n"
+     "rifle_grip_points=1\n"
+     "; How far the middle of the hand sits from the magwell, the light and the rail\n"
+     "; end (cm; half a hand's width).\n"
+     "rifle_grip_point_inset_cm=4.5\n"},
     {"fixed_height",
      "\n"
      "; 1 = your in-game height is always the character's, seated or standing\n"

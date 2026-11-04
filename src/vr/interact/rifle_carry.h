@@ -84,6 +84,11 @@ CarryHold HoldAsIs(const hands::Pose& hand, const FQuat& frame_rot, const FVecto
 CarryHold HoldFromGrab(const hands::Pose& hand, const FQuat& frame_rot, const FVector& grip_world, double muzzle_dist,
                        double bore_height, double fist_below_bore, const FQuat& turn);
 
+// Picked up from its spot at one of its grip points (vr/interact/grip_points.h):
+// the rifle lies along the hand as in HoldFromGrab, with that point (gun
+// frame) at the hand.
+CarryHold HoldAtPoint(const FVector& point, const FQuat& turn);
+
 // Rifle gun frame and grip point in the world for the hand's pose.
 void PlaceFromHand(const hands::Pose& hand, const CarryHold& h, FQuat* frame_rot, FVector* grip_world);
 
