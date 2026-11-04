@@ -73,5 +73,8 @@ int EditorHand();
 
 // Head (centre eye) in world space; valid once the headset is rendering.
 bool Head(Pose* out);
+// One eye (0 left, 1 right) in world space, from the headset's own eye
+// views (real eye spacing and world scale).
+bool Eye(int eye, Pose* out);
 
 }  // namespace holevr::vr::hands

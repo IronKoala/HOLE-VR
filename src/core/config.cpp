@@ -332,7 +332,7 @@ const Block kBlocks[] = {
      "rifle_stock_release_cm=20\n"
      "rifle_stock_forward_cm=0\n"
      "; How far your aiming eye sits behind the rear sight when shouldered (cm).\n"
-     "rifle_eye_relief_cm=7\n"
+     "rifle_eye_relief_cm=9\n"
      "rifle_stock_right_cm=0\n"
      "rifle_stock_up_cm=0\n"
      "; Room-scale: the character follows you when you walk around the room\n"

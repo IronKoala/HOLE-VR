@@ -139,7 +139,7 @@ struct Settings {
     bool virtual_stock = true;
     double stock_snap = 12.0;      // cm from the shoulder pocket to lock on
     double stock_release = 20.0;   // cm the hands must pull it away to let go
-    double eye_relief = 7.0;       // sight to eye when shouldered, cm
+    double eye_relief = 9.0;       // sight to eye when shouldered, cm
     double stock_forward = 0.0;    // move the shoulder pocket, cm (head frame)
     double stock_right = 0.0;
     double stock_up = 0.0;
@@ -207,7 +207,7 @@ void LoadSettings() {
     g_set.stock_snap = config::GetFloat("rifle_stock_snap_cm", 12.f);
     g_set.stock_release = config::GetFloat("rifle_stock_release_cm", 20.f);
     g_set.stock_forward = config::GetFloat("rifle_stock_forward_cm", 0.f);
-    g_set.eye_relief = config::GetFloat("rifle_eye_relief_cm", 7.f);
+    g_set.eye_relief = config::GetFloat("rifle_eye_relief_cm", 9.f);
     g_set.stock_right = config::GetFloat("rifle_stock_right_cm", 0.f);
     g_set.stock_up = config::GetFloat("rifle_stock_up_cm", 0.f);
     g_set.right_eye = config::GetInt("dominant_eye_right", 1) != 0;
@@ -360,6 +360,8 @@ hands::HandInteraction g_interaction[2];
 hands::FingerInput g_fingers[2];
 hands::Pose g_head;
 bool g_head_valid = false;
+hands::Pose g_eye[2];
+bool g_eye_valid[2] = {false, false};
 hands::EditButtons g_edit_buttons;
 std::atomic<int> g_editor_hand{-1};
 double g_clock = 0.0;
@@ -401,6 +403,10 @@ void UpdateHands(const input::Snapshot& s) {
         c.position.z = (v[0].pose.position.z + v[1].pose.position.z) * 0.5f;
         head_ok = ToWorld(c, &head);
     }
+    hands::Pose eyes[2];
+    bool eyes_ok[2] = {false, false};
+    if (head_ok)
+        for (int e = 0; e < 2; ++e) eyes_ok[e] = ToWorld(v[e].pose, &eyes[e]);
     std::lock_guard<std::mutex> lock(g_hands_mutex);
     for (int i = 0; i < 2; ++i) {
         const input::HandInput& in = s.hand[i];
@@ -422,6 +428,10 @@ void UpdateHands(const input::Snapshot& s) {
     g_hands[1] = h[1];
     g_head = head;
     g_head_valid = head_ok;
+    for (int e = 0; e < 2; ++e) {
+        g_eye[e] = eyes[e];
+        g_eye_valid[e] = eyes_ok[e];
+    }
 }
 
 // ---- locomotion and turning ----
@@ -1038,19 +1048,33 @@ void MeasureStock(UObject g, const FVector& actor_loc, const FQuat& actor_rot, c
               measured ? "measured" : "assumed", back, counted, W.ads_local.X, W.ads_local.Y, W.ads_local.Z);
 }
 
+// The aiming eye in the world: the headset's own view for that eye (owner
+// 2026-11-04: the sights must line up with the real right eye), falling
+// back to a 3.2 cm offset from the head centre.
+bool AimingEye(FVector* out) {
+    hands::Pose e;
+    if (hands::Eye(g_set.right_eye ? 1 : 0, &e)) {
+        *out = e.location;
+        return true;
+    }
+    hands::Pose head;
+    if (!hands::Head(&head)) return false;
+    *out = head.location + head.rotation.Rotate(FVector{0, g_set.right_eye ? 3.2 : -3.2, 0});
+    return true;
+}
+
 // Where the butt goes when the aiming eye looks down the sights: the
 // shoulder pocket, worked out from the headset and the gun's own geometry.
 bool ShoulderPocket(FVector* out) {
     hands::Pose head;
     if (!hands::Head(&head)) return false;
-    FVector eye = head.location + head.rotation.Rotate(FVector{0, g_set.right_eye ? 3.2 : -3.2, 0});
+    FVector eye;
+    if (!AimingEye(&eye)) return false;
     // Eye at the sight line, butt behind and below it along the bore. Keep
     // the eye-to-butt distance in a human range (12-30 cm).
     FVector d = W.stock_local - W.ads_local;
     d.X = std::fmax(-30.0, std::fmin(-12.0, d.X));
-    // The eye sits a little behind the rear sight, not inside it (owner
-    // 2026-11-04: "the rear sight is basically in my eyeball").
-    d.X += g_set.eye_relief;
+    d.X += g_set.eye_relief;   // the eye sits behind the sight (cheek weld)
     d = d + FVector{g_set.stock_forward, g_set.stock_right, g_set.stock_up};
     *out = eye + head.rotation.Rotate(d);
     return true;
@@ -1120,14 +1144,21 @@ void HoldGun(game::Gun& gun, const hands::HandState& rh) {
         }
         W.shoulder_blend += (W.shouldered ? 1.0 : -1.0) * g_dt / 0.12;
         W.shoulder_blend = std::fmax(0.0, std::fmin(1.0, W.shoulder_blend));
-        if (W.shoulder_blend > 0) {
+        FVector eye;
+        if (W.shoulder_blend > 0 && AimingEye(&eye)) {
+            // Cheek weld: the sight line runs through the aiming eye, which
+            // sits eye_relief behind the sight (owner 2026-11-04: the rear
+            // sight was in the eye and not lined up with it). The rifle
+            // turns about that point toward the support hand; the butt
+            // lands wherever the rifle's own length puts it.
+            const FVector anchor = W.ads_local - FVector{g_set.eye_relief + g_set.stock_forward, 0, 0};
             FVector front_local = two ? W.support_local : hand.Inverse().Rotate(rh.grip.location - grip_w);
             FVector front_w = two ? lh2.grip.location : rh.grip.location;
-            FVector gun_dir = Norm(hand.Rotate(front_local - W.stock_local));
-            FVector want = front_w - pocket;
+            FVector gun_dir = Norm(hand.Rotate(front_local - anchor));
+            FVector want = front_w - eye;
             if (Len(want) > 5.0) {
                 FQuat hs = FromTo(gun_dir, Norm(want)) * hand;
-                FVector gs = pocket - hs.Rotate(W.stock_local);
+                FVector gs = eye - hs.Rotate(anchor);
                 hand = Nlerp(hand, hs, W.shoulder_blend);
                 grip_w = grip_w + (gs - grip_w) * W.shoulder_blend;
             }
@@ -1582,6 +1613,50 @@ UObject SpawnMagazine(UObject player, UObject cls, const FVector& loc, const FQu
 
 bool LiveObject(UObject obj);
 
+// Where a magazine's own mesh is (it falls on its own after a drop; the
+// actor stays where it was let go).
+FVector MagMeshLocation(UObject mag) {
+    UObject mesh = 0;
+    if (ue::GetProp(mag, "MagazineMesh", mesh) && mesh) return ComponentToWorld(mesh).translation;
+    return ActorLocation(mag);
+}
+
+// Removes a magazine with its rounds: the game's own DestroyMag. Destroying
+// just the actor left its rounds lying on the floor (owner 2026-11-04).
+void DestroyMagazine(UObject mag) {
+    if (!LiveObject(mag)) return;
+    // Its rounds are actors attached to it: collect them first.
+    std::vector<UObject> rounds;
+    {
+        ue::Call at(mag, "GetAttachedActors");
+        at.Set("bResetArray", true).Set("bRecursivelyIncludeAttachedActors", true);
+        int32_t size = 0;
+        const uint8_t* raw = at.Invoke() ? at.Raw("OutActors", &size) : nullptr;
+        struct Arr { uintptr_t data; int32_t num, max; } arr{};
+        if (raw && size >= (int32_t)sizeof(Arr)) std::memcpy(&arr, raw, sizeof(Arr));
+        for (int32_t i = 0; i < arr.num && i < 128; ++i) {
+            UObject r = mem::ReadOr<uintptr_t>(arr.data + i * 8ull, 0);
+            if (r) rounds.push_back(r);
+        }
+    }
+    const std::string name = ue::GetName(mag);
+    ue::Call d(mag, "DestroyMag");
+    d.Invoke();
+    if (LiveObject(mag)) {
+        ue::Call k(mag, "K2_DestroyActor");
+        k.Invoke();
+    }
+    int left = 0;
+    for (UObject r : rounds) {
+        if (!LiveObject(r)) continue;
+        ++left;
+        ue::Call k(r, "K2_DestroyActor");
+        k.Invoke();
+    }
+    log::Info("controls: removed magazine %s and its %d rounds (%d were left after the game's DestroyMag)",
+              name.c_str(), (int)rounds.size(), left);
+}
+
 // The pouch magazine's class is read from the gun's own magazine in each
 // level. (A class remembered from an earlier level failed to spawn in the
 // next one, 2026-11-03: the pouch stayed empty all match.)
@@ -1683,7 +1758,11 @@ void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState& lh
         UObject mag = W.dropped_mag;
         W.dropped_mag = 0;
         if (LiveObject(mag)) {
-            const FVector now = ActorLocation(mag);
+            // The game's drop turns physics on for the magazine's mesh, which
+            // then falls on its own; the actor's root stays put. So look at
+            // the mesh (owner 2026-11-04: mags removed for "floating" left
+            // their rounds behind).
+            const FVector now = MagMeshLocation(mag);
             const bool floating = Len(now - W.dropped_at) < 3.0;
             log::Info("controls: dropped magazine %s moved %.0f cm down, %.0f cm in all, %.1f s after the drop%s",
                       ue::GetName(mag).c_str(), W.dropped_at.Z - now.Z, Len(now - W.dropped_at),
@@ -1693,7 +1772,8 @@ void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState& lh
                 // The game's own drop step didn't turn its physics on: do it
                 // here, and look again in a second.
                 UObject root = 0;
-                ue::GetProp(mag, "RootComponent", root);
+                ue::GetProp(mag, "MagazineMesh", root);
+                if (!root) ue::GetProp(mag, "RootComponent", root);
                 bool sim_ok = false;
                 if (root) {
                     ue::Call ce(root, "SetCollisionEnabled");
@@ -1703,7 +1783,7 @@ void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState& lh
                     sim.Set("bSimulate", true);
                     sim_ok = sim.Invoke();
                 }
-                log::Info("controls: turned physics on for the floating magazine (its root %s %s)",
+                log::Info("controls: turned physics on for the floating magazine (its mesh %s %s)",
                           root ? ue::GetName(ue::GetClass(root)).c_str() : "none", sim_ok ? "took it" : "refused");
                 W.dropped_mag = mag;
                 W.dropped_at = now;
@@ -1712,9 +1792,8 @@ void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState& lh
             } else if (floating) {
                 // Still hanging there: take it away (the game removes dropped
                 // magazines after a few seconds anyway).
-                ue::Call d(mag, "K2_DestroyActor");
-                d.Invoke();
-                log::Info("controls: removed the magazine that kept floating");
+                DestroyMagazine(mag);
+                log::Info("controls: removed the magazine that kept floating (with its rounds)");
             }
         }
     }
@@ -1837,6 +1916,13 @@ void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState& lh
         FVector seat = ComponentToWorld(well).translation;
         if (W.seat_learned) seat = seat + W.actor_rot.Rotate(W.seat_offset);
         FVector out = W.frame_rot.Rotate(in_g) * -1.0;
+        if (!W.is_pistol) {
+            // A rifle magazine goes in along the magwell's own axis (it
+            // leans a few degrees in this model); sliding it in square to the
+            // gun clipped it through the receiver (owner 2026-11-04).
+            const FVector up = ComponentToWorld(well).rotation.Rotate(FVector{0, 0, 1});
+            if (DotV(up, out) < -0.9) out = Norm(up) * -1.0;
+        }
         FVector p = lh.grip.location - seat;
         double along = DotV(p, out);
         double lateral = Len(p - out * along);
@@ -1954,7 +2040,7 @@ void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState& lh
         ue::Call drop(W.held_mag, "DropMagazine");
         drop.Invoke();
         W.dropped_mag = W.held_mag;
-        W.dropped_at = W.mag_shown;
+        W.dropped_at = MagMeshLocation(W.dropped_mag);
         W.dropped_check_at = g_clock + 0.8;
         W.dropped_stage = 0;
         W.held_mag = 0;
@@ -4783,8 +4869,7 @@ void OnTick(UObject player, float dt) {
             if (!LiveObject(m)) continue;
             UObject in_gun = 0;
             if (W.gun && LiveObject(W.gun) && ue::GetProp(W.gun, "MagazineObj", in_gun) && in_gun == m) continue;
-            ue::Call d(m, "K2_DestroyActor");
-            d.Invoke();
+            DestroyMagazine(m);
             removed++;
         }
         if (removed) log::Info("controls: removed %d spare magazine(s) of the gun put away", removed);
@@ -5044,6 +5129,12 @@ bool Head(Pose* out) {
     std::lock_guard<std::mutex> lock(controls::g_hands_mutex);
     if (!controls::g_head_valid) return false;
     *out = controls::g_head;
+    return true;
+}
+bool Eye(int eye, Pose* out) {
+    std::lock_guard<std::mutex> lock(controls::g_hands_mutex);
+    if (eye < 0 || eye > 1 || !controls::g_eye_valid[eye]) return false;
+    *out = controls::g_eye[eye];
     return true;
 }
 }  // namespace holevr::vr::hands
