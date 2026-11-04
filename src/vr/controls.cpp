@@ -2268,13 +2268,14 @@ void HandInteract(UObject player, int hand) {
     if (!hands::GetInteraction(static_cast<hands::Hand>(hand)).AllowsControls()) return;
     // One interact per 0.5 s across both hands: some things (the hole's
     // countdown) toggle on each Interact, so a two-hand press cancelled itself.
+    // Only after something was used: a press that found nothing doesn't
+    // hold up the next try.
     static double s_last = -10.0;
     if (g_clock - s_last < 0.5) {
         log::Info("controls: interact (%s hand) ignored, %.2f s after the last one",
                   hand == input::kLeft ? "left" : "right", g_clock - s_last);
         return;
     }
-    s_last = g_clock;
     UObject game_target = 0;
     ue::GetProp(player, "InteractTarget", game_target);
     if (game_target && !LiveObject(game_target)) game_target = 0;
@@ -2283,17 +2284,18 @@ void HandInteract(UObject player, int hand) {
         if (a && LiveObject(a)) ignore.push_back(a);
     const touch::Pick pick = touch::PickForHand(player, hand, ignore);
     const char* side = hand == input::kLeft ? "left" : "right";
-    input::Haptic(static_cast<input::Hand>(hand), 0.2f, 0.02f);
     const UObject target = pick.actor ? pick.actor : game_target;
     if (!target) {
+        // No buzz: a press that buzzes did something.
         log::Info("controls: interact (%s hand): nothing touched, pointed at or looked at", side);
         return;
     }
     if (touch::RecentlyUsed(target, 0.8)) {
-        log::Info("controls: interact (%s hand) on %s skipped: a touch used it a moment ago", side,
-                  ue::GetName(target).c_str());
+        log::Info("controls: interact (%s hand) on %s skipped: used a moment ago", side, ue::GetName(target).c_str());
         return;
     }
+    s_last = g_clock;
+    input::Haptic(static_cast<input::Hand>(hand), 0.35f, 0.04f);
     char why[96];
     std::snprintf(why, sizeof(why), "%s hand trigger, %s", side, pick.actor ? pick.how : "looking at");
     touch::InteractThroughGame(player, target, why);
