@@ -1318,7 +1318,27 @@ void SlideHandling(game::Gun& gun, const hands::HandState& lh, const input::Hand
             break;
         }
         case SlideEvent::kPartialRelease:
-        case SlideEvent::kSlipped:
+        case SlideEvent::kSlipped: {
+            // Outside review 2026-11-04: B accepted the slide stop at the
+            // catch (about 75 % of travel) but a let-go short of a full
+            // rack (90 %) still let the slide close. Past the catch with the
+            // lever up, the slide now locks there: the round was pulled out
+            // on the way back, as on a real pistol.
+            double len = gun.SlideBackLength() > 0.5 ? gun.SlideBackLength() : 4.7;
+            double stop = gun.SlideStopLength() > 0 ? gun.SlideStopLength() / len : 0.75;
+            if (W.lock_on_release && W.is_pistol && W.slide.Travel() >= stop - 0.05 && !gun.State().slide_locked) {
+                W.lock_on_release = false;
+                log::Info("controls: slide let go at %.0f%% with the slide stop up, before: %s",
+                          W.slide.Travel() * 100, gun.State().Describe().c_str());
+                gun.ChargeBoltPull();
+                gun.EndBoltCharging();
+                ue::SetProp<bool>(gun.Object(), "IsBolt(Slide)Stopped", true);
+                W.trace_until = g_clock + 1.5;
+                input::Haptic(input::kLeft, 0.6f, 0.04f);
+                log::Info("controls: slide locked open at the catch: %s", gun.State().Describe().c_str());
+                break;
+            }
+        }
             W.lock_on_release = false;
             W.trace_until = g_clock + 1.5;
             log::Info("controls: slide let go at %.0f%%", W.slide.Peak() * 100);
@@ -1530,7 +1550,21 @@ void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState& lh
         gun.DropMagazine();
         input::Haptic(input::kRight, 0.4f, 0.04f);
     }
-    if (!lh.valid) return;
+    if (!lh.valid) {
+        // Outside review 2026-11-04: a grip let go while the left controller
+        // had lost tracking was missed (its release edge came and went on a
+        // tick that returned here), and the magazine stayed in the hand.
+        // Now it drops where it was last shown.
+        if (W.held_mag && !W.mag_seating && (lin.grip_button.released || !lin.grip_button.down)) {
+            W.mag_engaged = false;
+            ue::Call drop(W.held_mag, "DropMagazine");
+            drop.Invoke();
+            W.held_mag = 0;
+            W.refill_pouch_at = g_clock + 0.5;
+            log::Info("controls: dropped the held magazine (let go while the left controller had no tracking)");
+        }
+        return;
+    }
 
     // A spare magazine always sits in its holster (the pouch), on the left
     // hip of the VR body unless placed somewhere else. The late tick places
@@ -1690,7 +1724,8 @@ void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState& lh
     W.mag_shown_rot = show_rot;
 
     // Let go of the grab: at the pouch it goes back in, anywhere else it drops.
-    if (lin.grip_button.released) {
+    // Also when the grip is simply up (a let-go missed on some earlier tick).
+    if (lin.grip_button.released || !lin.grip_button.down) {
         W.mag_engaged = false;
         const double d = Len(lh.grip.location - pouch_loc);
         if (have_pouch && !W.pouch_mag && d <= pouch_radius) {
