@@ -573,18 +573,24 @@ const Block kBlocks[] = {
      "workbench_snap_cm=5\n"
      "; Walk this far from a pistol lying on a table and it goes back to the holster (m).\n"
      "workbench_walk_away_m=3\n"},
-    {"workbench_zone",
+    {"workbench_box",
      "\n"
-     "; Once the workbench is bought: a see-through green box stands on the edge of\n"
-     "; its table where you walk up to it; let go of the pistol in it and it is held\n"
-     "; there upright. 1 = on. Its size (cm), how far out past the table edge its\n"
-     "; middle sits (0 = on the edge) and how high above the table top.\n"
-     "workbench_zone=1\n"
-     "workbench_zone_width_cm=34\n"
-     "workbench_zone_height_cm=26\n"
-     "workbench_zone_depth_cm=14\n"
-     "workbench_zone_out_cm=4\n"
-     "workbench_zone_lift_cm=2\n"},
+     "; Once the workbench is bought: a green box stands on the front edge of its\n"
+     "; table where you walk up to it; let go of the pistol in it and it is held\n"
+     "; there upright. 1 = on. Its edges are solid green lines that fade out\n"
+     "; toward the middle of each side, which is clear. Size (cm); how far out\n"
+     "; past the table edge its middle sits and how high above the table top; the\n"
+     "; line thickness and how far in the colour fades; how near your head must\n"
+     "; be for it to show.\n"
+     "workbench_box=1\n"
+     "workbench_box_width_cm=34\n"
+     "workbench_box_height_cm=52\n"
+     "workbench_box_depth_cm=14\n"
+     "workbench_box_out_cm=4\n"
+     "workbench_box_lift_cm=2\n"
+     "workbench_box_line_cm=0.6\n"
+     "workbench_box_fade_cm=4\n"
+     "workbench_box_show_cm=100\n"},
     {"touch_interact",
      "\n"
      "; --- Touch interact: rest an empty hand on a thing ---\n"

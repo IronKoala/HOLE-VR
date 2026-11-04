@@ -60,8 +60,11 @@ struct Settings {
     // The green zone at the unlocked bench (cm): size along the table edge,
     // height, depth; how far it sits out from the edge (0 = centred on it)
     // and above the table top; how far outside it a let-go still counts.
+    // The box's edge lines (cm thick), how far in from them its colour fades
+    // out, and how near your head must be for it to show at all.
     bool zone = true;
-    double zone_w = 34.0, zone_h = 26.0, zone_d = 14.0, zone_out = 4.0, zone_lift = 2.0, zone_margin = 8.0;
+    double zone_w = 34.0, zone_h = 52.0, zone_d = 14.0, zone_out = 4.0, zone_lift = 2.0, zone_margin = 8.0;
+    double zone_line = 0.6, zone_fade = 4.0, zone_show = 100.0;
 } S;
 
 // ---------------------------------------------------------------- engine helpers
@@ -751,10 +754,19 @@ bool InZone(const FVector& p, double margin) {
            std::fabs(Dot(d, Z.out)) <= S.zone_d * 0.5 + margin && std::fabs(d.Z) <= S.zone_h * 0.5 + margin;
 }
 
-// The see-through box: a plain engine cube with the engine's see-through
-// widget material (one-sided, unlit), tinted #00FF8D.
-UObject MakeZoneActor() {
-    static UObject sma = ue::FindObject("Class /Script/Engine.StaticMeshActor");
+// The box (owner 2026-11-04 07:57: "in the center of it i want 100%
+// visibility, the lines that make the box solid with a quickly gradual
+// decrease in its opacity"): its 12 edges are solid #00FF8D lines, and on
+// each face rings of thin strips step inward from the edges, each fainter,
+// so the colour fades out within a few cm and the middle of every face is
+// clear. Engine cubes drawn with the engine's see-through widget material
+// (one-sided, unlit), one instanced component per opacity level.
+constexpr float kZoneAlpha[] = {1.0f, 0.5f, 0.25f, 0.12f, 0.05f};  // the lines, then each ring inward
+constexpr int kZoneLevels = sizeof(kZoneAlpha) / sizeof(kZoneAlpha[0]);
+
+// One opacity level: an instanced engine cube, tinted #00FF8D at `alpha`.
+UObject MakeZoneLevel(UObject actor, float alpha, bool* tinted) {
+    static UObject ism_cls = ue::FindObject("Class /Script/Engine.InstancedStaticMeshComponent");
     static UObject cube = ue::FindObject("StaticMesh /Engine/BasicShapes/Cube.Cube");
     static UObject white = ue::FindObject("Texture2D /Engine/EngineResources/WhiteSquareTexture.WhiteSquareTexture");
     static UObject base = [] {
@@ -763,61 +775,93 @@ UObject MakeZoneActor() {
         if (cdo) ue::GetProp(cdo, "TranslucentMaterial_OneSided", m);
         return m;
     }();
-    if (!sma || !cube) {
-        log::Warn("workbench: green zone: engine cube not found (actor class %s, cube %s)", sma ? "ok" : "missing",
-                  cube ? "ok" : "missing");
-        return 0;
-    }
-    UObject a = SpawnActor(L.player, sma, Z.center, FQuat{});
-    UObject comp = 0;
-    if (!a || !ue::GetProp(a, "StaticMeshComponent", comp) || !comp) {
-        if (a) DestroyActor(a);
-        log::Warn("workbench: green zone: could not make its actor");
-        return 0;
-    }
-    ue::Call mob(comp, "SetMobility");
+    static FName tint{}, from_tex{}, slate{};
+    static const bool names = ue::names::Find("TintColorAndOpacity", &tint) &&
+                              ue::names::Find("OpacityFromTexture", &from_tex) && ue::names::Find("SlateUI", &slate);
+    if (!ism_cls || !cube) return 0;
+    ue::Call add(actor, "AddComponentByClass");
+    add.Set("Class", ism_cls).Set("bManualAttachment", false).Set("RelativeTransform", Xf{}).Set("bDeferredFinish", false);
+    UObject c = add.Invoke() ? add.Result<UObject>() : 0;
+    if (!c) return 0;
+    ue::Call mob(c, "SetMobility");
     mob.Set("NewMobility", uint8_t{2});
     mob.Invoke();
-    ue::Call sm(comp, "SetStaticMesh");
+    ue::Call sm(c, "SetStaticMesh");
     sm.Set("NewMesh", cube);
     sm.Invoke();
-    ue::Call col(comp, "SetCollisionEnabled");
+    ue::Call col(c, "SetCollisionEnabled");
     col.Set("NewType", uint8_t{0});
     col.Invoke();
-    ue::Call sh(comp, "SetCastShadow");
+    ue::Call sh(c, "SetCastShadow");
     sh.Set("NewCastShadow", false);
     sh.Invoke();
-    bool tinted = false;
-    FName tint{}, from_tex{}, slate{};
-    if (base && ue::names::Find("TintColorAndOpacity", &tint)) {
-        ue::Call mid(comp, "CreateDynamicMaterialInstance");
+    if (base && names) {
+        ue::Call mid(c, "CreateDynamicMaterialInstance");
         mid.Set("ElementIndex", int32_t{0}).Set("SourceMaterial", base);
         UObject m = mid.Invoke() ? mid.Result<UObject>() : 0;
         if (m) {
-            // #00FF8D in linear colour, see-through.
-            struct { float r, g, b, a; } c{0.0f, 1.0f, 0.266f, 0.3f};
+            // #00FF8D in linear colour.
+            struct { float r, g, b, a; } col4{0.0f, 1.0f, 0.266f, alpha};
             ue::Call v(m, "SetVectorParameterValue");
-            v.Set("ParameterName", tint).Set("Value", c);
-            tinted = v.Invoke();
-            if (ue::names::Find("OpacityFromTexture", &from_tex)) {
-                ue::Call f(m, "SetScalarParameterValue");
-                f.Set("ParameterName", from_tex).Set("Value", 0.0f);
-                f.Invoke();
-            }
-            if (white && ue::names::Find("SlateUI", &slate)) {
+            v.Set("ParameterName", tint).Set("Value", col4);
+            *tinted = v.Invoke() && *tinted;
+            ue::Call f(m, "SetScalarParameterValue");
+            f.Set("ParameterName", from_tex).Set("Value", 0.0f);
+            f.Invoke();
+            if (white) {
                 ue::Call tx(m, "SetTextureParameterValue");
                 tx.Set("ParameterName", slate).Set("Value", white);
                 tx.Invoke();
             }
+        } else {
+            *tinted = false;
         }
+    } else {
+        *tinted = false;
     }
-    ue::Call sc(a, "SetActorScale3D");
-    sc.Set("NewScale3D", FVector{S.zone_w / 100.0, S.zone_d / 100.0, S.zone_h / 100.0});
-    sc.Invoke();
+    return c;
+}
+
+UObject MakeZoneActor() {
+    static UObject sma = ue::FindObject("Class /Script/Engine.StaticMeshActor");
+    if (!sma) {
+        log::Warn("workbench: green zone: no StaticMeshActor class");
+        return 0;
+    }
+    UObject a = SpawnActor(L.player, sma, Z.center, FQuat{});
+    UObject root = 0;
+    if (!a || !ue::GetProp(a, "StaticMeshComponent", root) || !root) {
+        if (a) DestroyActor(a);
+        log::Warn("workbench: green zone: could not make its actor");
+        return 0;
+    }
+    ue::Call mob(root, "SetMobility");
+    mob.Set("NewMobility", uint8_t{2});
+    mob.Invoke();
+    bool tinted = true;
+    UObject lv[kZoneLevels] = {};
+    for (int i = 0; i < kZoneLevels; ++i) lv[i] = MakeZoneLevel(a, kZoneAlpha[i], &tinted);
+    if (!lv[0]) {
+        DestroyActor(a);
+        log::Warn("workbench: green zone: could not make its pieces");
+        return 0;
+    }
+    int lines = 0, rings = 0;
+    for (const auto& p : rules::BoxFrame(S.zone_w, S.zone_d, S.zone_h, S.zone_line, S.zone_fade, kZoneLevels)) {
+        UObject ism = lv[p.level];
+        if (!ism) continue;
+        Xf t;
+        t.translation = FVector{p.at[0], p.at[1], p.at[2]};
+        t.scale = FVector{p.size[0] / 100.0, p.size[1] / 100.0, p.size[2] / 100.0};
+        ue::Call c(ism, "AddInstance");
+        c.Set("InstanceTransform", t).Set("bWorldSpace", false);
+        if (c.Invoke()) ++(p.level == 0 ? lines : rings);
+    }
     const FVector up{0, 0, 1};
     SetActorPose(a, Z.center, FromAxes(Z.along, Cross(up, Z.along), up));
-    log::Info("workbench: green zone made (%s, %s; white texture %s)", ue::GetName(a).c_str(),
-              tinted ? "see-through green" : "NOT tinted: plain cube", white ? "found" : "not found");
+    log::Info("workbench: green zone made (%s): %d edge lines, %d fading strips, %.0f x %.0f x %.0f cm, %s",
+              ue::GetName(a).c_str(), lines, rings, S.zone_w, S.zone_d, S.zone_h,
+              tinted ? "see-through green" : "NOT tinted (material or its settings not found)");
     return a;
 }
 
@@ -1408,7 +1452,8 @@ void OnTick(UObject player, float dt) {
     if (!S.enabled) return;
 
     // The green zone at the bought bench: placed the first time you come
-    // within 1.2 m of its table, shown while you are within 4 m of it.
+    // within 1.2 m of its table, shown only while you are near it (owner:
+    // "if my body isnt near the box i dont want to see it at all").
     if (S.zone && L.unlocked && !Z.failed) {
         hands::Pose head;
         if (hands::Head(&head)) {
@@ -1423,7 +1468,11 @@ void OnTick(UObject player, float dt) {
             // Hidden while a menu is on the forearm: the menus switch off the
             // depth test of the engine's widget material, which this box's
             // material shares, so it would show through walls then.
-            if (Z.placed) ShowZone(Flat(head.location, Z.center) < 400.0 && !world_menu::MenuUp());
+            if (Z.placed) {
+                const double dist = Flat(head.location, Z.center);
+                const bool show = dist < S.zone_show || (Z.shown && dist < S.zone_show + 15.0);
+                ShowZone(show && !world_menu::MenuUp());
+            }
         }
     } else if (Z.shown) {
         ShowZone(false);
@@ -1585,12 +1634,17 @@ void Init() {
     S.grab_cm = config::GetFloat("workbench_grab_cm", 3.0f);
     S.snap_cm = config::GetFloat("workbench_snap_cm", 5.0f);
     S.walk_away_cm = config::GetFloat("workbench_walk_away_m", 3.0f) * 100.0;
-    S.zone = config::GetBool("workbench_zone", true);
-    S.zone_w = config::GetFloat("workbench_zone_width_cm", 34.0f);
-    S.zone_h = config::GetFloat("workbench_zone_height_cm", 26.0f);
-    S.zone_d = config::GetFloat("workbench_zone_depth_cm", 14.0f);
-    S.zone_out = config::GetFloat("workbench_zone_out_cm", 4.0f);
-    S.zone_lift = config::GetFloat("workbench_zone_lift_cm", 2.0f);
+    // workbench_box_* replaced workbench_zone_* (2026-11-04), whose sizes an
+    // earlier build already wrote into hole-vr.ini.
+    S.zone = config::GetBool("workbench_box", true);
+    S.zone_w = config::GetFloat("workbench_box_width_cm", 34.0f);
+    S.zone_h = config::GetFloat("workbench_box_height_cm", 52.0f);
+    S.zone_d = config::GetFloat("workbench_box_depth_cm", 14.0f);
+    S.zone_out = config::GetFloat("workbench_box_out_cm", 4.0f);
+    S.zone_lift = config::GetFloat("workbench_box_lift_cm", 2.0f);
+    S.zone_line = config::GetFloat("workbench_box_line_cm", 0.6f);
+    S.zone_fade = config::GetFloat("workbench_box_fade_cm", 4.0f);
+    S.zone_show = config::GetFloat("workbench_box_show_cm", 100.0f);
     game::AddTickListener(&OnTick);
 }
 
