@@ -11,10 +11,9 @@
 // so it hangs at whatever angle it was held. Defaults come from hole-vr.ini;
 // spots placed in the headset are saved to hole-vr/holsters.ini.
 //
-// Slots now: right hip = pistol, left hip = pistol magazines (the magazine
-// pouch), both movable anywhere on the body. Planned for when the rifle is
-// unlocked: a rifle slot (chest/back) and a rifle magazine slot; HolsterId
-// and DefaultSpot already have room.
+// Slots: right hip = pistol, left hip = pistol magazines (the magazine
+// pouch), behind the right shoulder = rifle; all movable anywhere on the
+// body. Still to come: a rifle magazine slot (HolsterId::kRifleMag).
 
 #include <string>
 
@@ -81,6 +80,10 @@ FVector SpotOffset(const FVector& world, const FVector& anchor, const FQuat& anc
 // right side facing out from the body. cant_deg tilts the grip forward (FBI
 // cant; the muzzle swings back).
 FQuat PistolHolsterFrame(const FQuat& body_rot, double cant_deg);
+// Gun frame of a rifle hanging behind the right shoulder: grip up at the
+// shoulder, muzzle down the back and slanted slant_deg toward the left, the
+// receiver's top against the back (grip and magazine stick out behind you).
+FQuat RifleBackFrame(const FQuat& anchor_rot, double slant_deg);
 // A gun frame whose magwell (raked rake_deg forward of the gun's up axis)
 // stands straight up, facing the body's front. A magazine placed the way it
 // sits in that gun stands upright in its pouch with the rounds facing forward.

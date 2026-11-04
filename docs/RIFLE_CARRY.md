@@ -100,4 +100,5 @@ Tests: `g++ -std=c++20 -Isrc tests/test_rifle_carry.cpp src/vr/interact/rifle_ca
 - With a posed `BP_AR_C.support` grip, the drawn hand follows the pose on the
   rifle, which can sit a little off the real controller while the left hand
   holds the rifle alone.
-- No rifle holster of our own yet: the rifle goes back to the game's spot.
+- The rifle now rests in its own holster behind the right shoulder
+  (`holster_rifle=1`, docs/HOLSTERS.md) instead of the game's spot.

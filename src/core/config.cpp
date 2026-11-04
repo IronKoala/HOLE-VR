@@ -373,6 +373,20 @@ const Block kBlocks[] = {
      "holster_mag_radius_cm=14\n"
      "; With the VR body off (F9), the belt is taken this far below the headset.\n"
      "holster_belt_below_head_cm=60\n"},
+    {"holster_rifle",
+     "\n"
+     "; --- Rifle holster ---\n"
+     "; 1 = the rifle rests behind your right shoulder when you don't hold it: reach\n"
+     "; back over the shoulder and squeeze the right grip to take it. 0 = it rests\n"
+     "; where the game hangs it. Move it anywhere with VR tab > Move holsters while\n"
+     "; holding the rifle (saved in hole-vr\\holsters.ini, which wins over these).\n"
+     "holster_rifle=1\n"
+     "; Where the hand grabs it, in cm from the top of your spine: forward, right\n"
+     "; (+) or left (-), up (+) or down (-), and how close the hand must be.\n"
+     "holster_rifle_forward_cm=-14\n"
+     "holster_rifle_right_cm=14\n"
+     "holster_rifle_up_cm=6\n"
+     "holster_rifle_radius_cm=18\n"},
     {"rifle_left_hand_carry",
      "\n"
      "; --- Rifle in your left hand while the pistol is out ---\n"

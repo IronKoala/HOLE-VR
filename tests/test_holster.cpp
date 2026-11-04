@@ -37,7 +37,10 @@ static void TestSpots() {
     EXPECT(Near(SpotOffset(w, belt, body), s.offset));
     HolsterSpot m = DefaultSpot(HolsterId::kMag);
     EXPECT(m.enabled && m.hand == 0 && m.offset.Y < -15);  // left hip
-    EXPECT(!DefaultSpot(HolsterId::kRifle).enabled);
+    // Rifle: behind the right shoulder, on the chest, taken by the right hand.
+    HolsterSpot r = DefaultSpot(HolsterId::kRifle);
+    EXPECT(r.enabled && r.anchor == HolsterAnchor::kChest && r.hand == 1);
+    EXPECT(r.offset.X < -8 && r.offset.Y > 8 && r.offset.Z > 0 && r.radius >= 15);
     EXPECT(!DefaultSpot(HolsterId::kRifleMag).enabled);
     // Calibration round trip from an arbitrary hand position.
     FVector hand{90, 230, 80};
@@ -171,6 +174,25 @@ static void TestPistolFrame() {
         EXPECT(Near(c.Rotate(FVector{0, 1, 0}), right, 1e-9));
         // Proper rotation (unit length).
         EXPECT(std::fabs(c.X * c.X + c.Y * c.Y + c.Z * c.Z + c.W * c.W - 1.0) < 1e-9);
+    }
+}
+
+static void TestRifleBackFrame() {
+    for (double yaw : {0.0, 90.0, -160.0}) {
+        const FQuat body = Yaw(yaw);
+        const FVector fwd = body.Rotate(FVector{1, 0, 0}), right = body.Rotate(FVector{0, 1, 0});
+        const FQuat f = RifleBackFrame(body, 30);
+        const FVector barrel = f.Rotate(FVector{1, 0, 0});
+        EXPECT(barrel.Z < -0.85);                 // muzzle down the back
+        EXPECT(Dot(barrel, right) < -0.45);       // slanted toward the left
+        EXPECT(std::fabs(Dot(barrel, fwd)) < 1e-9);
+        // Grip and magazine (gun -Z) stick out behind you.
+        EXPECT(Dot(f.Rotate(FVector{0, 0, -1}), fwd) < -0.99);
+        EXPECT(std::fabs(f.X * f.X + f.Y * f.Y + f.Z * f.Z + f.W * f.W - 1.0) < 1e-9);
+        // A proper rotation: right = up x barrel... (det +1).
+        const FVector x = f.Rotate(FVector{1, 0, 0}), y = f.Rotate(FVector{0, 1, 0}), z = f.Rotate(FVector{0, 0, 1});
+        const FVector c{x.Y * y.Z - x.Z * y.Y, x.Z * y.X - x.X * y.Z, x.X * y.Y - x.Y * y.X};
+        EXPECT(Near(c, z, 1e-9));
     }
 }
 
@@ -321,6 +343,7 @@ int main() {
     TestPlaceSpot();
     TestSpotLine();
     TestPistolFrame();
+    TestRifleBackFrame();
     TestMagFrame();
     TestHoldMode();
     TestGrabWhileReturning();
