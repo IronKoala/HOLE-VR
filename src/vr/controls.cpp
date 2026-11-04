@@ -2,6 +2,7 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -336,6 +337,7 @@ const hands::Pose& SpotAnchor(int spot) { return g_hw.anchor[static_cast<int>(g_
 std::mutex g_hands_mutex;
 hands::HandState g_hands[2];
 hands::HandGrab g_grab[2];
+hands::HandInteraction g_interaction[2];
 hands::FingerInput g_fingers[2];
 hands::Pose g_head;
 bool g_head_valid = false;
@@ -534,7 +536,6 @@ struct WeaponState {
     int spawn_fail_logs = 0;
     int wait_logs = 0;
     double refill_pouch_at = 0; // when to put a new magazine in the pouch
-    bool trigger_down = false;
     bool have_frame = false;
     FQuat gun_frame;           // gun frame (X barrel, Z up) expressed in actor space
     double check_chamber_at = -1;
@@ -2130,7 +2131,7 @@ bool LeftHandNearGun() {
 void HandInteract(UObject player, int hand) {
     // A hand holding a can (vr/drinks): a fist round the can can pull the
     // trigger too, and an interact then would drink it the flat way.
-    if (drinks::ClaimsGrip(hand)) return;
+    if (!hands::GetInteraction(static_cast<hands::Hand>(hand)).AllowsControls()) return;
     // One interact per 0.5 s across both hands: some things (the hole's
     // countdown) toggle on each Interact, so a two-hand press cancelled itself.
     static double s_last = -10.0;
@@ -2689,8 +2690,13 @@ void GameActions(UObject player, const input::Snapshot& s) {
     LabTraceTick();
     const input::HandInput& l = s.hand[input::kLeft];
     const input::HandInput& r = s.hand[input::kRight];
-    if (ui_panel::MenuOpen()) {
-        if (GA.sprinting) StopSprint(player, "menu");
+    const bool menu_open = ui_panel::MenuOpen();
+    if (!menu_open && g_req_grip_editor.exchange(false)) {
+        g_editor_y_until = g_clock + 1.1;   // the editor toggles on a 1 s hold of Y
+        log::Info("controls: opening/closing the grip editor (asked for from the VR tab)");
+    }
+    if (menu_open || hands::EditorHand() >= 0) {
+        if (GA.sprinting) StopSprint(player, menu_open ? "menu" : "grip editor");
         if (GA.light_down) {
             ue::Call c(player, "PlayerInput_SwitchLight");
             c.Set("IsPressed", false);
@@ -2725,11 +2731,6 @@ void GameActions(UObject player, const input::Snapshot& s) {
     // Right trigger interacts too while the right hand is empty (pistol
     // holstered, or no gun); with the gun in hand it only fires.
     if (r.trigger_button.pressed && !W.in_hand) HandInteract(player, input::kRight);
-    if (g_req_grip_editor.exchange(false)) {
-        g_editor_y_until = g_clock + 1.1;   // the editor toggles on a 1 s hold of Y
-        log::Info("controls: opening/closing the grip editor (asked for from the VR tab)");
-    }
-    if (hands::EditorHand() >= 0) return;   // the grip editor owns the buttons
     // No gestures (owner's rule): every action is one press of one button,
     // and the combat ones never need the left thumb off the move stick.
     const bool gun_in_hand = W.gun && W.in_hand;
@@ -2883,6 +2884,30 @@ bool GunIsRifle(UObject player) {
     return gun.Valid() && gun.Object() == W.gun && !W.is_pistol;
 }
 
+bool ControlsHoldsGrip(int hand) {
+    // Logical ownership must not disappear just because an IK pose is invalid.
+    if (hand == hands::kRight) return W.gun && W.in_hand;
+    return W.slide.Held() || W.held_mag || (g_rc.carried && g_rc.rifle) || W.two_hand;
+}
+
+void ResolveHandOwnership(bool actions_allowed) {
+    hands::HandInteraction next[2];
+    for (int h = 0; h < 2; ++h) {
+        hands::GripFacts facts;
+        facts.controls_held = ControlsHoldsGrip(h);
+        facts.attachment_held = workbench::HoldsGrip(h);
+        facts.drink_held = drinks::HoldsGrip(h);
+        facts.actions_allowed = actions_allowed;
+        if (actions_allowed) {
+            facts.attachment_candidate = workbench::ClaimsGrip(h);
+            facts.drink_candidate = drinks::ClaimsGrip(h);
+        }
+        next[h] = hands::ResolveGrip(facts);
+    }
+    std::lock_guard<std::mutex> lock(g_hands_mutex);
+    for (int h = 0; h < 2; ++h) g_interaction[h] = next[h];
+}
+
 void PublishGrabs(game::Gun& gun, const hands::HandState& rh, const hands::HandState& lh) {
     hands::HandGrab g[2];
     if (gun.Valid() && rh.valid && W.in_hand) {
@@ -2925,6 +2950,8 @@ void PublishGrabs(game::Gun& gun, const hands::HandState& rh, const hands::HandS
     std::lock_guard<std::mutex> lock(g_hands_mutex);
     g_grab[0] = g[0];
     g_grab[1] = g[1];
+    for (int h = 0; h < 2; ++h)
+        g_interaction[h] = hands::AfterControls(g_interaction[h], ControlsHoldsGrip(h));
 }
 
 // Per-frame trace while the slide is handled and 1.5 s after: frame time,
@@ -3964,13 +3991,31 @@ void OnTick(UObject player, float dt) {
     g_clock += dt;
     g_dt = dt;
     input::Snapshot s = input::Consume();
-    if (!s.valid || !g_set.enabled) return;
+    if (!s.valid || !g_set.enabled) {
+        ResolveHandOwnership(false);
+        ReleaseTrigger(player);
+        return;
+    }
     UpdateHands(s);
-    // The workbench (hub) owns a grip while that hand holds an attachment or
-    // is at one: no gun, slide or magazine grab with it. The drink machine
-    // (vr/drinks) the same while the hand holds a can or is at one.
-    for (int h = 0; h < 2; ++h)
-        if (workbench::ClaimsGrip(h) || drinks::ClaimsGrip(h)) s.hand[h].grip_button = input::Button{};
+    // Observe releases even when a menu/editor skips SlideHandling this tick.
+    // The slide stays frozen until gameplay resumes, but a UI-owned re-squeeze
+    // cannot inherit admission from the old gameplay hold.
+    if (!s.hand[input::kLeft].grip_button.down)
+        W.slide_squeeze.Update(false, false, false);
+    ResolveHandOwnership(!ui_panel::MenuOpen() && hands::EditorHand() < 0);
+    // Raw input remains available to the chosen feature through LastConsumed.
+    // A can/attachment also owns the trigger: it must not toggle a weapon light
+    // or interact with the world while that hand is manipulating the item.
+    for (int h = 0; h < 2; ++h) {
+        const auto access = hands::GetInteraction(static_cast<hands::Hand>(h));
+        const auto owner = access.owner;
+        if (owner == hands::GripOwner::kWorkbench || owner == hands::GripOwner::kDrink) {
+            s.hand[h].grip_button = input::Button{};
+        }
+        if (!access.AllowsControls()) {
+            s.hand[h].trigger_button = input::Button{};
+        }
+    }
     // The grip editor (vr/body) borrows one controller: none of its buttons
     // reach the game, and the gun does not fire while a grip is edited.
     if (int eh = g_editor_hand.load(); eh == 0 || eh == 1) {
@@ -4222,6 +4267,16 @@ HandState Get(Hand hand) {
 HandGrab GetGrab(Hand hand) {
     std::lock_guard<std::mutex> lock(controls::g_hands_mutex);
     return controls::g_grab[hand];
+}
+HandInteraction GetInteraction(Hand hand) {
+    HandInteraction result;
+    {
+        std::lock_guard<std::mutex> lock(controls::g_hands_mutex);
+        result = controls::g_interaction[hand];
+    }
+    // The body/editor or UI may open after controls ran in this same frame.
+    result.actions_allowed = result.actions_allowed && EditorHand() < 0 && !ui_panel::MenuOpen();
+    return result;
 }
 FingerInput GetFingers(Hand hand) {
     std::lock_guard<std::mutex> lock(controls::g_hands_mutex);

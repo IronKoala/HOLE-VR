@@ -43,12 +43,19 @@ void Init();
 
 // Latest controller state, consumed by the game thread once per game frame:
 // the pressed/released edges accumulate between calls so short taps are not lost.
+// If a menu retired a new press after a release, gameplay sees down=false for
+// that one Consume so an old hold ends. Peek still returns the real held level;
+// the next gameplay tick requires a new press to start a new interaction.
 // Poses are predicted for when the game's picture will be shown
 // (xr::PredictAhead), to match the head pose the game draws with.
 Snapshot Consume();
 // Latest state without taking the button edges, poses at this headset frame's
 // display time: for layers the headset draws itself (wrist display, laser).
 Snapshot Peek();
+// Active-menu read: atomically discard pending presses for both hands/all six
+// buttons before invoking UI callbacks that may close the menu. Retains pending
+// releases, raw button-down state, analog values, poses and LastConsumed.
+Snapshot PeekForMenu();
 // Like Peek, with the game's predicted-ahead poses: for things the game draws
 // in its picture (the forearm menu).
 Snapshot PeekGame();

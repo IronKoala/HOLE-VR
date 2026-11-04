@@ -1105,16 +1105,24 @@ void OnTick(UObject player, float dt) {
     for (int h = 0; h < 2; ++h) {
         const hands::HandState hs = hands::Get(static_cast<hands::Hand>(h));
         const input::HandInput& in = snap.hand[h];
+        const auto access = hands::GetInteraction(static_cast<hands::Hand>(h));
         if (g_held[h].active) {
-            if (!hs.valid) continue;
-            if (!in.grip_button.down) {
-                Release(h);
-            } else {
+            if (access.owner != hands::GripOwner::kWorkbench) {
+                ReturnHeld(h, "(the hand is now holding something else)");
+                continue;
+            }
+            if (snap.valid && !in.grip_button.down) {
+                // A menu/editor or lost pose cannot commit an old snap target,
+                // but releasing must still return the part and free the hand.
+                if (!access.actions_allowed || !hs.valid) ReturnHeld(h, "(interaction interrupted)");
+                else Release(h);
+            } else if (hs.valid) {
                 FollowHand(h, hs);
             }
             continue;
         }
-        const bool fresh = g_claim[h].time == hs.time && g_claim[h].c.kind != 0;
+        const bool fresh = access.CanAcquire(hands::GripOwner::kWorkbench) &&
+                           g_claim[h].time == hs.time && g_claim[h].c.kind != 0;
         if (fresh && !g_hover[h]) input::Haptic(static_cast<input::Hand>(h), 0.12f, 0.012f);
         g_hover[h] = fresh;
         if (fresh && in.grip_button.pressed && hs.valid) Grab(h, g_claim[h].c, hs);
@@ -1199,6 +1207,8 @@ void GunTaken() {
     P.on = false;
     log::Info("workbench: pistol picked up from the table");
 }
+
+bool HoldsGrip(int hand) { return hand >= 0 && hand < 2 && g_held[hand].active; }
 
 bool ClaimsGrip(int hand) {
     if (hand < 0 || hand > 1 || !S.enabled) return false;

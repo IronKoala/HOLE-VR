@@ -27,9 +27,11 @@ bool ParkedGun(ue::UObject gun, FVector* spot, FQuat* frame);
 bool TryPark(ue::UObject gun, const FQuat& frame, const FVector& hand);
 // The right hand picked the pistol up off the table.
 void GunTaken();
-// True while the workbench owns this hand's grip (0 left, 1 right): the hand
+// Candidate query for controls' per-frame ownership resolver (0 left, 1 right): the hand
 // holds an attachment, or is at one and closer to it than to anything
 // controls would grab. Controls ignores that grip for its own grabs.
 bool ClaimsGrip(int hand);
+// Actual hold only: never searches for a nearby part or claims another feature.
+bool HoldsGrip(int hand);
 
 }  // namespace holevr::vr::workbench

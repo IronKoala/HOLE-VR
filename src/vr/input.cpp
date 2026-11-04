@@ -1,4 +1,5 @@
 #include "vr/input.h"
+#include "vr/input_edges.h"
 
 #include <atomic>
 #include <cstdio>
@@ -74,7 +75,7 @@ std::string HandReport(double) {
     return line;
 }
 Snapshot g_consumed;   // what the game thread last saw (for edges)
-bool g_pending_edges[2][6][2] = {};  // [hand][button][pressed/released] accumulated
+PendingButtonEdges g_pending_edges;
 
 struct HapticRequest {
     Hand hand;
@@ -373,8 +374,7 @@ struct InputListener : xr::Listener {
                 const bool now_down[6] = {cur.stick_click.down, cur.primary.down, cur.secondary.down,
                                           cur.menu.down, trig, grab};
                 for (int i = 0; i < 6; ++i) {
-                    if (now_down[i] && !prev_down[i]) g_pending_edges[h][i][0] = true;
-                    if (!now_down[i] && prev_down[i]) g_pending_edges[h][i][1] = true;
+                    g_pending_edges.Observe(h, i, prev_down[i], now_down[i]);
                 }
             }
             g_latest = s;
@@ -447,9 +447,10 @@ Snapshot Consume() {
         Button* buttons[6] = {&s.hand[h].stick_click, &s.hand[h].primary, &s.hand[h].secondary,
                               &s.hand[h].menu, &s.hand[h].trigger_button, &s.hand[h].grip_button};
         for (int i = 0; i < 6; ++i) {
-            buttons[i]->pressed = g_pending_edges[h][i][0];
-            buttons[i]->released = g_pending_edges[h][i][1];
-            g_pending_edges[h][i][0] = g_pending_edges[h][i][1] = false;
+            const auto edges = g_pending_edges.Take(h, i);
+            buttons[i]->pressed = edges.pressed;
+            buttons[i]->released = edges.released;
+            buttons[i]->down = GameplayButtonDown(buttons[i]->down, edges);
         }
     }
     g_consumed = s;
@@ -458,6 +459,15 @@ Snapshot Consume() {
 
 Snapshot Peek() {
     std::lock_guard<std::mutex> lock(g_mutex);
+    return g_latest;
+}
+
+Snapshot PeekForMenu() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    // Do this before dispatching UI callbacks: a click may resume the game.
+    // Snapshot and discard share one lock, so the displayed input cannot leave
+    // its queued press behind between a separate Peek and discard operation.
+    g_pending_edges.DiscardPresses();
     return g_latest;
 }
 

@@ -129,7 +129,8 @@ struct UiListener : xr::Listener {
             g_menu_open = open;
             log::Info("menu panel: menu %s", open ? "opened" : "closed");
         }
-        input::Snapshot in = input::Peek();
+        const bool menu_active = open || world_menu::MenuUp();
+        input::Snapshot in = menu_active ? input::PeekForMenu() : input::Peek();
         HWND w = GameWindow();
 
         // Menu button on either controller toggles the pause menu: Escape
@@ -141,6 +142,9 @@ struct UiListener : xr::Listener {
         for (int hnd = 0; hnd < 2; ++hnd) {
             bool m = in.valid && in.hand[hnd].menu.down;
             if (S.pause_button && m && !PT.menu_down[hnd] && w && GetTickCount() - s_last_menu > 500) {
+                // Also covers a pause-menu toggle before its pointer pump runs.
+                // Opening a menu gives this same batch of presses to the UI.
+                (void)input::PeekForMenu();
                 if (world_menu::PauseMenuOnTop()) world_menu::RequestClosePause();
                 else PostKey(w, VK_ESCAPE);
                 s_last_menu = GetTickCount();

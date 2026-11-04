@@ -1,5 +1,5 @@
 // Native unit tests for body IK math and hand poses (no game, no Windows).
-//   g++ -std=c++20 -Isrc tests/test_body.cpp src/vr/body/ik_math.cpp src/vr/body/hand_pose.cpp -o /tmp/test_body && /tmp/test_body
+//   g++ -std=c++20 -Isrc tests/test_body.cpp src/vr/body/ik_math.cpp src/vr/body/hand_pose.cpp src/vr/body/grip_probe.cpp -o /tmp/test_body && /tmp/test_body
 #include <cstdio>
 
 #include "vr/body/grip_probe.h"

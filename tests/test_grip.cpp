@@ -1,6 +1,6 @@
 // Native unit tests for the skeleton pose, fingertip solver and grip records.
 //   g++ -std=c++20 -Isrc tests/test_grip.cpp src/vr/body/ik_math.cpp src/vr/body/skeleton.cpp
-//       src/vr/body/finger_solve.cpp src/vr/body/grip_record.cpp -o /tmp/test_grip && /tmp/test_grip
+//       src/vr/body/finger_solve.cpp src/vr/body/grip_record.cpp src/vr/body/grip_editor.cpp -o /tmp/test_grip && /tmp/test_grip
 #include <chrono>
 #include <cstdio>
 #include <string>

@@ -137,7 +137,6 @@ UObject Struct(const char* full_name) {
     return s;
 }
 
-constexpr const char* kPartsData = "UserDefinedStruct /Game/DataBase/Str_GunPartsData.Str_GunPartsData";
 constexpr const char* kPartsAndPath = "UserDefinedStruct /Game/Weapons/Custom/Data/Str_PartsAndPath.Str_PartsAndPath";
 constexpr const char* kSaveTemp =
     "UserDefinedStruct /Game/Weapons/Custom/Data/Str_WeaponCustomSaveData_Temp.Str_WeaponCustomSaveData_Temp";

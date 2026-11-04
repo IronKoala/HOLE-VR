@@ -645,7 +645,7 @@ void PressButtons(UObject player) {
                           HandName(h), FingerName(near_finger), near_gap, b.index,
                           (n_tips[h] ? tips[h][0].r : 0.6) + S.press_gap_cm);
             }
-            if (in && !b.inside[h]) {
+            if (in && !b.inside[h] && hands::GetInteraction(static_cast<hands::Hand>(h)).actions_allowed) {
                 input::Haptic(static_cast<input::Hand>(h), 0.45f, 0.04f);
                 if (g_clock >= M.ready_at) {
                     M.ready_at = g_clock + 1.0;
@@ -876,7 +876,12 @@ void HoldCan(UObject player, float dt) {
         H = Held{};
         return;
     }
-    if (hs.valid && !snap.hand[H.hand].grip_button.down) {
+    if (hands::GetInteraction(static_cast<hands::Hand>(H.hand)).owner != hands::GripOwner::kDrink) {
+        if (H.drunk) DropEmpty();
+        else PutBack("the hand is now holding something else");
+        return;
+    }
+    if (snap.valid && !snap.hand[H.hand].grip_button.down) {
         if (H.drunk) DropEmpty();
         else PutBack("let go before drinking");
         return;
@@ -888,6 +893,14 @@ void HoldCan(UObject player, float dt) {
         H.vel = H.vel * 0.6 + v * 0.4;
     }
     H.last_mid = H.mid;
+
+    // Keep following/releasing the held can while a menu/editor owns input,
+    // but never open or consume it as a side effect of operating that UI.
+    if (!hands::GetInteraction(static_cast<hands::Hand>(H.hand)).actions_allowed) {
+        H.pouring = false;
+        PlaceHeld();
+        return;
+    }
 
     // The tab: a fingertip of the other hand on it.
     const int other = 1 - H.hand;
@@ -1041,7 +1054,8 @@ void OnTick(UObject player, float dt) {
     const input::Snapshot snap = input::LastConsumed();
     for (int h = 0; h < 2; ++h) {
         const hands::HandState hs = hands::Get(static_cast<hands::Hand>(h));
-        if (!hs.valid || !snap.hand[h].grip_button.pressed || !HandFree(h)) continue;
+        if (!hs.valid || !snap.hand[h].grip_button.pressed || !HandFree(h) ||
+            !hands::GetInteraction(static_cast<hands::Hand>(h)).CanAcquire(hands::GripOwner::kDrink)) continue;
         const double d = Len(hs.grip.location - M.can_mid);
         if (d <= S.grab_cm) {
             TakeCan(h, hs);
@@ -1053,6 +1067,8 @@ void OnTick(UObject player, float dt) {
 }
 
 }  // namespace
+
+bool HoldsGrip(int hand) { return H.on && H.hand == hand; }
 
 bool ClaimsGrip(int hand) {
     if (hand < 0 || hand > 1 || !S.enabled) return false;

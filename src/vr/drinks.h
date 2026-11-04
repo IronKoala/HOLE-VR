@@ -25,8 +25,10 @@ namespace holevr::vr::drinks {
 void Init();
 
 // --- Called by vr/controls ---
-// True while this hand holds a can, or is at a can waiting in the slot:
+// Candidate query: this hand holds a can, or is at a can waiting in the slot.
 // controls leaves that hand's grip alone (no holster draw, no slide grab).
 bool ClaimsGrip(int hand);
+// Actual hold only, for the shared ownership resolver.
+bool HoldsGrip(int hand);
 
 }  // namespace holevr::vr::drinks

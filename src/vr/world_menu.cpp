@@ -3412,7 +3412,9 @@ Hit RayPanel(const FVector& o, const FVector& d, const Panel& p) {
 }
 
 void UpdatePointer() {
-    input::Snapshot in = input::Peek();
+    // This pump runs only with a hosted menu. Retire its input before any
+    // ReleaseKey/PressPointerKey callback can close it and resume gameplay.
+    input::Snapshot in = input::PeekForMenu();
     Laser laser;
     laser.show = S.laser && in.valid;
     if (!in.valid || !Alive(G.wic, G.wic_index)) {

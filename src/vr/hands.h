@@ -5,6 +5,7 @@
 #include <cstdint>
 
 #include "vr/math.h"
+#include "vr/hand_ownership.h"
 
 namespace holevr::vr::hands {
 
@@ -37,6 +38,11 @@ struct HandGrab {
     Pose target;            // world transform the hand should take while attached
 };
 HandGrab GetGrab(Hand hand);
+
+// Authoritative input reservation, separate from the body IK pose above.
+// Includes attachment/drink holds, and remains owned during tracking loss.
+// New actions must check this; existing holders may always release/clean up.
+HandInteraction GetInteraction(Hand hand);
 
 // Raw finger inputs for hand poses.
 struct FingerInput {
