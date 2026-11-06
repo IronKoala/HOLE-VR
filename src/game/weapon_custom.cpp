@@ -1,6 +1,12 @@
 #include "game/weapon_custom.h"
+#include "game/tube_refresh.h"
+#include "game/attachment_transaction.h"
+#include "game/ammo_refresh.h"
+#include "game/gun.h"
 
 #include <cstring>
+#include <algorithm>
+#include <cmath>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -394,6 +400,170 @@ UObject PartClass(const PartRow& part) {
     return cls;
 }
 
+namespace {
+bool DoubleField(UObject obj, const char* name, int32_t* offset=nullptr) {
+    const auto p=ue::reflection::FindProperty(ue::GetClass(obj),name);
+    const bool ok=p.valid() && p.type=="DoubleProperty" && p.element_size==8 && p.array_dim==1 &&
+                  mem::IsWritable(obj+p.offset,8);
+    if (ok && offset) *offset=p.offset;
+    return ok;
+}
+struct TubeEngine {
+    UObject gun;
+    bool Has(const char* name) {
+        ue::Call c(gun,name);
+        if (!c.Valid()) return false;
+        if (std::strcmp(name,"Init_GenerateWeaponParts")==0) {
+            int32_t n=0;
+            return c.Raw("GenerateDefaultWeaponParts",&n) && n==1;
+        }
+        return true;
+    }
+    bool RateFieldsValid() { return DoubleField(gun,"FireRate_RPM") && DoubleField(gun,"FireRate_SPR"); }
+    bool Call(const char* name) {
+        ue::Call c(gun,name);
+        if (std::strcmp(name,"Init_GenerateWeaponParts")==0) c.Set("GenerateDefaultWeaponParts",false);
+        return c.Invoke();
+    }
+    double Rpm() { double rpm=0;ue::GetProp(gun,"FireRate_RPM",rpm);return rpm; }
+    bool SetSecondsPerRound(double value) {
+        int32_t o=0;
+        return DoubleField(gun,"FireRate_SPR",&o) && mem::Write(gun+o,value);
+    }
+};
+
+// A muzzle attachment owns the muzzle component. Rebuilding it invalidates
+// that component, so the retained magazine and shells must use the new one.
+// Capture the shell actors before editing; never replace their ammo maps or
+// their identities, counts, spent state, or chamber/jam state.
+struct Retained {
+    UObject actor = 0;
+    UObject round = 0;  // cached projectile owner; zero for magazine/round actors
+};
+bool MuzzleField(UObject obj, int32_t* offset = nullptr) {
+    const auto p = ammo_refresh::MuzzleProperty([&](const char* name) {
+        return ue::reflection::FindProperty(ue::GetClass(obj), name);
+    });
+    const bool ok = p.valid() && mem::IsWritable(obj + p.offset, 8);
+    if (ok && offset) *offset = p.offset;
+    return ok;
+}
+bool ProjectileField(UObject obj, size_t i, int32_t* offset = nullptr) {
+    const auto& stat = ammo_refresh::kStats[i];
+    if (i != ammo_refresh::kPenetration) return DoubleField(obj, stat.projectile, offset);
+    const auto p = ue::reflection::FindProperty(ue::GetClass(obj), stat.projectile);
+    const bool ok = p.valid() && p.type == "IntProperty" && p.element_size == 4 && p.array_dim == 1 &&
+                    mem::IsWritable(obj + p.offset, 4);
+    if (ok && offset) *offset = p.offset;
+    return ok;
+}
+bool RetainedAmmo(UObject gun, std::vector<Retained>* ammo, std::string* why) {
+    auto fail = [&](const char* reason, UObject obj = 0) {
+        if (why) *why = std::string(reason) + (obj ? " on " + ue::GetName(ue::GetClass(obj)) : "");
+        return false;
+    };
+    std::vector<UObject> owners;
+    UObject mag=0, chamber=0;
+    if (!ue::GetProp(gun,"MagazineObj",mag) || !ue::GetProp(gun,"AmmoObj_InChamber",chamber))
+        return fail("magazine/chamber references unavailable", gun);
+    if (mag) {
+        if (!ue::IsLive(mag)) return fail("magazine is no longer live", mag);
+        owners.push_back(mag);
+        ue::Call c(mag,"GetAttachedActors");
+        int32_t n=0;
+        if (!c.Raw("bRecursivelyIncludeAttachedActors",&n) || n!=1)
+            return fail("GetAttachedActors signature not verified", mag);
+        c.Set("bResetArray",true).Set("bRecursivelyIncludeAttachedActors",true);
+        const auto* raw=c.Invoke()?c.Raw("OutActors",&n):nullptr;
+        struct {uintptr_t data;int32_t num,max;} a{};
+        if (!raw || n!=16) return fail("GetAttachedActors result unavailable", mag);
+        std::memcpy(&a,raw,16);
+        if (a.num<0 || a.num>a.max || a.num>128 || (a.num && !a.data))
+            return fail("attached ammunition array invalid", mag);
+        for (int i=0;i<a.num;++i) {
+            UObject obj=0;
+            if (!mem::Read(a.data+i*8ull,obj) || !ue::IsLive(obj))
+                return fail("attached ammunition actor unavailable", mag);
+            if (DoubleField(obj,"GunMOA")) owners.push_back(obj);
+        }
+    }
+    if (chamber) {
+        if (!ue::IsLive(chamber)) return fail("chamber actor is no longer live", chamber);
+        owners.push_back(chamber);
+    }
+    std::sort(owners.begin(),owners.end());
+    owners.erase(std::unique(owners.begin(),owners.end()),owners.end());
+    for (UObject obj:owners) {
+        if (!MuzzleField(obj)) return fail("ammo muzzle property layout not verified", obj);
+        for (const auto& stat : ammo_refresh::kStats) {
+            const char* source = std::strcmp(stat.gun, "GunMOA") == 0 ? "GunAccuracy" : stat.gun;
+            if (!DoubleField(gun, source) || !DoubleField(obj, stat.gun))
+                return fail("retained ammunition stat layout not verified", obj);
+        }
+        ammo->push_back({obj, 0});
+    }
+    for (UObject obj:owners) {
+        if (obj == mag) continue;
+        bool fired = false;
+        if (!ue::GetProp(obj, "IsFired", fired)) return fail("round spent state unavailable", obj);
+        // A spent shell may retain references to bullets already in flight or
+        // destroyed. Never retarget those or alter its spent state.
+        if (fired) continue;
+        const auto p = ue::reflection::FindProperty(ue::GetClass(obj), "MetaBullet_LineTrace");
+        ArrayView projectiles;
+        if (!p.valid() || p.type != "ArrayProperty" || p.element_size != 16 || p.array_dim != 1 ||
+            !ReadArray(obj + p.offset, &projectiles, 255))
+            return fail("cached projectile array layout not verified", obj);
+        for (const auto& stat : ammo_refresh::kStats)
+            if (!DoubleField(obj, stat.ammo)) return fail("round ammunition stat layout not verified", obj);
+        for (int32_t i = 0; i < projectiles.num; ++i) {
+            UObject bullet = 0;
+            if (!mem::Read(projectiles.data + i * 8ull, bullet) || !ue::IsLive(bullet) || !MuzzleField(bullet))
+                return fail("cached projectile muzzle layout not verified", obj);
+            for (size_t j = 0; j < std::size(ammo_refresh::kStats); ++j)
+                if (!ProjectileField(bullet, j)) return fail("cached projectile stat layout not verified", bullet);
+            ammo->push_back({bullet, obj});
+        }
+    }
+    return true;
+}
+bool RefreshRetainedAmmo(UObject gun, const std::vector<Retained>& ammo) {
+    UObject muzzle=0;
+    if (!ue::GetProp(gun,"MuzzleFirePoint",muzzle) || !ue::IsLive(muzzle)) return false;
+    for (const auto& kept:ammo) {
+        const UObject obj = kept.actor;
+        if (!ue::IsLive(obj)) return false;
+        int32_t muzzle_offset = 0;
+        if (!MuzzleField(obj, &muzzle_offset) || !mem::Write(obj + muzzle_offset, muzzle)) return false;
+        if (kept.round) {
+            if (!ue::IsLive(kept.round)) return false;
+            ammo_refresh::Values weapon{}, cartridge{}, result{};
+            for (size_t i = 0; i < weapon.size(); ++i) {
+                const auto& stat = ammo_refresh::kStats[i];
+                if (!ue::GetProp(kept.round, stat.gun, weapon[i]) ||
+                    !ue::GetProp(kept.round, stat.ammo, cartridge[i])) return false;
+            }
+            if (!ammo_refresh::ProjectileValues(weapon, cartridge, &result)) return false;
+            for (size_t i = 0; i < result.size(); ++i) {
+                int32_t dest = 0;
+                if (!ProjectileField(obj, i, &dest)) return false;
+                if (i == ammo_refresh::kPenetration) {
+                    if (!mem::Write(obj + dest, static_cast<int32_t>(result[i]))) return false;
+                } else if (!mem::Write(obj + dest, result[i])) return false;
+            }
+            continue;
+        }
+        for (const auto& stat:ammo_refresh::kStats) {
+            const char* source=std::strcmp(stat.gun,"GunMOA")==0?"GunAccuracy":stat.gun;
+            double value=0;int32_t dest=0;
+            if (!DoubleField(gun,source) || !DoubleField(obj,stat.gun,&dest) || !ue::GetProp(gun,source,value) ||
+                !std::isfinite(value) || !mem::Write(obj+dest,value)) return false;
+        }
+    }
+    return true;
+}
+}  // namespace
+
 bool ApplyLoadout(UObject player, UObject gun, const std::vector<SavedPart>& parts, std::string* why) {
     auto fail = [&](const char* w) {
         if (why) *why = w;
@@ -402,76 +572,115 @@ bool ApplyLoadout(UObject player, UObject gun, const std::vector<SavedPart>& par
     UObject gi = GameInstance(player);
     FName row;
     if (!gi || !gun || !WeaponRow(gun, &row)) return fail("no game instance or weapon row");
-    // Tube-fed guns empty and refill their magazine when they rebuild
-    // (ClearMagazine + Init_MagazineCreate): not for them.
-    uint8_t mag_type = 0;
-    if (ue::GetProp(gun, "MagazineType", mag_type) && mag_type == 1) return fail("tube magazine gun");
-    // A magazine the game is moving between hand and gun (MagazineObj_Temp)
-    // would be put in the gun by the rebuild (Gun_MagazineLoad).
-    UObject temp_mag = 0;
-    if (ue::GetProp(gun, "MagazineObj_Temp", temp_mag) && temp_mag) return fail("a magazine is on its way into the gun");
-    const int32_t o_meta = ue::PropertyOffset(gun, "WeaponCustomMetaData");
-    UObject meta_struct = Struct("UserDefinedStruct /Game/Weapons/Custom/Data/Str_WeaponCustomMetaData.Str_WeaponCustomMetaData");
-    const int32_t o_list = meta_struct ? Member(meta_struct, "WeaponCustomPartsAndPath") : -1;
-    if (o_meta < 0 || o_list < 0) return fail("gun metadata layout not found");
-    UObject wm = 0;
-    if (!ue::GetProp(player, "WeaponManager", wm) || !wm) return fail("no weapon manager");
-    // The weapon manager's RefreshWeaponSpec rebuilds every gun the player
-    // carries (primary, secondary, and the melee slot when it holds a gun),
-    // not only this one. A tube-fed gun empties its tube when it is rebuilt
-    // (ClearMagazine, then Init_MagazineCreate with LoadNum 0), and a gun
-    // with a magazine on its way in would take it. With such a gun carried,
-    // only this gun is rebuilt.
-    std::string other;
-    for (const char* slot : {"Obj_PrimaryWeapon", "Obj_SecondaryWeapon", "Obj_MeleeWeapon"}) {
-        UObject w = 0;
-        if (!ue::GetProp(wm, slot, w) || !w || w == gun || !ue::IsLive(w)) continue;
-        uint8_t mt = 0;
-        UObject tm = 0;
-        if ((ue::GetProp(w, "MagazineType", mt) && mt == 1) || (ue::GetProp(w, "MagazineObj_Temp", tm) && tm))
-            other = ue::GetName(w);
+    const std::string type=ue::GetName(ue::GetClass(gun));
+    if (type!="BP_HG_C" && type!="BP_AR_C" && type!="BP_SG_C" && type!="BP_SR_C")
+        return fail("unverified weapon class");
+    std::vector<SavedPart> previous;
+    if (!Saved(gi,row,&previous) || previous.empty()) return fail("original attachment list unavailable");
+    // All four base Blueprints reserve root slots 0/1 for ammo/magazines.
+    if (!tube_refresh::SameAmmo(previous,parts)) return fail("ammo or magazine slot changed");
+    uint8_t mag_type=0;
+    if (!ue::GetProp(gun,"MagazineType",mag_type)) return fail("unknown magazine type");
+    if (!ammo_refresh::MagazineLayoutValid(type, mag_type)) return fail("unverified magazine type");
+    TubeEngine tube_engine{gun};
+    if (!tube_refresh::Ready(tube_engine))
+        return fail("weapon refresh entry points not verified");
+    UObject temp_mag=0;
+    if (!ue::GetProp(gun,"MagazineObj_Temp",temp_mag) || temp_mag)
+        return fail("a magazine is on its way into the gun");
+    ue::Call motion(gun,"GetGunMotionInfo");
+    if (!motion.Invoke() || motion.Get<bool>("IsReloading") || motion.Get<bool>("IsBoltCharging") ||
+        motion.Get<bool>("IsFiring")) return fail("finish the weapon action before changing attachments");
+    ue::Call ammo_info(gun,"GetCurrentAmmoInfo");
+    if (!ammo_info.Valid()) return fail("ammo state unavailable");
+    std::vector<Retained> ammo;
+    std::string ammo_error;
+    if (!RetainedAmmo(gun,&ammo,&ammo_error)) return fail(ammo_error.c_str());
+    UObject old_mag=0,old_chamber=0;
+    ue::GetProp(gun,"MagazineObj",old_mag);ue::GetProp(gun,"AmmoObj_InChamber",old_chamber);
+    const GunState before=Gun(gun).State();
+    auto ammo_unchanged=[&] {
+        UObject mag=0,chamber=0;
+        if (!ue::GetProp(gun,"MagazineObj",mag) || !ue::GetProp(gun,"AmmoObj_InChamber",chamber)) return false;
+        const GunState after=Gun(gun).State();
+        return mag==old_mag && chamber==old_chamber && after.chamber==before.chamber &&
+               after.magazine==before.magazine && after.capacity==before.capacity && after.jammed==before.jammed;
+    };
+    // Refresh only the edited weapon. The manager-wide refresh also rebuilt
+    // carried guns, invalidating their muzzle components unnecessarily.
+    // Use only the verified cosmetic steps. The ordinary refresh clears
+    // internally fed SG/SR magazines and can initialize a replacement.
+    auto refresh=[&] {
+        const bool done=tube_refresh::Run(tube_engine);
+        return done && RefreshRetainedAmmo(gun,ammo) && ammo_unchanged();
+    };
+    const int32_t o_meta=ue::PropertyOffset(gun,"WeaponCustomMetaData");
+    const UObject meta_struct=Struct("UserDefinedStruct /Game/Weapons/Custom/Data/Str_WeaponCustomMetaData.Str_WeaponCustomMetaData");
+    const int32_t o_list=meta_struct?Member(meta_struct,"WeaponCustomPartsAndPath"):-1;
+    const int32_t o_row=meta_struct?Member(meta_struct,"WeaponRowName"):-1;
+    if (o_meta<0 || o_list<0 || o_row<0) return fail("gun metadata layout not found");
+    ue::Call metadata(gi,"GetSaveData_WeaponCustomMetaData");
+    int32_t size=0;
+    uint8_t* raw=metadata.Raw("WeaponCustomMetaData",&size);
+    struct Arr {uintptr_t data;int32_t num,max;} fresh{},old{};
+    const uintptr_t destination=gun+o_meta+o_list;
+    if (!metadata.Valid() || !raw || size<o_list+16 || size<o_row+8 ||
+        !mem::Read(destination,old) || !mem::IsWritable(destination,sizeof(old)))
+        return fail("metadata parameter or writable gun list missing");
+    if (old.num<0 || old.num>64 || old.num>old.max || (old.num && !old.data))
+        return fail("original metadata looks wrong");
+    metadata.Set("WeaponRowName",row);
+    bool swapped=false;
+    std::string error;
+    const auto result=transaction::Run(
+        [&] {return WriteSaved(gi,row,parts);},
+        [&] {
+            if (!metadata.Invoke() || !metadata.Get<bool>("Success")) {
+                error="the game built no metadata from the saved list";return false;
+            }
+            FName meta_row;
+            std::memcpy(&meta_row,raw+o_row,sizeof(meta_row));
+            std::memcpy(&fresh,raw+o_list,sizeof(fresh));
+            if (!SameName(meta_row,row) || fresh.num<0 || fresh.num>64 || fresh.num>fresh.max ||
+                (fresh.num && !fresh.data)) {error="metadata from the game looks wrong";return false;}
+            if (!mem::Write(destination,fresh)) {error="could not update the gun metadata";return false;}
+            swapped=true;
+            // Transfer the game-allocated list, retaining the old one for a
+            // possible rollback. Neither list is freed with the host allocator.
+            std::memcpy(raw+o_list,&old,sizeof(old));
+            if (!refresh()) {error="weapon refresh or ammo preservation check failed";return false;}
+            // Verify the actual rebuilt attachment actors before accepting
+            // the save. A failed/missing part must restore the previous list.
+            const auto installed=InstalledParts(gun);
+            for (const auto& p:parts) {
+                if (p.path.size()!=1 || p.path[0]<=1) continue;
+                const std::string want=NameOf(p.row);
+                bool present=false,empty=true;
+                for (const auto& actual:installed) if (actual.path==p.path) {
+                    empty=false;
+                    if (actual.row==want) present=true;
+                }
+                if (want=="Empty" ? !empty : !present) {error="rebuilt attachment did not match its saved slot";return false;}
+            }
+            return true;
+        },
+        [&] {
+            if (!swapped) return true;
+            if (!mem::Write(destination,old)) return false;
+            std::memcpy(raw+o_list,&fresh,sizeof(fresh));
+            return refresh();
+        },
+        [&] {return WriteSaved(gi,row,previous);});
+    if (result!=transaction::Result::kApplied) {
+        if (result==transaction::Result::kSaveRefused) return fail("the game did not take the new list");
+        error+=result==transaction::Result::kRestored ? "; previous loadout restored" : "; RESTORATION INCOMPLETE";
+        log::Warn("weapon custom: %s: %s",type.c_str(),error.c_str());
+        return fail(error.c_str());
     }
-
-    if (!WriteSaved(gi, row, parts)) return fail("the game did not take the new list");
-
-    ue::Call m(gi, "GetSaveData_WeaponCustomMetaData");
-    if (!m.Valid()) return fail("no GetSaveData_WeaponCustomMetaData");
-    m.Set("WeaponRowName", row);
-    if (!m.Invoke() || !m.Get<bool>("Success")) return fail("the game built no metadata from the saved list");
-    int32_t size = 0;
-    uint8_t* raw = m.Raw("WeaponCustomMetaData", &size);
-    struct Arr {
-        uintptr_t data;
-        int32_t num, max;
-    } fresh{}, old{};
-    if (!raw || size < o_list + 16) return fail("metadata parameter missing");
-    FName meta_row;
-    std::memcpy(&meta_row, raw, sizeof(FName));
-    std::memcpy(&fresh, raw + o_list, sizeof(Arr));
-    if (!SameName(meta_row, row) || fresh.num < 0 || fresh.num > 64 || fresh.num > fresh.max ||
-        (fresh.num > 0 && !fresh.data))
-        return fail("metadata from the game looks wrong");
-    // Hand the game-allocated list to the gun; its old list stays with us
-    // (a few hundred bytes, never freed: freeing needs the engine allocator).
-    if (!mem::Read(gun + o_meta + o_list, old) || !mem::Write(gun + o_meta + o_list, fresh))
-        return fail("could not write the gun's metadata");
-    std::memcpy(raw + o_list, &old, sizeof(Arr));
-
-    if (other.empty()) {
-        ue::Call r(wm, "RefreshWeaponSpec");
-        if (!r.Invoke()) return fail("RefreshWeaponSpec did not run");
-    } else {
-        // This gun alone (BPI_Gun RefreshGunSpec, what the manager calls on
-        // each gun), then what the player does on the manager's refresh
-        // broadcast (HUD light mode, barrel heat), run directly.
-        ue::Call r(gun, "RefreshGunSpec");
-        if (!r.Invoke()) return fail("RefreshGunSpec did not run");
-        ue::Call hud(player, "BndEvt__BP_Player_WeaponManager_K2Node_ComponentBoundEvent_10_RefreshWeapon__DelegateSignature");
-        if (hud.Valid()) hud.Invoke();
-        log::Info("weapon custom: only %s rebuilt; %s is carried too and rebuilding it would empty its tube or "
-                  "load a magazine that is on its way in",
-                  ue::GetName(gun).c_str(), other.c_str());
-    }
+    ue::Call hud(player,"BndEvt__BP_Player_WeaponManager_K2Node_ComponentBoundEvent_10_RefreshWeapon__DelegateSignature");
+    if (hud.Valid()) hud.Invoke();
+    log::Info("weapon custom: %s attachments refreshed; kept magazine %d and chamber %d rounds; other guns untouched",
+              type.c_str(),before.magazine,before.chamber);
 
     // The hub's weapon racks show the guns with their parts (the menu
     // refreshes them too).

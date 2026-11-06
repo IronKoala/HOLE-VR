@@ -32,10 +32,15 @@
 #include "ue/names.h"
 #include "vr/hands.h"
 #include "vr/workbench.h"
+#include "vr/workbench_carry.h"
 #include "vr/drinks.h"
 #include "vr/input.h"
 #include "vr/interact/grip_points.h"
 #include "vr/interact/holster.h"
+#include "vr/interact/holster_visual.h"
+#include "vr/interact/holster_feedback.h"
+#include "vr/interact/holster_audio.h"
+#include "vr/interact/holster_model.h"
 #include "vr/interact/rifle_carry.h"
 #include "vr/interact/slide.h"
 #include "vr/interact/touch.h"
@@ -367,7 +372,21 @@ bool g_eye_valid[2] = {false, false};
 hands::EditButtons g_edit_buttons;
 std::atomic<int> g_editor_hand{-1};
 double g_clock = 0.0;
+uint64_t g_controls_frame = 0;
 double g_dt = 0.0;
+XrTime g_last_tracking_time = 0;
+double g_last_tracking_ms = -1;
+
+void InvalidateHands() {
+    std::lock_guard<std::mutex> lock(g_hands_mutex);
+    for (int i = 0; i < 2; ++i) {
+        g_hands[i].valid = false;
+        g_eye_valid[i] = false;
+        g_fingers[i] = {};
+    }
+    g_head_valid = false;
+    g_edit_buttons = {};
+}
 
 bool ToWorld(const XrPosef& p, hands::Pose* out) {
     return stereo::TrackingToWorld(p, &out->location, &out->rotation);
@@ -2782,64 +2801,60 @@ void CameraHeightView(UObject player, bool crouched, bool known) {
     stereo::SetViewRaiseCm(raise);
 }
 
-// Body calibration (VR tab: Calibrate body): after the menu closes, 2 s to
-// stand up straight, then the highest head height over 2 s is your standing
-// height. Saved as standing_height_cm, so real crouch knows it from the start.
-struct HeightMeasure {
-    std::atomic<bool> requested{false};
-    double start = -1;
-    double best = 0;
-    double applied_cm = -1;
-} g_height;
+struct PhysicalSettings {
+    bool initialized = false;
+    bool real = false, seated = false, floor = false, crouch = false, jump = false;
+    double standing_cm = 0, crouch_drop_cm = 35;
+} g_physical_settings;
 
-void HeightCalibration(double head_m) {
-    if (g_height.requested.exchange(false)) {
-        g_height.start = g_clock;
-        g_height.best = 0;
-        log::Info("controls: height measure: stand up straight and look ahead");
+void ApplyPhysicalSettings() {
+    PhysicalSettings next;
+    next.initialized = true;
+    next.real = g_set.real_height;
+    next.seated = g_set.seated;
+    next.floor = xr::StandingSpace();
+    // LOCAL space's Y is an arbitrary origin, not a floor measurement. Keep
+    // stick crouch available, but never compare LOCAL Y to a stored floor height.
+    next.crouch = g_set.physical_crouch && next.floor;
+    next.jump = g_set.physical_jump && next.floor;
+    next.crouch_drop_cm = std::isfinite(g_set.physical_crouch_cm)
+        ? std::clamp(g_set.physical_crouch_cm, 15.0, 90.0) : 35.0;
+    if (next.floor && std::isfinite(g_set.standing_height_cm) &&
+        g_set.standing_height_cm >= 80 && g_set.standing_height_cm <= 230)
+        next.standing_cm = g_set.standing_height_cm;
+
+    const auto& old = g_physical_settings;
+    const bool reference_changed = !old.initialized || old.standing_cm != next.standing_cm;
+    const bool mode_changed = !old.initialized || old.real != next.real || old.seated != next.seated ||
+        old.floor != next.floor || old.crouch != next.crouch || old.jump != next.jump ||
+        old.crouch_drop_cm != next.crouch_drop_cm;
+    if (reference_changed) {
+        // SetStanding(0) intentionally ignores invalid measurements. Replacing
+        // the detector is required to forget a quarantined/untrusted reference.
+        g_phys = comfort::PhysicalBody{};
+        if (next.standing_cm > 0) g_phys.SetStanding(next.standing_cm / 100.0);
+    } else if (mode_changed) {
+        // Seated mode skips Update entirely. Its last head sample/velocity must
+        // not become a jump or crouch when physical controls resume later.
+        g_phys.Reset();
     }
-    if (g_height.start < 0) return;
-    const double t = g_clock - g_height.start;
-    if (t < 2.0) return;
-    if (g_height.best == 0) {
-        input::Haptic(input::kLeft, 0.3f, 0.08f);
-        input::Haptic(input::kRight, 0.3f, 0.08f);
-    }
-    g_height.best = std::fmax(g_height.best, head_m);
-    if (t < 4.0) return;
-    g_height.start = -1;
-    const double cm = std::round(g_height.best * 100.0);
-    if (cm < 100 || cm > 230) {
-        log::Warn("controls: height measure gave %.0f cm, which can't be right; not kept", cm);
-        return;
-    }
-    g_phys.SetStanding(cm / 100.0);
-    g_height.applied_cm = cm;
-    g_set.standing_height_cm = cm;
-    char v[32];
-    std::snprintf(v, sizeof(v), "%.0f", cm);
-    config::Set("standing_height_cm", v);
-    input::Haptic(input::kLeft, 0.6f, 0.15f);
-    input::Haptic(input::kRight, 0.6f, 0.15f);
-    log::Info("controls: height measured: your eyes are %.0f cm above the floor standing (real crouch uses this)",
-              cm);
+    g_phys.Configure(next.crouch, next.crouch_drop_cm, next.jump);
+    if (reference_changed || mode_changed)
+        log::Info("controls: physical posture reset (floor %s, standing %.1f cm, crouch %s, jump %s)",
+                  next.floor ? "known" : "unknown", next.standing_cm,
+                  next.crouch ? "on" : "off", next.jump ? "on" : "off");
+    g_physical_settings = next;
 }
 
 void PhysicalCrouchAndJump(UObject player) {
+    ApplyPhysicalSettings();
     bool known = false;
     const bool crouched = GameCrouched(player, &known);
     CameraHeightView(player, crouched, known);
-    g_phys.Configure(g_set.physical_crouch, g_set.physical_crouch_cm, g_set.physical_jump);
-    if (g_set.standing_height_cm >= 100 && g_set.standing_height_cm != g_height.applied_cm) {
-        g_phys.SetStanding(g_set.standing_height_cm / 100.0);
-        g_height.applied_cm = g_set.standing_height_cm;
-        log::Info("controls: standing height %.0f cm (measured earlier)", g_set.standing_height_cm);
-    }
+    if (!g_physical_settings.crouch && !g_physical_settings.jump) return;
     xr::EyeView v[2];
     if (!xr::LatestViews(v)) return;
     const double head_m = (v[0].pose.position.y + v[1].pose.position.y) * 0.5;
-    HeightCalibration(head_m);
-    if (!g_set.physical_crouch && !g_set.physical_jump) return;
     const comfort::BodyEvent e = g_phys.Update(head_m, g_dt);
     using E = comfort::BodyEvent;
     if (e == E::kCrouch || e == E::kStand) {
@@ -3508,6 +3523,43 @@ void SprintControl(UObject player, const input::HandInput& l) {
     }
 }
 
+// Finish already-sent input pulses even when a modal state skips new actions.
+// On entry to a menu, calibration or tracking loss they end immediately;
+// ordinary gameplay keeps the existing short press duration.
+void FinishActionPulses(UObject player, bool immediate) {
+    if (GA.jump_release_at > 0 && (immediate || g_clock >= GA.jump_release_at)) {
+        FireEvent(player, GA.jump_up);
+        GA.jump_release_at = -1;
+    }
+    if (GA.crouch_release_at > 0 && (immediate || g_clock >= GA.crouch_release_at)) {
+        FireEvent(player, GA.crouch_up);
+        GA.crouch_release_at = -1;
+    }
+    if (GA.melee_release_at > 0 && (immediate || g_clock >= GA.melee_release_at)) {
+        ue::Call c(player, "PlayerInput_MeleeAttack");
+        c.Set("Press Released", true);
+        c.Invoke();
+        GA.melee_release_at = -1;
+    }
+}
+
+void ReleaseModalActions(UObject player, const char* why) {
+    FinishActionPulses(player, true);
+    if (GA.sprinting) StopSprint(player, why);
+    if (GA.light_down) {
+        ue::Call c(player, "PlayerInput_SwitchLight");
+        c.Set("IsPressed", false);
+        c.Invoke();
+        GA.light_down = false;
+    }
+    // A Y press belonging to the old gameplay state cannot become a weapon
+    // switch when its release arrives after cancellation or menu dismissal.
+    GA.y_down_at = -1;
+}
+
+void BeginKick(UObject player);
+void ConfirmKick(UObject player);
+
 void GameActions(UObject player, const input::Snapshot& s) {
     if (!player) return;
     LabTraceTick();
@@ -3518,16 +3570,11 @@ void GameActions(UObject player, const input::Snapshot& s) {
         g_editor_y_until = g_clock + 1.1;   // the editor toggles on a 1 s hold of Y
         log::Info("controls: opening/closing the grip editor (asked for from the VR tab)");
     }
-    if (menu_open || hands::EditorHand() >= 0) {
-        if (GA.sprinting) StopSprint(player, menu_open ? "menu" : "grip editor");
-        if (GA.light_down) {
-            ue::Call c(player, "PlayerInput_SwitchLight");
-            c.Set("IsPressed", false);
-            c.Invoke();
-            GA.light_down = false;
-        }
+    if (menu_open || hands::EditorHand() >= 0 || body::CalibrationActive()) {
+        ReleaseModalActions(player, menu_open ? "menu" : "body setup/editor");
         return;
     }
+    FinishActionPulses(player, false);
     PhysicalCrouchAndJump(player);
     PhysicalButtons(player);
     // Left trigger: the weapon light when the left hand is right next to the
@@ -3598,8 +3645,6 @@ void GameActions(UObject player, const input::Snapshot& s) {
         }
         GA.y_down_at = -1;
     }
-    if (GA.jump_release_at > 0 && g_clock >= GA.jump_release_at) { FireEvent(player, GA.jump_up); GA.jump_release_at = -1; }
-    if (GA.crouch_release_at > 0 && g_clock >= GA.crouch_release_at) { FireEvent(player, GA.crouch_up); GA.crouch_release_at = -1; }
     StickCrouchCheck(player);
 
     // Left stick click: sprint on/off; it ends by itself when you stop.
@@ -3629,9 +3674,11 @@ void GameActions(UObject player, const input::Snapshot& s) {
     // Right stick click: kick (the game's melee). On a rifle it is the fire
     // selector instead (FireSelector).
     if (r.stick_click.pressed && !GunIsRifle(player) && g_clock >= GA.melee_ready_at) {
+        BeginKick(player);
         ue::Call c(player, "PlayerInput_MeleeAttack");
         c.Set("Press Released", false);
         c.Invoke();
+        ConfirmKick(player);
         GA.melee_release_at = g_clock + 0.1;
         GA.melee_ready_at = g_clock + 0.7;
         input::Haptic(input::kRight, 0.6f, 0.05f);
@@ -3643,12 +3690,6 @@ void GameActions(UObject player, const input::Snapshot& s) {
                 log::Info("controls: melee: game camera %.0f cm above the feet, %.0f cm from the middle", rel, side);
             LabTraceFor(2.0);
         }
-    }
-    if (GA.melee_release_at > 0 && g_clock >= GA.melee_release_at) {
-        ue::Call c(player, "PlayerInput_MeleeAttack");
-        c.Set("Press Released", true);
-        c.Invoke();
-        GA.melee_release_at = -1;
     }
 }
 
@@ -3738,6 +3779,22 @@ void ResolveHandOwnership(bool actions_allowed) {
     for (int h = 0; h < 2; ++h) g_interaction[h] = next[h];
 }
 
+interact::HolsterVisual g_holster_visual;
+interact::HolsterFeedback g_holster_feedback;
+hands::HandGrab g_holster_reach;
+UObject g_holster_owner = 0;
+void UpdateHolsterVisual(UObject player, const hands::HandState& rh);
+void DrawHolsterModel(UObject player);
+void ClearHolsterVisual() {
+    g_holster_visual.Reset();
+    g_holster_feedback.Reset();
+    holster_audio::Silence();
+    g_holster_reach = {};
+    holster_model::Hide();
+    std::lock_guard<std::mutex> lock(g_hands_mutex);
+    if (g_grab[hands::kRight].holster_preview) g_grab[hands::kRight] = {};
+}
+
 void PublishGrabs(game::Gun& gun, const hands::HandState& rh, const hands::HandState& lh) {
     hands::HandGrab g[2];
     if (gun.Valid() && rh.valid && W.in_hand) {
@@ -3762,6 +3819,9 @@ void PublishGrabs(game::Gun& gun, const hands::HandState& rh, const hands::HandS
                                    g_rifle_frame_world};
         g[hands::kRight].point = hands::kPointChargingHandle;
     }
+    // An actual grab, including the new right-hand charging handle, wins.
+    if (g[hands::kRight].kind == hands::GrabKind::kNone && rh.valid && !ControlsHoldsGrip(hands::kRight))
+        g[hands::kRight] = g_holster_reach;
     if (lh.valid) {
         if (LeftOnSlide()) {
             g[hands::kLeft].kind = hands::GrabKind::kSlideGrab;
@@ -3781,11 +3841,14 @@ void PublishGrabs(game::Gun& gun, const hands::HandState& rh, const hands::HandS
             g[hands::kLeft].object = g_rc.rifle;
             g[hands::kLeft].target = {g_rc.support_world, g_rc.frame_world};
             g[hands::kLeft].point = g_rc.point;
-        } else if (W.two_hand && W.have_support_point) {
+        } else if (gun.Valid() && W.two_hand && W.have_support_point && W.have_pose) {
             g[hands::kLeft].kind = hands::GrabKind::kSupportGrip;
             g[hands::kLeft].object = gun.Object();
-            g[hands::kLeft].target = lh.grip;
-            g[hands::kLeft].target.location = W.support_point;
+            // A support target is a rifle frame, even while the right pose
+            // is temporarily unavailable. Publishing the left controller's
+            // rotation here made ObjectFrame change coordinate systems when
+            // its normal right-grip override disappeared for one frame.
+            g[hands::kLeft].target = {W.support_point, W.frame_rot};
             g[hands::kLeft].point = W.support_id;
         }
     }
@@ -3877,62 +3940,208 @@ void ApplyCameraShakeSetting(UObject player) {
     }
 }
 
-// Kick aim (owner 2026-11-03: kicks "horribly unreliable" at landing where
-// aimed). The game's KickTrace sweeps a sphere from the foot toward the
-// actor location plus a reach turned by the CONTROL rotation, which in VR is
-// only the stick-turn yaw: the kick went where the character faced, not
-// where the player looks. Just for the trace, the control rotation takes the
-// headset's yaw and pitch, and is put back right after, inside the same game
-// call, so the camera and view never see it.
+// BP_Player_C::KickTrace (dump verified 2026-11-04) reads Mesh.thigh_l and
+// sweeps a 25 cm sphere 160 cm along Pitch(30) then control rotation. Keep
+// its complete stun/damage/physics/destructible/audio handling. Only replace
+// that one native socket result and temporarily supply a compensated control
+// rotation. Side and aim are latched at the press, shared with body posing.
 struct KickAim {
+    UObject player = 0;
+    kick::Plan plan;
+    uint64_t next_serial = 0;
     UObject controller = 0;
     FRotator saved{};
+    FVector origin;
+    bool posed_origin = false;
     bool active = false;
-    int logs = 0;
+    bool hook_ready = false;
+    bool origin_ready = false;
+    ue::FName thigh[2];
+    bool names_ready = false;
 } g_kick_aim;
+struct KickHips {
+    UObject player = 0;
+    FVector hip[2];
+    uint64_t frame = 0;
+    double time = -1;
+} g_kick_hips;
+// Native execs also run on animation workers. Only the trace's calling thread
+// may consume this scope; unrelated threads always receive the original result.
+thread_local kick::OriginOverride t_kick_origin;
+ue::process_event::NativeFn g_original_socket_location = nullptr;
+
+bool FiniteKickPoint(const FVector& p) {
+    return std::isfinite(p.X) && std::isfinite(p.Y) && std::isfinite(p.Z);
+}
+bool FreshKickHips(UObject player) {
+    return player && g_kick_hips.player == player && g_controls_frame >= g_kick_hips.frame &&
+           g_controls_frame-g_kick_hips.frame <= 1 && g_clock >= g_kick_hips.time &&
+           g_clock-g_kick_hips.time <= 0.25;
+}
+double KickBlend(UObject player) {
+    static UObject checked_class = 0;
+    static int32_t offset = -1;
+    const UObject cls = ue::GetClass(player);
+    if (cls != checked_class) {
+        checked_class = cls;
+        offset = -1;
+        const auto outer = ue::reflection::FindProperty(cls, "KickAnimValue");
+        if (outer.type == "StructProperty" && outer.inner && outer.element_size > 0) {
+            for (const auto& field : ue::reflection::GetProperties(outer.inner)) {
+                if (field.name.starts_with("BlendAlpha_") && field.type == "DoubleProperty" &&
+                    field.element_size == sizeof(double) && field.offset >= 0 &&
+                    outer.element_size >= static_cast<int32_t>(sizeof(double)) &&
+                    field.offset <= outer.element_size-static_cast<int32_t>(sizeof(double))) {
+                    offset = outer.offset+field.offset;
+                    break;
+                }
+            }
+        }
+    }
+    double blend = 0;
+    if (offset < 0 || !mem::Read(player+offset, blend) || !std::isfinite(blend)) return 0;
+    return std::clamp(blend, 0.0, 1.0);
+}
+bool KickPlaying(UObject player) {
+    UObject timeline = 0;
+    if (!player || !ue::GetProp(player, "TL_Kick", timeline) || !LiveObject(timeline)) return false;
+    ue::Call playing(timeline, "IsPlaying");
+    int32_t bytes = 0;
+    return playing.Raw("ReturnValue", &bytes) && bytes == sizeof(bool) &&
+           playing.Invoke() && playing.Result<bool>();
+}
+bool KickSocket(UObject mesh, int side, FVector* out) {
+    if (!mesh || !out || !g_kick_aim.names_ready) return false;
+    ue::Call exists(mesh, "DoesSocketExist");
+    exists.Set("InSocketName", g_kick_aim.thigh[side]);
+    if (!exists.Invoke() || !exists.Result<bool>()) return false;
+    ue::Call socket(mesh, "GetSocketLocation");
+    int32_t bytes = 0;
+    if (!socket.Raw("ReturnValue", &bytes) || bytes != sizeof(FVector)) return false;
+    socket.Set("InSocketName", g_kick_aim.thigh[side]);
+    if (!socket.Invoke()) return false;
+    *out = socket.Result<FVector>();
+    return FiniteKickPoint(*out);
+}
+void ExecKickSocket(UObject context, void* stack, void* result) {
+    g_original_socket_location(context, stack, result);
+    t_kick_origin.Apply(context, static_cast<FVector*>(result));
+}
+void BeginKick(UObject player) {
+    // The native gate ignores presses until its current kick finishes. Do not
+    // change the leg midway through that action, even if our cooldown expired.
+    if (g_kick_aim.player == player && KickPlaying(player)) return;
+    g_kick_aim.player = player;
+    g_kick_aim.plan = {};
+    if (!g_kick_aim.hook_ready || !config::GetBool("kick_aim_with_head", true)) return;
+    hands::Pose head;
+    if (!hands::Head(&head)) return;
+    UObject mesh = 0;
+    FVector right_hip;
+    const bool can_right = g_kick_aim.origin_ready && FreshKickHips(player) &&
+                           config::GetBool("body_ik", true) && ue::GetProp(player, "Mesh", mesh) &&
+                           KickSocket(mesh, 1, &right_hip);
+    g_kick_aim.plan = kick::MakePlan(head.rotation, ActorRotation(player), can_right);
+    if (g_kick_aim.plan.valid) g_kick_aim.plan.serial = ++g_kick_aim.next_serial;
+}
+void ConfirmKick(UObject player) {
+    if (!KickPlaying(player)) { g_kick_aim.plan = {}; return; }
+    const auto& p = g_kick_aim.plan;
+    if (p.valid)
+        log::Info("controls: kick #%llu %s locked yaw %.1f pitch %.1f (native pitch bias removed)",
+                  static_cast<unsigned long long>(p.serial), p.side ? "right" : "left", p.aim.Yaw, p.aim.Pitch);
+}
+void RefreshKick(UObject player) {
+    if (g_kick_aim.player != player || !KickPlaying(player)) g_kick_aim.plan = {};
+    if (g_kick_hips.player != player) g_kick_hips = {};
+}
 
 bool BeforeKickTrace(UObject self, UObject, void*) {
     g_kick_aim.active = false;
-    if (!g_set.enabled || !config::GetBool("kick_aim_with_head", true)) return true;
-    hands::Pose head;
-    if (!hands::Head(&head)) return true;
+    t_kick_origin.Clear();
+    if (!g_set.enabled || self != g_kick_aim.player || !g_kick_aim.plan.valid) return true;
+    const auto& p = g_kick_aim.plan;
+    // Body visibility can change during the windup. A right hit must never
+    // survive after the drawn body falls back to the game's left-only pose.
+    if (p.side && (!FreshKickHips(self) || !config::GetBool("body_ik", true))) {
+        g_kick_aim.plan = {};
+        return true;
+    }
+    UObject mesh = 0;
+    FVector left, selected;
+    const bool have_socket = g_kick_aim.origin_ready && ue::GetProp(self, "Mesh", mesh) &&
+                             KickSocket(mesh, 0, &left) && KickSocket(mesh, p.side, &selected);
+    if (p.side && !have_socket) {
+        // Never advertise a right-leg animation when the actual native sweep
+        // cannot be moved from the left. Leave the game's original action.
+        g_kick_aim.plan = {};
+        return true;
+    }
+    g_kick_aim.posed_origin = have_socket && FreshKickHips(self);
+    if (g_kick_aim.posed_origin) selected = g_kick_hips.hip[p.side];
     ue::Call gc(self, "GetController");
     UObject controller = gc.Invoke() ? gc.Result<UObject>() : 0;
-    if (!controller) return true;
+    if (!controller) { g_kick_aim.plan = {}; return true; }
     ue::Call get(controller, "GetControlRotation");
-    if (!get.Invoke()) return true;
+    if (!get.Invoke()) { g_kick_aim.plan = {}; return true; }
     const FRotator saved = get.Result<FRotator>();
-    FRotator look = ToRotator(head.rotation);
-    look.Pitch = std::clamp(look.Pitch, -50.0, 30.0);
-    look.Roll = 0;
     ue::Call set(controller, "SetControlRotation");
-    set.Set("NewRotation", look);
-    if (!set.Invoke()) return true;
+    set.Set("NewRotation", p.control);
+    if (!set.Invoke()) { g_kick_aim.plan = {}; return true; }
     g_kick_aim.controller = controller;
     g_kick_aim.saved = saved;
     g_kick_aim.active = true;
-    if (g_kick_aim.logs++ < 6)
-        log::Info("controls: kick aimed where you look: yaw %.0f pitch %.0f (the character faces yaw %.0f, "
-                  "%.0f deg off)",
-                  look.Yaw, look.Pitch, saved.Yaw, NormalizeAxis(look.Yaw - saved.Yaw));
+    g_kick_aim.origin = selected;
+    if (have_socket) t_kick_origin.Arm(mesh, left, selected);
     return true;
 }
 
 void AfterKickTrace(UObject, UObject, void*) {
+    const bool expected = t_kick_origin.mesh != 0;
+    const bool replaced = t_kick_origin.consumed;
+    const bool mismatch = expected && !t_kick_origin.armed && !replaced;
+    t_kick_origin.Clear();
     if (!g_kick_aim.active) return;
     g_kick_aim.active = false;
     ue::Call set(g_kick_aim.controller, "SetControlRotation");
     set.Set("NewRotation", g_kick_aim.saved);
     set.Invoke();
+    if (replaced) {
+        const auto& p = g_kick_aim.plan;
+        log::Info("controls: kick trace #%llu %s origin %.1f %.1f %.1f (%s hip), yaw %.1f pitch %.1f",
+                  static_cast<unsigned long long>(p.serial), p.side ? "right" : "left",
+                  g_kick_aim.origin.X, g_kick_aim.origin.Y, g_kick_aim.origin.Z,
+                  g_kick_aim.posed_origin ? "drawn" : "native", p.aim.Yaw, p.aim.Pitch);
+    }
+    if (mismatch) {
+        log::Warn("controls: kick socket result did not match; disabling bilateral adapter for this session");
+        g_kick_aim.origin_ready = false;
+        g_kick_aim.plan = {};
+    } else if (expected && !replaced) {
+        // The Blueprint event checks StateManager.HP before calling KickTrace.
+        // Dying during windup legitimately runs no socket read at all.
+        g_kick_aim.plan = {};
+    }
 }
 
 void HookKickAim(UObject player) {
-    static bool done = false;
-    if (done || !player) return;
-    done = true;
+    if (g_kick_aim.hook_ready || !player) return;
     UObject fn = ue::FindFunction(ue::GetClass(player), "TL_Kick__KickTrace__EventFunc");
-    const bool ok = fn && ue::process_event::On(fn, &BeforeKickTrace, &AfterKickTrace);
-    log::Info("controls: kick aim %s", ok ? "follows the headset" : "hook NOT found (kicks go where the body faces)");
+    if (!fn || !ue::process_event::On(fn, &BeforeKickTrace, &AfterKickTrace)) return;
+    g_kick_aim.hook_ready = true;
+    g_kick_aim.names_ready = ue::names::Find("thigh_l", &g_kick_aim.thigh[0]) &&
+                              ue::names::Find("thigh_r", &g_kick_aim.thigh[1]);
+    UObject mesh = 0;
+    if (g_kick_aim.names_ready && ue::GetProp(player, "Mesh", mesh) && mesh) {
+        ue::Call socket(mesh, "GetSocketLocation");
+        int32_t result_bytes = 0, name_bytes = 0;
+        if (socket.Raw("ReturnValue", &result_bytes) && result_bytes == sizeof(FVector) &&
+            socket.Raw("InSocketName", &name_bytes) && name_bytes == sizeof(ue::FName))
+            g_kick_aim.origin_ready = ue::process_event::HookNative(socket.Function(), &ExecKickSocket,
+                                                                   &g_original_socket_location);
+    }
+    log::Info("controls: kick aim locked per action; native hip adapter %s",
+              g_kick_aim.origin_ready ? "ready (left/right)" : "unavailable (left fallback)");
 }
 
 void HookChargeTimeline() {
@@ -4231,6 +4440,12 @@ void UpdatePistolHolster(UObject player, const hands::HandState& rh, const input
     using E = interact::HolsterEvent;
     const E e = W.holster.Update(in);
     W.in_hand = W.holster.InHand();
+    // A bench release must also work when the hip holster overlaps the
+    // interaction zone. Both release outcomes offer the gun to the bench.
+    const bool bench_release=was_in_hand && !W.in_hand && W.have_pose && W.have_frame && rh.valid &&
+        workbench::MayPark(e) &&
+        workbench::TryPark(W.gun,W.frame_rot,W.gun_frame,rh.grip.location,GunGripOffset(),workbench::ReleaseHand::kRight);
+    if (bench_release) W.holster.Reset(interact::HolsterState::kHolstered);
     switch (e) {
         case E::kHoverEnter:
             input::Haptic(input::kRight, 0.15f, 0.015f);
@@ -4242,15 +4457,13 @@ void UpdatePistolHolster(UObject player, const hands::HandState& rh, const input
             break;
         case E::kStowed:
             input::Haptic(input::kRight, 0.6f, 0.05f);
-            if (parked) log::Info("workbench: pistol put back down where it lay");
+            if (bench_release) log::Info("workbench: pistol released into the bench");
+            else if (parked) log::Info("workbench: pistol put back down where it lay");
             else log::Info("holster: pistol holstered (let go %.1f cm from the holster spot)", W.holster.LastDistance());
             break;
         case E::kReturnStarted:
             // Over a table at the workbench it is laid down there instead.
-            if (W.have_pose && workbench::TryPark(W.gun, W.frame_rot, rh.grip.location)) {
-                W.holster.Reset(interact::HolsterState::kHolstered);
-                break;
-            }
+            if (bench_release) break;
             log::Info("holster: pistol let go %.0f cm from the holster, it goes back by itself",
                       W.holster.LastDistance());
             break;
@@ -4390,7 +4603,27 @@ bool RifleHolsterGrab(FVector* spot, double* radius) {
 // The rifle is resting in the holster: neither hand holds it and it is not
 // flying back.
 bool RifleAtRest() {
-    return g_rc.rifle && !g_rc.carried && !g_rc.returning && !(W.gun == g_rc.rifle && W.in_hand);
+    return g_rc.rifle && !g_rc.carried && !g_rc.returning && !(W.gun == g_rc.rifle && W.in_hand) &&
+           !workbench::ParkedGun(g_rc.rifle, nullptr, nullptr);
+}
+
+// The bench owns an unheld long gun just as it owns the parked pistol.
+// Repeat this after the game's body animation, which otherwise moves it
+// back onto the character even though the earlier controls tick seated it.
+bool PlaceWorkbenchRifle() {
+    if (!g_rc.rifle || !g_rc.rg.ok || g_rc.rg.of != g_rc.rifle || g_rc.carried ||
+        (W.gun == g_rc.rifle && (W.in_hand || W.edit_frozen))) return false;
+    FVector spot, loc;
+    FQuat frame, rot;
+    if (!workbench::ParkedGun(g_rc.rifle, &spot, &frame)) return false;
+    interact::ActorFromFrame(frame, spot + frame.Rotate(GunGripOffset()), g_rc.rg.frame,
+                            g_rc.rg.grip_rel, &rot, &loc);
+    DetachIfAttached(g_rc.rifle);
+    SetActorTransform(g_rc.rifle, loc, rot);
+    g_rc.last_loc = loc;
+    g_rc.last_rot = rot;
+    g_rc.have_last = true;
+    return true;
 }
 
 interact::HolsterZone g_rifle_zone;
@@ -4399,6 +4632,7 @@ int g_rifle_logged = -1;
 // Late tick: keeps the resting rifle in its holster, and a light buzz when
 // the free right hand reaches it.
 void PlaceRifleInHolster() {
+    PlaceWorkbenchRifle();
     const bool on = g_set.rifle_carry && RifleHolsterOn() && RifleAtRest() && !(W.gun == g_rc.rifle && W.edit_frozen);
     FVector loc;
     FQuat rot;
@@ -4438,7 +4672,29 @@ bool g_late_ok = false;
 
 bool IsPistolClass(UObject g) { return ue::GetName(ue::GetClass(g)).find("HG") != std::string::npos; }
 
+// BP_WeaponManager calls SetOffsetTransform(false) on the spare pistol.
+// That moves PartsOffset/BaseOffset away from the held grip space used by
+// saved hand poses: measured bore height changed 14.9 -> 7.2 cm on a switch.
+// Our seated pistol must retain that same held arrangement before measuring
+// or placing it. The verified Blueprint function changes only those parts.
+bool EnsurePistolGripSpace(UObject pistol) {
+    const auto prop = ue::reflection::FindProperty(ue::GetClass(pistol), "IsOffset");
+    if (!prop.valid() || prop.type != "BoolProperty") return false;
+    uint8_t value = 0;
+    if (!mem::Read(pistol + prop.offset, value)) return false;
+    const uint8_t mask = prop.bool_mask ? prop.bool_mask : 0xff;
+    if (value & mask) return true;
+    ue::Call set(pistol, "SetOffsetTransform");
+    set.Set("IsOffset", true);
+    if (!set.Invoke() || !mem::Read(pistol + prop.offset, value) || !(value & mask)) return false;
+    if (g_rc.pg.of == pistol) g_rc.pg = GunGeom{}; // remeasure now, not after the failure retry delay
+    if (W.gun == pistol) W.have_frame = false;
+    log::Info("holster alignment: restored the pistol's held part offset after a weapon switch");
+    return true;
+}
+
 bool EnsureGeom(UObject g, GunGeom* geo) {
+    if (g && IsPistolClass(g) && !EnsurePistolGripSpace(g)) return false;
     if (geo->of == g && geo->ok) return true;
     // A gun that could not be measured is tried again once a second.
     static double retry_at = 0;
@@ -4544,7 +4800,8 @@ void RefreshCarryGuns(UObject player) {
 // parent, socket and offset there. Every half second while the game has it
 // (not current, not touched by us).
 void LearnRifleSpot(bool rifle_current) {
-    if (!g_rc.rifle || rifle_current || g_rc.carried || g_rc.returning || g_rc.parked || g_clock < g_rc.next_learn)
+    if (!g_rc.rifle || rifle_current || g_rc.carried || g_rc.returning || g_rc.parked || g_clock < g_rc.next_learn ||
+        workbench::ParkedGun(g_rc.rifle, nullptr, nullptr))
         return;
     g_rc.next_learn = g_clock + 0.5;
     UObject root = 0, parent = 0;
@@ -4690,6 +4947,7 @@ void RifleCarryOnNewGun(game::Gun& gun) {
 // to its spot, or held at its spot (the current rifle nobody holds).
 void PlaceRifle(const hands::HandState& lh, double dt, bool rifle_current) {
     if (!g_rc.rifle || !g_rc.rg.ok) return;
+    if (PlaceWorkbenchRifle()) return;
     FVector loc;
     FQuat rot;
     if (g_rc.carried) {
@@ -4873,7 +5131,9 @@ void RifleCarry(UObject player, const hands::HandState& rh, const hands::HandSta
                     Len(rh.grip.location - g_hw.spot[kPistolSpot]) <= g_spots[kPistolSpot].radius;
             if (!in.right_has_rifle && !in.right_has_pistol) {
                 now();
-                const double d = Len(rh.grip.location - grip);
+                FVector bench_grab;
+                const bool at_bench = workbench::ParkedGun(g_rc.rifle, &bench_grab, nullptr);
+                const double d = Len(rh.grip.location - (at_bench ? bench_grab : grip));
                 in.right_on_rifle_grip = d <= g_set.rifle_grip_reach;
                 // Resting in the holster: anywhere in its (wider) zone.
                 FVector hs;
@@ -4891,6 +5151,19 @@ void RifleCarry(UObject player, const hands::HandState& rh, const hands::HandSta
         }
         const interact::CarryAction a = interact::Decide(in);
         using A = interact::CarryAction;
+        bool bench_release = false;
+        if (workbench::MayPark(a, rifle_current)) {
+            if (a == A::kRightPutsAway && W.have_pose && W.have_frame && rh.valid) {
+                bench_release = workbench::TryPark(g_rc.rifle, W.frame_rot, W.gun_frame, rh.grip.location, GunGripOffset(),
+                                                  workbench::ReleaseHand::kRight);
+            } else if (a == A::kLetGo && lh.valid) {
+                now();
+                // The left hand is at the fore-end. Test the gun's grab
+                // point against the zone, not the distant support hand.
+                bench_release = workbench::TryPark(g_rc.rifle, frame, g_rc.rg.frame,
+                    grip - frame.Rotate(GunGripOffset()), GunGripOffset(),workbench::ReleaseHand::kLeft);
+            }
+        }
         switch (a) {
             case A::kPickUp: {
                 now();
@@ -4909,6 +5182,7 @@ void RifleCarry(UObject player, const hands::HandState& rh, const hands::HandSta
                 g_rc.pick_t = 0.0;
                 g_rc.carried = true;
                 g_rc.returning = g_rc.parked = false;
+                if (workbench::ParkedGun(g_rc.rifle, nullptr, nullptr)) workbench::GunTaken();
                 input::Haptic(input::kLeft, 0.35f, 0.03f);
                 log::Info("rifle carry: left hand picked up the rifle by the handguard at (%.1f %.1f %.1f) from the "
                           "grip, %s",
@@ -4940,7 +5214,11 @@ void RifleCarry(UObject player, const hands::HandState& rh, const hands::HandSta
                 // the back) and stays the current weapon, as when the left
                 // hand lets go of it; the right hand takes it from there.
                 if (!W.have_pose) break;
-                g_rc.returning = true;
+                g_rc.returning = !bench_release;
+                // Bench placement takes precedence while P exists. Keep
+                // the normal rest state ready when the session ends,
+                // including configurations with the VR back holster off.
+                g_rc.parked = bench_release;
                 g_rc.ret_t = 0.0;
                 g_rc.ret_loc = W.gun_set_loc;
                 g_rc.ret_rot = W.actor_rot;
@@ -4950,6 +5228,10 @@ void RifleCarry(UObject player, const hands::HandState& rh, const hands::HandSta
                 W.have_support_point = false;
                 ReleaseTrigger(player);
                 input::Haptic(input::kRight, 0.2f, 0.02f);
+                if (bench_release) {
+                    log::Info("workbench: right hand released the long gun into the bench");
+                    break;
+                }
                 if (g_set.holster_toggle)
                     log::Info("rifle carry: right hand let go of the rifle (squeezed again); it goes back to its %s",
                               RifleHolsterOn() ? "holster" : "spot on the back");
@@ -4984,6 +5266,7 @@ void RifleCarry(UObject player, const hands::HandState& rh, const hands::HandSta
                 break;
             case A::kRightTakesRifle:
                 if (rifle_current) {
+                    if (workbench::ParkedGun(g_rc.rifle, nullptr, nullptr)) workbench::GunTaken();
                     W.right_let_go = false;
                     W.in_hand = true;
                     if (g_rc.carried) {
@@ -5001,12 +5284,14 @@ void RifleCarry(UObject player, const hands::HandState& rh, const hands::HandSta
                 break;
             case A::kLetGo:
                 g_rc.carried = false;
-                g_rc.returning = true;
+                g_rc.returning = !bench_release;
+                g_rc.parked = bench_release;
                 g_rc.ret_t = 0.0;
                 g_rc.ret_loc = g_rc.have_last ? g_rc.last_loc : ActorLocation(g_rc.rifle);
                 g_rc.ret_rot = g_rc.have_last ? g_rc.last_rot : ActorRotation(g_rc.rifle);
                 input::Haptic(input::kLeft, 0.2f, 0.02f);
-                log::Info("rifle carry: left hand let go; the rifle goes back on the back");
+                log::Info(bench_release ? "workbench: last hand released the long gun into the bench"
+                                       : "rifle carry: left hand let go; the rifle goes back on the back");
                 break;
             default:
                 break;
@@ -5023,29 +5308,195 @@ void RifleCarry(UObject player, const hands::HandState& rh, const hands::HandSta
     }
 }
 
+// The fitted model is expressed in the pistol MainFrame mesh's native cm.
+// Reconstruct that mesh's transform at the SAME seat used by PlaceGunInHolster
+// and PlaceSparePistol. The calibration is a hand grab point, not a mesh origin.
+bool PistolModelSeat(UObject* pistol, holster_model::Transform* mesh_seat, hands::Pose* grip) {
+    *pistol = W.is_pistol && W.gun ? W.gun : g_rc.pistol;
+    const UObject p = *pistol;
+    if (!g_set.holster_pistol || !g_spots[kPistolSpot].enabled || !g_hw.valid || !LiveObject(p)) return false;
+    if (!EnsurePistolGripSpace(p)) return false;
+    UObject main = 0, mesh = 0;
+    if (!ue::GetProp(p, "MainHandPosition", main) || !LiveObject(main) ||
+        !ue::GetProp(p, "HG_Mk3_9mm_00_MainFrame", mesh) || !LiveObject(mesh)) return false;
+    const FVector actor_loc = ActorLocation(p);
+    const FQuat actor_rot = ActorRotation(p), inv = actor_rot.Inverse();
+    const UETransform main_w = ComponentToWorld(main), mesh_w = ComponentToWorld(mesh);
+    FVector grip_rel;
+    FQuat gun_frame;
+    if (p == W.gun && W.is_pistol) {
+        if (!W.have_frame && !LearnGunFrame(p, actor_loc, actor_rot, main_w.translation)) return false;
+        gun_frame = W.gun_frame;
+        grip_rel = inv.Rotate(main_w.translation - actor_loc);
+    } else {
+        // Only the spare pistol placed by the existing carry system occupies
+        // this slot. If that system is off we must not invent a second pistol.
+        if (!g_set.rifle_carry || W.gun != g_rc.rifle || !EnsureGeom(p, &g_rc.pg)) return false;
+        gun_frame = g_rc.pg.frame;
+        grip_rel = g_rc.pg.grip_rel;
+    }
+    const auto& sp = g_spots[kPistolSpot];
+    const FQuat frame = sp.turned ? g_hw.spot_anchor_rot[0] * sp.rot
+                                 : interact::PistolHolsterFrame(g_hw.spot_anchor_rot[0], g_set.holster_cant);
+    grip->rotation = frame;
+    grip->location = g_hw.spot[0] + frame.Rotate(GunGripOffset());
+    holster_model::Transform mesh_now;
+    mesh_now.translation = mesh_w.translation;
+    mesh_now.rotation = mesh_w.rotation;
+    mesh_now.scale = mesh_w.scale;
+    *mesh_seat = holster_model::MeshAtSeat(grip->location, frame, gun_frame, grip_rel, actor_loc, actor_rot, mesh_now);
+    return true;
+}
+
+void UpdateHolsterVisual(UObject player, const hands::HandState& rh) {
+    g_holster_reach = {};
+    if (!player || !rh.valid || ui_panel::MenuOpen() || hands::EditorHand() >= 0 ||
+        body::CalibrationActive() || W.edit_frozen) {
+        ClearHolsterVisual();
+        return;
+    }
+    if (g_holster_owner != player) {
+        g_holster_owner = player;
+        g_holster_visual.Reset();
+        g_holster_feedback.Reset();
+        holster_audio::Silence();
+    }
+    UObject pistol = 0;
+    holster_model::Transform seat;
+    hands::Pose grip;
+    if (!PistolModelSeat(&pistol, &seat, &grip)) { ClearHolsterVisual(); return; }
+    FVector parked_at;
+    FQuat parked_rot;
+    const bool parked = workbench::ParkedGun(pistol, &parked_at, &parked_rot);
+    const bool current = pistol == W.gun;
+    const bool seated = current
+        ? interact::PistolSeated(true, parked, W.holster.State(), W.holster.Blend())
+        : !parked;  // PlaceSparePistol owns this seat while the rifle is current.
+    const auto access = hands::GetInteraction(hands::kRight);
+    interact::HolsterVisualInput in;
+    in.enabled = true;
+    in.seated = seated;
+    in.tracked = rh.valid;
+    in.actions = access.AllowsControls() && !ui_panel::MenuOpen() && hands::EditorHand() < 0 && !W.edit_frozen;
+    const bool other_item = workbench::HoldsGrip(hands::kRight) || drinks::HoldsGrip(hands::kRight) ||
+        (ControlsHoldsGrip(hands::kRight) && !(W.is_pistol && W.gun == pistol && W.in_hand));
+    in.hand_free = !ControlsHoldsGrip(hands::kRight) && !other_item && g_rc.switch_to == 0;
+    in.hood_allowed = !other_item;
+    in.distance = rh.valid ? Len(rh.grip.location - g_hw.spot[kPistolSpot]) : 1e9;
+    in.radius = g_spots[kPistolSpot].radius;
+    in.dt = g_dt;
+    g_holster_visual.Update(in);
+    using Occupancy = interact::PistolOccupancy;
+    interact::HolsterFeedbackInput feedback;
+    feedback.enabled = rh.valid && !ui_panel::MenuOpen() && hands::EditorHand() < 0 && !W.edit_frozen;
+    feedback.pistol = pistol;
+    feedback.occupancy = parked ? Occupancy::kParked : seated ? Occupancy::kSeated
+        : current && W.holster.InHand() ? Occupancy::kInHand
+        : current && W.holster.State() == interact::HolsterState::kReturning ? Occupancy::kReturning
+        : Occupancy::kSettling;
+    feedback.hood_wants_open = !seated || g_holster_visual.Near();
+    feedback.hood_open = g_holster_visual.HoodOpen();
+    auto cues = g_holster_feedback.Update(feedback);
+    if (!config::GetBool("holster_model", true) || !in.hood_allowed)
+        cues &= ~(unsigned(interact::HolsterCue::kHoodOpen) | unsigned(interact::HolsterCue::kHoodClose));
+    hands::Pose head;
+    const bool have_head = hands::Head(&head);
+    holster_audio::Update(feedback.enabled && have_head && config::GetBool("holster_sounds", true),
+        g_hw.spot[kPistolSpot], head.location, head.rotation, config::GetFloat("holster_sound_volume", .8f));
+    // One game-thread dispatch; the worker plays it at the existing holster.
+    interact::DispatchHolsterCues(cues, player, g_hw.spot[kPistolSpot]);
+    for (auto cue : {interact::HolsterCue::kHoodOpen, interact::HolsterCue::kHoodClose,
+                     interact::HolsterCue::kDraw, interact::HolsterCue::kHolster})
+        if (cues & unsigned(cue)) log::Info("holster sound hook: %s", interact::HolsterCueName(cue));
+    if (g_holster_visual.HandBlend() > 0 && config::GetBool("holster_hand_snap", true)) {
+        g_holster_reach.kind = hands::GrabKind::kGunGrip;
+        g_holster_reach.object = pistol;
+        g_holster_reach.target = grip;
+        g_holster_reach.holster_preview = true;
+        g_holster_reach.pose_blend = g_holster_visual.HandBlend();
+    }
+    static int last = -1;
+    const int state = (!seated ? 0 : g_holster_visual.Near() ? 1 : 2);
+    if (state != last) {
+        last = state;
+        log::Info("holster model: %s; hand snap %s; existing %s placement",
+                  state == 0 ? "empty/returning/parked, hood forced open" : state == 1 ? "seated, hand near, opening" : "seated, hand away, closing",
+                  g_holster_reach.object ? "on" : "off", interact::AnchorName(g_spots[kPistolSpot].anchor));
+    }
+}
+
+void DrawHolsterModel(UObject player) {
+    UObject pistol = 0;
+    holster_model::Transform seat;
+    hands::Pose grip;
+    if (config::GetBool("holster_model", true) && PistolModelSeat(&pistol, &seat, &grip))
+        holster_model::Show(player, seat, g_holster_visual.HoodOpen(), g_clock);
+    else holster_model::Hide();
+}
+
 void OnLateTick(UObject player, float) {
-    if (!g_set.enabled) return;
+    if (!g_set.enabled || ui_panel::MenuOpen() || hands::EditorHand() >= 0 || body::CalibrationActive()) {
+        ClearHolsterVisual();
+        return;
+    }
     ComputeHolsterWorld();
-    if (!g_late_ok) return;
+    if (!g_late_ok) { ClearHolsterVisual(); return; }
     g_late_ok = false;
-    if (!g_hw.valid || !W.gun || !player) return;
+    if (!g_hw.valid || !W.gun || !player) { ClearHolsterVisual(); return; }
     game::Gun gun(W.gun);
     if (W.uses_holster && !W.in_hand && !W.edit_frozen) PlaceGunInHolster(gun);
     PlacePouchMag(W.gun);
     if (!W.edit_frozen) PlaceSparePistol();
     PlaceRifleInHolster();
+    DrawHolsterModel(player);
 }
 
 void OnTick(UObject player, float dt) {
     g_clock += dt;
+    ++g_controls_frame;
+    RefreshKick(player);
     g_dt = dt;
     input::Snapshot s = input::Consume();
-    if (!s.valid || !g_set.enabled) {
+    const double tracking_ms = perf::NowMs();
+    if (s.valid && s.time != g_last_tracking_time) {
+        g_last_tracking_time = s.time;
+        g_last_tracking_ms = tracking_ms;
+    }
+    if (!s.valid || !g_set.enabled || g_last_tracking_ms < 0 || tracking_ms - g_last_tracking_ms > 150.0) {
+        if (body::CalibrationActive()) body::SetCalibrationTriggers(false, false, false);
+        InvalidateHands();
+        ClearHolsterVisual();
         ResolveHandOwnership(false);
         ReleaseTrigger(player);
+        ReleaseModalActions(player, "tracking unavailable");
+        teleport::Hide();
+        g_late_ok = false;
         return;
     }
     UpdateHands(s);
+    if (body::CalibrationActive()) {
+        ClearHolsterVisual();
+        // Keep raw tracked poses available to calibration, but give this pose
+        // sequence exclusive input ownership. It must not sprint, shoot, grab,
+        // crouch or turn the tracking frame while collecting measurements.
+        ResolveHandOwnership(false);
+        ReleaseTrigger(player);
+        GameActions(player, s);  // releases sprint/light through its modal path
+        teleport::Hide();
+        g_late_ok = false;
+        // Calibration exclusively owns both triggers. A release/repress in
+        // this input batch must interrupt the hold even if its final level is
+        // down. Cancel and keep-arms take precedence; A has no setup action.
+        if (s.hand[0].secondary.pressed || s.hand[1].secondary.pressed) body::CancelCalibration();
+        else if (!ui_panel::MenuOpen()) {
+            if (s.hand[input::kLeft].primary.pressed) body::SkipCalibrationArms();
+            else body::SetCalibrationTriggers(s.hand[input::kLeft].trigger_button.down,
+                s.hand[input::kRight].trigger_button.down, true,
+                s.hand[input::kLeft].trigger_button.released || s.hand[input::kRight].trigger_button.released);
+        }
+        else body::SetCalibrationTriggers(false, false, false);
+        return;
+    }
     // Observe releases even when a menu/editor skips SlideHandling this tick.
     // The slide stays frozen until gameplay resumes, but a UI-owned re-squeeze
     // cannot inherit admission from the old gameplay hold.
@@ -5084,6 +5535,7 @@ void OnTick(UObject player, float dt) {
     }
     TurnHandsWithView(Locomotion(player, s, dt));
     RoomScaleFollow(player);
+    HookKickAim(player);
     GameActions(player, s);
     ApplyCameraShakeSetting(player);
 
@@ -5126,6 +5578,8 @@ void OnTick(UObject player, float dt) {
         }
     }
     if (!gun.Valid()) {
+        g_late_ok = false;
+        ClearHolsterVisual();
         hands::HandState none;
         PublishGrabs(gun, none, none);
         return;
@@ -5133,7 +5587,6 @@ void OnTick(UObject player, float dt) {
     DropDeadMagazines();
     HookChargeTimeline();
     HookPlayerRecoil(player);
-    HookKickAim(player);
     ShotStudyTick();
     {
         // A round leaving the gun while the trigger is held = a shot (works
@@ -5279,6 +5732,7 @@ void OnTick(UObject player, float dt) {
         FireSelector(gun, s.hand[input::kRight]);
         RifleCarry(player, rh, lh, s.hand[input::kLeft], s.hand[input::kRight], dt, true);
     }
+    UpdateHolsterVisual(player, rh);
     PublishGrabs(gun, rh, lh);
     RackTrace(gun, dt);
 }
@@ -5287,6 +5741,7 @@ void OnTick(UObject player, float dt) {
 // than a new value (the pistol holster's hold/toggle mode).
 void ReloadSettings() {
     LoadSettings();
+    ApplyPhysicalSettings();
     if (W.gun)
         W.holster.Configure(g_spots[kPistolSpot].radius,
                             g_set.holster_toggle ? interact::DrawMode::kToggle : interact::DrawMode::kHold);
@@ -5302,6 +5757,27 @@ void ReloadSettings() {
 
 }  // namespace
 
+bool GetKickPlan(uintptr_t player, kick::Plan* out) {
+    if (!out || !player || player != g_kick_aim.player || !g_kick_aim.plan.valid) return false;
+    *out = g_kick_aim.plan;
+    out->blend = KickBlend(player);
+    return true;
+}
+void PublishKickHips(uintptr_t player, const FVector hips[2]) {
+    if (!player || !hips || !FiniteKickPoint(hips[0]) || !FiniteKickPoint(hips[1])) {
+        ClearKickHips(player);
+        return;
+    }
+    g_kick_hips.player = player;
+    g_kick_hips.hip[0] = hips[0];
+    g_kick_hips.hip[1] = hips[1];
+    g_kick_hips.frame = g_controls_frame;
+    g_kick_hips.time = g_clock;
+}
+void ClearKickHips(uintptr_t player) {
+    if (!player || g_kick_hips.player == player) g_kick_hips = {};
+}
+
 void RequestGripEditor() {
     g_req_grip_editor.store(true);
     log::Info("controls: grip editor asked for from the VR tab; it opens when the menu closes");
@@ -5312,14 +5788,11 @@ void RequestHolsterMove() {
     log::Info("controls: holster move asked for from the VR tab; 5 s countdown when the menu closes");
 }
 
-void RequestHeightMeasure() {
-    g_height.requested.store(true);
-    log::Info("controls: height measure asked for from the VR tab; it starts when the menu closes");
-}
 
 void Init() {
     LoadSettings();
     LoadMagSeats();
+    holster_audio::Init(config::Dir());
     config::AddChangeListener(&ReloadSettings);
     game::AddTickListener(&OnTick);
     perf::AddReportLine(&WallPushReport);
@@ -5354,7 +5827,8 @@ HandInteraction GetInteraction(Hand hand) {
         result = controls::g_interaction[hand];
     }
     // The body/editor or UI may open after controls ran in this same frame.
-    result.actions_allowed = result.actions_allowed && EditorHand() < 0 && !ui_panel::MenuOpen();
+    result.actions_allowed = result.actions_allowed && EditorHand() < 0 && !ui_panel::MenuOpen() &&
+                             !body::CalibrationActive();
     return result;
 }
 FingerInput GetFingers(Hand hand) {

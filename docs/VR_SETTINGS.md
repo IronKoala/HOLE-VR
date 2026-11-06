@@ -56,13 +56,20 @@ whatever the laser is on). A step writes the ini key(s) into `hole-vr.ini` in pl
 | Hands stop at walls | On, Off | `hand_wall_collision` |
 | Gun kick | Off, Light, Normal, Strong | `gun_recoil_kick` |
 | Monitor shows | Right eye, Left eye, Both eyes | `monitor_view` (right, left, both) |
-| Calibrate body | (action) | after the menu closes: height at 2 to 4 s (`standing_height_cm`), arms at 5 s (`body-measure.ini`) |
+| Calibrate body | (action) | height → arms forward → arms out → bent elbows → forward check; hold both triggers for 2s to record; left X keeps the current arms |
 | Edit hand grips | (action) | opens the grip editor once the menu closes; while it is open the row reads "open, click to close" and closes it |
 | Move holsters | (action) | 5 s after the menu closes (a buzz each second), each holster moves to where the hand holding its item is |
 
 Move holsters is here because the right stick click (which used to be held
 for it) is now the kick. The grip editor (left Y hold) and the arm measure
 (left stick click hold) still open on their buttons too.
+
+Right-stick kick automatically chooses the right leg when you aim right of
+the body; left/centre uses the left leg. Aim and side lock when the kick starts.
+The existing rifle fire-selector use of the button is unchanged. The VR body
+and native kick trace share the chosen side/direction, with the game's extra
+upward trace offset removed. If the bilateral adapter or body is unavailable,
+the native kick remains the fallback. No arm recalibration is required.
 
 The tab button and an empty page are added when Options opens; the rows
 are then made a few per frame (up to 3 ms of each frame, at least one row)
@@ -108,17 +115,27 @@ levels. Each frame picks one part of it.
 ## Height, real crouch and hop to jump (controls.cpp `PhysicalCrouchAndJump`)
 
 - **Character** (default): your eyes are at the character's eye height
-  whatever your real height.
+  whether you physically sit or stand. Calibration keeps this height and does
+  not guess your physical posture or overwrite saved height references.
 - **Your own**: your real head height. When the game's camera drops for a
   crouch, the mod gives that drop back (`stereo::SetViewRaiseCm`) so your eyes
-  stay where your real head is.
+  stay where your real head is. Calibrate standing upright to record the
+  standing floor-to-eye reference.
 - **Seated**: like Character, and real crouch and hop to jump are off.
+  Calibration records a separate seated reference while you sit comfortably;
+  it leaves the standing reference and character height unchanged.
 - **Real crouch**: dropping your head 35 cm (`physical_crouch_cm`) below your
   standing height makes the character crouch (the game's own Crouch). Standing
-  back up past 25 cm stands it up. Your standing height is learned in the
-  first 1.5 s and is the highest still head height under 2.3 m.
+  back up past 25 cm stands it up. A valid saved standing measurement sets the
+  baseline; otherwise it learns the highest still head height under 2.3 m,
+  starting after 1.5 s.
 - **Hop to jump** (off by default): the head rising faster than 1.1 m/s while
   above standing height presses jump. Then 1 s before it can fire again.
+
+In Character and Seated modes, the drawn pelvis follows the game's stance.
+Shoulder fitting adjusts the spine within bounds instead of forcing a squat;
+the game's actual crouches still apply. Switching height mode does not require
+repeating a successful arm calibration.
 
 ### Stick crouch check and the camera hold (controls.cpp)
 
@@ -179,12 +196,47 @@ right hand. Putting the gun in the left hand is a later change.
 
 ## Body calibration
 
-Calibrate body on the VR tab. After the menu closes, stand straight with your
-arms straight out to the sides. At 2 s both controllers buzz and your eye
-height is measured for 2 s (the highest point), then saved as
-`standing_height_cm` (a strong buzz). At 5 s the body measures your arms as
-before (left stick click 2 s still works too). Real crouch uses the standing
-height from the start of every run instead of learning it.
+Put down held items and select **Calibrate body** on the VR tab, then close the
+menu. Follow the five steps at a comfortable pace:
+
+1. **Height:** relax and look ahead. Stand for **Your own**, sit for **Seated**,
+   or use the usual posture for **Character**. Character keeps existing height
+   references because the tracking floor alone does not identify physical posture.
+2. **Forward:** extend arms comfortably forward, palms inward and wrists in line.
+   Choose a comfortable height; do not lock the elbows.
+3. **Out:** open the straight arms comfortably to the sides, palms down and
+   wrists in line. This opening motion helps estimate the shoulders.
+4. **Bend:** let the hands rise by bending the elbows. Keep elbows near their
+   current places and wrists in line; palms can turn naturally.
+5. **Forward check:** return to the earlier comfortable forward pose, palms inward.
+
+When comfortable, **hold both index triggers for two seconds**. Recording happens
+during that hold and tolerates natural movement. Vibration builds from 0% toward
+90%, then reaches 100% when the step is accepted. Release both triggers between
+steps. Releasing either early resets only the current recording and stops the
+vibration. A no longer confirms. The bar shows recording progress. There is no overhead reach, exact required arm
+height, prescribed bend angle or repeated raise/lower cycle. The program learns
+from the confirmed poses instead of deciding readiness from guessed joint positions.
+
+**Left X skips arm setup and keeps the current arms.** Your own/Seated can still
+record the corresponding height reference; Character or unavailable floor tracking
+keeps existing references. No uncomfortable movement should be forced. B/Y cancels.
+Tracking loss pauses the current sample and retains completed steps; release both triggers, then hold them again when ready. Recentring or
+changing height mode during setup stops the attempt without saving partial data.
+
+The fit learns the shoulder directions supported by the recorded motion. Other
+directions remain estimates. Elbow motion independently estimates forearm length;
+upper-arm length can still depend on an uncertain shoulder. These confidence levels
+are saved separately, and an uncertain fit is not labeled a measured proportion.
+The final forward sample checks repeatability rather than proving exact anatomy.
+
+One learned wrist mapping applies across poses. Free-hand elbow posture remains
+independent of wrist turning. Profile v6 preserves separate standing/seated heights,
+shoulder confidence and forearm confidence. Updating one height keeps the other;
+skipping arms keeps the previous arm fit. Older profiles remain usable and are not
+rewritten by installation. Cancelled/failed setup keeps the saved file; a successful
+replacement backs it up first. V1/v2 heights remain unclassified, never assumed standing.
+See [BODY.md](BODY.md) for validation rules and remaining tracking limitations.
 
 ## Shot study (does the game shoot from the muzzle?)
 
@@ -334,7 +386,7 @@ The fingers follow the controller's curl less the flatness.
   the character standing; calling Crouch directly`, and `... by itself N s
   after` if something else changes it.
 - `teleport: arc uses ...`, `teleport: moved N cm`, `teleport: no room ...`.
-- `controls: height measured: your eyes are N cm above the floor`.
+- `body calibration:` stage, rejection and per-arm fit-quality records.
 - `vr options: Edit hand grips clicked ...` then `controls: opening/closing the
   grip editor (asked for from the VR tab)`.
 - `vr options: Move holsters clicked ...` then the holster countdown lines.

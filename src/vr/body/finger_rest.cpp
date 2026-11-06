@@ -28,7 +28,9 @@ double PlaneDepth(const Chain& c, const Angles& a, const skel::Xf& hand, const F
 }
 
 Angles Bend(const Chain& c, double bend, const Limits& lim) {
+    if (!std::isfinite(bend)) bend = 0.0;
     if (bend >= 0.0) return Curl(c, bend, lim);
+    bend = std::max(-1.0, bend);
     Angles a;
     const double share = c.thumb ? 0.5 : 1.0;
     for (int j = 0; j < 3; ++j) a.flex[j] = -bend * lim.flex_min[j] * kDegToRad * share;
@@ -66,10 +68,11 @@ Push PushFromPlane(const Chain& c, const Limits& lim, const skel::Xf& hand, doub
         // Out along one side: to the first clear bend, else the shallowest.
         auto out_along = [&](int way) {
             double prev = from;
-            for (int n = 1;; ++n) {
-                double b = from + way * n * kStep;
-                if (b < kLo - 1e-9 || b > max_curl + 1e-9) break;
-                b = std::clamp(b, kLo, max_curl);
+            const double end = way > 0 ? max_curl : kLo;
+            for (int n = 1; way * (end - prev) > 1e-12; ++n) {
+                // Include the actual joint stop even when `from` is not on
+                // the 0.05 grid. It can be the only clear pose.
+                const double b = std::clamp(from + way * n * kStep, kLo, max_curl);
                 const double d = at(b);
                 if (d <= 0.0) {
                     p.bend = touch(b, prev);
@@ -117,6 +120,17 @@ FVector TipWorld(const Chain& c, const Angles& a, const skel::Xf& hand) {
     FVector tip;
     Fk(c, a, j, &tip);
     return skel::Apply(hand, tip);
+}
+
+Angles BlendOnPlane(const Chain& c, const Angles& current, const Angles& solved, double t,
+                   const skel::Xf& hand, const FVector& point, const FVector& normal, double radius) {
+    const Angles eased = Blend(current, solved, std::clamp(t, 0.0, 1.0));
+    const double allowed = PlaneDepth(c, solved, hand, point, normal, radius);
+    // A moving hand may have put last frame's pose inside the surface.
+    // Cosmetic easing must not undo the contact correction. If the solver
+    // cannot fully clear the plane, preserve its residual rather than add
+    // more penetration. Clear motion still receives the normal easing.
+    return PlaneDepth(c, eased, hand, point, normal, radius) <= allowed + 1e-6 ? eased : solved;
 }
 
 void DragTip(const Chain& c, const Limits& lim, const skel::Xf& hand, double bend, const FVector& move,

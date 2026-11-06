@@ -92,13 +92,18 @@ UObject PartClass(const PartRow& part);
 // without respawning the player's weapons: writes `parts` as the weapon's
 // saved list (SetSaveData_WeaponCustomSaveData, which also saves the game),
 // gives the gun the metadata the game builds from it
-// (GetSaveData_WeaponCustomMetaData), then runs the weapon manager's
-// RefreshWeaponSpec, which has each carried gun rebuild its parts and stats
-// from its metadata (BP_GunBase_C.InitializeWeapon). Same gun actor, magazine
-// and chamber. While another carried gun would lose its load in a rebuild
-// (tube-fed, or a magazine on its way in), only this gun is rebuilt. Then
-// refreshes the hub's weapon racks like the menu. False (with *why) if the
-// game refused a step. Game thread.
+// (GetSaveData_WeaponCustomMetaData), then refreshes only this gun's parts
+// and stats. Other carried guns are never rebuilt. Same gun actor, magazine
+// and chamber. All four guns run the verified attachment/stat steps without
+// clearing magazines or chambers. This includes both SG and SR's internally
+// fed ammunition, preserving the actual round actors and order. Ammo
+// or magazine changes and an active reload/bolt/firing action are refused.
+// All retained ammo gets the new muzzle component and validated weapon stats,
+// including each unfired round's cached projectiles. Magazine/projectile
+// MuzzlePoint and round Muzzle Point are resolved by their actual names.
+// A failed rebuild/verification restores the old metadata and saved list;
+// reports restoration failure separately. On success, refreshes the HUD and
+// hub weapon racks like the menu. False (with *why) on refusal. Game thread.
 bool ApplyLoadout(UObject player, UObject gun, const std::vector<SavedPart>& parts, std::string* why);
 
 // Logs the workbench, the guns' slots and parts, the save data and what the

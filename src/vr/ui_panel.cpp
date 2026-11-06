@@ -16,6 +16,7 @@
 #include "ue/objects.h"
 #include "ue/reflection.h"
 #include "vr/dxgi_hooks.h"
+#include "vr/body/body.h"
 #include "vr/input.h"
 #include "vr/openxr.h"
 #include "vr/world_menu.h"
@@ -55,6 +56,7 @@ std::atomic<UObject> g_pc_class_ok{0};  // a controller class known to be a Play
 std::atomic<bool> g_cursor_shown{false};
 std::atomic<uint64_t> g_cursor_read_ms{0};
 std::atomic<bool> g_menu_open{false};
+std::atomic<uint64_t> g_watch_pause_until{0};
 
 // A reading older than this (loading, title screen, paused: the player isn't
 // ticking) counts as "no cursor menu". The pause menu and the other forearm
@@ -139,6 +141,17 @@ struct UiListener : xr::Listener {
         // it goes back a step, like B/Y. A half-second guard so a double
         // press doesn't open and close it.
         static DWORD s_last_menu = 0;
+        // An open-only request from the game thread. Recheck atomic modal and
+        // tracking flags here: calibration/editor/menu may start while queued.
+        const uint64_t watch_until = g_watch_pause_until.exchange(0);
+        if (watch_until && GetTickCount64() <= watch_until && !menu_active &&
+            !body::CalibrationActive() && hands::EditorHand() < 0 && in.valid &&
+            in.hand[0].grip_valid && in.hand[1].grip_valid && w && GetTickCount() - s_last_menu > 500) {
+            (void)input::PeekForMenu();
+            PostKey(w, VK_ESCAPE);
+            s_last_menu = GetTickCount();
+            log::Info("watch: raised-wrist index tap requested pause menu");
+        }
         for (int hnd = 0; hnd < 2; ++hnd) {
             bool m = in.valid && in.hand[hnd].menu.down;
             if (S.pause_button && m && !PT.menu_down[hnd] && w && GetTickCount() - s_last_menu > 500) {
@@ -202,5 +215,11 @@ void Maintain() {
 // The cursor never shows for the VR pause menu, so a menu on the forearm
 // counts as open too (stops the controls firing while you press buttons).
 bool MenuOpen() { return g_menu_open.load() || world_menu::MenuUp(); }
+
+bool RequestPauseFromWatch() {
+    if (MenuOpen() || body::CalibrationActive() || hands::EditorHand() >= 0) return false;
+    g_watch_pause_until = GetTickCount64() + 200;
+    return true;
+}
 
 }  // namespace holevr::vr::ui_panel

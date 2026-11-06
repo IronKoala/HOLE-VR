@@ -193,7 +193,7 @@ FVector Mul(const FVector& a, const FVector& b) { return {a.X * b.X, a.Y * b.Y, 
 
 const char* HandName(int h) { return h == 0 ? "left" : "right"; }
 bool HandFree(int h) {
-    const hands::GrabKind k = hands::GetGrab(static_cast<hands::Hand>(h)).kind;
+    const hands::GrabKind k = hands::HeldGrabKind(hands::GetGrab(static_cast<hands::Hand>(h)));
     return k == hands::GrabKind::kNone || k == hands::GrabKind::kHolster;
 }
 

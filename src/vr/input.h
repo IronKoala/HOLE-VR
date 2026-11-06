@@ -38,6 +38,21 @@ struct Snapshot {
     HandInput hand[2];
 };
 
+// Calibration-only, actively tracked poses, all located at the SAME base
+// display time in the runtime's reference space (metres). No game prediction
+// or last-known fallback. Rendering/gameplay validity is deliberately separate.
+struct CalibrationTracking {
+    bool valid = false;       // actively tracked head AND both hands
+    bool head_valid = false;  // height remains measurable with resting/occluded hands
+    XrTime time = 0;
+    XrPosef head{{0, 0, 0, 1}, {0, 0, 0}};
+    XrPosef grip[2] = {{{0, 0, 0, 1}, {0, 0, 0}}, {{0, 0, 0, 1}, {0, 0, 0}}};
+};
+// Extra head location work runs only while capture is enabled. Switching
+// capture clears the published sample, including across disable/re-enable.
+void SetCalibrationCapture(bool enabled);
+CalibrationTracking CalibrationSample();
+
 // Call before the VR system starts (registers the OpenXR listener).
 void Init();
 
@@ -66,5 +81,8 @@ Snapshot LastConsumed();
 
 // Vibration, queued from any thread and played on the next frame.
 void Haptic(Hand hand, float amplitude, float seconds, float frequency_hz = 0.f);
+// Cancel queued pulses for this hand and stop its active runtime vibration.
+// Does not discard the other hand's requests.
+void StopHaptic(Hand hand);
 
 }  // namespace holevr::vr::input

@@ -3,10 +3,21 @@
 // tested on the host (tests/test_workbench_rules.cpp). vr/workbench.cpp acts
 // on them.
 #include <vector>
+#include <utility>
 
 #include "game/weapon_custom.h"
+#include "vr/hands.h"
 
 namespace holevr::vr::workbench::rules {
+
+// InstalledParts is authoritative after a rebuild. The old actor may still
+// have a live UObject slot while waiting for garbage collection.
+inline ue::UObject FittedActor(const std::vector<game::custom::Installed>& installed, int slot,
+                               const std::string& row) {
+    for (const auto& p:installed)
+        if (p.path.size()==1 && p.path[0]==slot && p.row==row) return p.actor;
+    return 0;
+}
 
 // Is `row` still the gun's own part in `slot`, going by the saved list (what
 // the game builds the gun from)? A part a hand took off the gun stays the
@@ -17,6 +28,47 @@ inline bool StillFitted(const std::vector<game::custom::SavedPart>& saved, int s
     for (const auto& p : saved)
         if (p.path.size() == 1 && p.path[0] == slot) return game::custom::SameName(p.row, row);
     return false;
+}
+
+// Controls resolves both candidates before either hand actually grabs.
+// Recheck the current actor and logical source slot at acquisition time.
+template<class Holds>
+bool CanTakeFittedPart(const std::vector<game::custom::Installed>& installed, int slot,
+                      const std::string& row, ue::UObject actor, const Holds& holds) {
+    if (!actor || FittedActor(installed,slot,row) != actor) return false;
+    for (const auto& held : holds)
+        if (held.active && held.from_gun && held.from_slot == slot) return false;
+    return true;
+}
+template<class Items>
+int LooseIndex(const Items& items, ue::UObject actor) {
+    if (!actor) return -1;
+    for (size_t i=0;i<items.size();++i) if (items[i].actor == actor) return static_cast<int>(i);
+    return -1;
+}
+inline bool HoldsTargetGun(ue::UObject gun, const hands::HandGrab& grab) {
+    const auto kind = hands::HeldGrabKind(grab);
+    return gun && grab.object == gun &&
+           (kind == hands::GrabKind::kGunGrip || kind == hands::GrabKind::kSupportGrip);
+}
+
+// Moving one held attachment between mounts is one saved-loadout edit:
+// fill the destination AND empty its old mount. A failed rebuild can then
+// restore both slots through the existing transaction. Ammo paths stay intact.
+inline bool SlotEdit(const std::vector<game::custom::SavedPart>& before, int target, const ue::FName& row,
+                     int source, const ue::FName& empty, std::vector<game::custom::SavedPart>* out) {
+    if (target <= 1 || target > 255 || source < -1 || source > 255 || (source >= 0 && source <= 1)) return false;
+    const bool moving = source >= 0 && source != target;
+    if (moving && (!empty.comparison_index || !StillFitted(before,source,row))) return false;
+    auto edited = before;
+    auto put = [&](int slot,const ue::FName& name) {
+        for (auto& p:edited) if (p.path.size()==1 && p.path[0]==slot) { p.row=name; return; }
+        edited.push_back({name,{static_cast<uint8_t>(slot)}});
+    };
+    put(target,row);
+    if (moving) put(source,empty);
+    *out = std::move(edited);
+    return true;
 }
 
 // What letting go of a held part does.
@@ -37,8 +89,11 @@ struct LetGoFacts {
 };
 
 inline LetGo DecideLetGo(const LetGoFacts& f) {
-    if (f.snapped >= 0 && f.have_gun)
-        return f.from_gun && f.snapped == f.from_slot ? LetGo::kPutBack : LetGo::kFit;
+    if (f.snapped >= 0 && f.have_gun) {
+        if (f.from_gun && f.snapped == f.from_slot) return LetGo::kPutBack;
+        if (f.from_gun && !f.slot_can_be_empty) return LetGo::kBackOnGun;
+        return LetGo::kFit;
+    }
     if (f.from_gun) return f.have_gun && f.slot_can_be_empty ? LetGo::kEmptySlot : LetGo::kBackOnGun;
     return LetGo::kToTable;
 }

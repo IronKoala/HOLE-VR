@@ -692,7 +692,7 @@ int HandBalls(int h, const hands::HandState& hs, Ball* out) {
 // Nothing in the hand and nothing else using it.
 bool HandFree(int h, const hands::HandState& hs) {
     if (!hs.valid || hands::EditorHand() == h) return false;
-    if (hands::GetGrab(h == 0 ? hands::kLeft : hands::kRight).kind != hands::GrabKind::kNone) return false;
+    if (hands::HeldGrabKind(hands::GetGrab(h == 0 ? hands::kLeft : hands::kRight)) != hands::GrabKind::kNone) return false;
     // The workbench (a hand at or holding an attachment) and the drink
     // machine (a hand at or holding a can) own the hand then.
     if (workbench::ClaimsGrip(h) || drinks::ClaimsGrip(h)) return false;

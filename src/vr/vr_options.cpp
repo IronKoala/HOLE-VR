@@ -311,9 +311,8 @@ void ClickRow(RowWidget& r, int step) {
     const auto& row = vr_menu::Rows()[static_cast<size_t>(r.row)];
     if (row.kind == vr_menu::RowKind::kMeasureArms) {
         body::RequestMeasure();
-        controls::RequestHeightMeasure();
-        log::Info("vr options: Calibrate body clicked; once the menu closes, stand straight with your arms out to "
-                  "the sides (height after 2 s, arms after 5 s)");
+        log::Info("vr options: guided body calibration requested; close the menu with both hands free, then follow "
+                  "height, forward, out, bend and forward-check instructions; hold both triggers 2s, release between steps; X keeps arms; B/Y cancels");
         input::Haptic(input::kLeft, 0.4f, 0.05f);
         return;
     }

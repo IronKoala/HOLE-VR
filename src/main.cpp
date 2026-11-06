@@ -25,6 +25,7 @@
 #include "vr/body/body.h"
 #include "vr/comfort.h"
 #include "vr/hole_watch.h"
+#include "vr/watch.h"
 #include "vr/controls.h"
 #include "vr/workbench.h"
 #include "vr/interact/touch.h"
@@ -184,6 +185,7 @@ DWORD WINAPI InitThread(LPVOID) {
         vr::hole_watch::InitGame();
         vr::menu_study::InitGame();
         vr::ui_panel::InitGame();
+        vr::watch::InitGame();  // after body/input/menu owners: solved wrist + visible fingertip
         vr::square_test::Init();  // after cvars: switches render features for its tests
     }
 

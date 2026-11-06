@@ -85,10 +85,12 @@ bool g_have_frame_views = false;
 
 // Recentering, in UE axes but metres (scaled by WorldToMeters on use).
 std::atomic<bool> g_recenter{true};
+std::atomic<std::uint64_t> g_origin_generation{1};
 FVector g_origin_m;
 double g_origin_yaw = 0.0;
 std::atomic<double> g_standing_eye_m{0.0};   // 0: not measured
 std::atomic<bool> g_standing_apply{false};
+std::atomic<XrTime> g_standing_clear_after{0};
 
 // Logs the first time each hook runs, so a log shows which engine paths are live.
 #define HOLEVR_FIRST_CALL(name)                                  \
@@ -490,8 +492,8 @@ void HookCalcOffset(void* self, int32_t view_index, FRotator* rotation, float en
         }
     }
 
-    const bool recentered_now = g_recenter.load();
-    if (g_recenter.exchange(false)) {
+    const bool recentered_now = g_recenter.exchange(false);
+    if (recentered_now) {
         const XrVector3f& a = views[0].pose.position;
         const XrVector3f& b = views[1].pose.position;
         g_origin_m = XrToUePosition((a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f, (a.z + b.z) * 0.5f, 1.0);
@@ -499,14 +501,30 @@ void HookCalcOffset(void* self, int32_t view_index, FRotator* rotation, float en
         g_origin_yaw = YawOf(XrToUeQuat(q.x, q.y, q.z, q.w));
         log::Info("stereo: recentered (yaw %.1f)", g_origin_yaw);
     }
-    if (recentered_now || g_standing_apply.exchange(false)) {
+    const bool standing_requested = g_standing_apply.exchange(false);
+    if (recentered_now || standing_requested) {
         const double y = g_standing_eye_m.load();
-        if (y > 0.5 && y < 2.5) {
+        if (y > 0.5 && y < 2.5 && xr::StandingSpace()) {
             const double before = g_origin_m.Z;
             g_origin_m.Z = XrToUePosition(0, static_cast<float>(y), 0, 1.0).Z;
             log::Info("stereo: standing eye height %.0f cm from your measurement (the head was %.0f cm %s it at the "
                       "recentre)", y * 100.0, std::fabs(before - g_origin_m.Z) * 100.0,
                       before >= g_origin_m.Z ? "above" : "below");
+        } else if (standing_requested) {
+            const double head_y = (static_cast<double>(views[0].pose.position.y) + views[1].pose.position.y) * 0.5;
+            // View caches can retain the last valid pose during tracking loss.
+            // A clear must wait for a new observation rather than reusing it.
+            const bool fresh = y > 0 || (views[0].base_time > g_standing_clear_after.load() &&
+                                        views[1].base_time > g_standing_clear_after.load());
+            if (fresh && std::isfinite(head_y)) {
+                const double before = g_origin_m.Z;
+                g_origin_m.Z = head_y;  // UE tracking Z equals OpenXR Y, in metres
+                if (std::fabs(before - head_y) > 1e-6) ++g_origin_generation;
+                log::Info("stereo: standing reference inactive; vertical origin reset to current head %.1f cm (XY/yaw kept)",
+                          head_y * 100.0);
+            } else {
+                g_standing_apply = true;  // retry at the next fresh valid picture
+            }
         }
     }
 
@@ -807,8 +825,19 @@ bool Install() {
     return true;
 }
 
-void Recenter() { g_recenter = true; }
+void Recenter() { ++g_origin_generation; g_recenter = true; }
+std::uint64_t OriginGeneration() { return g_origin_generation.load(); }
+double TrackingScale() {
+    std::lock_guard<std::mutex> lock(g_world_mutex);
+    return g_world.valid && g_world.world_to_meters > 0 ? g_world.world_to_meters / 100.0 : 1.0;
+}
 void SetStandingEyeHeight(double floor_to_eye_m) {
+    if (!std::isfinite(floor_to_eye_m) ||
+        (floor_to_eye_m != 0 && !(floor_to_eye_m > 0.5 && floor_to_eye_m < 2.5))) return;
+    if (floor_to_eye_m == 0) {
+        xr::EyeView views[2];
+        g_standing_clear_after = xr::LatestViews(views) ? std::max(views[0].base_time, views[1].base_time) : 0;
+    }
     g_standing_eye_m = floor_to_eye_m;
     g_standing_apply = true;
 }

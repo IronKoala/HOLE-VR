@@ -1,4 +1,4 @@
-// HOLE VR installer. A single exe with the mod's dxgi.dll embedded.
+// HOLE VR installer. A single exe with the mod and accessory defaults embedded.
 //
 // Finds HOLE through Steam, copies dxgi.dll next to HOLE-Win64-Shipping.exe,
 // backs up any other dxgi.dll that was there (ReShade and similar tools use
@@ -178,6 +178,53 @@ struct Result {
     std::wstring message;
 };
 
+bool DefaultDirectory(const std::wstring& path) {
+    if (!CreateDirectoryW(path.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) return false;
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) &&
+           !(attributes & FILE_ATTRIBUTE_REPARSE_POINT);
+}
+
+bool DefaultAsset(const std::wstring& path, int resource) {
+    // Preserve user artwork/sounds on updates. CREATE_NEW also prevents a race
+    // from overwriting a file created after the initial existence check.
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    if (attributes != INVALID_FILE_ATTRIBUTES)
+        return !(attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT));
+    HRSRC res = FindResourceW(nullptr, MAKEINTRESOURCEW(resource), RT_RCDATA);
+    HGLOBAL mem = res ? LoadResource(nullptr, res) : nullptr;
+    const void* bytes = mem ? LockResource(mem) : nullptr;
+    const DWORD size = res ? SizeofResource(nullptr, res) : 0;
+    if (!bytes || !size) return false;
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        if (GetLastError() != ERROR_FILE_EXISTS) return false;
+        const DWORD existing = GetFileAttributesW(path.c_str());
+        return existing != INVALID_FILE_ATTRIBUTES &&
+               !(existing & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT));
+    }
+    DWORD written = 0;
+    const bool ok = WriteFile(file, bytes, size, &written, nullptr) && written == size && FlushFileBuffers(file);
+    CloseHandle(file);
+    if (!ok) DeleteFileW(path.c_str()); // only the new file created above
+    return ok;
+}
+
+Result InstallAccessoryDefaults(const std::wstring& bin) {
+    for (const wchar_t* relative : {L"\\hole-vr", L"\\hole-vr\\watch", L"\\hole-vr\\sounds", L"\\hole-vr\\sounds\\holster"})
+        if (!DefaultDirectory(bin + relative)) return {false, L"Could not prepare the watch or holster data folder. The mod DLL was left unchanged."};
+    struct Asset { const wchar_t* relative; int resource; };
+    const Asset assets[] = {
+        {L"\\hole-vr\\watch\\dial.png",102}, {L"\\hole-vr\\watch\\timer-atlas.png",103},
+        {L"\\hole-vr\\sounds\\holster\\draw.wav",104}, {L"\\hole-vr\\sounds\\holster\\holster.wav",105},
+        {L"\\hole-vr\\sounds\\holster\\hood_close.wav",106}, {L"\\hole-vr\\sounds\\holster\\hood_open.wav",107}
+    };
+    for (const auto& asset : assets)
+        if (!DefaultAsset(bin + asset.relative, asset.resource))
+            return {false, L"Could not install accessory data: " + std::wstring(asset.relative) + L". The mod DLL was left unchanged."};
+    return {true,{}};
+}
+
 Result Install(const std::wstring& bin) {
     if (GameRunning()) return {false, L"HOLE is running. Close the game, then try again."};
     HRSRC res = FindResourceW(nullptr, MAKEINTRESOURCEW(kDllResource), RT_RCDATA);
@@ -185,6 +232,9 @@ Result Install(const std::wstring& bin) {
     const void* bytes = mem ? LockResource(mem) : nullptr;
     DWORD size = res ? SizeofResource(nullptr, res) : 0;
     if (!bytes || !size) return {false, L"This installer is damaged (the mod file is missing)."};
+
+    const auto accessory = InstallAccessoryDefaults(bin);
+    if (!accessory.ok) return accessory;
 
     std::wstring dll = bin + L"\\dxgi.dll";
     std::wstring note;
