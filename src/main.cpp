@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+#include "core/builtin_files.h"
 #include "core/config.h"
 #include "core/log.h"
 #include "core/memory.h"
@@ -277,6 +278,12 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
             holevr::log::Init(g_mod_dir);
             holevr::log::Info("HOLE VR %s starting", kVersion);
             holevr::log::Info("build: %s (compiled %s %s)", HOLEVR_BUILD_ID, __DATE__, __TIME__);
+            // Hand poses, holster spots and magazine seats that ship with the
+            // mod, for any the player has not saved their own of yet.
+            const auto seeded = holevr::builtin_files::SeedMissing(g_mod_dir);
+            holevr::log::Info("built-in files (grips, holsters, magazine seats): %d written, %d already there and "
+                              "kept, %d failed",
+                              seeded.written, seeded.kept, seeded.failed);
             holevr::config::Load(g_mod_dir);
             holevr::proxy::SetFactoryCallback(&holevr::vr::dxgi_hooks::OnFactoryCreated);
             holevr::vr::stereo::InstallCommandLineHook();
