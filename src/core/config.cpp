@@ -687,6 +687,14 @@ const Block kBlocks[] = {
      "touch_interact_point_min_cm=6\n"
      "; 1 = log where each item that appears during a level goes (first 80 a level).\n"
      "touch_interact_loot_log=1\n"},
+    {"touch_interact_point_pitch_deg",
+     "\n"
+     "; Where the trigger interact's ray points, turned from the controller's aim\n"
+     "; pose (degrees; minus = down; yaw is for the right hand, mirrored for the\n"
+     "; left). The aim pose sits about 30 degrees above where a hand points, the\n"
+     "; same offset the held pistol uses.\n"
+     "touch_interact_point_pitch_deg=-30\n"
+     "touch_interact_point_yaw_deg=5\n"},
     {"drinks_by_hand",
      "\n"
      "; --- Drink machine by hand (hub) ---\n"

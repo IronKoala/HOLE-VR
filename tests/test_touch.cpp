@@ -219,6 +219,27 @@ static void TestAim() {
     EXPECT(!InAimCone(7.0, 10.0, 8, 6));
 }
 
+// The pointing ray: 30 degrees under the controller's aim, 5 to the outside.
+static void TestPointDir() {
+    // A level aim pose straight along +X: points 30 degrees down.
+    FVector d = PointDir(FQuat{}, -30, 5, false);
+    EXPECT(Near(d.Z, -0.5, 1e-6));
+    EXPECT(d.X > 0.85);
+    EXPECT(d.Y > 0.05);   // right hand: a little right (UE +Y)
+    FVector l = PointDir(FQuat{}, -30, 5, true);
+    EXPECT(Near(l.Z, -0.5, 1e-6));
+    EXPECT(Near(l.Y, -d.Y, 1e-9));  // left hand: mirrored
+    // The run that showed it (2026-11-06 08:33:24): the raw aim was level,
+    // the box's top about 80 cm below it 140 cm away (30 degrees down); the
+    // turned ray goes through it.
+    const Box box{FVector{120, -25, 0}, FVector{190, 25, 32}};
+    double t = 0;
+    const FVector hand{0, 0, 111};
+    EXPECT(SegmentBoxGap(hand, FVector{1, 0, 0}, 200, box, &t) > 75);
+    EXPECT(Near(SegmentBoxGap(hand, PointDir(FQuat{}, -30, 0, true), 200, box, &t), 0.0));
+    EXPECT(t > 140 && t < 200);
+}
+
 int main() {
     TestClassify();
     TestBox();
@@ -226,6 +247,7 @@ int main() {
     TestTouch();
     TestUnknown();
     TestAim();
+    TestPointDir();
     if (failures) {
         std::printf("%d failure(s)\n", failures);
         return 1;
