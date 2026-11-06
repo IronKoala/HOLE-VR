@@ -436,10 +436,42 @@ bool AddArrows(RowWidget& r, UObject label, UObject outer, UObject owner_widget,
     return true;
 }
 
+// Children in a panel widget, or -1.
+int ChildCount(UObject panel) {
+    if (!panel) return -1;
+    ue::Call c(panel, "GetChildrenCount");
+    return c.Valid() && c.Invoke() ? c.Result<int32_t>() : -1;
+}
+
+UObject ParentOf(UObject widget) {
+    if (!widget) return 0;
+    ue::Call c(widget, "GetParent");
+    return c.Invoke() ? c.Result<UObject>() : 0;
+}
+
+// True when our VR tab button is still in the tab row and our page still in
+// the switcher of this same Options widget.
+bool StillBuilt(UObject option) {
+    if (!Alive(T.option) || T.option.obj != option || !Alive(T.vr_button) || !Alive(T.page) || !Alive(T.switcher))
+        return false;
+    return ParentOf(T.vr_button.obj) && ParentOf(T.page.obj) == T.switcher.obj;
+}
+
 void Build(UObject option) {
     mem::ScopedRegionCache rc;
     if (!L.done) {
         log::Warn("vr options: engine lookups missing; no VR tab");
+        return;
+    }
+    // The game keeps its Options widget and shows the same one again each
+    // time (the pause menu does the same: one UIM_Pause_C for the whole
+    // session). Adding the tab on every opening put a second, third ... VR
+    // tab and page into it: the "VR menu duplicating itself" (owner
+    // 2026-11-06). The tab we already added is kept and only relabelled.
+    if (StillBuilt(option)) {
+        T.relabel_frames = 30;
+        log::Info("vr options: Options opened again; its VR tab is already there (not added again; tab row has %d "
+                  "buttons)", ChildCount(ParentOf(T.vr_button.obj)));
         return;
     }
     T = Tab{};
@@ -494,6 +526,7 @@ void Build(UObject option) {
     ue::process_event::HookVtableOf(vr);
     std::vector<std::string> names;
     SetBlueprintTexts(vr, L"VR", &names);
+    const int tabs_before = ChildCount(tab_row);
     UObject vr_slot = AddChild(tab_row, vr);
     int copied = CopySlotLayout(SlotOf(tab_button), vr_slot);
     T.vr_button = Track(vr);
@@ -501,9 +534,10 @@ void Build(UObject option) {
     for (UObject t : T.vr_button_texts) SetText(t, L"VR");
     std::string text_names;
     for (auto& n : names) text_names += n + " ";
-    log::Info("vr options: VR tab button added to %s (%s; %d layout values copied; %zu text(s); label variables: %s)",
+    log::Info("vr options: VR tab button added to %s (%s; %d layout values copied; %zu text(s); label variables: %s; "
+              "the row had %d buttons before)",
               ue::GetName(tab_row).c_str(), ue::GetName(tab_class).c_str(), copied, T.vr_button_texts.size(),
-              text_names.empty() ? "none" : text_names.c_str());
+              text_names.empty() ? "none" : text_names.c_str(), tabs_before);
 
     // The page: a scroll box of rows, one per setting.
     UObject tree = 0;

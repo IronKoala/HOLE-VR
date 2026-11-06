@@ -397,11 +397,34 @@ std::atomic<bool> g_req_grip_editor{false};
 std::atomic<bool> g_req_holsters{false};
 double g_editor_y_until = -1;   // g_clock until which left Y is held for the grip editor
 
+// Each controller's pose: 0 the pose is not bound or the controller is off
+// (SteamVR gives no pose for it; buttons can still work), 1 bound but not
+// tracked, 2 tracked but not placed in the world, 3 in use. Logged when it
+// changes. Owner's 2026-11-06 06:23 run: buttons fired both guns, but the
+// hands were never valid (no arms, no pouch magazine, no holster lid) and
+// the log could not say why.
+void LogHandPoseState(int hand, int state) {
+    static int last[2] = {-1, -1};
+    static int lines = 0;
+    if (state == last[hand]) return;
+    last[hand] = state;
+    if (lines >= 40) return;
+    if (++lines == 40) log::Info("controls: controller pose changes stop being logged here (40 lines)");
+    static const char* const kText[] = {
+        "no pose (SteamVR gives none: the controller is off, asleep, or its pose is not bound; buttons may still "
+        "work)",
+        "bound but not tracked (out of the headset's view or lost)", "tracked, but not placed in the world",
+        "tracked"};
+    log::Info("controls: %s controller pose: %s", hand == 0 ? "left" : "right", kText[state]);
+}
+
 void UpdateHands(const input::Snapshot& s) {
     hands::HandState h[2];
     for (int i = 0; i < 2; ++i) {
         const input::HandInput& in = s.hand[i];
-        if (!in.grip_valid || !ToWorld(in.grip, &h[i].grip)) continue;
+        const bool placed = in.grip_valid && ToWorld(in.grip, &h[i].grip);
+        LogHandPoseState(i, placed ? 3 : in.grip_valid ? 2 : in.active ? 1 : 0);
+        if (!placed) continue;
         if (in.aim_valid) ToWorld(in.aim, &h[i].aim);
         else h[i].aim = h[i].grip;
         // Grip pose: +X (XR) is out of the palm for the left hand, into it
@@ -5348,10 +5371,26 @@ bool PistolModelSeat(UObject* pistol, holster_model::Transform* mesh_seat, hands
     return true;
 }
 
+// Why the holster lid, sounds and hand snap are not running, logged when the
+// reason changes (the 2026-11-06 06:23 run never ran them and said nothing).
+void LogHolsterVisualSkip(int reason) {
+    static int last = -1, lines = 0;
+    if (reason == last) return;
+    last = reason;
+    if (lines >= 30) return;
+    if (++lines == 30) log::Info("holster model: changes stop being logged here (30 lines)");
+    static const char* const kWhy[] = {"running", "no player", "right hand not tracked", "a menu is open",
+                                       "the grip editor is open", "body calibration is running",
+                                       "the gun is frozen", "the pistol has no seat in its holster"};
+    log::Info("holster model: lid, sounds and hand snap %s%s", reason ? "paused: " : "", reason ? kWhy[reason] : kWhy[0]);
+}
+
 void UpdateHolsterVisual(UObject player, const hands::HandState& rh) {
     g_holster_reach = {};
-    if (!player || !rh.valid || ui_panel::MenuOpen() || hands::EditorHand() >= 0 ||
-        body::CalibrationActive() || W.edit_frozen) {
+    const int skip = !player ? 1 : !rh.valid ? 2 : ui_panel::MenuOpen() ? 3 : hands::EditorHand() >= 0 ? 4
+                   : body::CalibrationActive() ? 5 : W.edit_frozen ? 6 : 0;
+    if (skip) {
+        LogHolsterVisualSkip(skip);
         ClearHolsterVisual();
         return;
     }
@@ -5364,7 +5403,12 @@ void UpdateHolsterVisual(UObject player, const hands::HandState& rh) {
     UObject pistol = 0;
     holster_model::Transform seat;
     hands::Pose grip;
-    if (!PistolModelSeat(&pistol, &seat, &grip)) { ClearHolsterVisual(); return; }
+    if (!PistolModelSeat(&pistol, &seat, &grip)) {
+        LogHolsterVisualSkip(7);
+        ClearHolsterVisual();
+        return;
+    }
+    LogHolsterVisualSkip(0);
     FVector parked_at;
     FQuat parked_rot;
     const bool parked = workbench::ParkedGun(pistol, &parked_at, &parked_rot);
@@ -5425,6 +5469,12 @@ void UpdateHolsterVisual(UObject player, const hands::HandState& rh) {
     }
 }
 
+// Named parts of the holster work, so the 10 s perf report says which part
+// costs time (tick 3 alone was 8 ms a frame on 2026-11-06).
+perf::Counter g_perf_holster_place{"holsters: guns and pouch placed"};
+perf::Counter g_perf_holster_model{"holsters: 3D holster drawn"};
+perf::Counter g_perf_holster_visual{"holsters: lid, sounds, hand snap"};
+
 void DrawHolsterModel(UObject player) {
     UObject pistol = 0;
     holster_model::Transform seat;
@@ -5439,15 +5489,19 @@ void OnLateTick(UObject player, float) {
         ClearHolsterVisual();
         return;
     }
-    ComputeHolsterWorld();
-    if (!g_late_ok) { ClearHolsterVisual(); return; }
-    g_late_ok = false;
-    if (!g_hw.valid || !W.gun || !player) { ClearHolsterVisual(); return; }
-    game::Gun gun(W.gun);
-    if (W.uses_holster && !W.in_hand && !W.edit_frozen) PlaceGunInHolster(gun);
-    PlacePouchMag(W.gun);
-    if (!W.edit_frozen) PlaceSparePistol();
-    PlaceRifleInHolster();
+    {
+        perf::Scope t(g_perf_holster_place);
+        ComputeHolsterWorld();
+        if (!g_late_ok) { ClearHolsterVisual(); return; }
+        g_late_ok = false;
+        if (!g_hw.valid || !W.gun || !player) { ClearHolsterVisual(); return; }
+        game::Gun gun(W.gun);
+        if (W.uses_holster && !W.in_hand && !W.edit_frozen) PlaceGunInHolster(gun);
+        PlacePouchMag(W.gun);
+        if (!W.edit_frozen) PlaceSparePistol();
+        PlaceRifleInHolster();
+    }
+    perf::Scope t(g_perf_holster_model);
     DrawHolsterModel(player);
 }
 
@@ -5732,7 +5786,10 @@ void OnTick(UObject player, float dt) {
         FireSelector(gun, s.hand[input::kRight]);
         RifleCarry(player, rh, lh, s.hand[input::kLeft], s.hand[input::kRight], dt, true);
     }
-    UpdateHolsterVisual(player, rh);
+    {
+        perf::Scope t(g_perf_holster_visual);
+        UpdateHolsterVisual(player, rh);
+    }
     PublishGrabs(gun, rh, lh);
     RackTrace(gun, dt);
 }
@@ -5801,6 +5858,8 @@ void Init() {
 }
 
 void InitLate() {
+    for (perf::Counter* c : {&g_perf_holster_place, &g_perf_holster_model, &g_perf_holster_visual})
+        perf::Register(c);
     game::AddTickListener(&OnLateTick);
     log::Info("controls: holsters ready (pistol %s, %s; magazine pouch; to move one anywhere on the body, hold its "
               "item there at the angle you want after VR tab: Move holsters)",
