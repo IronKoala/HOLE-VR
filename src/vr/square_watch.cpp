@@ -61,6 +61,8 @@ Slot g_slots[kSlots];
 int g_recorded = -1;
 ID3D12Fence* g_fence = nullptr;
 unsigned g_strip = 0;
+unsigned g_every = 4;   // copy a strip on one headset frame in this many
+unsigned g_frame = 0;
 
 bool Supported(DXGI_FORMAT f) {
     switch (f) {
@@ -440,18 +442,24 @@ std::string Report(double) {
 }  // namespace
 
 void Init() {
-    g_on = config::GetBool("square_watch", true);
+    // Off unless asked for: it costs a strip read-back on the render thread
+    // and 3.5-4.3 ms of a background core for every strip compared.
+    g_on = config::GetBool("square_watch", false);
     if (!g_on) {
-        log::Info("square watch: off (square_watch=0)");
+        log::Info("square watch: off (square_watch=1 in hole-vr.ini turns it on)");
         return;
     }
+    g_every = static_cast<unsigned>(std::clamp(config::GetInt("square_watch_every", 4), 1, 8));
     perf::Register(&g_perf_copy);
     perf::Register(&g_perf_check);
     perf::AddReportLine(&Report);
     std::thread(Worker).detach();
-    log::Info("square watch: on; compares the two eyes in one strip of each headset picture and saves "
-              "capture-squares-*.bmp when one eye has white blocks the other doesn't (square_watch=0 turns it off)");
+    log::Info("square watch: on; compares the two eyes in one strip of every %u headset pictures and saves "
+              "capture-squares-*.bmp when one eye has white blocks the other doesn't (square_watch=0 turns it off)",
+              g_every);
 }
+
+bool On() { return g_on; }
 
 void Record(ID3D12Device* device, ID3D12GraphicsCommandList* cmd, ID3D12Resource* source) {
     if (!g_on || !device || !cmd || !source) return;
@@ -467,6 +475,7 @@ void Record(ID3D12Device* device, ID3D12GraphicsCommandList* cmd, ID3D12Resource
     // Only in the game world with no forearm menu up (title screen and menus
     // have flat panels in one eye on purpose).
     if (!game::Player() || render_fixes::PauseBlurOn()) return;
+    if (++g_frame % g_every) return;  // lighter: one frame in g_every
 
     int idx = -1;
     for (int i = 0; i < kSlots; ++i)

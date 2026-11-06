@@ -9,9 +9,9 @@ OpenXR composition layers.
 
 The startup log line `build: <git revision>` names the code that ran (the
 revision is generated at every build; `-dirty` means uncommitted changes).
-These hole-vr.ini lines are added on while the white squares are being
-investigated; set paired_capture_enabled=0 for performance comparisons and
-once the squares are fixed:
+It is off by default since 2026-11-06: seven captures in three runs showed
+the eye copies exact, and each capture costs a hitch. To use it again, set
+in hole-vr.ini (on-dots requests also need square_watch=1):
 
 ```ini
 paired_capture_enabled=1
