@@ -604,10 +604,15 @@ void Tick(UObject player, float) {
 bool Busy() { return g_on && g_phase != Phase::kWatch && g_phase != Phase::kDone; }
 
 void Init() {
-    g_on = config::GetBool("square_test", true);
+    g_on = config::GetBool("square_test", false);
     g_trigger = std::max(square_watch::kStripExcess, config::GetInt("square_test_trigger", 200));
     if (!g_on) {
-        log::Info("square test: off (square_test=0)");
+        log::Info("square test: off (square_test=1 in hole-vr.ini turns it on)");
+        return;
+    }
+    if (!square_watch::On()) {  // it only acts on what the watch sees
+        g_on = false;
+        log::Info("square test: off (needs square_watch=1)");
         return;
     }
     AddRenderSuspects();
