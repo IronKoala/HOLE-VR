@@ -111,6 +111,10 @@ double SegmentBoxGap(const FVector& o, const FVector& d, double len, const Box& 
     return best;
 }
 
+FVector PointDir(const FQuat& aim, double pitch_deg, double yaw_deg, bool left) {
+    return (aim * ToQuat(FRotator{pitch_deg, left ? -yaw_deg : yaw_deg, 0.0})).Rotate(FVector{1, 0, 0});
+}
+
 Box ScaledBox(const FVector& mn, const FVector& mx, const FVector& s) {
     auto axis = [](double a, double b, double k, double* lo, double* hi) {
         *lo = std::fmin(a * k, b * k);

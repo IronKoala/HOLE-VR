@@ -327,6 +327,9 @@ const Block kBlocks[] = {
      "; 1 = also let the game's own keyboard/gamepad movement through (Steam Input can turn the VR\n"
      "; controllers into a gamepad the game reads, which walked the character on its own). 0 = off.\n"
      "game_move_input=0\n"
+     "; 1 = also let the game's own mouse/gamepad look through. In VR it pitched the game's aim, bending\n"
+     "; the body's back or sinking it into a crouch under the VR body. 0 = off.\n"
+     "game_look_input=0\n"
      "; left hand this close to the gun (cm): left trigger toggles the weapon light instead of interacting\n"
      "light_hand_reach_cm=12\n"
      "; Tilts the gun in your hand up (+) or down (-), degrees.\n"
@@ -687,6 +690,14 @@ const Block kBlocks[] = {
      "touch_interact_point_min_cm=6\n"
      "; 1 = log where each item that appears during a level goes (first 80 a level).\n"
      "touch_interact_loot_log=1\n"},
+    {"touch_interact_point_pitch_deg",
+     "\n"
+     "; Where the trigger interact's ray points, turned from the controller's aim\n"
+     "; pose (degrees; minus = down; yaw is for the right hand, mirrored for the\n"
+     "; left). The aim pose sits about 30 degrees above where a hand points, the\n"
+     "; same offset the held pistol uses.\n"
+     "touch_interact_point_pitch_deg=-30\n"
+     "touch_interact_point_yaw_deg=5\n"},
     {"drinks_by_hand",
      "\n"
      "; --- Drink machine by hand (hub) ---\n"
