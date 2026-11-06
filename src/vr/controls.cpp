@@ -41,6 +41,7 @@
 #include "vr/interact/holster_feedback.h"
 #include "vr/interact/holster_audio.h"
 #include "vr/interact/holster_model.h"
+#include "vr/interact/magwell_zone.h"
 #include "vr/interact/rifle_carry.h"
 #include "vr/interact/slide.h"
 #include "vr/interact/touch.h"
@@ -181,6 +182,13 @@ struct Settings {
     // magazine; false: the right hand holds the gun, the left takes magazines.
     bool either_hand = true;
     double handle_grab_radius = 9.0;      // either hand grabs the AR charging handle this close to its rear end, cm
+    // Magazines (owner 2026-11-06: the AR's 10 round magazine snapped "way to
+    // early"; "make custom sized detection zones for all mags"): each
+    // magazine lines up when its top is this close below the magwell
+    // opening, measured per magazine and gun (vr/interact/magwell_zone.h).
+    double mag_snap_slack = 1.0;          // cm
+    double mag_seat_finish = 6.0;         // pushed this close to seated, it seats itself (at most half its travel), cm
+    bool mag_exact_seat = true;           // seat each magazine where the game itself puts it (AttachPoint_Mag)
 };
 Settings g_set;
 
@@ -249,6 +257,9 @@ void LoadSettings() {
     g_set.rifle_right_let_go = config::GetBool("rifle_right_let_go", true);
     g_set.either_hand = config::GetBool("either_hand_guns", true);
     g_set.handle_grab_radius = std::clamp(config::GetFloat("rifle_charging_handle_grab_cm", 9.f), 3.f, 15.f);
+    g_set.mag_snap_slack = std::clamp(config::GetFloat("mag_snap_slack_cm", 1.f), 0.f, 15.f);
+    g_set.mag_seat_finish = std::clamp(config::GetFloat("mag_seat_finish_cm", 6.f), 0.f, 15.f);
+    g_set.mag_exact_seat = config::GetBool("mag_exact_seat", true);
     LoadHolsterSpots();
 }
 
@@ -289,7 +300,10 @@ void LoadMagSeats() {
         MagSeat m;
         m.offset = FVector{v[0], v[1], v[2]};
         m.rot.X = v[3]; m.rot.Y = v[4]; m.rot.Z = v[5]; m.rot.W = v[6];
-        if (std::sqrt(m.offset.X * m.offset.X + m.offset.Y * m.offset.Y + m.offset.Z * m.offset.Z) > 15.0) continue;
+        // (The AR's seat is 16.7 cm from its magwell point: a 15 cm limit
+        // dropped it on every launch, so each session's first AR reload
+        // aimed at the magwell point.)
+        if (std::sqrt(m.offset.X * m.offset.X + m.offset.Y * m.offset.Y + m.offset.Z * m.offset.Z) > 45.0) continue;
         g_mag_seats[name] = m;
         log::Info("controls: magazine seat for %s from mag-seats.ini (%.1f %.1f %.1f)", name, v[0], v[1], v[2]);
     }
@@ -651,6 +665,11 @@ struct WeaponState {
     double seat_from = 0, seat_t0 = 0;
     FVector mag_shown;            // where the held mag is drawn
     FQuat mag_shown_rot;          // and how it is turned
+    double mag_insert = 0;        // lined up: how far in, 0 top at the opening .. 1 seated (the hand's reload pose)
+    // This magazine's own window in this gun (vr/interact/magwell_zone.h),
+    // measured once when it first comes near the magwell.
+    UObject zone_mag = 0, zone_gun = 0;
+    interact::MagwellZone zone;
     bool seat_learned = false;
     FVector seat_offset;          // inserted mag origin minus MagazinePoint, actor space
     FQuat seat_rot;               // inserted mag rotation, actor space
@@ -1947,6 +1966,94 @@ void RefillPouch(game::Gun& gun, UObject player, const FVector& loc, const FQuat
 // AR-15's magwell is square to the bore.
 double MagwellRake() { return W.is_pistol ? 18.0 : 0.0; }
 
+bool MeshBoxInFrame(UObject c, const FQuat& frame_inv, const FVector& grip_w, FVector* lo, FVector* hi);
+std::vector<UObject> MeshComponents(UObject actor);
+
+// Where the game itself seats this magazine (BP_GunBase Gun_MagazineLoad):
+// attached to the gun's MagazinePoint, then moved by the inverse of its own
+// AttachPoint_Mag. Each magazine has its own point, so each its own seat
+// (before: one seat per gun, learned from whichever magazine went in first).
+bool ExactSeat(const UETransform& well_w, UObject mag, FVector* loc, FQuat* rot) {
+    UObject point = 0;
+    if (!mag || !ue::GetProp(mag, "AttachPoint_Mag", point) || !point) return false;
+    ue::Call rt(point, "GetRelativeTransform");
+    if (!rt.Invoke()) return false;
+    const UETransform r = rt.Result<UETransform>();
+    if (!std::isfinite(r.translation.X + r.translation.Y + r.translation.Z) || Len(r.translation) > 60.0) return false;
+    // The magazine in the MagazinePoint's frame: the point's transform undone.
+    const FQuat inv = r.rotation.Inverse();
+    const FVector t = inv.Rotate(r.translation * -1.0);
+    FQuat q = well_w.rotation * inv;
+    const double n = std::sqrt(q.X * q.X + q.Y * q.Y + q.Z * q.Z + q.W * q.W);
+    if (!(n > 1e-6)) return false;
+    *rot = FQuat{q.X / n, q.Y / n, q.Z / n, q.W / n};
+    *loc = well_w.translation + well_w.rotation.Rotate(FVector{t.X * well_w.scale.X, t.Y * well_w.scale.Y,
+                                                               t.Z * well_w.scale.Z});
+    return true;
+}
+
+// This magazine's window in this gun (vr/interact/magwell_zone.h): the
+// magazine's mesh as it sits seated against the gun's parts. Measured once
+// per magazine and gun, in the gun frame, and logged.
+const interact::MagwellZone& MagwellZoneFor(UObject g, UObject mag, const FVector& seat, const FQuat& seat_rot,
+                                            const FVector& out) {
+    if (W.zone_mag == mag && W.zone_gun == g) return W.zone;
+    W.zone_mag = mag;
+    W.zone_gun = g;
+    W.zone = interact::MagwellZone{};
+    if (!W.have_frame || !mag || !g) return W.zone;
+    const FQuat inv = W.frame_rot.Inverse();
+    std::vector<interact::PartBox> parts;
+    for (UObject c : MeshComponents(g)) {
+        interact::PartBox p;
+        if (!MeshBoxInFrame(c, inv, W.grip_world, &p.lo, &p.hi)) continue;
+        if (p.hi.X - p.lo.X > 80 || p.hi.Y - p.lo.Y > 80 || p.hi.Z - p.lo.Z > 80) continue;
+        p.name = ue::GetName(c);
+        parts.push_back(p);
+    }
+    // The magazine's meshes in its own frame, then as it sits seated.
+    const FVector mag_loc = ActorLocation(mag);
+    const FQuat mag_rot = ActorRotation(mag);
+    std::vector<FVector> corners;
+    for (UObject c : MeshComponents(mag)) {
+        FVector lo, hi;
+        if (!MeshBoxInFrame(c, mag_rot.Inverse(), mag_loc, &lo, &hi)) continue;
+        if (hi.X - lo.X > 40 || hi.Y - lo.Y > 40 || hi.Z - lo.Z > 60) continue;
+        for (int k = 0; k < 8; ++k) {
+            const FVector m{k & 1 ? hi.X : lo.X, k & 2 ? hi.Y : lo.Y, k & 4 ? hi.Z : lo.Z};
+            corners.push_back(inv.Rotate(seat + seat_rot.Rotate(m) - W.grip_world));
+        }
+    }
+    const FVector seat_g = inv.Rotate(seat - W.grip_world);
+    const FVector in_g = inv.Rotate(out * -1.0);
+    W.zone = interact::MeasureMagwell(corners, seat_g, in_g, parts);
+    const std::string mag_cls = ue::GetName(ue::GetClass(mag)), gun_cls = ue::GetName(ue::GetClass(g));
+    const double old_below = W.is_pistol ? 14.0 : 16.0;
+    if (W.zone.ok) {
+        log::Info("controls: magwell zone for %s in %s: seated, its top is %.1f cm above its seat and its bottom %.1f "
+                  "below; the magwell opening (bottom of %s) is %.1f cm %s the seat, so it goes %.1f cm into the gun. "
+                  "It lines up with its top within %.1f cm of the opening: its origin %.1f cm or less below the seat "
+                  "(was %.0f for every %s magazine); it seats itself from %.1f cm",
+                  mag_cls.c_str(), gun_cls.c_str(), W.zone.top, -W.zone.bottom, W.zone.part.c_str(),
+                  std::fabs(W.zone.opening), W.zone.opening < 0 ? "below" : "above", W.zone.insert,
+                  g_set.mag_snap_slack, interact::SnapBelow(W.zone, g_set.mag_snap_slack, old_below), old_below,
+                  W.is_pistol ? "pistol" : "rifle", interact::SeatFinish(W.zone, g_set.mag_seat_finish));
+    } else {
+        std::string list;
+        char buf[160];
+        for (const auto& p : parts) {
+            std::snprintf(buf, sizeof(buf), "%s%s X %.1f..%.1f Y %.1f..%.1f Z %.1f..%.1f", list.empty() ? "" : ", ",
+                          p.name.c_str(), p.lo.X, p.hi.X, p.lo.Y, p.hi.Y, p.lo.Z, p.hi.Z);
+            if (list.size() < 1500) list += buf;
+        }
+        log::Info("controls: magwell zone for %s in %s NOT measured (%zu magazine mesh corners, seat (%.1f %.1f %.1f), "
+                  "in (%.2f %.2f %.2f)); the old window is used (%.0f cm below the seat). Gun parts: %s",
+                  mag_cls.c_str(), gun_cls.c_str(), corners.size(), seat_g.X, seat_g.Y, seat_g.Z, in_g.X, in_g.Y,
+                  in_g.Z, old_below, list.c_str());
+    }
+    return W.zone;
+}
+
 // How a seated magazine sits in the gun frame (X barrel, Z up), from the
 // first insert (learned) or the magwell point. Doesn't depend on where the
 // gun is, so it works with the gun in the holster too.
@@ -2176,23 +2283,56 @@ void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState hs[
     // Only into a gun in the (other) hand, never one in the holster.
     const bool can_seat = well && W.have_pose && W.in_hand && mh != GunHand() && !gun.State().has_magazine;
     if (can_seat) {
-        FVector seat = ComponentToWorld(well).translation;
+        const UETransform well_w = ComponentToWorld(well);
+        FVector seat = well_w.translation;
         if (W.seat_learned) seat = seat + W.actor_rot.Rotate(W.seat_offset);
+        {
+            // This magazine's own seat, where the game puts it.
+            FVector exact_loc;
+            FQuat exact_rot;
+            if (g_set.mag_exact_seat && ExactSeat(well_w, W.held_mag, &exact_loc, &exact_rot)) {
+                static std::string told;
+                const std::string key = ue::GetName(ue::GetClass(W.held_mag)) + " in " + gun.ClassName();
+                if (told != key) {
+                    told = key;
+                    const double dq = std::fabs(exact_rot.X * seat_rot.X + exact_rot.Y * seat_rot.Y +
+                                                exact_rot.Z * seat_rot.Z + exact_rot.W * seat_rot.W);
+                    log::Info("controls: seat for %s from its AttachPoint_Mag: %.1f cm from the magwell point; the %s "
+                              "seat was %.1f cm from this one and turned %.0f deg from it",
+                              key.c_str(), Len(exact_loc - well_w.translation),
+                              W.seat_learned ? "learned" : "magwell point's", Len(exact_loc - seat),
+                              2.0 * std::acos(std::fmin(1.0, dq)) * 180.0 / 3.14159265358979);
+                }
+                seat = exact_loc;
+                seat_rot = exact_rot;
+            }
+        }
         FVector out = W.frame_rot.Rotate(in_g) * -1.0;
         if (!W.is_pistol) {
             // A rifle magazine goes in along the magwell's own axis (it
             // leans a few degrees in this model); sliding it in square to the
             // gun clipped it through the receiver (owner 2026-11-04).
-            const FVector up = ComponentToWorld(well).rotation.Rotate(FVector{0, 0, 1});
+            const FVector up = well_w.rotation.Rotate(FVector{0, 0, 1});
             if (DotV(up, out) < -0.9) out = Norm(up) * -1.0;
         }
         FVector p = lh.grip.location - seat;
         double along = DotV(p, out);
         double lateral = Len(p - out * along);
+        // This magazine's own window (measured as it first comes near):
+        // it lines up with its top just under the magwell opening, and its
+        // travel from there to seated is the reload's progress.
+        const double old_below = W.is_pistol ? 14.0 : 16.0;
+        static const interact::MagwellZone kNoZone;
+        const interact::MagwellZone& zone = Len(p) < 40.0 || W.mag_engaged || W.mag_seating
+                                                ? MagwellZoneFor(gun.Object(), W.held_mag, seat, seat_rot, out)
+                                                : kNoZone;
+        const double max_below = interact::SnapBelow(zone, g_set.mag_snap_slack, old_below);
+        const double finish = interact::SeatFinish(zone, g_set.mag_seat_finish);
 
         if (W.mag_seating) {
             double t = std::fmin(1.0, (g_clock - W.seat_t0) / 0.1);
             along = W.seat_from * (1.0 - t);
+            W.mag_insert = interact::InsertProgress(zone, along, old_below);
             show_loc = seat + out * along;
             show_rot = seat_rot;
             SetActorTransform(W.held_mag, show_loc, show_rot);
@@ -2254,19 +2394,19 @@ void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState hs[
         if (!W.mag_engaged && g_clock >= W.magwell_log_at && Len(p) < 35.0) {
             W.magwell_log_at = g_clock + 0.5;
             log::Info("controls: held magazine near the magwell: %.1f cm below it, %.1f cm off its axis, pointing %.0f deg "
-                      "off it (lines up within -4..%.0f below, %.1f off, %.0f deg)", along, lateral, aim_off_deg,
-                      W.is_pistol ? 14.0 : 16.0, W.is_pistol ? 5.5 : 7.5, W.is_pistol ? 40.0 : 60.0);
+                      "off it (lines up within -4..%.1f below, %.1f off, %.0f deg)", along, lateral, aim_off_deg,
+                      max_below, W.is_pistol ? 5.5 : 7.5, W.is_pistol ? 40.0 : 60.0);
         }
         // A rifle's magwell is wider and its magazine is held more freely
         // (owner 2026-11-04: "i cannot reload the AR at all"): more slack.
         const double max_lat = W.is_pistol ? 5.5 : 7.5, max_aim = W.is_pistol ? 40.0 : 60.0;
-        const double max_below = W.is_pistol ? 14.0 : 16.0;
         if (!W.mag_engaged) {
             if (along > -4.0 && along < max_below && lateral < max_lat && aim_off_deg < max_aim) {
                 W.mag_engaged = true;
                 input::Haptic(InputOf(mh), 0.25f, 0.02f);
-                log::Info("controls: magazine lined up with the magwell (%.1f cm below, %.1f off axis, %.0f deg)",
-                          along, lateral, aim_off_deg);
+                log::Info("controls: magazine lined up with the magwell (%.1f cm below, %.1f off axis, %.0f deg; "
+                          "window %.1f cm%s)",
+                          along, lateral, aim_off_deg, max_below, zone.ok ? ", this magazine's own" : ", not measured");
             }
         } else if (lateral > max_lat + 1.5 || along > max_below + 3.0 || aim_off_deg > max_aim + 10.0) {
             W.mag_engaged = false;
@@ -2275,7 +2415,8 @@ void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState hs[
             double a = std::fmax(0.0, along);
             show_loc = seat + out * a;
             show_rot = seat_rot;
-            if (a < 6.0 && lin.grip_button.down) {
+            W.mag_insert = interact::InsertProgress(zone, a, old_below);
+            if (a < finish && lin.grip_button.down) {
                 W.mag_seating = true;
                 W.seat_from = a;
                 W.seat_t0 = g_clock;
@@ -2284,6 +2425,7 @@ void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState hs[
     } else {
         W.mag_engaged = false;
     }
+    if (!W.mag_engaged && !W.mag_seating) W.mag_insert = 0;
     SetActorTransform(W.held_mag, show_loc, show_rot);
     W.mag_shown = show_loc;
     W.mag_shown_rot = show_rot;
@@ -3939,7 +4081,13 @@ void PublishGrabs(game::Gun& gun, const hands::HandState hs[2]) {
         g[mh].kind = hands::GrabKind::kMagHeld;
         g[mh].object = W.held_mag;
         g[mh].target = hs[mh].grip;
-        if (W.mag_engaged || W.mag_seating) g[mh].target.location = W.mag_shown;
+        if (W.mag_engaged || W.mag_seating) {
+            // Lined up with the magwell: the hand's second pose, and the
+            // game's reload animation by how far in it is.
+            g[mh].kind = hands::GrabKind::kMagInsert;
+            g[mh].insert = W.mag_insert;
+            g[mh].target.location = W.mag_shown;
+        }
     };
     if (lh.valid) {
         if (OtherOnSlide()) {
@@ -6214,6 +6362,7 @@ void OnTick(UObject player, float dt) {
                 W.seat_offset = inv.Rotate(off);
                 W.seat_rot = inv * ActorRotation(mag);
                 W.seat_learned = true;
+                W.zone_mag = 0;  // a magazine window measured from the old seat is measured again
                 g_mag_seats[gun.ClassName()] = MagSeat{W.seat_offset, W.seat_rot};
                 SaveMagSeats();
                 // How far the seated magazine is turned from the magwell

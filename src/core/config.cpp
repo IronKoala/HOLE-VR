@@ -499,6 +499,25 @@ const Block kBlocks[] = {
      "; close to it (cm). The right hand can do it while the left hand holds the rifle\n"
      "; by the handguard. Each hand has its own pose in the grip editor.\n"
      "rifle_charging_handle_grab_cm=9\n"},
+    {"mag_snap_slack_cm",
+     "\n"
+     "; --- Reloading: a magazine into the magwell ---\n"
+     "; Each magazine lines up with the magwell when its top is this close under the\n"
+     "; gun's magwell opening (cm), measured for each magazine in each gun.\n"
+     "mag_snap_slack_cm=1\n"
+     "; Pushed this close to seated (cm) it seats itself; never more than half of how\n"
+     "; far that magazine goes into the gun.\n"
+     "mag_seat_finish_cm=6\n"
+     "; 1 = each magazine seats where the game itself puts that magazine.\n"
+     "mag_exact_seat=1\n"
+     "; While a magazine is lined up the hand holding it has a second pose (pose it\n"
+     "; in the grip editor then). 1 = until it is posed, the game's own reload hold.\n"
+     "mag_insert_game_hold=1\n"
+     "; 1 = the game's own left-hand reload animation plays as you push the magazine\n"
+     "; in, and backwards as you pull it back out. For AR magazines: the pistol's\n"
+     "; (pistol), the AR's own (rifle) or none (off).\n"
+     "mag_insert_anim=1\n"
+     "mag_insert_anim_rifle=pistol\n"},
     {"fixed_height",
      "\n"
      "; 1 = your in-game height is always the character's, seated or standing\n"

@@ -6,6 +6,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <atomic>
 #include <map>
 #include <memory>
@@ -44,6 +45,7 @@
 #include "vr/body/calibration_hold.h"
 #include "vr/body/leg_pose.h"
 #include "vr/body/leg_world.h"
+#include "vr/body/reload_anim.h"
 #include "vr/body/torso_pose.h"
 #include "vr/body/skeleton.h"
 #include "vr/interact/grip_points.h"
@@ -109,6 +111,12 @@ struct Settings {
     bool press_flat = true;    // an empty hand pushed against a wall settles flat on it
     double press_push = 4.0;   // cm the real hand goes on past where it touched until the hand is flat
     double finger_drag = 1.0;  // fingertips trail along a surface the hand slides on (0 = off, 1 = normal)
+    // A magazine lined up with the magwell (owner 2026-11-06): its own hand
+    // pose (stage 2), the game's reload hold until it is posed, and the
+    // game's own left-hand reload animation played by how far it is in.
+    bool mag_insert_anim = true;
+    int mag_insert_rifle_clip = reload_anim::kPistol;  // for AR magazines: kPistol, kRifle or -1 (none)
+    bool mag_insert_game_hold = true;
 } S;
 
 void LoadSettings() {
@@ -154,6 +162,16 @@ void LoadSettings() {
     S.press_flat = config::GetBool("hand_press_flat_on_walls", true);
     S.press_push = std::clamp<double>(config::GetFloat("hand_press_flat_push_cm", 4.f), 0.5, 20.0);
     S.finger_drag = std::clamp<double>(config::GetFloat("hand_finger_drag", 1.f), 0.0, 3.0);
+    S.mag_insert_anim = config::GetBool("mag_insert_anim", true);
+    {
+        // The owner asked for the pistol's reload on the AR's magazines too.
+        std::string r = config::GetString("mag_insert_anim_rifle", "pistol");
+        for (char& ch : r) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        S.mag_insert_rifle_clip = r == "rifle" || r == "ar" ? reload_anim::kRifle
+                                  : r == "off" || r == "none" || r == "0" ? -1
+                                                                          : reload_anim::kPistol;
+    }
+    S.mag_insert_game_hold = config::GetBool("mag_insert_game_hold", true);
 }
 
 // ---- small files beside the ini ----
@@ -1351,6 +1369,8 @@ std::string BaseRecordKey(int side, const hands::HandGrab& grab) {
         // One pose per grip point on the handguard (vr/interact/grip_points.h).
         case hands::GrabKind::kSupportGrip:
             return grab.point >= 0 ? cls + ".support-" + interact::PointKey(grab.point) : cls + ".support";
+        // Stage 2: the magazine lined up with the magwell, going in.
+        case hands::GrabKind::kMagInsert: return cls + ".mag-insert";
         default: return cls + ".mag";
     }
 }
@@ -1800,6 +1820,81 @@ void LimitRecord(int side, const std::string& key, gr::Record* rec, const std::s
         log::Error("body: could not copy grips\\%s.ini to grips\\before-joint-limits", key.c_str());
 }
 
+// ---- a magazine going into the magwell (stage 2) ----
+// Which of the game's reload animations plays for a magazine: the pistol's
+// for every magazine (owner 2026-11-06: re-use the pistol's left-hand reload
+// for the AR's magazines), the AR's own with mag_insert_anim_rifle=rifle.
+// -1: none.
+int InsertClip(UObject mag) {
+    if (!S.mag_insert_anim || !mag) return -1;
+    const std::string cls = ue::GetName(ue::GetClass(mag));
+    const bool rifle = cls.find("_AR_") != std::string::npos;
+    return rifle ? S.mag_insert_rifle_clip : reload_anim::kPistol;
+}
+
+// The game's own hold of a magazine while it reloads (BP_GunBase
+// Gun_MagazineCreate): the magazine hangs from the hand socket
+// HandItemPoint_L by its AttachPoint_ReloadHand, i.e. that point of the
+// magazine sits on the socket. So the hand bone, in the magazine's frame, is
+// the socket's place in the hand undone from that point. Fingers: the
+// reload animation's pose where the insert begins. A left-hand record.
+bool GameInsertHold(UObject mag, gr::Record* rec, std::string* why) {
+    const HandRig& r = G.rig[kL];
+    const int clip = InsertClip(mag);
+    if (!r.ok) {
+        *why = "the left hand is not rigged";
+        return false;
+    }
+    if (clip < 0) {
+        *why = "no reload animation for it (mag_insert_anim)";
+        return false;
+    }
+    const reload_anim::ClipData& d = reload_anim::Get(static_cast<reload_anim::Clip>(clip));
+    if (!d.ready || !d.have_socket) {
+        *why = d.failed ? "the game's reload animation could not be read: " + d.why
+                        : "the game's reload animation is not read yet";
+        return false;
+    }
+    UObject point = 0;
+    if (!ue::GetProp(mag, "AttachPoint_ReloadHand", point) || !point) {
+        *why = "the magazine has no AttachPoint_ReloadHand";
+        return false;
+    }
+    ue::Call rt(point, "GetRelativeTransform");
+    if (!rt.Invoke()) {
+        *why = "its AttachPoint_ReloadHand could not be read";
+        return false;
+    }
+    Xf point_in_mag = rt.Result<Xf>();
+    point_in_mag.scale = FVector{1, 1, 1};
+    Xf socket_in_hand;
+    socket_in_hand.rotation = d.socket_rot;
+    socket_in_hand.translation = d.socket_pos;
+    const Xf hand_in_socket = skel::Relative(Xf{}, socket_in_hand);
+    const Xf hand = skel::Compose(hand_in_socket, point_in_mag);
+    if (!std::isfinite(Length(hand.translation)) || Length(hand.translation) > 60.0) {
+        *why = "the hold came out more than 60 cm from the magazine";
+        return false;
+    }
+    *rec = gr::Record{};
+    rec->right_hand = false;
+    gr::StoreHand(rec, r.geo, Normalized(hand.rotation), hand.translation);
+    for (int t = 0; t < gr::kTipCount; ++t) {
+        const int f = TipFinger(t);
+        fingers::Angles a;
+        for (int j = 0; j < 3; ++j) {
+            rec->joint[t][j] = Normalized(r.chain[f].ref[j].rotation.Inverse() * d.pose[0].joint[f][j]);
+            a.extra[j] = rec->joint[t][j];
+        }
+        rec->posed[t] = true;
+        Xf joints[3];
+        FVector tip;
+        fingers::Fk(r.chain[f], a, joints, &tip);
+        rec->tip[t] = hand.translation + Normalized(hand.rotation).Rotate(tip);
+    }
+    return true;
+}
+
 bool GripRecord(int side, hands::GrabKind kind, UObject object, const std::string& key, gr::Record* out,
                 bool* from_file) {
     std::string text;
@@ -1878,6 +1973,37 @@ bool GripRecord(int side, hands::GrabKind kind, UObject object, const std::strin
         if (!found) {
             found = ReadText(RecordPath(cls + ".support"), &text);
             if (found) file_key = cls + ".support";
+        }
+    }
+    // A magazine lined up with the magwell, its stage 2 not posed yet: the
+    // game's own reload hold, else the magazine's grab pose (stage 1).
+    if (!found && kind == hands::GrabKind::kMagInsert && object) {
+        static std::set<std::string> told;
+        std::string why;
+        if (S.mag_insert_game_hold && GameInsertHold(object, &rec, &why)) {
+            have = true;
+            if (told.insert(key + "#game").second)
+                log::Info("body: %s not posed yet: the game's own reload hold (HandItemPoint_L on the magazine's "
+                          "AttachPoint_ReloadHand); pose it in the grip editor while the magazine is lined up to "
+                          "change it",
+                          key.c_str());
+        } else {
+            const std::string tail = ".mag-insert";
+            auto grab_key = [&](const std::string& k) {
+                const size_t at = k.rfind(tail);
+                return at == std::string::npos ? k : k.substr(0, at) + ".mag" + k.substr(at + tail.size());
+            };
+            for (const std::string& k : {grab_key(key), grab_key(usual)}) {
+                if (ReadText(RecordPath(k), &text)) {
+                    found = true;
+                    file_key = k;
+                    break;
+                }
+            }
+            if (told.insert(key + "#grab").second)
+                log::Info("body: %s not posed yet and %s: using the magazine's grab pose%s", key.c_str(),
+                          S.mag_insert_game_hold ? why.c_str() : "the game's hold is off (mag_insert_game_hold=0)",
+                          found ? (" (" + file_key + ")").c_str() : " (none saved: the hand stays on the controller)");
         }
     }
     if (found) {
@@ -3466,6 +3592,19 @@ int PickRearPinch(int side, const hands::HandState& h, const hands::Pose& obj, c
     return pick;
 }
 
+// The hand moving between a magazine's grab pose and its pose in the
+// magwell (stage 2), and back: over a short moment instead of a jump.
+struct MagStageBlend {
+    bool on = false;
+    UObject object = 0;
+    FQuat rot;     // the hand in the magazine's frame, before the change
+    FVector pos;
+    double t0_ms = 0;
+} g_mag_stage[2];
+constexpr double kMagStageMs = 120.0;
+
+bool IsMagKind(hands::GrabKind k) { return k == hands::GrabKind::kMagHeld || k == hands::GrabKind::kMagInsert; }
+
 void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, const hands::HandGrab& right_grab,
               const FVector& body_fwd, const FVector& body_right, double dt) {
     const Skeleton& k = G.skel;
@@ -3494,7 +3633,24 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
             g_slide_hold[side] = PickSlideHold(h, gun, grab.object);
             if (g_slide_hold[side] == kSlideRear) g_slide_hold[side] = PickRearPinch(side, h, gun, grab);
         }
+        // Into or out of the magwell with the same magazine: from where the
+        // hand was on it.
+        const bool mag_stage = grab.object && grab.object == g.object && IsMagKind(grab.kind) && IsMagKind(g.kind) &&
+                               g.have && !g.pending;
+        if (mag_stage) g_mag_stage[side] = {true, grab.object, g.hand_rot, g.hand_pos, perf::NowMs()};
+        else g_mag_stage[side].on = false;
         LoadGrip(side, grab);
+        if (grab.kind == hands::GrabKind::kMagInsert) {
+            const int clip = InsertClip(grab.object);
+            const bool anim = side == kL && clip >= 0 && reload_anim::Get(static_cast<reload_anim::Clip>(clip)).ready;
+            log::Info("body: %s hand's magazine lined up with the magwell: pose %s %s; fingers %s",
+                      side == kL ? "left" : "right", g.key.c_str(),
+                      g.have || g.pending ? (g.from_file ? "(saved)" : "(built in)") : "(none: hand on the controller)",
+                      anim ? (clip == reload_anim::kRifle ? "play the game's AR reload as it goes in"
+                                                          : "play the game's pistol reload as it goes in")
+                           : side == kR ? "held (the game's reload animation is for the left hand)"
+                                        : "held (the game's reload animation is not read)");
+        }
         g_free_slide[side].on = false;
         // Not posed yet: the hand stays where the controller grabbed (the
         // pistol builds a pinch or overhand from the slide's shape first).
@@ -3546,8 +3702,21 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
     FVector hand_pos;
     double flat = 0.0;  // how flat an empty hand is pressed on a wall
     if (recorded) {
-        hand_rot = Normalized(obj.rotation * g.hand_rot);
-        hand_pos = obj.location + obj.rotation.Rotate(grab.holster_preview ? g.approach.hand_position : g.hand_pos);
+        FQuat in_rot = g.hand_rot;
+        FVector in_pos = g.hand_pos;
+        MagStageBlend& mb = g_mag_stage[side];
+        if (mb.on) {
+            const double t = (perf::NowMs() - mb.t0_ms) / kMagStageMs;
+            if (t >= 1.0 || t < 0.0 || mb.object != grab.object || !IsMagKind(grab.kind)) {
+                mb.on = false;
+            } else {
+                const double e = t * t * (3.0 - 2.0 * t);
+                in_pos = mb.pos + (g.hand_pos - mb.pos) * e;
+                in_rot = Normalized(mb.rot * Scale(Normalized(mb.rot.Inverse() * g.hand_rot), e));
+            }
+        }
+        hand_rot = Normalized(obj.rotation * in_rot);
+        hand_pos = obj.location + obj.rotation.Rotate(grab.holster_preview ? g.approach.hand_position : in_pos);
     } else {
         // Unposed slide hold: a controller carried along with the slide.
         hands::HandState hv = h;
@@ -3794,6 +3963,15 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
         want[hand_pose::kPinky] = g.tip_angles[gr::kPinky];
         fingers::Angles idx = fingers::Blend(g.tip_angles[gr::kIndexOff], g.tip_angles[gr::kIndexRest], G.index_touch[side]);
         want[hand_pose::kIndex] = fingers::Blend(idx, g.tip_angles[gr::kIndexPull], G.index_pull[side]);
+        // The magazine going in: the game's own left-hand reload plays on
+        // top of the pose, by how far in it is (back out: backwards).
+        const int clip = grab.kind == hands::GrabKind::kMagInsert && side == kL ? InsertClip(grab.object) : -1;
+        if (clip >= 0 && reload_anim::Get(static_cast<reload_anim::Clip>(clip)).ready) {
+            reload_anim::Pose turn;
+            reload_anim::Delta(reload_anim::Get(static_cast<reload_anim::Clip>(clip)), grab.insert, &turn);
+            for (int f = 0; f < hand_pose::kFingerCount && f < reload_anim::kFingers; ++f)
+                for (int j = 0; j < 3; ++j) want[f].extra[j] = Normalized(want[f].extra[j] * turn.joint[f][j]);
+        }
     } else if (segment_contact) {
         perf::Scope contact_timer(g_perf_finger_contact);
         const hand_pose::Curl curl = hand_pose::Target(grab.kind, fin);
@@ -4213,6 +4391,32 @@ void OnTick(UObject player, float dt_f) {
     G.pose.SetAllLocal(G.frame_local.data(), static_cast<int>(G.frame_local.size()));
     G.pose.ClearChanged();
     ++G.frames;
+
+    // The game's left-hand reload animation, read once a few seconds into
+    // the level (reload_anim.h); magazine poses in the magwell built before
+    // it was read are built again.
+    if (S.mag_insert_anim && G.frames > 200 && k.fingers_ok[kL]) {
+        reload_anim::Bones bones;
+        auto fname = [](const FName& n) {
+            uint64_t v = 0;
+            std::memcpy(&v, &n, sizeof(v));
+            return v;
+        };
+        bones.hand = fname(G.engine.names[k.hand[kL]]);
+        for (int f = 0; f < hand_pose::kFingerCount && f < reload_anim::kFingers; ++f)
+            for (int j = 0; j < 3; ++j) bones.finger[f][j] = fname(G.engine.names[k.finger[kL][f][j]]);
+        unsigned clips = 1u << reload_anim::kPistol;
+        if (S.mag_insert_rifle_clip == reload_anim::kRifle) clips |= 1u << reload_anim::kRifle;
+        reload_anim::Tick(player, G.anim_src ? G.anim_src : G.source, bones, clips);
+        static uint64_t seen = 0;
+        if (reload_anim::Generation() != seen) {
+            seen = reload_anim::Generation();
+            for (auto it = g_grip_cache.begin(); it != g_grip_cache.end();)
+                it = it->first.find(".mag-insert") != std::string::npos ? g_grip_cache.erase(it) : std::next(it);
+            for (int side = 0; side < 2; ++side)
+                if (G.grip[side].kind == hands::GrabKind::kMagInsert) G.grip[side].object = 0;  // reload next frame
+        }
+    }
 
     CollectSolves();
     const hands::HandState live[2] = {hands::Get(hands::kLeft), hands::Get(hands::kRight)};

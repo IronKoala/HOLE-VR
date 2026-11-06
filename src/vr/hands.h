@@ -45,6 +45,9 @@ struct HandGrab {
     // or changes the controller. The authored approach clears the shell.
     bool holster_preview = false;
     double pose_blend = 1.0;
+    // kMagInsert: how far the magazine is in, 0 with its top at the magwell
+    // opening, 1 seated (plays the game's reload animation on the hand).
+    double insert = 0.0;
 };
 // Interaction checks use the held kind; pose solvers keep the authored kind
 // so the visual-only approach can still use the pistol's hand shape.
