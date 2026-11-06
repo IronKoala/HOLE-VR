@@ -2,7 +2,6 @@
 
 #include <cmath>
 #include <cstdio>
-#include <sstream>
 
 namespace holevr::vr::grip_record {
 
@@ -66,10 +65,10 @@ Record DefaultPistol() {
 }
 
 namespace {
-void Put(std::ostringstream& o, const char* k, const FVector& v) {
+void Put(std::string& o, const char* k, const FVector& v) {
     char buf[128];
     std::snprintf(buf, sizeof(buf), "%s=%.2f %.2f %.2f\n", k, v.X, v.Y, v.Z);
-    o << buf;
+    o += buf;
 }
 bool Vec(const std::string& s, FVector* v) {
     double x, y, z;
@@ -81,13 +80,15 @@ bool Vec(const std::string& s, FVector* v) {
 }  // namespace
 
 std::string Serialize(const Record& r) {
-    std::ostringstream o;
-    o << "; HOLE VR grip record (written by the in-headset grip editor).\n"
+    // Plain strings rather than string streams: a stream pulls about 0.5 MB of
+    // the C++ library's locale code into the DLL for nothing.
+    std::string o;
+    o += "; HOLE VR grip record (written by the in-headset grip editor).\n"
          "; Object frame, cm: X forward (barrel), Y right, Z up.\n"
          "; knuckle = middle finger knuckle; fingers = wrist->knuckle direction;\n"
          "; across = pinky->index knuckle direction; tip_* = fingertip targets.\n";
-    o << "name=" << r.name << "\n";
-    o << "hand=" << (r.right_hand ? "right" : "left") << "\n";
+    o += "name=" + r.name + "\n";
+    o += std::string("hand=") + (r.right_hand ? "right" : "left") + "\n";
     Put(o, "knuckle", r.knuckle);
     Put(o, "fingers", r.fingers);
     Put(o, "across", r.across);
@@ -100,22 +101,27 @@ std::string Serialize(const Record& r) {
             const FQuat& q = r.joint[t][j];
             n += std::snprintf(buf + n, sizeof(buf) - n, "%s%.5f %.5f %.5f %.5f", j ? "  " : "", q.X, q.Y, q.Z, q.W);
         }
-        o << buf << "\n";
+        o += buf;
+        o += "\n";
     }
     for (const OutlineBox& b : r.outline) {
         char buf[200];
         std::snprintf(buf, sizeof(buf), "box=%s %.2f %.2f %.2f %.2f %.2f %.2f %.1f\n", b.name.c_str(), b.centre.X,
                       b.centre.Y, b.centre.Z, b.half.X, b.half.Y, b.half.Z, b.pitch_deg);
-        o << buf;
+        o += buf;
     }
-    return o.str();
+    return o;
 }
 
 bool Parse(const std::string& text, Record* r) {
-    std::istringstream in(text);
     std::string line;
     bool any = false, boxes = false;
-    while (std::getline(in, line)) {
+    // One line at a time, as std::getline would split them.
+    for (size_t pos = 0; pos < text.size();) {
+        size_t end = text.find('\n', pos);
+        if (end == std::string::npos) end = text.size();
+        line.assign(text, pos, end - pos);
+        pos = end + 1;
         if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.empty() || line[0] == ';' || line[0] == '#') continue;
         size_t eq = line.find('=');

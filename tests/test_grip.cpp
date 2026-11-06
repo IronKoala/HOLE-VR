@@ -1,6 +1,6 @@
 // Native unit tests for the skeleton pose, fingertip solver and grip records.
 //   g++ -std=c++20 -Isrc tests/test_grip.cpp src/vr/body/ik_math.cpp src/vr/body/skeleton.cpp
-//       src/vr/body/finger_solve.cpp src/vr/body/grip_record.cpp src/vr/body/grip_editor.cpp -o /tmp/test_grip && /tmp/test_grip
+//       src/vr/body/finger_solve.cpp src/vr/body/grip_record.cpp src/vr/body/grip_editor.cpp src/vr/body/holster_pose.cpp -o /tmp/test_grip && /tmp/test_grip
 #include <chrono>
 #include <cstdio>
 #include <string>
@@ -8,6 +8,7 @@
 #include "vr/body/finger_solve.h"
 #include "vr/body/grip_editor.h"
 #include "vr/body/grip_record.h"
+#include "vr/body/holster_pose.h"
 #include "vr/body/skeleton.h"
 
 using namespace holevr::vr;
@@ -292,7 +293,61 @@ static void TestPosedJoints() {
     EXPECT(Near(h.extra[0].Z, std::sin(kPi / 8), 1e-6));
 }
 
+static void TestHolsterApproach() {
+    TestHand h = MakeHand();
+    auto r = grip_record::DefaultPistol();
+    // Real saved targets were far forward/up; the approach must not inherit
+    // those targets or the trigger's bent resting/pulled pose.
+    r.tip[grip_record::kThumb] = {21.90,-9.45,12.66};
+    r.tip[grip_record::kIndexOff] = {28.47,-7.15,21.30};
+    FQuat rot; FVector pos;
+    grip_record::HandInObject(r,h.geo,&rot,&pos);
+    const auto p = holster_pose::Approach(h.chain[0],h.chain[1],rot);
+    for (int f=0;f<2;++f) {
+        const auto& a = f==0 ? p.thumb : p.index;
+        Xf joint[3]; FVector tip;
+        fingers::Fk(h.chain[f],a,joint,&tip);
+        const FVector aim = f==0 ? Normalize(FVector{-.4,0,1}) : Normalize(FVector{1,-.04,.25});
+        const FVector points[4] = {joint[0].translation,joint[1].translation,joint[2].translation,tip};
+        EXPECT(Near(points[0],h.chain[f].ref[0].translation)); // knuckle stays on saved grip
+        EXPECT(Near(Length(tip-points[0]),h.chain[f].length,1e-5));
+        if (f==1) {
+            const FVector in_gun=rot.Rotate(tip-points[0]);
+            EXPECT(in_gun.Y < -.2 && in_gun.Y > -.6); // modest inward adjustment
+            EXPECT(in_gun.X > .96*h.chain[f].length); // still points down barrel
+            EXPECT(in_gun.Z > .24*h.chain[f].length); // reaches the side above the lower rim
+        }
+        for (int j=0;j<3;++j) {
+            EXPECT(Dot(Normalize(rot.Rotate(points[j+1]-points[j])),aim) > .999999);
+            EXPECT(std::isfinite(a.extra[j].W));
+        }
+        // A tilted/calibrated holster carries the pose along with the gun.
+        const FQuat holster = Normalized(FQuat{-.07713,-.73441,-.03793,-.67324});
+        EXPECT(Dot(Normalize(holster.Rotate(rot.Rotate(tip-points[0]))),holster.Rotate(aim)) > .999999);
+    }
+    // Also straighten reference chains whose joints are not already collinear.
+    Xf curved[3] = {X({0,0,0}),X({4,1,0},AxisAngle({0,0,1},.3)),X({7,2,1},AxisAngle({0,1,0},.4))};
+    auto chain = fingers::Build(curved,{0,1,0},{0,0,-3},false);
+    auto a = holster_pose::Extended(chain,{0,0,-1});
+    Xf joint[3]; FVector tip;
+    fingers::Fk(chain,a,joint,&tip);
+    EXPECT(Near(tip,{0,0,-chain.length},1e-5));
+    auto invalid = holster_pose::Extended(fingers::Chain{}, {0,0,1});
+    EXPECT(Near(invalid.extra[0].W,1));
+    const auto before = grip_record::Serialize(r);
+    const auto fit = holster_pose::Fit(r,h.chain,rot,pos,.5);
+    EXPECT(Near(fit.hand_position-pos,FVector{0,1.8,0}));
+    EXPECT(grip_record::Serialize(r)==before); // held grip is not changed
+    for (int f=2;f<5;++f) {
+        Xf joint[3];FVector tip;
+        fingers::Fk(h.chain[f],fit.finger[f],joint,&tip);
+        const FVector p=fit.hand_position+rot.Rotate(tip);
+        EXPECT(Length(p-r.tip[grip_record::kMiddle+f-2]) < 2.0);
+    }
+}
+
 int main() {
+    TestHolsterApproach();
     TestPosedJoints();
     TestEditor();
     BenchPose();

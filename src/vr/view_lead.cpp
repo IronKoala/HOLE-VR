@@ -49,7 +49,7 @@ Anchors Sample(UObject player) {
     }
     // The gun in the right hand, for the shake line in the log.
     const hands::HandGrab grab = hands::GetGrab(hands::kRight);
-    if (grab.kind == hands::GrabKind::kGunGrip && grab.object) {
+    if (hands::HeldGrabKind(grab) == hands::GrabKind::kGunGrip && grab.object) {
         ue::Call c(grab.object, "GetTransform");
         if (c.Invoke()) {
             const skel::Xf x = c.Result<skel::Xf>();

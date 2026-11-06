@@ -1,0 +1,12 @@
+Adapted from user-supplied Bench Vise — Low-poly Papercraft Style by xammurapi88.
+{
+  "extras": {
+    "author": "xammurapi88 (https://sketchfab.com/xammurapi88)",
+    "license": "SKETCHFAB Standard (https://sketchfab.com/licenses)",
+    "source": "https://sketchfab.com/3d-models/bench-vise-low-poly-papercraft-style-6d0d17daf87b45c6b0452e3cb8cb8fd8",
+    "title": "Bench Vise \u2014 Low-poly Papercraft Style"
+  },
+  "generator": "Sketchfab-0.17.0",
+  "version": "2.0"
+}
+Source file is preserved in the user Downloads folder. Original license metadata is retained; this is not labelled an original or open-source mesh.

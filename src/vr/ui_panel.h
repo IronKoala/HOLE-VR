@@ -16,4 +16,7 @@ void InitGame();
 void Maintain();
 // True while a game menu is open, so gameplay input (firing) can stand down.
 bool MenuOpen();
+// Game-thread watch contact queues a short-lived open-only request. The
+// present thread rechecks menu/calibration/editor state before sending it.
+bool RequestPauseFromWatch();
 }  // namespace holevr::vr::ui_panel

@@ -151,6 +151,40 @@ struct SettleStats {
     void Add(const Settle& s);
 };
 
+// Whether the tick's lead may be used. The lead says where the game's view
+// will be from where the character moved; that is wrong when the view does
+// not follow the character. In the extraction hole the character falls about
+// 40 m/s while the game's view holds still: every anchor predicts 55 cm a
+// frame the view never makes, and the hands (and the forearm menu on them)
+// land a frame's fall away from the eyes (owner's 2026-11-03 20:44 run,
+// found by the forearm menu thread). After each frame whose real view move
+// was measured: a prediction off by more than off_cm stops the lead; it
+// starts again on a measured frame whose prediction is within on_cm. `pick`
+// is the anchor the lead would use (Pick), applied or not; -1 changes nothing.
+struct LeadTrust {
+    bool trusted = true;
+    void Update(const FVector& actual, const Leads& l, int pick, double off_cm, double on_cm);
+    // For the log; ResetTotals keeps `trusted`.
+    long long off_frames = 0;  // measured frames with the lead stopped
+    int stops = 0;
+    double worst_miss = 0;  // largest miss that stopped it
+    void ResetTotals();
+};
+
+// The held gun kept out of walls. The line from the eyes to the muzzle
+// first meets a surface at `impact`, whose normal (out of the surface,
+// toward the eyes) is `normal`; `muzzle` is where the hand puts the muzzle.
+// Returns how far to move the gun: out along the normal by how deep the
+// muzzle is behind that surface, plus clearance_cm, at most max_cm; zero
+// when the muzzle is in front of it. Against a wall the gun slides along it.
+// The old push went back along the eyes-to-muzzle line instead: with the
+// head beside a wall that line meets it at a shallow angle, so a muzzle 3 cm
+// in came back about 17 cm toward the face, and as the head bobbed while
+// sprinting the gun jumped 15-20 cm in a frame against the hand (owner's
+// 2026-11-03 20:44 run: every such jump came with the head at a wall).
+FVector WallPushOut(const FVector& muzzle, const FVector& impact, const FVector& normal, double clearance_cm,
+                    double max_cm);
+
 double AngleDeg(const FQuat& q);  // rotation angle of q, 0..180
 
 double Length(const FVector& v);

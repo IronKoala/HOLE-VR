@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -84,8 +85,12 @@ bool g_have_frame_views = false;
 
 // Recentering, in UE axes but metres (scaled by WorldToMeters on use).
 std::atomic<bool> g_recenter{true};
+std::atomic<std::uint64_t> g_origin_generation{1};
 FVector g_origin_m;
 double g_origin_yaw = 0.0;
+std::atomic<double> g_standing_eye_m{0.0};   // 0: not measured
+std::atomic<bool> g_standing_apply{false};
+std::atomic<XrTime> g_standing_clear_after{0};
 
 // Logs the first time each hook runs, so a log shows which engine paths are live.
 #define HOLEVR_FIRST_CALL(name)                                  \
@@ -199,7 +204,12 @@ view_lead::Anchors g_anchor_view;     // g_anchor_end when the latest left eye w
 view_lead::Leads g_leads;             // from the latest tick start since those views
 bool g_leads_set = false;
 int g_lead_used = -1;
+int g_lead_pick = -1;  // the anchor the lead would use, applied or not (g_lead_trust)
 FVector g_lead_cm;  // added to the camera by TrackingToWorld and GameCameraLocation
+// The lead is stopped while its prediction is far off the game's view (the
+// view not following the character: the extraction hole's fall).
+view_lead::LeadTrust g_lead_trust;
+constexpr double kTrustAgainCm = 10.0;  // a measured frame this close starts the lead again
 // The views are drawn from where the mod placed the hands for, eased toward
 // the game's camera (view_lead::SettleView). g_world.camera_location is that
 // drawn camera; g_game_cam_prev is the game's own camera at the same views.
@@ -212,6 +222,7 @@ std::mutex g_lead_stats_mutex;
 view_lead::Stats g_lead_stats;
 view_lead::GunShake g_gun_shake;   // also under g_lead_stats_mutex
 view_lead::SettleStats g_settle_stats;  // also under g_lead_stats_mutex
+view_lead::LeadTrust g_trust_log;       // totals only, also under g_lead_stats_mutex
 bool g_moving_this_view = false;   // the camera moved between the latest two views (view thread)
 FVector g_view_shift;              // this frame's views: drawn camera - game camera (view thread)
 
@@ -220,17 +231,37 @@ FVector g_view_shift;              // this frame's views: drawn camera - game ca
 // camera exactly (hands and gun jump when it moves suddenly).
 double ViewFollow() { return std::clamp(static_cast<double>(config::GetFloat("view_follow", 0.15f)), 0.05, 1.0); }
 
+// The lead stopped or started again (view_lead::LeadTrust). View thread,
+// no lock held. The first 40 changes of a run are logged one by one; the
+// 10 s line counts them all.
+void LogTrustChange(int change, const FVector& actual, const view_lead::Leads& l, int pick) {
+    static int s_logged = 0;
+    if (s_logged >= 40) return;
+    ++s_logged;
+    const double predicted = pick >= 0 && pick < view_lead::kKinds ? view_lead::Length(l.move[pick]) : 0.0;
+    if (change < 0)
+        log::Info("view lead: stopped; the game's view moved %.1f cm but the character's %s said %.1f cm (the view "
+                  "isn't following the character); hands go with the game's view until they agree again",
+                  view_lead::Length(actual), pick >= 0 ? view_lead::kKindNames[pick] : "anchor", predicted);
+    else
+        log::Info("view lead: on again; the game's view moved %.1f cm and the character's %s said %.1f cm",
+                  view_lead::Length(actual), pick >= 0 ? view_lead::kKindNames[pick] : "anchor", predicted);
+}
+
 // The 10 s report line: how far the hands would have trailed the view, and
 // how far off each anchor's prediction was.
 std::string LeadReport(double) {
     view_lead::Stats s;
     view_lead::SettleStats settle;
+    view_lead::LeadTrust trust;
     {
         std::lock_guard<std::mutex> lock(g_lead_stats_mutex);
         s = g_lead_stats;
         g_lead_stats = {};
         settle = g_settle_stats;
         g_settle_stats = {};
+        trust = g_trust_log;
+        g_trust_log = {};
     }
     if (s.frames == 0 && s.turn_frames == 0) return {};
     const int choice = static_cast<int>(config::GetFloat("view_lead", -1.f));
@@ -283,6 +314,14 @@ std::string LeadReport(double) {
                       "%lld of %lld frames drawn at the game's camera (no tick or a jump)",
                       ViewFollow(), settle.mismatch_sum / h, settle.mismatch_max, settle.off_sum / h, settle.off_max,
                       settle.snaps, settle.frames);
+        out += b;
+    }
+    if (trust.stops > 0 || trust.off_frames > 0) {
+        char b[260];
+        std::snprintf(b, sizeof(b),
+                      ". Lead stopped %d times (worst miss %.1f cm: the game's view not following the character), "
+                      "off for %lld frames",
+                      trust.stops, trust.worst_miss, trust.off_frames);
         out += b;
     }
     return out;
@@ -388,6 +427,9 @@ void HookCalcOffset(void* self, int32_t view_index, FRotator* rotation, float en
         view_lead::Settle settle;
         settle.view = *location;
         bool have_settle = false;
+        int trust_changed = 0;  // 1 the lead started again, -1 it stopped
+        int pick = -1;
+        view_lead::LeadTrust trust;  // this frame's totals, for the log
         {
             std::lock_guard<std::mutex> lock(g_world_mutex);
             static double s_last_yaw = 0;
@@ -400,6 +442,7 @@ void HookCalcOffset(void* self, int32_t view_index, FRotator* rotation, float en
                 measured = true;
                 leads = g_leads;
                 used = g_lead_used;
+                pick = g_lead_pick;
                 actual = *location - g_game_cam_prev - g_pending_world_cm;
             }
             // Draw the views from where this tick placed the hands for, eased
@@ -409,6 +452,15 @@ void HookCalcOffset(void* self, int32_t view_index, FRotator* rotation, float en
                 settle = view_lead::SettleView(*location, placed_for, ViewFollow(), g_leads_set && g_lead_used >= 0,
                                                kSnapCm);
                 have_settle = true;
+            }
+            // Judge the lead by this frame, whether or not it was applied,
+            // for the next tick (view_lead::LeadTrust).
+            if (measured) {
+                const bool was = g_lead_trust.trusted;
+                g_lead_trust.Update(actual, leads, pick, kSnapCm, kTrustAgainCm);
+                if (was != g_lead_trust.trusted) trust_changed = g_lead_trust.trusted ? 1 : -1;
+                trust = g_lead_trust;
+                g_lead_trust.ResetTotals();
             }
             g_game_cam_prev = *location;
             g_have_game_cam = true;
@@ -421,8 +473,10 @@ void HookCalcOffset(void* self, int32_t view_index, FRotator* rotation, float en
             g_leads = {};
             g_leads_set = false;
             g_lead_used = -1;
+            g_lead_pick = -1;
             g_lead_cm = FVector{};
         }
+        if (trust_changed) LogTrustChange(trust_changed, actual, leads, pick);
         g_moving_this_view = measured && view_lead::Length(actual) > 0.5;
         g_view_shift = settle.view - *location;
         if (measured || have_settle) {
@@ -430,18 +484,48 @@ void HookCalcOffset(void* self, int32_t view_index, FRotator* rotation, float en
             if (measured) {
                 g_lead_stats.Add(actual, leads, used, rotation->Yaw);
                 g_lead_stats.AddTurn(turn);
+                g_trust_log.off_frames += trust.off_frames;
+                g_trust_log.stops += trust.stops;
+                if (trust.worst_miss > g_trust_log.worst_miss) g_trust_log.worst_miss = trust.worst_miss;
             }
             if (have_settle) g_settle_stats.Add(settle);
         }
     }
 
-    if (g_recenter.exchange(false)) {
+    const bool recentered_now = g_recenter.exchange(false);
+    if (recentered_now) {
         const XrVector3f& a = views[0].pose.position;
         const XrVector3f& b = views[1].pose.position;
         g_origin_m = XrToUePosition((a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f, (a.z + b.z) * 0.5f, 1.0);
         const XrQuaternionf& q = views[0].pose.orientation;
         g_origin_yaw = YawOf(XrToUeQuat(q.x, q.y, q.z, q.w));
         log::Info("stereo: recentered (yaw %.1f)", g_origin_yaw);
+    }
+    const bool standing_requested = g_standing_apply.exchange(false);
+    if (recentered_now || standing_requested) {
+        const double y = g_standing_eye_m.load();
+        if (y > 0.5 && y < 2.5 && xr::StandingSpace()) {
+            const double before = g_origin_m.Z;
+            g_origin_m.Z = XrToUePosition(0, static_cast<float>(y), 0, 1.0).Z;
+            log::Info("stereo: standing eye height %.0f cm from your measurement (the head was %.0f cm %s it at the "
+                      "recentre)", y * 100.0, std::fabs(before - g_origin_m.Z) * 100.0,
+                      before >= g_origin_m.Z ? "above" : "below");
+        } else if (standing_requested) {
+            const double head_y = (static_cast<double>(views[0].pose.position.y) + views[1].pose.position.y) * 0.5;
+            // View caches can retain the last valid pose during tracking loss.
+            // A clear must wait for a new observation rather than reusing it.
+            const bool fresh = y > 0 || (views[0].base_time > g_standing_clear_after.load() &&
+                                        views[1].base_time > g_standing_clear_after.load());
+            if (fresh && std::isfinite(head_y)) {
+                const double before = g_origin_m.Z;
+                g_origin_m.Z = head_y;  // UE tracking Z equals OpenXR Y, in metres
+                if (std::fabs(before - head_y) > 1e-6) ++g_origin_generation;
+                log::Info("stereo: standing reference inactive; vertical origin reset to current head %.1f cm (XY/yaw kept)",
+                          head_y * 100.0);
+            } else {
+                g_standing_apply = true;  // retry at the next fresh valid picture
+            }
+        }
     }
 
     const XrPosef& pose = views[view_index].pose;
@@ -741,7 +825,22 @@ bool Install() {
     return true;
 }
 
-void Recenter() { g_recenter = true; }
+void Recenter() { ++g_origin_generation; g_recenter = true; }
+std::uint64_t OriginGeneration() { return g_origin_generation.load(); }
+double TrackingScale() {
+    std::lock_guard<std::mutex> lock(g_world_mutex);
+    return g_world.valid && g_world.world_to_meters > 0 ? g_world.world_to_meters / 100.0 : 1.0;
+}
+void SetStandingEyeHeight(double floor_to_eye_m) {
+    if (!std::isfinite(floor_to_eye_m) ||
+        (floor_to_eye_m != 0 && !(floor_to_eye_m > 0.5 && floor_to_eye_m < 2.5))) return;
+    if (floor_to_eye_m == 0) {
+        xr::EyeView views[2];
+        g_standing_clear_after = xr::LatestViews(views) ? std::max(views[0].base_time, views[1].base_time) : 0;
+    }
+    g_standing_eye_m = floor_to_eye_m;
+    g_standing_apply = true;
+}
 
 void SetGameFrameCallback(void (*fn)()) { g_frame_callback.store(fn); }
 
@@ -815,7 +914,8 @@ void CharacterAtTickStart(const view_lead::Anchors& now) {
     if (!g_world.valid) return;
     g_leads = view_lead::Predict(g_anchor_view, now, g_world.camera_location, kMaxLeadCm);
     g_leads_set = true;
-    g_lead_used = view_lead::Pick(g_leads, choice);
+    g_lead_pick = view_lead::Pick(g_leads, choice);
+    g_lead_used = g_lead_trust.trusted ? g_lead_pick : -1;
     g_lead_cm = g_lead_used >= 0 ? g_leads.move[g_lead_used] : FVector{};
 }
 

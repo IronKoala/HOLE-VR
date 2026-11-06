@@ -20,6 +20,7 @@
 #include "ue/objects.h"
 #include "ue/reflection.h"
 #include "vr/cvars.h"
+#include "vr/gpu_test.h"
 #include "vr/render_fixes.h"
 #include "vr/square_watch.h"
 
@@ -483,7 +484,7 @@ void Tick(UObject player, float) {
     square_watch::Sweep sw;
     switch (g_phase) {
         case Phase::kWatch: {
-            if (now < g_next_check) return;
+            if (now < g_next_check || gpu_test::Running()) return;  // it switches render features too
             g_next_check = now + kCheckEveryMs;
             if (!square_watch::LatestSweep(now - 1500, &sw)) {
                 g_strong = 0;
@@ -600,11 +601,18 @@ void Tick(UObject player, float) {
 
 }  // namespace
 
+bool Busy() { return g_on && g_phase != Phase::kWatch && g_phase != Phase::kDone; }
+
 void Init() {
-    g_on = config::GetBool("square_test", true);
+    g_on = config::GetBool("square_test", false);
     g_trigger = std::max(square_watch::kStripExcess, config::GetInt("square_test_trigger", 200));
     if (!g_on) {
-        log::Info("square test: off (square_test=0)");
+        log::Info("square test: off (square_test=1 in hole-vr.ini turns it on)");
+        return;
+    }
+    if (!square_watch::On()) {  // it only acts on what the watch sees
+        g_on = false;
+        log::Info("square test: off (needs square_watch=1)");
         return;
     }
     AddRenderSuspects();

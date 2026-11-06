@@ -47,12 +47,14 @@ struct CarryInput {
     bool right_at_pistol_holster = false;  // right hand in the pistol holster's zone
     bool toggle = false;            // grip toggle: squeeze again to let go (left hand)
     bool right_toggle = false;      // gun grip toggle: the right hand lets go of the rifle on a squeeze
+    bool right_puts_away = true;    // the right hand alone letting go sends the rifle to its holster
 };
 
 enum class CarryAction {
     kNone,
     kPickUp,          // left hand takes the rifle by the handguard from wherever it is
     kRightLetGo,      // both hands on the rifle and the right let go: the left keeps it
+    kRightPutsAway,   // only the right hand on the rifle and it let go: the rifle goes back to its holster
     kDrawPistol,      // rifle out, right grip at the pistol holster: switch to the pistol
     kRightTakesRifle, // right hand empty, right grip on the rifle's grip
     kLetGo,           // the left hand lets go of the rifle it holds alone
@@ -83,6 +85,11 @@ CarryHold HoldAsIs(const hands::Pose& hand, const FQuat& frame_rot, const FVecto
 // was grabbed (kept inside the handguard).
 CarryHold HoldFromGrab(const hands::Pose& hand, const FQuat& frame_rot, const FVector& grip_world, double muzzle_dist,
                        double bore_height, double fist_below_bore, const FQuat& turn);
+
+// Picked up from its spot at one of its grip points (vr/interact/grip_points.h):
+// the rifle lies along the hand as in HoldFromGrab, with that point (gun
+// frame) at the hand.
+CarryHold HoldAtPoint(const FVector& point, const FQuat& turn);
 
 // Rifle gun frame and grip point in the world for the hand's pose.
 void PlaceFromHand(const hands::Pose& hand, const CarryHold& h, FQuat* frame_rot, FVector* grip_world);

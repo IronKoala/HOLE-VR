@@ -8,6 +8,7 @@
 #include <cstdlib>
 
 #include "core/log.h"
+#include "core/perf.h"
 
 namespace holevr::mem {
 
@@ -45,30 +46,101 @@ struct RegionCache {
     uintptr_t end = 0;
     bool readable = false;
 };
-thread_local RegionCache t_cache[4];
-thread_local unsigned t_next = 0;
 
-// ScopedRegionCache: every region looked up while one is alive, sorted by
-// start address. Regions VirtualQuery reports never overlap.
+// Everything one thread keeps between checks. MinGW builds `thread_local`
+// as emulated TLS: every use of one is a call into __emutls_get_address
+// (the 2026-11-06 profile of a test run put it at a fifth of each checked
+// read). One Windows TLS slot holding a pointer to this, read straight from
+// the thread's TEB, costs one instruction instead.
+struct ThreadState {
+    // Level 1: the last 4 regions this thread used.
+    RegionCache cache[4];
+    unsigned next = 0;
+    // Level 2: every readable region this thread looked up during the
+    // current game frame, sorted by start (2026-11-06). The 4-entry cache
+    // alone kept missing when code hopped between many objects (each object,
+    // its class and each name sit in different heap blocks), and every miss
+    // was a VirtualQuery system call. Both levels are emptied when a new game
+    // frame starts (NewFrame), so an answer is at most one frame old; the
+    // copy itself is guarded (SafeCopy), so memory freed within the frame is
+    // still caught.
+    unsigned epoch = 0;
+    std::vector<RegionCache> frame;
+    // ScopedRegionCache: every region looked up while one is alive.
+    int scope_depth = 0;
+    std::vector<RegionCache>* scoped = nullptr;
+    unsigned scoped_queries = 0;
+    // Counts for the report (atomics on every read would cost more than they
+    // measure), added up now and then.
+    unsigned long long checks = 0, vq = 0, old_vq = 0;
+    bool is_game = false;
+    RegionCache old[4];  // the old cache, simulated for the count only
+    unsigned old_next = 0;
+};
+
+constexpr size_t kMaxFrameRegions = 1024;
 constexpr size_t kMaxScopedRegions = 4096;
-thread_local int t_scope_depth = 0;
-thread_local std::vector<RegionCache>* t_scoped = nullptr;
-thread_local unsigned t_scoped_queries = 0;
+// A function-local static: something may read memory before this file's
+// globals are set up, and slot 0 would be someone else's.
+DWORD TlsIndex() {
+    static const DWORD index = TlsAlloc();
+    return index;
+}
 
-const RegionCache* FindScoped(uintptr_t p) {
-    if (!t_scoped || t_scoped->empty()) return nullptr;
-    auto it = std::upper_bound(t_scoped->begin(), t_scoped->end(), p,
-                               [](uintptr_t v, const RegionCache& c) { return v < c.start; });
-    if (it == t_scoped->begin()) return nullptr;
+ThreadState* NewThreadState() {
+    // Kept for the thread's life: a few hundred bytes per thread that reads
+    // game memory (the game, render and a few of our own threads).
+    auto* ts = new ThreadState();
+    ts->frame.reserve(256);
+    TlsSetValue(TlsIndex(), ts);
+    return ts;
+}
+
+inline ThreadState& TS() {
+    ThreadState* ts;
+    const DWORD g_tls = TlsIndex();
+    if (g_tls < 64) {
+        uintptr_t v;
+        // TEB.TlsSlots[g_tls] (x64 TEB offset 0x1480).
+        __asm__("movq %%gs:(%1), %0" : "=r"(v) : "r"(static_cast<uintptr_t>(0x1480 + g_tls * 8)));
+        ts = reinterpret_cast<ThreadState*>(v);
+    } else {
+        ts = static_cast<ThreadState*>(TlsGetValue(g_tls));
+    }
+    return ts ? *ts : *NewThreadState();
+}
+
+std::atomic<unsigned> g_epoch{1};
+std::atomic<unsigned long long> g_checks{0}, g_vq{0}, g_old_vq{0};
+std::atomic<unsigned long long> g_game_checks{0}, g_game_vq{0}, g_game_old_vq{0};
+std::atomic<long long> g_game_frames{0};
+
+void FlushCounts(ThreadState& ts) {
+    if (ts.is_game) {
+        g_game_checks.fetch_add(ts.checks, std::memory_order_relaxed);
+        g_game_vq.fetch_add(ts.vq, std::memory_order_relaxed);
+        g_game_old_vq.fetch_add(ts.old_vq, std::memory_order_relaxed);
+    }
+    g_checks.fetch_add(ts.checks, std::memory_order_relaxed);
+    g_vq.fetch_add(ts.vq, std::memory_order_relaxed);
+    g_old_vq.fetch_add(ts.old_vq, std::memory_order_relaxed);
+    ts.checks = ts.vq = ts.old_vq = 0;
+}
+
+const RegionCache* FindSorted(const std::vector<RegionCache>* v, uintptr_t p) {
+    if (!v || v->empty()) return nullptr;
+    auto it = std::upper_bound(v->begin(), v->end(), p,
+                               [](uintptr_t x, const RegionCache& c) { return x < c.start; });
+    if (it == v->begin()) return nullptr;
     --it;
     return p < it->end ? &*it : nullptr;
 }
 
-void RememberScoped(const RegionCache& c) {
-    if (!t_scoped || t_scoped->size() >= kMaxScopedRegions) return;
-    auto it = std::upper_bound(t_scoped->begin(), t_scoped->end(), c.start,
-                               [](uintptr_t v, const RegionCache& r) { return v < r.start; });
-    t_scoped->insert(it, c);
+void InsertSorted(std::vector<RegionCache>* v, const RegionCache& c, size_t max) {
+    if (!v || v->size() >= max) return;
+    auto it = std::upper_bound(v->begin(), v->end(), c.start,
+                               [](uintptr_t x, const RegionCache& r) { return x < r.start; });
+    v->insert(it, c);
 }
 
 bool ProtectReadable(DWORD protect) {
@@ -77,54 +149,107 @@ bool ProtectReadable(DWORD protect) {
                        PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
 }
 
+void CountOld(ThreadState& ts, uintptr_t p, const RegionCache& answer) {
+    for (auto& c : ts.old)
+        if (c.readable && p >= c.start && p < c.end) return;
+    if (!FindSorted(ts.scoped, p)) ++ts.old_vq;
+    ts.old[ts.old_next++ & 3] = answer;
+}
+
 bool RegionReadable(uintptr_t p, uintptr_t* region_end) {
     // Only "readable" answers are reused. A free or reserved region can be
     // huge and the game commits memory inside it all the time, so a cached
     // "unreadable" went stale and hid live objects; asking again costs one
     // VirtualQuery and bad pointers are rare.
-    for (auto& c : t_cache) {
+    ThreadState& ts = TS();
+    if (++ts.checks >= 8192 && !ts.is_game) FlushCounts(ts);
+    const unsigned epoch = g_epoch.load(std::memory_order_relaxed);
+    if (ts.epoch != epoch) {
+        ts.epoch = epoch;
+        for (auto& c : ts.cache) c = RegionCache{};
+        ts.frame.clear();
+    }
+    for (auto& c : ts.cache) {
         if (c.readable && p >= c.start && p < c.end) {
             *region_end = c.end;
-            return c.readable;
+            CountOld(ts, p, c);
+            return true;
         }
     }
-    if (const RegionCache* s = FindScoped(p)) {
-        t_cache[t_next++ & 3] = *s;
-        *region_end = s->end;
-        return s->readable;
+    const RegionCache* known = FindSorted(ts.scoped, p);
+    if (!known) known = FindSorted(&ts.frame, p);
+    if (known) {
+        RegionCache c = *known;
+        ts.cache[ts.next++ & 3] = c;
+        *region_end = c.end;
+        CountOld(ts, p, c);
+        return c.readable;
     }
     MEMORY_BASIC_INFORMATION mbi;
-    if (t_scope_depth > 0) ++t_scoped_queries;
+    if (ts.scope_depth > 0) ++ts.scoped_queries;
+    ++ts.vq;
     if (!VirtualQuery(reinterpret_cast<void*>(p), &mbi, sizeof(mbi))) {
         *region_end = p + 1;
+        CountOld(ts, p, RegionCache{});
         return false;
     }
-    RegionCache& c = t_cache[t_next++ & 3];
+    RegionCache& c = ts.cache[ts.next++ & 3];
     c.start = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
     c.end = c.start + mbi.RegionSize;
     c.readable = mbi.State == MEM_COMMIT && ProtectReadable(mbi.Protect);
-    if (t_scope_depth > 0 && c.end > c.start) RememberScoped(c);
+    if (c.end > c.start) {
+        if (ts.scope_depth > 0) InsertSorted(ts.scoped, c, kMaxScopedRegions);
+        if (c.readable) InsertSorted(&ts.frame, c, kMaxFrameRegions);
+    }
+    CountOld(ts, p, c);
     *region_end = c.end;
     return c.readable;
 }
+
+std::string MemoryReport(double span_s) {
+    const long long frames = g_game_frames.exchange(0);
+    const unsigned long long gc = g_game_checks.exchange(0), gv = g_game_vq.exchange(0), go = g_game_old_vq.exchange(0);
+    const unsigned long long ac = g_checks.exchange(0), av = g_vq.exchange(0), ao = g_old_vq.exchange(0);
+    if (!ac || span_s <= 0) return {};
+    char b[600];
+    std::snprintf(b, sizeof(b),
+                  "memory checks: game thread %.0f checked reads a frame, %.0f asked Windows (VirtualQuery) a frame; "
+                  "the old 4-entry cache would have asked %.0f a frame. All threads: %.0f checks/s, %.0f asked "
+                  "Windows/s (old cache %.0f/s)",
+                  frames ? static_cast<double>(gc) / frames : 0.0, frames ? static_cast<double>(gv) / frames : 0.0,
+                  frames ? static_cast<double>(go) / frames : 0.0, ac / span_s, av / span_s, ao / span_s);
+    return b;
+}
 }  // namespace
 
+void NewFrame() {
+    static const bool registered = (perf::AddReportLine(&MemoryReport), true);
+    (void)registered;
+    ThreadState& ts = TS();
+    ts.is_game = true;
+    FlushCounts(ts);
+    g_game_frames.fetch_add(1, std::memory_order_relaxed);
+    g_epoch.fetch_add(1, std::memory_order_relaxed);
+}
+
 ScopedRegionCache::ScopedRegionCache() {
-    if (t_scope_depth++ == 0) {
-        t_scoped = new std::vector<RegionCache>();
-        t_scoped->reserve(256);
-        t_scoped_queries = 0;
+    ThreadState& ts = TS();
+    if (ts.scope_depth++ == 0) {
+        ts.scoped = new std::vector<RegionCache>();
+        ts.scoped->reserve(256);
+        ts.scoped_queries = 0;
     }
 }
 
 ScopedRegionCache::~ScopedRegionCache() {
-    if (--t_scope_depth == 0) {
-        delete t_scoped;
-        t_scoped = nullptr;
+    ThreadState& ts = TS();
+    if (--ts.scope_depth == 0) {
+        delete ts.scoped;
+        ts.scoped = nullptr;
     }
 }
 
-unsigned ScopedRegionCache::Lookups() { return t_scoped_queries; }
+unsigned ScopedRegionCache::Lookups() { return TS().scoped_queries; }
 // ------------------------------------------------------------ SafeCopy --
 #ifdef _WIN32
 // holevr_guarded_copy(dst, src, len) copies with plain moves and returns 1.
@@ -222,11 +347,13 @@ bool InstallGuardHandler() {
 // The faulting address is no longer readable: drop whatever this thread's
 // cache remembered about it so the next IsReadable asks Windows again.
 void ForgetRegion(uintptr_t p) {
-    for (auto& c : t_cache)
+    ThreadState& ts = TS();
+    for (auto& c : ts.cache)
         if (p >= c.start && p < c.end) c = RegionCache{};
-    if (t_scoped) {
-        for (auto it = t_scoped->begin(); it != t_scoped->end();) {
-            if (p >= it->start && p < it->end) it = t_scoped->erase(it);
+    for (std::vector<RegionCache>* v : {ts.scoped, &ts.frame}) {
+        if (!v) continue;
+        for (auto it = v->begin(); it != v->end();) {
+            if (p >= it->start && p < it->end) it = v->erase(it);
             else ++it;
         }
     }

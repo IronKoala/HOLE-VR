@@ -1,7 +1,9 @@
 #include "vr/input.h"
 #include "vr/input_edges.h"
+#include "vr/haptic_queue.h"
 
 #include <atomic>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <deque>
@@ -37,6 +39,15 @@ struct Actions {
 
 std::mutex g_mutex;
 Snapshot g_latest;     // written on the render thread
+std::atomic<bool> g_calibration_capture{false};
+std::atomic<std::uint64_t> g_calibration_epoch{0};
+CalibrationTracking g_calibration_tracking;  // guarded by g_mutex
+
+void InvalidateCalibration(XrTime time) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_calibration_tracking = {};
+    g_calibration_tracking.time = time;
+}
 // The same controllers predicted ahead to when the game's picture will be
 // shown (xr::PredictAhead), for the game thread: Consume and PeekGame put
 // these poses in. Guarded by g_mutex.
@@ -77,10 +88,6 @@ std::string HandReport(double) {
 Snapshot g_consumed;   // what the game thread last saw (for edges)
 PendingButtonEdges g_pending_edges;
 
-struct HapticRequest {
-    Hand hand;
-    float amplitude, seconds, frequency;
-};
 std::vector<HapticRequest> g_haptics;
 
 XrPath Path(const char* s) {
@@ -207,6 +214,7 @@ struct InputListener : xr::Listener {
     }
 
     void OnSessionCreated(XrSession session, std::vector<XrActionSet>& sets) override {
+        SetCalibrationCapture(false);
         if (!g_set) return;
         auto create_space = Fn<PFN_xrCreateActionSpace>("xrCreateActionSpace");
         for (int h = 0; h < 2; ++h) {
@@ -223,7 +231,11 @@ struct InputListener : xr::Listener {
     }
 
     void OnFrame(XrSession session, XrSpace space, XrTime time) override {
-        if (!g_set) return;
+        if (!g_set) { InvalidateCalibration(time); return; }
+        const auto calibration_epoch = g_calibration_epoch.load();
+        const bool capture = g_calibration_capture.load();
+        CalibrationTracking calibration;
+        calibration.time = time;
         static auto sync = Fn<PFN_xrSyncActions>("xrSyncActions");
         static auto get_float = Fn<PFN_xrGetActionStateFloat>("xrGetActionStateFloat");
         static auto get_bool = Fn<PFN_xrGetActionStateBoolean>("xrGetActionStateBoolean");
@@ -231,13 +243,16 @@ struct InputListener : xr::Listener {
         static auto get_pose = Fn<PFN_xrGetActionStatePose>("xrGetActionStatePose");
         static auto locate = Fn<PFN_xrLocateSpace>("xrLocateSpace");
         static auto haptic = Fn<PFN_xrApplyHapticFeedback>("xrApplyHapticFeedback");
+        static auto stop_haptic = Fn<PFN_xrStopHapticFeedback>("xrStopHapticFeedback");
 
         XrActiveActionSet active{g_set, XR_NULL_PATH};
         XrActionsSyncInfo si{XR_TYPE_ACTIONS_SYNC_INFO};
         si.countActiveActionSets = 1;
         si.activeActionSets = &active;
         XrResult sr = sync(session, &si);
-        if (XR_FAILED(sr)) return;  // e.g. session not focused (dashboard open)
+        if (XR_FAILED(sr)) { InvalidateCalibration(time); return; }
+        // XR_SESSION_NOT_FOCUSED is non-negative, but not a measurement frame.
+        bool calibration_hands_tracked = capture && sr == XR_SUCCESS;
 
         Snapshot s;
         s.valid = true;
@@ -294,6 +309,12 @@ struct InputListener : xr::Listener {
                 hi.grip = loc.pose;
                 if (vel.velocityFlags & XR_SPACE_VELOCITY_LINEAR_VALID_BIT) hi.linear_velocity = vel.linearVelocity;
             }
+            constexpr XrSpaceLocationFlags kCalibrationTracked =
+                XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT |
+                XR_SPACE_LOCATION_POSITION_TRACKED_BIT | XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
+            calibration_hands_tracked = calibration_hands_tracked && hi.active && hi.grip_valid &&
+                (loc.locationFlags & kCalibrationTracked) == kCalibrationTracked;
+            if (capture) calibration.grip[h] = hi.grip;
             XrSpaceLocation aloc{XR_TYPE_SPACE_LOCATION};
             if (g_aim_space[h] && XR_SUCCEEDED(locate(g_aim_space[h], space, time, &aloc)) &&
                 (aloc.locationFlags & kTracked) == kTracked) {
@@ -320,6 +341,33 @@ struct InputListener : xr::Listener {
                     gp.aim_valid = true;
                     gp.aim = galoc.pose;
                 }
+            }
+        }
+
+        // Height-only setup must work while controllers rest outside camera
+        // coverage. Locate the head independently; arm measurement still
+        // requires all three actively tracked poses at this exact base time.
+        if (capture && sr == XR_SUCCESS && g_calibration_capture.load() &&
+            g_calibration_epoch.load() == calibration_epoch) {
+            static auto locate_views = Fn<PFN_xrLocateViews>("xrLocateViews");
+            XrViewLocateInfo info{XR_TYPE_VIEW_LOCATE_INFO};
+            info.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+            info.displayTime = time;
+            info.space = space;
+            XrViewState state{XR_TYPE_VIEW_STATE};
+            XrView views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+            uint32_t count = 0;
+            constexpr XrViewStateFlags kCalibrationViews =
+                XR_VIEW_STATE_POSITION_VALID_BIT | XR_VIEW_STATE_ORIENTATION_VALID_BIT |
+                XR_VIEW_STATE_POSITION_TRACKED_BIT | XR_VIEW_STATE_ORIENTATION_TRACKED_BIT;
+            if (locate_views && locate_views(session, &info, &state, 2, &count, views) == XR_SUCCESS &&
+                count == 2 && (state.viewStateFlags & kCalibrationViews) == kCalibrationViews) {
+                calibration.head = views[0].pose;
+                calibration.head.position.x = (views[0].pose.position.x + views[1].pose.position.x) * .5f;
+                calibration.head.position.y = (views[0].pose.position.y + views[1].pose.position.y) * .5f;
+                calibration.head.position.z = (views[0].pose.position.z + views[1].pose.position.z) * .5f;
+                calibration.head_valid = true;
+                calibration.valid = calibration_hands_tracked;
             }
         }
 
@@ -378,6 +426,8 @@ struct InputListener : xr::Listener {
                 }
             }
             g_latest = s;
+            if (capture && g_calibration_capture.load() && g_calibration_epoch.load() == calibration_epoch)
+                g_calibration_tracking = calibration;
             for (int h = 0; h < 2; ++h) g_game[h] = game[h];
             g_have_game = true;
             haptics.swap(g_haptics);
@@ -390,11 +440,13 @@ struct InputListener : xr::Listener {
             XrHapticActionInfo hi{XR_TYPE_HAPTIC_ACTION_INFO};
             hi.action = A.haptic;
             hi.subactionPath = g_hand_path[r.hand];
-            haptic(session, &hi, reinterpret_cast<const XrHapticBaseHeader*>(&v));
+            if(r.stop) { if(stop_haptic) stop_haptic(session,&hi); }
+            else haptic(session, &hi, reinterpret_cast<const XrHapticBaseHeader*>(&v));
         }
     }
 
     void OnSessionEnding() override {
+        SetCalibrationCapture(false);
         std::lock_guard<std::mutex> lock(g_mutex);
         g_latest = Snapshot();
         g_have_game = false;
@@ -407,6 +459,18 @@ InputListener g_listener;
 }  // namespace
 
 void Init() { xr::RegisterListener(&g_listener); }
+
+void SetCalibrationCapture(bool enabled) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    ++g_calibration_epoch;
+    g_calibration_capture = enabled;
+    g_calibration_tracking = {};
+}
+
+CalibrationTracking CalibrationSample() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return g_calibration_tracking;
+}
 
 // g_latest with the game's controller poses: those located for the moment
 // the picture being prepared will be shown (`shown`, from
@@ -485,6 +549,10 @@ Snapshot PeekGame() {
 void Haptic(Hand hand, float amplitude, float seconds, float frequency_hz) {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_haptics.size() < 16) g_haptics.push_back({hand, amplitude, seconds, frequency_hz});
+}
+void StopHaptic(Hand hand) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    QueueHapticStop(g_haptics,static_cast<int>(hand));
 }
 
 }  // namespace holevr::vr::input

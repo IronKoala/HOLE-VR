@@ -40,10 +40,27 @@ the hand finally came within range of the box.
     trigger.
   - A hand holding the gun, a magazine, the slide, a workbench part or a
     drink can is never used for touch. Neither is the grip editor's hand.
-- **Trigger** with an empty hand: the thing the hand touches wins. Next is the
-  thing the hand points at, found with the game's own interact trace (channel
-  2, hit part object type 16) from the hand instead of the eyes. Where you
-  look is the fallback.
+- **Trigger** with an empty hand, in this order:
+  1. what the hand touches or nearly touches (within
+     `touch_interact_trigger_near_cm`, 8 cm), smallest first;
+  2. what the hand points at exactly, found with the game's own interact
+     trace (channel 2, hit part object type 16) from the hand instead of the
+     eyes;
+  3. what the hand points near: the thing whose shapes come closest to the
+     aim, within `touch_interact_point_cone_deg` (8 degrees) or
+     `touch_interact_point_min_cm` (6 cm) of it, as far as the game reaches
+     when you look (`InteractiveDistance`, 200 cm). A wall, shelf or door in
+     between (the Visibility trace) rules a thing out;
+  4. where you look (the game's own target).
+
+  A press buzzes only when it used something, and only a press that used
+  something holds up the next one (0.5 s).
+
+  Why the cone (run 2026-11-03 20:44, build 399a3d0): ten presses at two
+  cardboard boxes from about 1 m away found nothing. The game's interact part
+  on a `BP_DataBox_500_C` is a 64 cm sphere (`InteractArea`) centred on the
+  box's base, half of it under the floor, so only an exact hit on that dome
+  counted, and the game's own look target was empty at those moments too.
 - Every interact goes through the game's own steps: the thing's
   `InteractInOverlay`, the player's `InteractTarget` and `IsInteractReady`,
   then `PlayerInput_Interact`. That is the same as looking at the thing and
@@ -76,8 +93,22 @@ the hand finally came within range of the box.
   game's interact`: a touch fired. Trigger presses say `left hand trigger,
   touching|pointing at|looking at`.
 - `touch: result of ... : it opened (IsOpen 0 -> 1)` / `it is gone (taken)` /
-  `no change the mod can see`: read 1 s later. Use this to check each touch
-  really did something.
+  `it opened and the game removed it` (a box destroys itself 1 s after its
+  loot is out) / `no change the mod can see`: read 1 s later. Use this to
+  check each touch really did something. Before build 2 (399a3d0 and older)
+  the "before" state was read after the game's Interact had run, so every
+  line said "already open": ignore those.
+- `touch: left hand trigger: pointing 3.2 deg off <actor> ...` / `... is in
+  the way` / `the left hand touches and points at nothing ... aim from (...)
+  along (...)`: how each trigger press picked (or didn't).
+- `touch: loot: <item> appeared ...`, `... after 2.5 s is ... cm from you,
+  ... above your feet; moved ...; n of m meshes shown; solid above it, floor
+  below it` and `... is gone: taken by your hand | not by the mod's touch or
+  trigger (walked into, timed out, or fell out of the level)`: where each
+  item that appears during a level goes (first 80 lines a level). Owner
+  2026-11-04: "no loot spawned". The game did spawn items from every box and
+  fridge in that run, but almost none was picked up. Turn off with
+  `touch_interact_loot_log=0`.
 - `touch: study: <class> (...)`: once a run per class, its components (object
   type, collision, size, place) and the shapes touch uses. The class's
   bytecode goes to `dump/script/<class>.txt` (`touch: study: the game's code
@@ -92,9 +123,24 @@ the hand finally came within range of the box.
 `touch_interact_hold_s` (0.08); `touch_interact_door_hold_s` (0.2);
 `door_handle_height_cm` (100); `door_handle_from_edge_cm` (22);
 `touch_interact_extra_containers` and `touch_interact_skip` (class-name
-pieces, comma separated); `touch_interact_study` (1).
+pieces, comma separated); `touch_interact_study` (1);
+`touch_interact_trigger_near_cm` (8); `touch_interact_point_cone_deg` (8);
+`touch_interact_point_min_cm` (6); `touch_interact_loot_log` (1).
 
-## Not known yet (first build)
+## What the game does (bytecode, dump/script)
+
+- `BP_ItemBoxBase_C.Interact` calls `OpenBox`: if not `IsOpen`, it sets it,
+  plays the open animation (the cardboard box's flaps), then spawns each item
+  in `ItemsInBox` at the box's base one by one (0.066 s apart) with
+  `IsItemJump` (they jump up 4-7 m/s and out up to 2 m/s) and
+  `IsToutchWithBody`, and destroys the box 1 s after the last one.
+- `BP_ItemBase_C`: `Interact` takes the item (`TakeItem`); with
+  `IsToutchWithBody`, the player's body walking into its `InteractArea`
+  (64 cm sphere) takes it too. Health packs (`OItem_HP25_C`, once items) are
+  only used when HP is below max and above 0, so at full health touching one
+  does nothing.
+
+## Not known yet (first build; the first two are answered above)
 
 - Whether "cardboard boxes" in levels are `BP_ItemBoxBase_C`, `LCBP_Fridge_C`
   or something else. `BP_DataBox_500_C` and actors named `StaticMeshActor_N`

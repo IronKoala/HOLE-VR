@@ -5,11 +5,13 @@
 #include <string>
 #include <vector>
 
+#include "core/builtin_files.h"
 #include "core/config.h"
 #include "core/log.h"
 #include "core/memory.h"
 #include "core/perf.h"
 #include "core/process_metrics.h"
+#include "core/sampler.h"
 #include "game/game.h"
 #include "game/weapon_lab.h"
 #include "proxy/dxgi_proxy.h"
@@ -21,10 +23,12 @@
 #include "ue/objects.h"
 #include "ue/process_event.h"
 #include "ue/reflection.h"
+#include "vr/gpu_test.h"
 #include "vr/dxgi_hooks.h"
 #include "vr/body/body.h"
 #include "vr/comfort.h"
 #include "vr/hole_watch.h"
+#include "vr/watch.h"
 #include "vr/controls.h"
 #include "vr/workbench.h"
 #include "vr/interact/touch.h"
@@ -150,6 +154,7 @@ DWORD WINAPI InitThread(LPVOID) {
     if (!WaitFor("GUObjectArray", ue::objects::Init, timeout)) return 0;
     if (!WaitFor("reflection offsets", ue::reflection::Init, timeout)) return 0;
     log::Info("Engine discovery complete");
+    sampler::Start();  // samples the game, render and present threads (profile=0 turns it off)
     // Before the slow start-up work: the title screen is up within seconds.
     vr::launch::Init();
 
@@ -177,6 +182,7 @@ DWORD WINAPI InitThread(LPVOID) {
         vr::touch::Init();         // after the body: reads this frame's drawn hands
         vr::drinks::Init();        // after controls: reads this frame's hand poses
         vr::cvars::Init();
+        vr::gpu_test::Init();  // after cvars: switches render features to measure their GPU cost
         vr::wrist_hud::InitGame();
         vr::world_menu::InitGame();
         vr::vr_options::InitGame();
@@ -184,6 +190,7 @@ DWORD WINAPI InitThread(LPVOID) {
         vr::hole_watch::InitGame();
         vr::menu_study::InitGame();
         vr::ui_panel::InitGame();
+        vr::watch::InitGame();  // after body/input/menu owners: solved wrist + visible fingertip
         vr::square_test::Init();  // after cvars: switches render features for its tests
     }
 
@@ -275,6 +282,12 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
             holevr::log::Init(g_mod_dir);
             holevr::log::Info("HOLE VR %s starting", kVersion);
             holevr::log::Info("build: %s (compiled %s %s)", HOLEVR_BUILD_ID, __DATE__, __TIME__);
+            // Hand poses, holster spots and magazine seats that ship with the
+            // mod, for any the player has not saved their own of yet.
+            const auto seeded = holevr::builtin_files::SeedMissing(g_mod_dir);
+            holevr::log::Info("built-in files (grips, holsters, magazine seats): %d written, %d already there and "
+                              "kept, %d failed",
+                              seeded.written, seeded.kept, seeded.failed);
             holevr::config::Load(g_mod_dir);
             holevr::proxy::SetFactoryCallback(&holevr::vr::dxgi_hooks::OnFactoryCreated);
             holevr::vr::stereo::InstallCommandLineHook();

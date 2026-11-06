@@ -104,6 +104,41 @@ const Block kBlocks[] = {
      "; Turn further away than this and the screen comes back in front of you.\n"
      "menu_panel_follow_deg=60\n"
      "menu_button_pauses=1\n"},
+    {"hand_world_trace_complex",
+     "\n"
+     "; Diagnostic surface mode shared by empty-hand palm and finger checks.\n"
+     "; 0 = the game's simple collision, 1 = complex mesh collision.\n"
+     "; Compare only when visible surfaces lack contact; this does not create\n"
+     "; collision on meshes that disable it, and detailed queries may cost more.\n"
+     "hand_world_trace_complex=0\n"},
+    {"hand_individual_finger_collision",
+     "\n"
+     "; Empty fingers check each of their three segments against nearby objects.\n"
+     "; Joints bend independently; requires both hand_wall_collision and\n"
+     "; hand_fingers_rest_on_walls.\n"
+     "; 0 = use the older shared wall-plane response.\n"
+     "hand_individual_finger_collision=1\n"
+     "; Maximum collision checks per hand per frame (16-64).\n"
+     "; Lower budgets reduce displayed-pose and fast-motion coverage.\n"
+     "hand_finger_query_budget=32\n"
+     "; Refresh even when your hand is still (5-50 milliseconds).\n"
+     "hand_finger_contact_refresh_ms=50\n"},
+    {"hand_thumb_opposition",
+     "\n"
+     "; Empty thumb turns its pad toward the index finger for a pinch or grip.\n"
+     "; Saved weapon grips keep their authored thumb pose.\n"
+     "hand_thumb_opposition=1\n"},
+    {"hand_follow_hz",
+     "\n"
+     "; Empty hands follow with bounded spring resistance and slide on surfaces.\n"
+     "; Higher follow rate feels firmer; damping controls settling.\n"
+     "hand_follow_hz=10\n"
+     "hand_follow_damping=1\n"
+     "hand_follow_max_force_n=65\n"
+     "hand_follow_max_speed_cm_s=700\n"
+     "hand_surface_friction=5\n"
+     "; Large persistent separation enters recovery while still respecting walls.\n"
+     "hand_recovery_distance_cm=40\n"},
     {"menu_mode",
      "\n"
      "; --- Menus as panels in the world ---\n"
@@ -289,6 +324,9 @@ const Block kBlocks[] = {
      "; Left stick moves toward: 0 = where you look, 1 = where your left hand points.\n"
      "move_direction=0\n"
      "stick_deadzone=0.15\n"
+     "; 1 = also let the game's own keyboard/gamepad movement through (Steam Input can turn the VR\n"
+     "; controllers into a gamepad the game reads, which walked the character on its own). 0 = off.\n"
+     "game_move_input=0\n"
      "; left hand this close to the gun (cm): left trigger toggles the weapon light instead of interacting\n"
      "light_hand_reach_cm=12\n"
      "; Tilts the gun in your hand up (+) or down (-), degrees.\n"
@@ -310,10 +348,10 @@ const Block kBlocks[] = {
      "; fingers (bend back where their pads press, curl where their backs press)\n"
      "; instead of going in.\n"
      "hand_fingers_rest_on_walls=1\n"
-     "; Fingertips trail behind as the hand slides along a surface (0 = off,\n"
+     "; Legacy plane mode: fingertips trail as the hand slides (0 = off,\n"
      "; 1 = normal, 2 = twice as much).\n"
      "hand_finger_drag=1\n"
-     "; 1 = an empty hand pushed against a wall, table or door settles flat on it\n"
+     "; Legacy plane mode: an empty hand pushed against a wall settles flat on it\n"
      "; once it touches (the side or back of the hand keeps its angle). It is flat\n"
      "; once the real hand is this far (cm) past where the drawn hand stopped.\n"
      "hand_press_flat_on_walls=1\n"
@@ -331,6 +369,8 @@ const Block kBlocks[] = {
      "rifle_stock_snap_cm=12\n"
      "rifle_stock_release_cm=20\n"
      "rifle_stock_forward_cm=0\n"
+     "; How far your aiming eye sits behind the rear sight when shouldered (cm).\n"
+     "rifle_eye_relief_cm=9\n"
      "rifle_stock_right_cm=0\n"
      "rifle_stock_up_cm=0\n"
      "; Room-scale: the character follows you when you walk around the room\n"
@@ -373,6 +413,27 @@ const Block kBlocks[] = {
      "holster_mag_radius_cm=14\n"
      "; With the VR body off (F9), the belt is taken this far below the headset.\n"
      "holster_belt_below_head_cm=60\n"},
+    {"holster_model",
+     "\n"
+     "; --- Fitted pistol holster ---\n"
+     "; Original model follows the existing pistol spot in holsters.ini.\n"
+     "holster_model=1\n"
+     "; Blend the visible free right hand onto its saved pistol grip nearby.\n"
+     "; Draw/stow inputs are unchanged; an empty hood stays open.\n"
+     "holster_hand_snap=1\n"},
+    {"holster_sounds",
+     "\n"
+     "; --- Pistol holster audio ---\n"
+     "; Four mono PCM16 WAVs in sounds/holster follow the game's audio output.\n"
+     "holster_sounds=1\n"
+     "; Separate sound level, 0 (silent) to 1; uses the Windows game mixer.\n"
+     "holster_sound_volume=0.8\n"},
+    {"watch_enabled",
+     "\n"
+     "; --- Wrist watch ---\n"
+     "; Local analog clock and retained level timer on the left wrist.\n"
+     "; Raise and look at it, then tap with a free right index to open pause.\n"
+     "watch_enabled=1\n"},
     {"holster_rifle",
      "\n"
      "; --- Rifle holster ---\n"
@@ -403,6 +464,29 @@ const Block kBlocks[] = {
      "rifle_carry_roll_deg=0\n"
      "; The right hand takes the rifle when it squeezes this close to its grip (cm).\n"
      "rifle_grip_reach_cm=14\n"},
+    {"rifle_grip_points",
+     "\n"
+     "; --- Where the left hand holds a rifle's handguard ---\n"
+     "; 1 = three grip points: just in front of the magazine, where the scope's top\n"
+     "; rail ends, and just behind the light. The left hand takes the nearest one, and\n"
+     "; each has its own hand pose in the grip editor. 0 = the hand holds wherever it grabs.\n"
+     "rifle_grip_points=1\n"
+     "; How far the middle of the hand sits behind the light (cm; half a hand's width).\n"
+     "rifle_grip_point_inset_cm=4.5\n"},
+    {"rifle_right_let_go",
+     "\n"
+     "; --- Letting go of the rifle with the right hand ---\n"
+     "; 1 = open the right hand on the rifle (the left hand not on it) and the rifle\n"
+     "; goes back to its holster by itself, like the pistol. With the left hand on the\n"
+     "; handguard the left hand keeps it. 0 = the rifle stays in the right hand.\n"
+     "rifle_right_let_go=1\n"},
+    {"rifle_charging_handle_grab_cm",
+     "\n"
+     "; --- The rifle's charging handle ---\n"
+     "; Either hand grabs the charging handle at its rear end when it squeezes this\n"
+     "; close to it (cm). The right hand can do it while the left hand holds the rifle\n"
+     "; by the handguard. Each hand has its own pose in the grip editor.\n"
+     "rifle_charging_handle_grab_cm=9\n"},
     {"fixed_height",
      "\n"
      "; 1 = your in-game height is always the character's, seated or standing\n"
@@ -419,7 +503,7 @@ const Block kBlocks[] = {
      "body_max_spine_bend=45\n"
      "; 1 = let the game's animation (recoil, aim sway) move your spine and shoulders.\n"
      "body_animated_upper_body=0\n"
-     "; Keep the feet planted with leg IK while crouching/turning.\n"
+     "; Ground-aware idle feet and room steps. Preserve moving strides and kicks.\n"
      "body_leg_ik=1\n"
      "; Hide the character's head so it never blocks the view.\n"
      "body_hide_head=1\n"
@@ -438,30 +522,28 @@ const Block kBlocks[] = {
      "hand_palm_depth_cm=3\n"},
     {"body_turn_threshold_deg",
      "\n"
-     "; --- VR body, second version (2026-11-01) ---\n"
+     "; --- VR body calibration and pose constraints ---\n"
      "; Degrees you can turn your head before the body turns with it.\n"
      "body_turn_threshold_deg=25\n"
      "; How much the body also turns toward where your hands are (0-1).\n"
      "body_turn_toward_hands=0.3\n"
-     "; Arm length. Measure it once: stand straight, hold both arms straight out\n"
-     "; to the sides and hold the LEFT STICK click for 2 seconds (keep the pose\n"
-     "; for 3 more seconds). Saved in hole-vr/body-measure.ini.\n"
+     "; Calibrate body in VR Options with both hands free, or hold LEFT STICK 2 s.\n"
+     "; Follow the overhead -> slow straight-arm T -> bent-elbow T instructions.\n"
+     "; Saved in body-calibration.ini; failed attempts preserve the previous fit.\n"
      "; body_arm_scale_override: 0 = use the measurement, or a fixed multiplier.\n"
      "body_arm_scale_override=0\n"
-     "; Most the arms may stretch past their length to keep the hands on the\n"
-     "; controllers: after measuring, and before.\n"
+     "; Legacy-fit arm stretch limits. The new calibrated segments do not stretch.\n"
      "body_max_arm_stretch=1.04\n"
      "body_max_arm_stretch_unmeasured=1.15\n"
-     "; Shoulders below and behind your eyes, cm. 0 = from your eye height.\n"
+     "; Fallback shoulder offsets before calibration. 0 = from standing height.\n"
      "body_shoulder_below_eyes_cm=0\n"
      "body_shoulder_behind_eyes_cm=0\n"
      "; Forearm roll: share of the hand's twist taken by the forearm bone and by\n"
      "; the forearm twist bone (less pinching at the wrist).\n"
      "body_forearm_roll_share=0.5\n"
      "body_forearm_twist_bone_share=1.0\n"
-     "; How much the elbow follows the hand's turn (0-1), and whether it may\n"
-     "; swing further to keep the wrist from bending too far.\n"
-     "body_elbow_follow_hand=0.7\n"
+     "; Optional wrist relief for recorded gun grips only. Free-hand elbow\n"
+     "; placement follows the body and reach, independently of hand rotation.\n"
      "body_elbow_relieves_wrist=1\n"
      "; Holding the pistol: the elbow goes where the wrist stays straightest\n"
      "; (forearm in line behind the gun).\n"
@@ -519,8 +601,9 @@ const Block kBlocks[] = {
      "; How big the world looks: 1 = true size, 1.1 = 10% bigger (you feel\n"
      "; smaller), 0.9 = 10% smaller (0.5 - 2).\n"
      "world_scale=1\n"
-     "; Your standing eye height, cm, from Calibrate body on the VR tab (stand\n"
-     "; straight, arms out). 0 = learned while you play. Real crouch uses it.\n"
+     "; Physical standing eye height, cm, measured in Your Own height mode.\n"
+     "; Seated calibration stores its own reference. 0 = unknown; real crouch\n"
+     "; learns a standing reference while you play. Character height is separate.\n"
      "standing_height_cm=0\n"},
     {"monitor_view",
      "\n"
@@ -548,6 +631,24 @@ const Block kBlocks[] = {
      "workbench_snap_cm=5\n"
      "; Walk this far from a pistol lying on a table and it goes back to the holster (m).\n"
      "workbench_walk_away_m=3\n"},
+    {"workbench_box",
+     "\n"
+     "; Once the workbench is bought: a green box stands on the front edge of its\n"
+     "; table where you walk up to it; let go of the pistol in it and it is held\n"
+     "; there upright. 1 = on. Its edges are solid green lines that fade out\n"
+     "; toward the middle of each side, which is clear. Size (cm); how far out\n"
+     "; past the table edge its middle sits and how high above the table top; the\n"
+     "; line thickness and how far in the colour fades; how near your head must\n"
+     "; be for it to show.\n"
+     "workbench_box=1\n"
+     "workbench_box_width_cm=34\n"
+     "workbench_box_height_cm=52\n"
+     "workbench_box_depth_cm=14\n"
+     "workbench_box_out_cm=4\n"
+     "workbench_box_lift_cm=2\n"
+     "workbench_box_line_cm=0.6\n"
+     "workbench_box_fade_cm=4\n"
+     "workbench_box_show_cm=100\n"},
     {"touch_interact",
      "\n"
      "; --- Touch interact: rest an empty hand on a thing ---\n"
@@ -574,6 +675,18 @@ const Block kBlocks[] = {
      "; 1 = log what each kind of thing is made of and save its game code in\n"
      "; dump/script (once a run), to improve this feature.\n"
      "touch_interact_study=1\n"},
+    {"touch_interact_point_cone_deg",
+     "\n"
+     "; --- Trigger interact aim ---\n"
+     "; The trigger with an empty hand uses, in order: what the hand touches or is\n"
+     "; within trigger_near_cm of; what it points at exactly; the thing nearest the\n"
+     "; aim within point_cone_deg (or point_min_cm) of it, not through a wall; then\n"
+     "; where you look.\n"
+     "touch_interact_trigger_near_cm=8\n"
+     "touch_interact_point_cone_deg=8\n"
+     "touch_interact_point_min_cm=6\n"
+     "; 1 = log where each item that appears during a level goes (first 80 a level).\n"
+     "touch_interact_loot_log=1\n"},
     {"drinks_by_hand",
      "\n"
      "; --- Drink machine by hand (hub) ---\n"
@@ -616,10 +729,22 @@ const Block kBlocks[] = {
      "; the next frame's whole picture before the headset copy plus both copied eye\n"
      "; pictures, and check the copies match it pixel for pixel. Ctrl+F11 asks for\n"
      "; one by hand. At most paired_capture_limit per run (8 max). Each costs a\n"
-     "; short hitch, so 0 for performance comparisons. See docs/WHITE_SQUARE_CAPTURE.md.\n"
-     "paired_capture_enabled=1\n"
+     "; short hitch. Off by default: 7 captures already showed the copies exact.\n"
+     "; See docs/WHITE_SQUARE_CAPTURE.md.\n"
+     "paired_capture_enabled=0\n"
      "paired_capture_limit=3\n"
      "paired_capture_on_dots=1\n"},
+    {"square_watch",
+     "\n"
+     "; White squares (diagnostic): compare the two eyes for white squares and dots\n"
+     "; drawn into one eye only, and save pictures when they show (square_watch=1).\n"
+     "; It reads one strip of the picture on one frame in square_watch_every (1 to\n"
+     "; 8; fewer frames cost less). square_test=1 also switches game effects off\n"
+     "; one at a time when the dots show, to find which draws them (needs the watch).\n"
+     "; Both cost frame time, so they are off for play.\n"
+     "square_watch=0\n"
+     "square_watch_every=4\n"
+     "square_test=0\n"},
     {"process_metrics",
      "\n"
      "; Every 30 s log the game process's memory, handles, CPU and disk use (game\n"

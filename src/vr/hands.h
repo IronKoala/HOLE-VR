@@ -36,8 +36,36 @@ struct HandGrab {
     GrabKind kind = GrabKind::kNone;
     uintptr_t object = 0;   // gun or magazine UObject
     Pose target;            // world transform the hand should take while attached
+    // kSupportGrip: which grip point on the handguard (vr/interact/grip_points.h;
+    // each has its own hand pose), -1 where the hand grabbed.
+    // kSlideGrab: kPointChargingHandle = a rifle's charging handle held at its
+    // rear end (one pose per hand), -1 = a pistol slide (holds by grab spot).
+    int point = -1;
+    // Visual-only reach onto a seated pistol; never acquires input ownership
+    // or changes the controller. The authored approach clears the shell.
+    bool holster_preview = false;
+    double pose_blend = 1.0;
 };
+// Interaction checks use the held kind; pose solvers keep the authored kind
+// so the visual-only approach can still use the pistol's hand shape.
+inline GrabKind HeldGrabKind(const HandGrab& pose) {
+    return pose.holster_preview ? GrabKind::kNone : pose.kind;
+}
+// A visual holster approach is not a held item. Actual ownership and the
+// attachment/drink holders still veto calibration, even if a pose is stale.
+// Workbench/drink candidate reservations alone do not mean an object is held.
+inline bool HasHeldObject(const HandGrab& pose, const HandInteraction& access,
+                          bool attachment_held, bool drink_held) {
+    return access.owner == GripOwner::kControls || attachment_held || drink_held ||
+           HeldGrabKind(pose) != GrabKind::kNone;
+}
+constexpr int kPointChargingHandle = 0;
 HandGrab GetGrab(Hand hand);
+// A rifle's charging handle is grabbed at the rear end of its mesh (from
+// 2026-11-04; before, at the handle's origin). shift = the grab point now
+// minus the old one, gun frame, cm, so a hand pose saved on the old point
+// can stay where it was on the gun. false: not measured on this gun yet.
+bool ChargingHandleShift(uintptr_t gun, FVector* shift);
 
 // Authoritative input reservation, separate from the body IK pose above.
 // Includes attachment/drink holds, and remains owned during tracking loss.
@@ -70,5 +98,8 @@ int EditorHand();
 
 // Head (centre eye) in world space; valid once the headset is rendering.
 bool Head(Pose* out);
+// One eye (0 left, 1 right) in world space, from the headset's own eye
+// views (real eye spacing and world scale).
+bool Eye(int eye, Pose* out);
 
 }  // namespace holevr::vr::hands

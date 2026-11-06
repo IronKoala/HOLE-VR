@@ -10,6 +10,7 @@
 #include "core/log.h"
 #include "core/memory.h"
 #include "core/perf.h"
+#include "core/sampler.h"
 #include "ue/call.h"
 #include "ue/process_event.h"
 
@@ -58,6 +59,8 @@ void OnPlayerTick(UObject self, UObject, void* params) {
     // ReceiveTick(float DeltaSeconds): the only parameter, at offset 0.
     float dt = 0.f;
     std::memcpy(&dt, params, sizeof(dt));
+    mem::NewFrame();
+    sampler::NoteGameFrame();
     g_player.store(self);
     g_last_tick_ms.store(GetTickCount());
     if (!g_first_tick_logged.exchange(true))

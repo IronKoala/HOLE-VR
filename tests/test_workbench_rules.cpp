@@ -5,6 +5,8 @@
 // hand, fit light B in the same slot with the other, then let go of A away
 // from the gun. A was still treated as the gun's own part, so letting it go
 // emptied the slot and took B off again.
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <vector>
 
@@ -72,6 +74,102 @@ int main() {
     // means not fitted.
     Check(!StillFitted({{kAmmo, {0}}}, kLightSlot, kLightA), "slot missing from the list: not fitted");
     Check(!StillFitted({{kLightA, {kLightSlot, 2}}}, kLightSlot, kLightA), "sub-slot paths are not the top slot");
+
+    // The green box (owner 2026-11-04 07:57): twice as tall (52 cm), solid
+    // edge lines, colour fading out within 4 cm, the middle of each side clear.
+    {
+        const double w = 34, d = 14, h = 52, line = 0.6, fade = 4, thin = 0.1;
+        const int levels = 5;
+        const auto frame = BoxFrame(w, d, h, line, fade, levels, thin);
+        int lines = 0, strips = 0;
+        bool inside = true, ring_ok = true;
+        const double dim[3] = {w, d, h};
+        for (const auto& p : frame) {
+            (p.level == 0 ? lines : strips)++;
+            for (int a = 0; a < 3; ++a)
+                if (std::fabs(p.at[a]) + p.size[a] * 0.5 > dim[a] * 0.5 + line * 0.5 + 1e-9) inside = false;
+            if (p.level == 0) continue;
+            // A strip lies on one face (its thin axis at the face), between
+            // r0 and r1 in from that face's edges on one in-plane axis.
+            int n = -1;
+            for (int a = 0; a < 3; ++a)
+                if (std::fabs(p.size[a] - thin) < 1e-9 && std::fabs(std::fabs(p.at[a]) - dim[a] * 0.5) < 1e-9) n = a;
+            if (n < 0) {
+                ring_ok = false;
+                continue;
+            }
+            const double band = fade / (levels - 1), r0 = line * 0.5 + (p.level - 1) * band;
+            bool on_ring = false;
+            for (int a = 0; a < 3; ++a) {
+                if (a == n) continue;
+                const double from_edge = dim[a] * 0.5 - (std::fabs(p.at[a]) + p.size[a] * 0.5);
+                if (std::fabs(p.size[a] - band) < 1e-9 && std::fabs(from_edge - r0) < 1e-9) on_ring = true;
+            }
+            if (!on_ring) ring_ok = false;
+        }
+        Check(lines == 12, "box: 12 solid edge lines");
+        Check(strips == 6 * (levels - 1) * 4, "box: 4 fading rings of 4 strips on each of the 6 sides");
+        Check(inside, "box: every piece stays on the box");
+        Check(ring_ok, "box: each fading strip sits on its ring, the fainter ones further in");
+        // No two strips of one ring on one side overlap (the corners are not
+        // drawn twice, which would show as brighter squares).
+        bool overlap = false;
+        for (size_t i = 0; i < frame.size(); ++i)
+            for (size_t j = i + 1; j < frame.size(); ++j) {
+                const auto &p = frame[i], &q = frame[j];
+                if (p.level == 0 || p.level != q.level) continue;
+                double vol = 1;
+                for (int a = 0; a < 3; ++a) {
+                    const double lo = std::max(p.at[a] - p.size[a] * 0.5, q.at[a] - q.size[a] * 0.5);
+                    const double hi = std::min(p.at[a] + p.size[a] * 0.5, q.at[a] + q.size[a] * 0.5);
+                    vol *= std::max(0.0, hi - lo);
+                }
+                if (vol > 1e-6) overlap = true;
+            }
+        Check(!overlap, "box: strips of one ring never overlap");
+        // The middle of every side is clear: nothing but the lines comes
+        // further in than line/2 + fade from a side's edges.
+        bool clear = true;
+        for (const auto& p : frame) {
+            if (p.level == 0) continue;
+            for (int a = 0; a < 3; ++a) {
+                if (p.size[a] <= thin + 1e-9) continue;
+                const double reach = dim[a] * 0.5 - (std::fabs(p.at[a]) - p.size[a] * 0.5);
+                // A strip that runs along this axis spans it; one across it
+                // must stay within the fade band.
+                if (p.size[a] < dim[a] - 2 * (line * 0.5 + fade) - 1e-9 && reach > line * 0.5 + fade + 1e-9) clear = false;
+            }
+        }
+        // Points on each side just past the fade (and its very middle) are
+        // covered by no piece; points inside the fade are.
+        auto covered = [&](const double pt[3]) {
+            for (const auto& p : frame) {
+                bool in = true;
+                for (int a = 0; a < 3; ++a)
+                    if (std::fabs(pt[a] - p.at[a]) > p.size[a] * 0.5 + 1e-9) in = false;
+                if (in) return true;
+            }
+            return false;
+        };
+        bool past_clear = true, fade_drawn = true;
+        for (int n = 0; n < 3; ++n) {
+            const int a = (n + 1) % 3, b = (n + 2) % 3;
+            for (int side = -1; side <= 1; side += 2) {
+                for (double in_cm : {line * 0.5 + fade + 0.2, dim[a] * 0.5}) {
+                    double pt[3];
+                    pt[n] = side * dim[n] * 0.5, pt[b] = 0;
+                    pt[a] = dim[a] * 0.5 - std::min(in_cm, dim[a] * 0.5);
+                    if (covered(pt)) past_clear = false;
+                }
+                double pt[3];
+                pt[n] = side * dim[n] * 0.5, pt[b] = 0, pt[a] = dim[a] * 0.5 - (line * 0.5 + fade * 0.5);
+                if (!covered(pt)) fade_drawn = false;
+            }
+        }
+        Check(clear && past_clear, "box: the middle of every side is clear (the colour is gone within 4 cm of the lines)");
+        Check(fade_drawn, "box: inside the fade band every side is drawn");
+        Check(BoxFrame(w, d, 26, line, fade, levels, thin).size() == frame.size(), "box: a shorter box has the same pieces");
+    }
 
     std::printf(g_fail ? "%d workbench rule test(s) FAILED\n" : "all workbench rule tests passed\n", g_fail);
     return g_fail ? 1 : 0;
