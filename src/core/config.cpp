@@ -513,11 +513,17 @@ const Block kBlocks[] = {
      "; While a magazine is lined up the hand holding it has a second pose (pose it\n"
      "; in the grip editor then). 1 = until it is posed, the game's own reload hold.\n"
      "mag_insert_game_hold=1\n"
-     "; 1 = the game's own left-hand reload animation plays as you push the magazine\n"
-     "; in, and backwards as you pull it back out. For AR magazines: the pistol's\n"
-     "; (pistol), the AR's own (rifle) or none (off).\n"
-     "mag_insert_anim=1\n"
-     "mag_insert_anim_rifle=pistol\n"},
+     "; 1 = with a pistol magazine, the game's own left-hand pistol reload plays as\n"
+     "; you push it in, and backwards as you pull it back out.\n"
+     "mag_insert_anim=1\n"},
+    {"mag_insert_anim_ar",
+     "\n"
+     "; --- Reloading the AR ---\n"
+     "; off = an AR magazine only takes your two poses: the grab pose, then the pose\n"
+     "; for when it lines up with the magwell (pose that one in the grip editor\n"
+     "; while it is lined up; until then it keeps the grab pose).\n"
+     "; pistol / rifle = also play the game's pistol or AR reload on the left hand.\n"
+     "mag_insert_anim_ar=off\n"},
     {"fixed_height",
      "\n"
      "; 1 = your in-game height is always the character's, seated or standing\n"

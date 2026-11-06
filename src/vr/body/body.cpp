@@ -114,8 +114,11 @@ struct Settings {
     // A magazine lined up with the magwell (owner 2026-11-06): its own hand
     // pose (stage 2), the game's reload hold until it is posed, and the
     // game's own left-hand reload animation played by how far it is in.
+    // Pistol magazines play the game's pistol reload; AR magazines only take
+    // the two poses (owner 2026-11-06 23:29 UTC: "reuse the games pistol
+    // reload for the pistol, not the AR. For the AR i want the multi-pose").
     bool mag_insert_anim = true;
-    int mag_insert_rifle_clip = reload_anim::kPistol;  // for AR magazines: kPistol, kRifle or -1 (none)
+    int mag_insert_ar_clip = -1;  // for AR magazines: -1 (poses only), kPistol or kRifle
     bool mag_insert_game_hold = true;
 } S;
 
@@ -164,12 +167,14 @@ void LoadSettings() {
     S.finger_drag = std::clamp<double>(config::GetFloat("hand_finger_drag", 1.f), 0.0, 3.0);
     S.mag_insert_anim = config::GetBool("mag_insert_anim", true);
     {
-        // The owner asked for the pistol's reload on the AR's magazines too.
-        std::string r = config::GetString("mag_insert_anim_rifle", "pistol");
+        // A new key: mag_insert_anim_rifle (pistol by default) was the first
+        // reading of the owner's ask, and ini files keep what they were
+        // given.
+        std::string r = config::GetString("mag_insert_anim_ar", "off");
         for (char& ch : r) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-        S.mag_insert_rifle_clip = r == "rifle" || r == "ar" ? reload_anim::kRifle
-                                  : r == "off" || r == "none" || r == "0" ? -1
-                                                                          : reload_anim::kPistol;
+        S.mag_insert_ar_clip = r == "rifle" || r == "ar" ? reload_anim::kRifle
+                               : r == "pistol" || r == "hg" ? reload_anim::kPistol
+                                                            : -1;
     }
     S.mag_insert_game_hold = config::GetBool("mag_insert_game_hold", true);
 }
@@ -1822,14 +1827,22 @@ void LimitRecord(int side, const std::string& key, gr::Record* rec, const std::s
 
 // ---- a magazine going into the magwell (stage 2) ----
 // Which of the game's reload animations plays for a magazine: the pistol's
-// for every magazine (owner 2026-11-06: re-use the pistol's left-hand reload
-// for the AR's magazines), the AR's own with mag_insert_anim_rifle=rifle.
-// -1: none.
+// for pistol magazines (BPC_Mag_HG_...); none for AR magazines
+// (BPC_Mag_AR_...), which take the two poses only, unless
+// mag_insert_anim_ar says otherwise; none for any other magazine. -1: none.
+bool IsArMag(UObject mag) { return mag && ue::GetName(ue::GetClass(mag)).find("_AR_") != std::string::npos; }
+bool IsPistolMag(UObject mag) { return mag && ue::GetName(ue::GetClass(mag)).find("_HG_") != std::string::npos; }
 int InsertClip(UObject mag) {
     if (!S.mag_insert_anim || !mag) return -1;
-    const std::string cls = ue::GetName(ue::GetClass(mag));
-    const bool rifle = cls.find("_AR_") != std::string::npos;
-    return rifle ? S.mag_insert_rifle_clip : reload_anim::kPistol;
+    if (IsPistolMag(mag)) return reload_anim::kPistol;
+    if (IsArMag(mag)) return S.mag_insert_ar_clip;
+    return -1;
+}
+// Why InsertClip gave none (for the log).
+const char* NoClipWhy(UObject mag) {
+    if (!S.mag_insert_anim) return "the game's reload is off (mag_insert_anim=0)";
+    if (IsArMag(mag)) return "AR magazines take your own poses only (mag_insert_anim_ar=off)";
+    return "the game has no reload animation for this magazine";
 }
 
 // The game's own hold of a magazine while it reloads (BP_GunBase
@@ -1846,7 +1859,7 @@ bool GameInsertHold(UObject mag, gr::Record* rec, std::string* why) {
         return false;
     }
     if (clip < 0) {
-        *why = "no reload animation for it (mag_insert_anim)";
+        *why = NoClipWhy(mag);
         return false;
     }
     const reload_anim::ClipData& d = reload_anim::Get(static_cast<reload_anim::Clip>(clip));
@@ -3649,6 +3662,7 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
                       anim ? (clip == reload_anim::kRifle ? "play the game's AR reload as it goes in"
                                                           : "play the game's pistol reload as it goes in")
                            : side == kR ? "held (the game's reload animation is for the left hand)"
+                           : clip < 0   ? (std::string("held: ") + NoClipWhy(grab.object)).c_str()
                                         : "held (the game's reload animation is not read)");
         }
         g_free_slide[side].on = false;
@@ -4406,7 +4420,7 @@ void OnTick(UObject player, float dt_f) {
         for (int f = 0; f < hand_pose::kFingerCount && f < reload_anim::kFingers; ++f)
             for (int j = 0; j < 3; ++j) bones.finger[f][j] = fname(G.engine.names[k.finger[kL][f][j]]);
         unsigned clips = 1u << reload_anim::kPistol;
-        if (S.mag_insert_rifle_clip == reload_anim::kRifle) clips |= 1u << reload_anim::kRifle;
+        if (S.mag_insert_ar_clip >= 0) clips |= 1u << S.mag_insert_ar_clip;
         reload_anim::Tick(player, G.anim_src ? G.anim_src : G.source, bones, clips);
         static uint64_t seen = 0;
         if (reload_anim::Generation() != seen) {
