@@ -3745,6 +3745,9 @@ struct RifleCarryState {
     bool right_held = false;         // the right grip squeezed and not let go since (LongSqueeze)
     interact::LongSqueeze right_squeeze;
     double actions_at = -1;          // last frame the hand moves were read (not in the grip editor or a menu)
+    bool offset_forced = false;      // we put the rifle's parts in their held place (RifleGripSpace)
+    bool offset_warned = false;
+    int offset_logs = 0;
     bool left_sticky = false;        // back from the editor / a menu with the left hand open: it keeps the rifle
     // Where the rifle is kept when nobody holds it: the game's own spot
     // (learned from where the game hangs it; WeaponLocation_Back until then).
@@ -4784,30 +4787,104 @@ bool g_late_ok = false;
 
 bool IsPistolClass(UObject g) { return ue::GetName(ue::GetClass(g)).find("HG") != std::string::npos; }
 
+// BP_WeaponBase.SetOffsetTransform(IsOffset): the gun's parts
+// (PartsOffset/BaseOffset) in their held place (true) or put-away place
+// (false). Puts them in the place asked for. false: the gun has no IsOffset
+// or the call did not take. *changed: this call moved them; *moved_cm: how
+// far the grip point moved against the actor (when it changed).
+bool SetHeldPartSpace(UObject gun, bool held, bool* changed, double* moved_cm = nullptr) {
+    *changed = false;
+    const auto prop = ue::reflection::FindProperty(ue::GetClass(gun), "IsOffset");
+    if (!prop.valid() || prop.type != "BoolProperty") return false;
+    uint8_t value = 0;
+    if (!mem::Read(gun + prop.offset, value)) return false;
+    const uint8_t mask = prop.bool_mask ? prop.bool_mask : 0xff;
+    if (((value & mask) != 0) == held) return true;
+    UObject main = 0;
+    const bool have_main = moved_cm && ue::GetProp(gun, "MainHandPosition", main) && main;
+    auto grip_in_actor = [&] {
+        return ActorRotation(gun).Inverse().Rotate(ComponentToWorld(main).translation - ActorLocation(gun));
+    };
+    const FVector before = have_main ? grip_in_actor() : FVector{};
+    ue::Call set(gun, "SetOffsetTransform");
+    set.Set("IsOffset", held);
+    if (!set.Invoke() || !mem::Read(gun + prop.offset, value) || ((value & mask) != 0) != held) return false;
+    *changed = true;
+    if (moved_cm) *moved_cm = have_main ? Len(grip_in_actor() - before) : -1.0;
+    return true;
+}
+
 // BP_WeaponManager calls SetOffsetTransform(false) on the spare pistol.
 // That moves PartsOffset/BaseOffset away from the held grip space used by
 // saved hand poses: measured bore height changed 14.9 -> 7.2 cm on a switch.
 // Our seated pistol must retain that same held arrangement before measuring
 // or placing it. The verified Blueprint function changes only those parts.
 bool EnsurePistolGripSpace(UObject pistol) {
-    const auto prop = ue::reflection::FindProperty(ue::GetClass(pistol), "IsOffset");
-    if (!prop.valid() || prop.type != "BoolProperty") return false;
-    uint8_t value = 0;
-    if (!mem::Read(pistol + prop.offset, value)) return false;
-    const uint8_t mask = prop.bool_mask ? prop.bool_mask : 0xff;
-    if (value & mask) return true;
-    ue::Call set(pistol, "SetOffsetTransform");
-    set.Set("IsOffset", true);
-    if (!set.Invoke() || !mem::Read(pistol + prop.offset, value) || !(value & mask)) return false;
+    bool changed = false;
+    if (!SetHeldPartSpace(pistol, true, &changed)) return false;
+    if (!changed) return true;
     if (g_rc.pg.of == pistol) g_rc.pg = GunGeom{}; // remeasure now, not after the failure retry delay
     if (W.gun == pistol) W.have_frame = false;
     log::Info("holster alignment: restored the pistol's held part offset after a weapon switch");
     return true;
 }
 
+// The same for the rifle (owner, 2026-11-06 run: "if i held my rifle with my
+// left hand and tried to grab my pistol with my right hand then my rifle
+// would move out of place on its own ... as soon as i grabbed it with both
+// hands again it would go back to normal"): switching to the pistol, the
+// game moves the rifle's parts to their put-away place while the left hand
+// still holds it. While the mod places the rifle (in the left hand, flying
+// back, resting in its holster) its parts stay in the held place that its
+// measured frame and the hand poses are in; handed back to the game's own
+// spot on the back, they go back to the put-away place.
+void RifleGripSpace(bool rifle_current) {
+    if (!g_rc.rifle) return;
+    if (rifle_current) {
+        g_rc.offset_forced = false;   // the game's current gun: its parts are in the held place
+        return;
+    }
+    const bool ours = g_rc.carried || g_rc.returning || g_rc.parked || (RifleHolsterOn() && RifleAtRest());
+    bool changed = false;
+    double moved = -1;
+    if (ours) {
+        if (!SetHeldPartSpace(g_rc.rifle, true, &changed, &moved)) {
+            if (!g_rc.offset_warned) {
+                g_rc.offset_warned = true;
+                log::Warn("rifle carry: could not keep the rifle's parts in their held place (no IsOffset or "
+                          "SetOffsetTransform on %s)", ue::GetName(ue::GetClass(g_rc.rifle)).c_str());
+            }
+            return;
+        }
+        if (!changed) return;
+        g_rc.offset_forced = true;
+        if (++g_rc.offset_logs > 30) return;   // once per pistol draw is expected; never a line every frame
+        log::Info("rifle carry: the game moved the rifle's parts to their put-away place (the pistol is out); put "
+                  "them back in the held place (the grip point moved %.1f cm) because %s",
+                  moved, g_rc.carried ? "the left hand holds it" : g_rc.returning ? "it is flying back"
+                                                                   : "it rests in its holster");
+    } else if (g_rc.offset_forced) {
+        g_rc.offset_forced = false;
+        if (SetHeldPartSpace(g_rc.rifle, false, &changed, &moved) && changed && ++g_rc.offset_logs <= 30)
+            log::Info("rifle carry: rifle handed back to the game; its parts are in the put-away place again (the "
+                      "grip point moved %.1f cm)",
+                      moved);
+    }
+}
+
 bool EnsureGeom(UObject g, GunGeom* geo) {
     if (g && IsPistolClass(g) && !EnsurePistolGripSpace(g)) return false;
     if (geo->of == g && geo->ok) return true;
+    // A rifle is measured with its parts in their held place too (RifleGripSpace
+    // puts them back when the game owns it).
+    if (g && !IsPistolClass(g)) {
+        bool changed = false;
+        if (SetHeldPartSpace(g, true, &changed) && changed && g == g_rc.rifle) {
+            g_rc.offset_forced = true;
+            log::Info("rifle carry: measuring %s with its parts in their held place",
+                      ue::GetName(ue::GetClass(g)).c_str());
+        }
+    }
     // A gun that could not be measured is tried again once a second.
     static double retry_at = 0;
     if (geo->of == g && g_clock < retry_at) return false;
@@ -5411,6 +5488,7 @@ void RifleCarry(UObject player, const hands::HandState& rh, const hands::HandSta
     }
     // The current rifle back in the right hand: HoldGun places it.
     if (rifle_current && W.in_hand) g_rc.returning = g_rc.parked = false;
+    RifleGripSpace(rifle_current);
     PlaceRifle(lh, dt, rifle_current);
     // For the right hand on the charging handle next frame.
     g_rifle_grip_valid = g_rc.carried && rifle_current && lh.valid;
