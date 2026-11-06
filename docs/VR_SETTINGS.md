@@ -33,7 +33,7 @@ whatever the laser is on). A step writes the ini key(s) into `hole-vr.ini` in pl
 
 | Row | Choices | ini key(s) |
 |---|---|---|
-| Movement | Teleport; Snap turn 15, 30, 45, 60, 90 deg; Smooth turn 60, 90, 120, 180, 240 deg/s (default 90) | `locomotion` + `turn_mode` + `snap_turn_degrees` / `smooth_turn_speed`; Teleport also sets snap turns of 30 deg |
+| Movement | Teleport, no turning; Teleport, snap turn 30 deg; Walk, no turning; Walk, snap turn 15, 30, 45, 60, 90 deg; Walk, smooth turn 60, 90, 120, 180, 240 deg/s (default 90) | `locomotion` + `turn_mode` (0 snap, 1 smooth, 2 no stick turning) + `snap_turn_degrees` / `smooth_turn_speed` |
 | Move stick | Left, Right | `move_stick` |
 | Move toward (not with Teleport) | Where you look, Stick hand | `move_direction` |
 | Vignette moving | Off, Light, Medium, Strong | `comfort_vignette_move` (0, 0.35, 0.6, 0.85) |
@@ -43,7 +43,7 @@ whatever the laser is on). A step writes the ini key(s) into `hole-vr.ini` in pl
 | Real crouch (not Seated) | On, Off | `physical_crouch` |
 | Hop to jump (not Seated) | Off, On | `physical_jump` |
 | World size | 80% to 120% | `world_scale` (0.8 to 1.2) |
-| Room walking | On, Off | `room_scale_follow` |
+| Roomscale | On, Off | `room_scale_follow` |
 | Grip | Hold, Toggle | `grip_toggle` |
 | Aim smoothing | Off, Light, Medium, Strong | `aim_smoothing` (0, 0.33, 0.66, 1) |
 | Rifle stock | On, Off | `rifle_virtual_stock` |
@@ -87,9 +87,13 @@ set) for a later left-handed mode. "Head in a wall" and "Wall fade starts"
 are one row, Wall fade: Off or the distance the fade starts at. Owner's
 answer the same day: "Smooth turn, snap turn, teleport all merge into row":
 Moving, Turning, Snap turn and Turn speed are one row, Movement, stepping
-Teleport, Snap turn 15-90 deg, Smooth turn 60-240 deg/s. `locomotion` is
-each choice's first key, so it decides which choice is shown; an older ini
-with teleport and smooth turns reads Teleport.
+Teleport, Snap turn 15-90 deg, Smooth turn 60-240 deg/s. Then (owner,
+same day): "Rename room walking to roomscale, and to add an option to turn
+off joystick turning altogether": `turn_mode=2` turns the stick's sideways
+push off (you turn with your body), offered as "Teleport, no turning" and
+"Walk, no turning". A choice's keys that the ini has count for it when they
+match and against it when they don't, so "no turning" (two keys) beats a
+turn choice whose step or speed happens to match the ini.
 
 Move holsters is here because the right stick click (which used to be held
 for it) is now the kick. The grip editor (left Y hold) and the arm measure

@@ -10,20 +10,20 @@ namespace holevr::vr::vr_menu {
 const std::vector<Row>& Rows() {
     using K = RowKind;
     // Owner 2026-11-06: "Smooth turn, snap turn, teleport all merge into
-    // row". One row, Movement, for what were Moving (smooth/teleport),
-    // Turning (smooth/snap), Snap turn (how far) and Turn speed: Teleport,
-    // then walking with snap turns of 15-90 deg, then walking with smooth
-    // turns of 60-240 deg/s (more comfortable to the left, the right arrow
-    // steps toward smooth and faster). Teleport turns in 30 deg snaps.
-    // locomotion is every choice's first key, so it decides first; a tie
-    // goes to the default (walk, smooth 90 deg/s).
+    // row", then "add an option to turn off joystick turning altogether".
+    // One row, Movement, for what were Moving (smooth/teleport), Turning
+    // (smooth/snap), Snap turn (how far) and Turn speed, plus no stick
+    // turning (turn_mode=2: you turn with your body): Teleport with no
+    // turning or 30 deg snaps, then walking with no turning, snap turns of
+    // 15-90 deg or smooth turns of 60-240 deg/s (the right arrow steps
+    // toward smooth and faster). locomotion is every choice's first key.
     //
     // Hidden while they do nothing: Move toward with Teleport (the arc goes
     // where the stick hand points), Vignette turning unless turning is
     // smooth (a snap is instant), Real crouch and Hop to jump when seated
     // (controls.cpp turns both off then).
-    constexpr unsigned kWalk = 0x7FEu;          // Movement: every choice but Teleport
-    constexpr unsigned kSmoothTurn = 0x7C0u;    // Movement: the smooth turn choices
+    constexpr unsigned kWalk = 0x1FFCu;         // Movement: the walking choices (2-12)
+    constexpr unsigned kSmoothTurn = 0x1F00u;   // Movement: the smooth turn choices (8-12)
     constexpr unsigned kStanding = (1u << 0) | (1u << 1);  // Height: Character, Your own
     // "Aiming eye" (dominant_eye_right) is gone from the tab (owner
     // 2026-11-06: useful before 6DoF aiming, not now): it only chose which
@@ -32,20 +32,22 @@ const std::vector<Row>& Rows() {
     static const std::vector<Row> rows = {
         {"Movement",
          K::kChoice,
-         {{"Teleport", {{"locomotion", "teleport"}, {"turn_mode", "0"}, {"snap_turn_degrees", "30"}}},
-          {"Snap turn 15 deg", {{"locomotion", "smooth"}, {"turn_mode", "0"}, {"snap_turn_degrees", "15"}}},
-          {"Snap turn 30 deg", {{"locomotion", "smooth"}, {"turn_mode", "0"}, {"snap_turn_degrees", "30"}}},
-          {"Snap turn 45 deg", {{"locomotion", "smooth"}, {"turn_mode", "0"}, {"snap_turn_degrees", "45"}}},
-          {"Snap turn 60 deg", {{"locomotion", "smooth"}, {"turn_mode", "0"}, {"snap_turn_degrees", "60"}}},
-          {"Snap turn 90 deg", {{"locomotion", "smooth"}, {"turn_mode", "0"}, {"snap_turn_degrees", "90"}}},
-          {"Smooth turn 60 deg/s", {{"locomotion", "smooth"}, {"turn_mode", "1"}, {"smooth_turn_speed", "60"}}},
-          {"Smooth turn 90 deg/s", {{"locomotion", "smooth"}, {"turn_mode", "1"}, {"smooth_turn_speed", "90"}}},
-          {"Smooth turn 120 deg/s", {{"locomotion", "smooth"}, {"turn_mode", "1"}, {"smooth_turn_speed", "120"}}},
-          {"Smooth turn 180 deg/s", {{"locomotion", "smooth"}, {"turn_mode", "1"}, {"smooth_turn_speed", "180"}}},
-          {"Smooth turn 240 deg/s", {{"locomotion", "smooth"}, {"turn_mode", "1"}, {"smooth_turn_speed", "240"}}}},
-         7,
-         "Teleport: aim an arc with the stick, let go to move there; turns are 30 deg snaps. Snap or Smooth turn: "
-         "walk, and turn by that step or speed."},
+         {{"Teleport, no turning", {{"locomotion", "teleport"}, {"turn_mode", "2"}}},
+          {"Teleport, snap turn 30 deg", {{"locomotion", "teleport"}, {"turn_mode", "0"}, {"snap_turn_degrees", "30"}}},
+          {"Walk, no turning", {{"locomotion", "smooth"}, {"turn_mode", "2"}}},
+          {"Walk, snap turn 15 deg", {{"locomotion", "smooth"}, {"turn_mode", "0"}, {"snap_turn_degrees", "15"}}},
+          {"Walk, snap turn 30 deg", {{"locomotion", "smooth"}, {"turn_mode", "0"}, {"snap_turn_degrees", "30"}}},
+          {"Walk, snap turn 45 deg", {{"locomotion", "smooth"}, {"turn_mode", "0"}, {"snap_turn_degrees", "45"}}},
+          {"Walk, snap turn 60 deg", {{"locomotion", "smooth"}, {"turn_mode", "0"}, {"snap_turn_degrees", "60"}}},
+          {"Walk, snap turn 90 deg", {{"locomotion", "smooth"}, {"turn_mode", "0"}, {"snap_turn_degrees", "90"}}},
+          {"Walk, smooth turn 60 deg/s", {{"locomotion", "smooth"}, {"turn_mode", "1"}, {"smooth_turn_speed", "60"}}},
+          {"Walk, smooth turn 90 deg/s", {{"locomotion", "smooth"}, {"turn_mode", "1"}, {"smooth_turn_speed", "90"}}},
+          {"Walk, smooth turn 120 deg/s", {{"locomotion", "smooth"}, {"turn_mode", "1"}, {"smooth_turn_speed", "120"}}},
+          {"Walk, smooth turn 180 deg/s", {{"locomotion", "smooth"}, {"turn_mode", "1"}, {"smooth_turn_speed", "180"}}},
+          {"Walk, smooth turn 240 deg/s", {{"locomotion", "smooth"}, {"turn_mode", "1"}, {"smooth_turn_speed", "240"}}}},
+         9,
+         "Walk with the stick or teleport (aim an arc, let go to move there). Turn by snaps, smoothly, or not "
+         "at all: only with your body."},
         {"Move stick", K::kChoice,
          {{"Left", {{"move_stick", "left"}}}, {"Right", {{"move_stick", "right"}}}}, 0,
          "Which hand's stick moves you. The other stick turns, jumps and crouches."},
@@ -103,7 +105,7 @@ const std::vector<Row>& Rows() {
           {"110%", {{"world_scale", "1.1"}}},
           {"120%", {{"world_scale", "1.2"}}}},
          2, "How big the world looks around you. Above 100% it looks bigger, so you feel smaller."},
-        {"Room walking", K::kChoice, {{"On", {{"room_scale_follow", "1"}}}, {"Off", {{"room_scale_follow", "0"}}}}, 0,
+        {"Roomscale", K::kChoice, {{"On", {{"room_scale_follow", "1"}}}, {"Off", {{"room_scale_follow", "0"}}}}, 0,
          "Walking around your real room moves your character with you. Walls still stop it."},
         {"Grip", K::kChoice, {{"Hold", {{"grip_toggle", "0"}}}, {"Toggle", {{"grip_toggle", "1"}}}}, 0,
          "Hold: keep squeezing grip to keep holding. Toggle: squeeze once to take a gun or mag, again to let go."},
@@ -182,7 +184,9 @@ int CurrentChoice(const Row& row, const Getter& get) {
         const auto& sets = row.choices[c].sets;
         for (size_t k = 0; k < sets.size(); ++k) {
             std::string v = get(sets[k].key);
-            if (!v.empty() && SameValue(v, sets[k].value)) score += k == 0 ? 2 : 1;
+            if (v.empty()) continue;
+            const int weight = k == 0 ? 2 : 1;
+            score += SameValue(v, sets[k].value) ? weight : -weight;
         }
         if (score > best_score || (score > 0 && score == best_score && static_cast<int>(c) == row.default_choice)) {
             best_score = score;

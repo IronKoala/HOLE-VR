@@ -106,6 +106,9 @@ void DetachIfAttached(UObject actor) {
 struct Settings {
     bool enabled = true;
     bool smooth_turn = false;
+    // Owner 2026-11-06: "an option to turn off joystick turning altogether"
+    // (turn_mode=2): you turn with your body only.
+    bool no_stick_turn = false;
     double snap_degrees = 30.0;
     double smooth_speed = 180.0;   // degrees per second at full stick
     bool move_with_hand = false;   // false: head direction
@@ -186,6 +189,7 @@ void LoadHolsterSpots();
 void LoadSettings() {
     g_set.enabled = config::GetBool("vr_controls", true);
     g_set.smooth_turn = config::GetInt("turn_mode", 1) == 1;
+    g_set.no_stick_turn = config::GetInt("turn_mode", 1) == 2;
     g_set.snap_degrees = config::GetFloat("snap_turn_degrees", 30.f);
     g_set.smooth_speed = config::GetFloat("smooth_turn_speed", 90.f);
     g_set.move_with_hand = config::GetInt("move_direction", 0) == 1;
@@ -517,7 +521,9 @@ double Locomotion(UObject player, const input::Snapshot& s, double dt) {
     }
 
     double turn = 0;
-    if (g_set.smooth_turn) {
+    if (g_set.no_stick_turn) {
+        g_snap_armed = true;  // the stick's sideways push does nothing
+    } else if (g_set.smooth_turn) {
         if (std::fabs(right.stick_x) > g_set.deadzone) turn = right.stick_x * g_set.smooth_speed * dt;
     } else {
         if (g_snap_armed && std::fabs(right.stick_x) > 0.7) {
@@ -6325,7 +6331,8 @@ void ReloadSettings() {
     g_aim_smoother.Reset();
     log::Info("controls: settings changed (%s, %s turn %.0f deg / %.0f deg/s, move by %s, grip %s, aim smoothing %.2f, "
               "height %s, physical crouch %s, physical jump %s)",
-              g_set.teleport ? "teleport" : "smooth moving", g_set.smooth_turn ? "smooth" : "snap", g_set.snap_degrees,
+              g_set.teleport ? "teleport" : "smooth moving",
+              g_set.no_stick_turn ? "no stick" : g_set.smooth_turn ? "smooth" : "snap", g_set.snap_degrees,
               g_set.smooth_speed, g_set.move_with_hand ? "hand" : "head", g_set.grip_toggle ? "toggle" : "hold",
               g_set.aim_smoothing,
               g_set.real_height ? "real" : g_set.seated ? "seated" : "fixed", g_set.physical_crouch ? "on" : "off",
@@ -6373,7 +6380,8 @@ void Init() {
     config::AddChangeListener(&ReloadSettings);
     game::AddTickListener(&OnTick);
     perf::AddReportLine(&WallPushReport);
-    log::Info("controls: ready (%s turn, move by %s)", g_set.smooth_turn ? "smooth" : "snap",
+    log::Info("controls: ready (%s turn, move by %s)",
+              g_set.no_stick_turn ? "no stick" : g_set.smooth_turn ? "smooth" : "snap",
               g_set.move_with_hand ? "hand" : "head");
 }
 

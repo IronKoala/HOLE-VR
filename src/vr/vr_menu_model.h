@@ -44,9 +44,10 @@ const Row* Find(const char* label);
 
 // Reads a key's current value; empty when the ini doesn't have it.
 using Getter = std::function<std::string(const char* key)>;
-// The choice the current settings match best (each matching key counts, the
-// first key of a choice counts double; a tie goes to the row's default), or
-// the row's default if none match.
+// The choice the current settings match best: each key the ini has counts
+// for the choice when it matches and against it when it doesn't (the first
+// key of a choice counts double), a tie goes to the row's default, and with
+// no choice above zero the row's default.
 int CurrentChoice(const Row& row, const Getter& get);
 // Values match as numbers when both are numbers, else ignoring case.
 bool SameValue(const std::string& a, const std::string& b);

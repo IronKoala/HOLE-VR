@@ -316,7 +316,7 @@ const Block kBlocks[] = {
      "; --- Motion controls ---\n"
      "; 1 = use the VR controllers, 0 = keyboard/mouse/gamepad only.\n"
      "vr_controls=1\n"
-     "; Turning on the right stick: 0 = snap, 1 = smooth.\n"
+     "; Turning on the right stick: 0 = snap, 1 = smooth, 2 = no stick turning (turn with your body).\n"
      "turn_mode=1\n"
      "snap_turn_degrees=30\n"
      "; Degrees per second at full stick for smooth turning.\n"
