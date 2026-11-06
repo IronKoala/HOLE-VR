@@ -4056,12 +4056,17 @@ void HookPlayerRecoil(UObject player) {
 // 2026-11-06 14:17: "why is my character walking non-stop?", hands off both
 // sticks; that run's sprint check read the mod's stick as 0.00 at 627 cm/s.
 // In VR the left stick moves you only through Locomotion, so the game's
-// move axes are dropped (game_move_input=1 lets them through). The look
-// axes are only logged: nothing so far says they misbehave.
+// move axes are dropped (game_move_input=1 lets them through).
+// The look axes are dropped too (game_look_input=1 lets them through): the
+// real mouse fed LookUp/Down (up to 2.9 a frame in the 08:28 run, 2026-11-06),
+// the game pitched its aim, and the character bent its back or sank into a
+// near-crouch under the VR body (owner 15:14: "it messes with the IK
+// horribly"). In VR the head and hands aim; the right stick turns through
+// Locomotion's own SetControlRotation, which these hooks never see.
 struct GameAxis {
     const char* name;
     const char* label;
-    bool block;
+    bool look;
     UObject fn = 0;
     int32_t value_offset = -1;
     double peak = 0;
@@ -4070,19 +4075,20 @@ struct GameAxis {
     bool reported_first = false;
 };
 GameAxis g_game_axes[] = {
-    {"InpAxisEvt_MoveForward/Backwards_K2Node_InputAxisEvent_0", "move forward/back", true},
-    {"InpAxisEvt_MoveRight/Left_K2Node_InputAxisEvent_1", "move right/left", true},
-    {"InpAxisEvt_LookLeft/Right_K2Node_InputAxisEvent_3", "look left/right", false},
-    {"InpAxisEvt_LookUp/Down_K2Node_InputAxisEvent_2", "look up/down", false},
+    {"InpAxisEvt_MoveForward/Backwards_K2Node_InputAxisEvent_0", "move forward/back", false},
+    {"InpAxisEvt_MoveRight/Left_K2Node_InputAxisEvent_1", "move right/left", false},
+    {"InpAxisEvt_LookLeft/Right_K2Node_InputAxisEvent_3", "look left/right", true},
+    {"InpAxisEvt_LookUp/Down_K2Node_InputAxisEvent_2", "look up/down", true},
 };
 bool g_game_move_input = false;  // game_move_input=1: let the game's own move axes through
+bool g_game_look_input = false;  // game_look_input=1: let the game's own look axes (mouse) through
 
 bool BeforeGameAxis(UObject, UObject fn, void* params) {
     GameAxis* a = nullptr;
     for (GameAxis& g : g_game_axes)
         if (g.fn == fn) a = &g;
     if (!a) return true;
-    const bool drop = g_set.enabled && a->block && !g_game_move_input;
+    const bool drop = g_set.enabled && !(a->look ? g_game_look_input : g_game_move_input);
     float value = 0;
     if (a->value_offset >= 0 && params)
         value = mem::ReadOr<float>(reinterpret_cast<uintptr_t>(params) + a->value_offset, 0.f);
@@ -4096,7 +4102,9 @@ bool BeforeGameAxis(UObject, UObject fn, void* params) {
             a->reported_first = true;
             log::Info("controls: the game's own %s input is %.2f (a gamepad or keyboard the game reads itself, "
                       "such as Steam Input's virtual pad), not the mod's stick; %s", a->label, value,
-                      drop ? "dropped: in VR the left stick moves you through the mod only" : "passed to the game");
+                      !drop ? "passed to the game" :
+                      a->look ? "dropped: in VR your head and hands aim, and the right stick turns through the mod" :
+                                "dropped: in VR the left stick moves you through the mod only");
         }
     }
     static int summaries = 0;
@@ -4123,6 +4131,7 @@ void HookGameAxes(UObject player) {
     hooked_class = cls;
     ++classes_hooked;
     g_game_move_input = config::GetBool("game_move_input", false);
+    g_game_look_input = config::GetBool("game_look_input", false);
     int n = 0;
     for (GameAxis& a : g_game_axes) {
         a.fn = ue::FindFunction(cls, a.name);
@@ -4131,9 +4140,10 @@ void HookGameAxes(UObject player) {
         a.value_offset = p.valid() && p.type == "FloatProperty" ? p.offset : -1;
         if (ue::process_event::On(a.fn, &BeforeGameAxis, nullptr)) ++n;
     }
-    log::Info("controls: the game's own move and look inputs watched (%d of %zu found); its move input is %s", n,
-              sizeof(g_game_axes) / sizeof(g_game_axes[0]),
-              g_game_move_input ? "passed to the game (game_move_input=1)" : "dropped while VR controls are on");
+    log::Info("controls: the game's own move and look inputs watched (%d of %zu found); move input %s, look "
+              "input (mouse) %s", n, sizeof(g_game_axes) / sizeof(g_game_axes[0]),
+              g_game_move_input ? "passed to the game (game_move_input=1)" : "dropped while VR controls are on",
+              g_game_look_input ? "passed to the game (game_look_input=1)" : "dropped while VR controls are on");
 }
 
 // The game's own "camera shake" option (BP_Player.CameraShake): off in VR
