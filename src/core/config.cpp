@@ -376,7 +376,7 @@ const Block kBlocks[] = {
      "; Room-scale: the character follows you when you walk around the room\n"
      "; (1 = on; walls stop it).\n"
      "room_scale_follow=1\n"
-     "; Aiming eye: 1 = right, 0 = left.\n"
+     "; Eye the rifle's shoulder lock lines the sights up with (not on the VR tab): 1 = right, 0 = left.\n"
      "dominant_eye_right=1\n"
      "; Pistol slide can be grabbed this far forward of its rear (front serrations, press checks)\n"
      "slide_grab_forward_cm=16\n"

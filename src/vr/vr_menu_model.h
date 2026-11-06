@@ -26,18 +26,33 @@ struct Row {
     RowKind kind = RowKind::kChoice;
     std::vector<Choice> choices;
     int default_choice = 0;  // when the ini has none of the keys
+    // What the setting does, in a sentence or two: shown beside the list
+    // while the row is pointed at (owner 2026-11-06: "a brief description of
+    // what the option does just off to the right").
+    const char* about = "";
+    // A row that does nothing with some choice of another row is hidden then
+    // (owner 2026-11-06: "are any of them redundant/moot?"): shown only while
+    // the row labelled `only_with` is on one of `only_choices` (bit n =
+    // choice n). No `only_with`: always shown.
+    const char* only_with = nullptr;
+    unsigned only_choices = 0;
 };
 
 const std::vector<Row>& Rows();
+// The row with this label, or nullptr.
+const Row* Find(const char* label);
 
 // Reads a key's current value; empty when the ini doesn't have it.
 using Getter = std::function<std::string(const char* key)>;
 // The choice the current settings match best (each matching key counts, the
-// first key of a choice counts double), or the row's default if none match.
+// first key of a choice counts double; a tie goes to the row's default), or
+// the row's default if none match.
 int CurrentChoice(const Row& row, const Getter& get);
 // Values match as numbers when both are numbers, else ignoring case.
 bool SameValue(const std::string& a, const std::string& b);
 // "Label: choice", what the row's button shows.
 std::string RowText(const Row& row, int choice);
+// Whether the row is shown with the current settings (see Row::only_with).
+bool Shown(const Row& row, const Getter& get);
 
 }  // namespace holevr::vr::vr_menu

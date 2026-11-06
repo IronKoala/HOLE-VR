@@ -35,21 +35,19 @@ whatever the laser is on). A step writes the ini key(s) into `hole-vr.ini` in pl
 |---|---|---|
 | Moving | Smooth, Teleport | `locomotion` |
 | Turning | Smooth, Snap | `turn_mode` |
-| Snap turn | 15, 30, 45, 60, 90 deg | `snap_turn_degrees` |
-| Turn speed | 60, 90, 120, 180, 240 deg/s | `smooth_turn_speed` |
+| Snap turn (Snap turning only) | 15, 30, 45, 60, 90 deg | `snap_turn_degrees` |
+| Turn speed (Smooth turning only) | 60, 90, 120, 180, 240 deg/s | `smooth_turn_speed` |
 | Move stick | Left, Right | `move_stick` |
-| Move toward | Where you look, Stick hand | `move_direction` |
+| Move toward (Smooth moving only) | Where you look, Stick hand | `move_direction` |
 | Vignette moving | Off, Light, Medium, Strong | `comfort_vignette_move` (0, 0.35, 0.6, 0.85) |
-| Vignette turning | Off, Light, Medium, Strong | `comfort_vignette_turn` |
-| Head in a wall | Fades, No fade | `head_wall_fade` |
-| Wall fade starts | 5, 10, 15, 20, 25 cm away | `head_wall_fade_start_cm` (15) |
+| Vignette turning (Smooth turning only) | Off, Light, Medium, Strong | `comfort_vignette_turn` |
+| Wall fade | Off, 5, 10, 15, 20, 25 cm away | `head_wall_fade` + `head_wall_fade_start_cm` (on, 15) |
 | Height | Character, Your own, Seated | `fixed_height` + `height_mode` |
-| Real crouch | On, Off | `physical_crouch` |
-| Hop to jump | Off, On | `physical_jump` |
+| Real crouch (not Seated) | On, Off | `physical_crouch` |
+| Hop to jump (not Seated) | Off, On | `physical_jump` |
 | World size | 80% to 120% | `world_scale` (0.8 to 1.2) |
 | Room walking | On, Off | `room_scale_follow` |
 | Grip | Hold, Toggle | `grip_toggle` |
-| Aiming eye | Right, Left | `dominant_eye_right` |
 | Aim smoothing | Off, Light, Medium, Strong | `aim_smoothing` (0, 0.33, 0.66, 1) |
 | Rifle stock | On, Off | `rifle_virtual_stock` |
 | Gun stops at walls | On, Off | `gun_wall_collision` |
@@ -59,6 +57,38 @@ whatever the laser is on). A step writes the ini key(s) into `hole-vr.ini` in pl
 | Calibrate body | (action) | height → arms forward → arms out → bent elbows → forward check; hold both triggers for 2s to record; left X keeps the current arms |
 | Edit hand grips | (action) | opens the grip editor once the menu closes; while it is open the row reads "open, click to close" and closes it |
 | Move holsters | (action) | 5 s after the menu closes (a buzz each second), each holster moves to where the hand holding its item is |
+
+**Descriptions** (owner 2026-11-06: "when one is selected/cursor is hover
+over it, i want a brief description of what the option does just off to the
+right"). The page is a horizontal box: the scroll box of rows (filling the
+width) and, right of it, a 520-unit column (`SizeBox`) holding one wrapping
+`TextBlock`. Pointing the laser at a row or its arrows, clicking it, or
+selecting it with a gamepad shows that row's description (`Row::about` in
+`vr_menu_model.cpp`), moved down level with the row (a render translation,
+so nothing else is laid out again) and kept inside the column; it follows
+the list when it scrolls. Moving off the rows keeps the last description.
+Hover comes from the game button class's own hover/unhover and focus events
+(`AfterHover`), which the laser's widget interaction sets off like a mouse.
+The text gets the rows' font, and the forearm menu outlines and enlarges it
+with the rest of the page. Log: `vr options: description column added right
+of the rows`, `descriptions follow N row button event(s)`, and `describing
+<row>` for the first six each time Options opens.
+
+**Hidden rows** (owner 2026-11-06: "are any of them redundant/moot?"). A
+row that does nothing with another row's current choice is collapsed
+(`Row::only_with`): Snap turn unless turning is Snap; Turn speed and
+Vignette turning with Snap turning (a snap is instant, so there is nothing
+to darken); Move toward with Teleport (the arc follows the stick hand);
+Real crouch and Hop to jump when Seated (they are off then). Changing the
+deciding row shows or hides them at once. Log: `vr options: Turning:
+hidden (they do nothing now): Turn speed, Vignette turning; shown again:
+Snap turn`.
+
+**Removed and merged** (2026-11-06): "Aiming eye" is off the tab: since
+6DoF aiming it only chose which eye the rifle's shoulder lock lines the
+sights up with. `dominant_eye_right` still works in the ini (right unless
+set) for a later left-handed mode. "Head in a wall" and "Wall fade starts"
+are one row, Wall fade: Off or the distance the fade starts at.
 
 Move holsters is here because the right stick click (which used to be held
 for it) is now the kick. The grip editor (left Y hold) and the arm measure
@@ -95,7 +125,7 @@ levels. Each frame picks one part of it.
   Strong the clear circle is about 33 deg wide each side of centre.
 - Head in a wall: a ball is swept from the body's middle at head height to
   the eyes. Its radius is where the fade begins (`head_wall_fade_start_cm`,
-  15 cm, the "Wall fade starts" row). Where it stops, the eyes are that
+  15 cm, the "Wall fade" row). Where it stops, the eyes are that
   close to a surface; the closer they are to it, measured along the
   surface's normal (comfort_math `WallFade`), the darker, until black
   `head_wall_fade_full_cm` (2 cm) before the surface. Until 2026-11-04 the

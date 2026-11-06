@@ -1,6 +1,8 @@
 // Native unit tests for the VR tab's model and the in-place ini edit.
 //   g++ -std=c++20 -Isrc tests/test_vr_options.cpp src/vr/vr_menu_model.cpp src/core/ini_edit.cpp -o /tmp/test_vr_options && /tmp/test_vr_options
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <map>
 #include <set>
 #include <string>
@@ -51,6 +53,13 @@ static void TestIniEdit() {
     EXPECT(out == "a=5\nb=2\n");
 }
 
+static const Row& RowNamed(const char* label) {
+    for (const auto& r : Rows())
+        if (std::string(r.label) == label) return r;
+    std::printf("no row %s\n", label);
+    std::abort();
+}
+
 static void TestRows() {
     const auto& rows = Rows();
     EXPECT(rows.size() >= 15);
@@ -65,14 +74,52 @@ static void TestRows() {
         }
         // Short enough for a menu button.
         for (size_t c = 0; c < r.choices.size(); ++c) EXPECT(RowText(r, static_cast<int>(c)).size() <= 40);
+        // Every row says what it does, briefly (a few lines beside the list).
+        const size_t about = std::strlen(r.about);
+        EXPECT(about >= 20 && about <= 120);
+        if (about < 20 || about > 120) std::printf("  %s: description is %zu characters\n", r.label, about);
+        // A row hidden by another names a real row, and is shown with at
+        // least one of its choices but not all of them.
+        if (r.only_with) {
+            const Row* by = Find(r.only_with);
+            EXPECT(by && by != &r);
+            if (by) {
+                const unsigned all = (1u << by->choices.size()) - 1;
+                EXPECT((r.only_choices & all) != 0 && (r.only_choices & all) != all);
+            }
+        }
     }
+    // Aiming eye is gone (6DoF aiming made it moot); the ini key still works.
+    EXPECT(!Find("Aiming eye"));
+    for (const auto& r : rows)
+        for (const auto& c : r.choices)
+            for (const auto& kv : c.sets) EXPECT(std::string(kv.key) != "dominant_eye_right");
 }
 
-static const Row& RowNamed(const char* label) {
-    for (const auto& r : Rows())
-        if (std::string(r.label) == label) return r;
-    std::printf("no row %s\n", label);
-    std::abort();
+// Rows that do nothing with the current choices are hidden.
+static void TestShown() {
+    std::map<std::string, std::string> ini;
+    Getter get = [&](const char* k) {
+        auto it = ini.find(k);
+        return it == ini.end() ? std::string() : it->second;
+    };
+    auto shown = [&](const char* label) { return Shown(RowNamed(label), get); };
+    // Defaults: smooth moving, smooth turning, character height.
+    EXPECT(!shown("Snap turn"));
+    EXPECT(shown("Turn speed") && shown("Vignette turning") && shown("Move toward"));
+    EXPECT(shown("Real crouch") && shown("Hop to jump"));
+    EXPECT(shown("Turning") && shown("Vignette moving") && shown("Calibrate body"));
+    ini["turn_mode"] = "0";  // snap
+    EXPECT(shown("Snap turn") && !shown("Turn speed") && !shown("Vignette turning"));
+    ini["locomotion"] = "teleport";
+    EXPECT(!shown("Move toward"));
+    EXPECT(shown("Vignette moving"));  // falls still count
+    ini["fixed_height"] = "1";
+    ini["height_mode"] = "seated";
+    EXPECT(!shown("Real crouch") && !shown("Hop to jump"));
+    ini["fixed_height"] = "0";
+    ini["height_mode"] = "real";
+    EXPECT(shown("Real crouch") && shown("Hop to jump"));
 }
 
 static void TestCurrent() {
@@ -127,11 +174,31 @@ static void TestDefaultsAndActions() {
     EXPECT(std::string(monitor.choices[static_cast<size_t>(CurrentChoice(monitor, get))].text) == "Right eye");
     ini["monitor_view"] = "Both";
     EXPECT(std::string(monitor.choices[static_cast<size_t>(CurrentChoice(monitor, get))].text) == "Both eyes");
-    // The wall fade starts 15 cm from a surface unless chosen otherwise.
-    const Row& fade = RowNamed("Wall fade starts");
-    EXPECT(std::string(fade.choices[static_cast<size_t>(CurrentChoice(fade, get))].text) == "15 cm away");
+    // One wall fade row: on, starting 15 cm from a surface, unless chosen
+    // otherwise.
+    const Row& fade = RowNamed("Wall fade");
+    auto fade_text = [&] { return std::string(fade.choices[static_cast<size_t>(CurrentChoice(fade, get))].text); };
+    EXPECT(fade_text() == "15 cm away");
+    ini["head_wall_fade"] = "1";  // on, no distance yet: the default distance, not the first
+    EXPECT(fade_text() == "15 cm away");
     ini["head_wall_fade_start_cm"] = "25";
-    EXPECT(std::string(fade.choices[static_cast<size_t>(CurrentChoice(fade, get))].text) == "25 cm away");
+    EXPECT(fade_text() == "25 cm away");
+    ini["head_wall_fade_start_cm"] = "12";  // not a choice: the default distance
+    EXPECT(fade_text() == "15 cm away");
+    ini["head_wall_fade"] = "0";  // off wins over a matching distance
+    ini["head_wall_fade_start_cm"] = "15";
+    EXPECT(fade_text() == "Off");
+    ini.erase("head_wall_fade");  // only a distance: on, at it
+    ini["head_wall_fade_start_cm"] = "5";
+    EXPECT(fade_text() == "5 cm away");
+    EXPECT(!Find("Head in a wall") && !Find("Wall fade starts"));
+    // Choosing a distance turns the fade on too.
+    for (const auto& c : fade.choices) {
+        bool sets_on = false;
+        for (const auto& kv : c.sets)
+            if (std::string(kv.key) == "head_wall_fade") sets_on = std::string(kv.value) == "1";
+        EXPECT(sets_on == (std::string(c.text) != "Off"));
+    }
     // Empty hands stop at walls unless turned off.
     const Row& hand_walls = RowNamed("Hands stop at walls");
     EXPECT(std::string(hand_walls.choices[static_cast<size_t>(CurrentChoice(hand_walls, get))].text) == "On");
@@ -143,6 +210,7 @@ int main() {
     TestIniEdit();
     TestRows();
     TestCurrent();
+    TestShown();
     TestDefaultsAndActions();
     if (failures) {
         std::printf("%d failure(s)\n", failures);
