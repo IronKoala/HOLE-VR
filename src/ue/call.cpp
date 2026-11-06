@@ -7,6 +7,7 @@
 #include <utility>
 
 #include "core/log.h"
+#include "core/perf.h"
 #include "ue/process_event.h"
 #include "ue/reflection.h"
 
@@ -44,6 +45,11 @@ bool IsDefaultObject(UObject obj) {
     return (mem::ReadOr<uint32_t>(obj + off::kObjFlags) & RF_ClassDefaultObject) != 0;
 }
 
+// A search decodes the name of every function up the class chain. Hits are
+// kept, misses are not (classes load late), so a function asked for every
+// frame on a class that lacks it shows up here as a high count per second.
+static perf::Counter g_perf_fn_search{"lookups: function searched by name"};
+
 UObject FindFunction(UObject cls, const std::string& name) {
     if (!cls) return 0;
     auto key = std::make_pair(cls, name);
@@ -52,6 +58,13 @@ UObject FindFunction(UObject cls, const std::string& name) {
         auto it = g_fn_cache.find(key);
         if (it != g_fn_cache.end()) return it->second;
     }
+    static const bool registered = [] {
+        g_perf_fn_search.per_second_total = true;
+        perf::Register(&g_perf_fn_search);
+        return true;
+    }();
+    (void)registered;
+    perf::Scope timed(g_perf_fn_search);
     UObject found = 0;
     for (UObject s = cls; s && !found; s = reflection::GetSuper(s)) {
         for (UObject f : reflection::GetFunctions(s)) {

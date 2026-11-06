@@ -8,6 +8,7 @@
 
 #include "core/log.h"
 #include "core/memory.h"
+#include "core/perf.h"
 
 namespace holevr::ue::reflection {
 namespace {
@@ -144,9 +145,22 @@ bool Ready() { return g_ready; }
 UObject GetSuper(UObject s) { return g_ready && s ? mem::ReadOr<uintptr_t>(s + o_super) : 0; }
 int32_t GetPropertiesSize(UObject s) { return g_ready && s ? mem::ReadOr<int32_t>(s + o_props_size) : 0; }
 
+// Reading every variable of a class decodes each name through guarded reads
+// (about 1 ms for a weapon Blueprint and its parents). Counted so the perf
+// report shows any code that does it every frame instead of once
+// (2026-11-06: three uncached pistol lookups cost 9 ms of every frame).
+static perf::Counter g_perf_props{"lookups: all of a class's variables read"};
+
 std::vector<PropertyInfo> GetProperties(UObject s) {
     std::vector<PropertyInfo> out;
     if (!g_ready || !s) return out;
+    static const bool registered = [] {
+        g_perf_props.per_second_total = true;
+        perf::Register(&g_perf_props);
+        return true;
+    }();
+    (void)registered;
+    perf::Scope timed(g_perf_props);
     uintptr_t f = mem::ReadOr<uintptr_t>(s + o_child_props);
     for (int n = 0; f && n < 4096; ++n) {
         PropertyInfo p;
