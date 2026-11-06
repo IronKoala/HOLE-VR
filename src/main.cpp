@@ -11,6 +11,7 @@
 #include "core/memory.h"
 #include "core/perf.h"
 #include "core/process_metrics.h"
+#include "core/sampler.h"
 #include "game/game.h"
 #include "game/weapon_lab.h"
 #include "proxy/dxgi_proxy.h"
@@ -22,6 +23,7 @@
 #include "ue/objects.h"
 #include "ue/process_event.h"
 #include "ue/reflection.h"
+#include "vr/gpu_test.h"
 #include "vr/dxgi_hooks.h"
 #include "vr/body/body.h"
 #include "vr/comfort.h"
@@ -152,6 +154,7 @@ DWORD WINAPI InitThread(LPVOID) {
     if (!WaitFor("GUObjectArray", ue::objects::Init, timeout)) return 0;
     if (!WaitFor("reflection offsets", ue::reflection::Init, timeout)) return 0;
     log::Info("Engine discovery complete");
+    sampler::Start();  // samples the game, render and present threads (profile=0 turns it off)
     // Before the slow start-up work: the title screen is up within seconds.
     vr::launch::Init();
 
@@ -179,6 +182,7 @@ DWORD WINAPI InitThread(LPVOID) {
         vr::touch::Init();         // after the body: reads this frame's drawn hands
         vr::drinks::Init();        // after controls: reads this frame's hand poses
         vr::cvars::Init();
+        vr::gpu_test::Init();  // after cvars: switches render features to measure their GPU cost
         vr::wrist_hud::InitGame();
         vr::world_menu::InitGame();
         vr::vr_options::InitGame();

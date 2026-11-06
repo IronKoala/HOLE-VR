@@ -20,6 +20,7 @@
 #include "ue/objects.h"
 #include "ue/reflection.h"
 #include "vr/cvars.h"
+#include "vr/gpu_test.h"
 #include "vr/render_fixes.h"
 #include "vr/square_watch.h"
 
@@ -483,7 +484,7 @@ void Tick(UObject player, float) {
     square_watch::Sweep sw;
     switch (g_phase) {
         case Phase::kWatch: {
-            if (now < g_next_check) return;
+            if (now < g_next_check || gpu_test::Running()) return;  // it switches render features too
             g_next_check = now + kCheckEveryMs;
             if (!square_watch::LatestSweep(now - 1500, &sw)) {
                 g_strong = 0;
@@ -599,6 +600,8 @@ void Tick(UObject player, float) {
 }
 
 }  // namespace
+
+bool Busy() { return g_on && g_phase != Phase::kWatch && g_phase != Phase::kDone; }
 
 void Init() {
     g_on = config::GetBool("square_test", true);

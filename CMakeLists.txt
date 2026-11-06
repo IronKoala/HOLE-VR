@@ -14,6 +14,7 @@ add_library(hole_vr SHARED
     src/core/builtin_files.cpp
     src/core/memory.cpp
     src/core/perf.cpp
+    src/core/sampler.cpp
     src/core/process_metrics.cpp
     src/ue/names.cpp
     src/ue/objects.cpp
@@ -24,6 +25,8 @@ add_library(hole_vr SHARED
     src/vr/openxr.cpp
     src/vr/menu_study.cpp
     src/vr/dxgi_hooks.cpp
+    src/vr/gpu_timer.cpp
+    src/vr/gpu_test.cpp
     src/vr/stereo.cpp
     src/vr/view_lead.cpp
     src/vr/view_lead_math.cpp
