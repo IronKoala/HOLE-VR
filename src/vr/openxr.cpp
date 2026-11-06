@@ -1733,7 +1733,7 @@ bool RequestPairedCapture(const char* tag) {
     // Default matches the ini block: config appends a missing block to the
     // file but reads it only from the next launch, so the first launch after
     // an update runs on this default.
-    if (!config::GetBool("paired_capture_enabled", true)) return false;
+    if (!config::GetBool("paired_capture_enabled", false)) return false;
     std::lock_guard<std::mutex> lock(g_pair_capture_mutex);
     if (g_pair_capture_busy.load()) return false;
     const unsigned limit = static_cast<unsigned>(std::clamp(config::GetInt("paired_capture_limit", 3), 1, 8));

@@ -60,6 +60,12 @@ inline bool InAimCone(double gap, double t, double cone_deg, double min_cm) {
     return gap <= std::fmax(min_cm, std::tan(cone_deg * 3.14159265358979323846 / 180.0) * std::fmax(t, 0.0));
 }
 
+// Where a hand points, from its controller's aim pose turned by `pitch_deg`
+// and `yaw_deg` in the controller's own frame (yaw mirrored for the left
+// hand, `left`). The aim pose sits about 30 degrees above where a hand
+// naturally points, so the default is pitch -30, yaw 5 (vr/controls' pistol).
+FVector PointDir(const FQuat& aim, double pitch_deg, double yaw_deg, bool left);
+
 // The box of a mesh's own bounds [mn, mx] under a component scale (negative
 // scales flip an axis; the result is sorted).
 Box ScaledBox(const FVector& mn, const FVector& mx, const FVector& scale);

@@ -166,6 +166,11 @@ struct Settings {
     // Trigger: a hand this close counts as touching; else the thing nearest
     // the aim within point_cone degrees (or point_min cm) of it.
     double trigger_near = 8.0, point_cone = 8.0, point_min = 6.0;
+    // Where a hand points, from the controller's aim pose: the aim pose sits
+    // about 30 degrees above where a hand naturally points (the same offset
+    // the held pistol uses, vr/controls kBasePitch/kBaseYaw, from the
+    // owner's headset tests). Yaw is for the right hand, mirrored for the left.
+    double point_pitch = -30.0, point_yaw = 5.0;
     bool loot_log = true;    // where loot that appears goes (answers "no loot spawned")
     std::vector<std::string> extra_containers, skip;
     HandleZoneSettings handle;
@@ -184,6 +189,8 @@ void LoadSettings() {
     S.point_cone = std::clamp<double>(config::GetFloat("touch_interact_point_cone_deg", 8.0f), 0.0, 30.0);
     S.point_min = std::clamp<double>(config::GetFloat("touch_interact_point_min_cm", 6.0f), 0.0, 30.0);
     S.loot_log = config::GetBool("touch_interact_loot_log", true);
+    S.point_pitch = std::clamp<double>(config::GetFloat("touch_interact_point_pitch_deg", -30.0f), -60.0, 30.0);
+    S.point_yaw = std::clamp<double>(config::GetFloat("touch_interact_point_yaw_deg", 5.0f), -30.0, 30.0);
     S.extra_containers = SplitList(config::GetString("touch_interact_extra_containers", ""));
     S.skip = SplitList(config::GetString("touch_interact_skip", ""));
     S.handle.height = std::clamp<double>(config::GetFloat("door_handle_height_cm", 100.0f), 40.0, 180.0);
@@ -942,7 +949,13 @@ Pick PickForHand(UObject player, int hand, const std::vector<UObject>& ignore) {
     // the game reaches when you look.
     double reach = 200.0;
     if (!ReadNumber(player, "InteractiveDistance", &reach) || reach < 50.0 || reach > 2000.0) reach = 200.0;
-    const FVector o = hs.aim.location, d = hs.aim.rotation.Rotate(FVector{1, 0, 0});
+    // Owner 2026-11-06: opening boxes with the trigger "isnt much better, i
+    // think what going on is the angle isnt in line with my hand, i think
+    // its pointing more towards the sky". It was: the raw aim pose was level
+    // at boxes on the floor 1.4 m away (log 08:33:24), about 30 degrees
+    // above the hand. The pointing ray now has the pistol's offset.
+    const FVector o = hs.aim.location, d = PointDir(hs.aim.rotation, S.point_pitch, S.point_yaw, hand == 0);
+    const FVector raw = hs.aim.rotation.Rotate(FVector{1, 0, 0});
     TraceHit hit;
     if (Trace(player, o, o + d * reach, 2, ignore, &hit) && hit.objtype == 16) {
         if (const Thing* th = FindThing(hit.actor)) {
@@ -1020,9 +1033,10 @@ Pick PickForHand(UObject player, int hand, const std::vector<UObject>& ignore) {
     static int s_diag = 0;
     if (s_diag++ < 40)
         log::Info("touch: the %s hand touches and points at nothing to interact with (%zu things here; nearest %s, "
-                  "%s, %.0f cm from the hand; aim from (%.0f %.0f %.0f) along (%.2f %.2f %.2f))",
+                  "%s, %.0f cm from the hand; pointing from (%.0f %.0f %.0f) along (%.2f %.2f %.2f), the controller's "
+                  "raw aim along (%.2f %.2f %.2f))",
                   side, L.things.size(), nearest ? nearest->name.c_str() : "none", nearest ? nearest->cls.c_str() : "-",
-                  nearest_d, o.X, o.Y, o.Z, d.X, d.Y, d.Z);
+                  nearest_d, o.X, o.Y, o.Z, d.X, d.Y, d.Z, raw.X, raw.Y, raw.Z);
     return out;
 }
 
