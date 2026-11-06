@@ -1,5 +1,11 @@
 # Rifle in the left hand, pistol in the right
 
+Since 2026-11-06 either hand can hold either gun (docs/HOLSTERS.md, "Either
+hand"). Below, "right hand" means the gun hand and "left hand" the other hand;
+`interact::Decide` is unchanged and is fed the two roles. New with it: the
+other hand can hold the rifle by its own grip (`by_grip`) while the pistol is
+out, and the rifle comes out in that hand when the pistol is put away.
+
 Owner request (2026-11-03): "hold the foregrip of the rifle in one hand and
 pistol in the other". The rifle stays in the left hand by its handguard while
 the pistol is the gun that fires, like a soldier going from a rifle to a

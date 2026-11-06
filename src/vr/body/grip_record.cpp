@@ -211,4 +211,19 @@ double Depth(const Record& r, const FVector& p, std::string* box) {
     return worst;
 }
 
+std::string SideKey(const std::string& base, bool right_hand, bool usual_hand) {
+    if (usual_hand) return base;
+    return base + (right_hand ? "-right" : "-left");
+}
+
+std::string UsualKey(const std::string& key) {
+    auto ends = [&](const std::string& tail) {
+        return key.size() >= tail.size() && key.compare(key.size() - tail.size(), tail.size(), tail) == 0;
+    };
+    if (ends(".charging-left") || ends(".charging-right")) return key;
+    if (ends("-left")) return key.substr(0, key.size() - 5);
+    if (ends("-right")) return key.substr(0, key.size() - 6);
+    return key;
+}
+
 }  // namespace holevr::vr::grip_record

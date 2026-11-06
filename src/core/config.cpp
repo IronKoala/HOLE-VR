@@ -483,6 +483,15 @@ const Block kBlocks[] = {
      "; goes back to its holster by itself, like the pistol. With the left hand on the\n"
      "; handguard the left hand keeps it. 0 = the rifle stays in the right hand.\n"
      "rifle_right_let_go=1\n"},
+    {"either_hand_guns",
+     "\n"
+     "; --- Either hand for guns and magazines ---\n"
+     "; 1 = any free hand can draw the pistol, take the rifle from its holster or by\n"
+     "; its grip, and take a magazine from the pouch. The hand that holds a gun by its\n"
+     "; grip fires it (its trigger), drops the magazine (A or X) and releases the slide\n"
+     "; (B or Y); the other hand racks, reloads, holds the handguard and works the light.\n"
+     "; 0 = the right hand always holds the gun and the left hand takes the magazines.\n"
+     "either_hand_guns=1\n"},
     {"rifle_charging_handle_grab_cm",
      "\n"
      "; --- The rifle's charging handle ---\n"
