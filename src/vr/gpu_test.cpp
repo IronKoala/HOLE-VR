@@ -10,6 +10,7 @@
 #include "game/game.h"
 #include "vr/cvars.h"
 #include "vr/gpu_timer.h"
+#include "vr/openxr.h"
 #include "vr/square_test.h"
 #include "vr/ui_panel.h"
 
@@ -22,12 +23,15 @@ using ue::UObject;
 // every window is left out (the engine reallocates some buffers on a switch).
 struct Suspect {
     const char* what;
-    const char* cvar;  // nullptr: nothing switched (shows the noise)
+    const char* cvar;  // nullptr: nothing switched (shows the noise), or `toggle`
     const char* test;
     bool is_float;
+    void (*toggle)(bool test) = nullptr;  // switched by the mod, not a console variable
+    void (*decide)(const struct Suspect& s) = nullptr;  // after it is measured
     std::string original;
     double base_ms = 0.0, test_ms = 0.0, base_idle = 0.0, test_idle = 0.0;
     long base_n = 0, test_n = 0, base_idle_n = 0, test_idle_n = 0;
+    long long base_sent = 0, test_sent = 0, base_missed = 0, test_missed = 0;  // headset frames
     std::string tries;  // "-4.1 -4.5 -4.4"
     double cycle_base = 0.0;
     double saved = 0.0;
@@ -39,6 +43,7 @@ Phase g_phase = Phase::kWaiting;
 double g_clock = 0.0, g_window_start = 0.0;
 int g_index = 0, g_window = 0;  // windows per suspect: base, test, base, test, ...
 bool g_settled = false;
+long long g_win_sent = 0, g_win_missed = 0;  // headset totals when the window's counting began
 // Seconds played in the current level, which must not be the home base
 // (Area000_Home draws far less than a run's level, so its numbers say little).
 UObject g_level_player = 0;
@@ -66,6 +71,10 @@ std::string ReadNow(const Suspect& s) {
 }
 
 void Set(UObject player, const Suspect& s, bool test) {
+    if (s.toggle) {
+        s.toggle(test);
+        return;
+    }
     if (!s.cvar || s.original.empty() || s.original == "-12345") return;
     cvars::RunNow(std::string(s.cvar) + " " + (test ? s.test : s.original), player);
 }
@@ -75,6 +84,7 @@ void BeginSuspect(UObject player) {
     if (s.cvar) s.original = ReadNow(s);
     s.base_ms = s.test_ms = s.base_idle = s.test_idle = 0.0;
     s.base_n = s.test_n = s.base_idle_n = s.test_idle_n = 0;
+    s.base_sent = s.test_sent = s.base_missed = s.test_missed = 0;
     s.tries.clear();
     g_window = 0;
     g_window_start = g_clock;
@@ -103,15 +113,19 @@ void FinishSuspect(UObject player) {
     const double bidle = s.base_idle_n ? s.base_idle / s.base_idle_n : 0.0;
     const double tidle = s.test_idle_n ? s.test_idle / s.test_idle_n : 0.0;
     s.saved = base - test;
+    const double bmiss = s.base_sent ? 100.0 * s.base_missed / (s.base_sent + s.base_missed) : 0.0;
+    const double tmiss = s.test_sent ? 100.0 * s.test_missed / (s.test_sent + s.test_missed) : 0.0;
     if (s.cvar && (s.original.empty() || s.original == "-12345")) {
         log::Info("GPU cost test: %s: %s could not be read, skipped", s.what, s.cvar);
         s.saved = 0.0;
     } else {
         log::Info("GPU cost test: %s (%s %s, was %s): GPU %.2f -> %.2f ms a frame (%+.2f ms; each try%s), GPU idle "
-                  "%.2f -> %.2f ms; %ld + %ld frames",
-                  s.what, s.cvar ? s.cvar : "nothing switched", s.cvar ? s.test : "", s.cvar ? s.original.c_str() : "-",
-                  base, test, test - base, s.tries.c_str(), bidle, tidle, s.base_n, s.test_n);
+                  "%.2f -> %.2f ms; headset slots missed %.1f%% -> %.1f%%; %ld + %ld frames",
+                  s.what, s.cvar ? s.cvar : s.toggle ? "the mod" : "nothing switched", s.cvar ? s.test : "",
+                  s.cvar ? s.original.c_str() : "-", base, test, test - base, s.tries.c_str(), bidle, tidle, bmiss,
+                  tmiss, s.base_n, s.test_n);
     }
+    if (s.decide) s.decide(s);
     ++g_index;
     if (g_index >= static_cast<int>(g_suspects.size())) {
         g_phase = Phase::kDone;
@@ -169,6 +183,7 @@ void OnTick(UObject player, float dt) {
         g_settled = false;
         s.base_ms = s.test_ms = s.base_idle = s.test_idle = 0.0;
         s.base_n = s.test_n = s.base_idle_n = s.test_idle_n = 0;
+        s.base_sent = s.test_sent = s.base_missed = s.test_missed = 0;
         s.tries.clear();
         return;
     }
@@ -176,11 +191,18 @@ void OnTick(UObject player, float dt) {
     if (!g_settled && in >= kSettleS) {
         g_settled = true;
         gpu_timer::TakeWindow();  // drop the frames drawn while it settled
+        xr::HeadsetFrameTotals(&g_win_sent, &g_win_missed);
         return;
     }
     if (in < kWindowS) return;
     const gpu_timer::Window w = gpu_timer::TakeWindow();
+    long long sent = 0, missed = 0;
+    xr::HeadsetFrameTotals(&sent, &missed);
+    sent -= g_win_sent;
+    missed -= g_win_missed;
     const bool was_test = g_window % 2 == 1;
+    (was_test ? s.test_sent : s.base_sent) += sent;
+    (was_test ? s.test_missed : s.base_missed) += missed;
     if (was_test) {
         s.test_ms += w.frame_ms;
         s.test_n += w.frames;
@@ -212,18 +234,41 @@ void OnTick(UObject player, float dt) {
 
 bool Running() { return g_phase == Phase::kRunning; }
 
+// xrEndFrame on its own thread: measured off (base) and on (test). With
+// xr_end_async=2 it stays on for the rest of the run only if the headset
+// missed fewer display slots with it, or as few while the GPU's whole frame
+// (its work plus its idle) got shorter.
+void ToggleAsyncEnd(bool on) { xr::SetAsyncEnd(on, "GPU cost test"); }
+
+void DecideAsyncEnd(const Suspect& s) {
+    const double base = s.base_n ? (s.base_ms + s.base_idle) / s.base_n : 0.0;
+    const double test = s.test_n ? (s.test_ms + s.test_idle) / s.test_n : 0.0;
+    const double bmiss = s.base_sent ? static_cast<double>(s.base_missed) / (s.base_sent + s.base_missed) : 0.0;
+    const double tmiss = s.test_sent ? static_cast<double>(s.test_missed) / (s.test_sent + s.test_missed) : 0.0;
+    const bool measured = s.base_n > 30 && s.test_n > 30;
+    const bool better = measured && (tmiss < bmiss * 0.8 - 0.002 || (tmiss <= bmiss + 0.002 && test < base - 0.2));
+    log::Info("GPU cost test: xrEndFrame on its own thread: GPU work + idle %.2f -> %.2f ms a frame, headset slots "
+              "missed %.1f%% -> %.1f%%; keeping it %s for this run",
+              base, test, 100.0 * bmiss, 100.0 * tmiss, better ? "ON" : "off");
+    xr::SetAsyncEnd(better, better ? "GPU cost test: it measured better" : "GPU cost test: it did not measure better");
+}
+
 void Init() {
     if (!config::GetBool("gpu_cost_test", true)) return;
     Add("nothing (measurement noise)", nullptr, nullptr);
-    Add("Lumen global illumination", "r.Lumen.DiffuseIndirect.Allow", "0");
-    Add("Lumen GI at quality 1 instead of the level's 2", "r.Lumen.ScreenProbeGather.TracingOctahedronResolution", "6");
+    if (config::GetInt("xr_end_async", 2) == 2) {
+        Add("xrEndFrame on its own thread (headset hand-off)", nullptr, nullptr);
+        g_suspects.back().toggle = &ToggleAsyncEnd;
+        g_suspects.back().decide = &DecideAsyncEnd;
+    }
+    // Measured on 2026-11-06 (08:49 run): Lumen GI off -0.63 ms, regular
+    // shadows instead of virtual +7.9 ms, fog and screen-space AO were off
+    // already; those are no longer switched.
+    Add("Lumen GI tracing at 3/4 resolution", "r.Lumen.ScreenProbeGather.TracingOctahedronResolution", "6");
     Add("Lumen GI probes at half density", "r.Lumen.ScreenProbeGather.DownsampleFactor", "32");
     Add("Lumen lighting of see-through things", "r.Lumen.TranslucencyVolume.Enable", "0");
     Add("Lumen short-range AO", "r.Lumen.ScreenProbeGather.ShortRangeAO", "0");
-    Add("virtual shadow maps (regular shadows instead)", "r.Shadow.Virtual.Enable", "0");
     Add("shadow quality high instead of epic", "sg.ShadowQuality", "2");
-    Add("volumetric fog", "r.VolumetricFog", "0");
-    Add("screen-space AO", "r.AmbientOcclusionLevels", "0");
     Add("75% resolution", "r.ScreenPercentage", "75", true);
     game::AddTickListener(&OnTick);
     log::Info("GPU cost test: ready; runs once, %.0f s into the first run level (not the home base), if the GPU "

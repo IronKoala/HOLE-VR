@@ -153,10 +153,11 @@ LightField g_light[] = {
     {"SSR intensity", "bOverride_ScreenSpaceReflectionIntensity", "ScreenSpaceReflectionIntensity", nullptr, 0},
     {"SSR quality", "bOverride_ScreenSpaceReflectionQuality", "ScreenSpaceReflectionQuality", nullptr, 0},
 };
-// VR cap on Lumen GI quality (vr_lumen_gi_quality, 0 = leave the game's). A
-// level's post-process component asks for quality 2; in a headset that cost
-// is paid once per eye. Only sources that set the quality themselves are
-// capped; the rest use the engine's default of 1.
+// VR cap on Lumen GI quality (vr_lumen_gi_quality, default 1; 0 = leave the
+// game's). A level's post-process component asks for quality 2; in a headset
+// that cost is paid once per eye (the 08:49 run's cost test: about 0.7 ms of
+// GPU time a frame). Only sources that set the quality themselves are capped;
+// the rest use the engine's default of 1.
 float g_gi_quality_cap = 0.f;
 constexpr int kGiQualityField = 3;  // g_light index of LumenFinalGatherQuality
 // Background thread (Apply) only: what was last logged for each source.
@@ -356,9 +357,9 @@ bool Init() {
             ++found;
         }
         log::Info("render fixes: %d of %zu reflection and GI settings readable", found, std::size(g_light));
-        g_gi_quality_cap = config::GetFloat("vr_lumen_gi_quality", 0.f);
+        g_gi_quality_cap = config::GetFloat("vr_lumen_gi_quality", 1.f);
         if (g_gi_quality_cap > 0.f)
-            log::Info("render fixes: Lumen GI quality capped at %.2f in VR (vr_lumen_gi_quality; 0 = the game's)%s",
+            log::Info("render fixes: Lumen GI quality capped at %.2f in VR (vr_lumen_gi_quality; 0 = the game's own, which is 2 in levels)%s",
                       g_gi_quality_cap,
                       g_light[kGiQualityField].value_offset >= 0 ? "" : ", but the setting wasn't found");
     }

@@ -24,7 +24,9 @@ struct Listener {
     // Once per frame after xrWaitFrame, on the thread that presents (render side).
     virtual void OnFrame(XrSession session, XrSpace tracking_space, XrTime predicted_display_time) {}
     // Extra composition layers (e.g. quad layers for menus), submitted on top
-    // of the eye images in xrEndFrame. Pointers must stay valid until it returns.
+    // of the eye images in xrEndFrame. Pointers must stay valid until it
+    // returns, which can be after this frame's Present (xr_end_async): keep
+    // the layers in storage that lives until the next AddLayers call.
     virtual void AddLayers(XrSession session, XrSpace tracking_space, XrTime display_time,
                            std::vector<const XrCompositionLayerBaseHeader*>& layers) {}
     virtual void OnSessionEnding() {}
@@ -48,6 +50,16 @@ void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* back_buffer);
 
 // The texture the engine rendered both eyes into (left half / right half).
 void SetEyeTexture(ID3D12Resource* texture);
+
+// xrEndFrame on its own thread (see openxr.cpp): the xr_end_async setting
+// (0 never, 1 always, 2 decided by the GPU cost test; -1 before the first
+// frame or with 0), switching it (any thread; takes effect next frame), and
+// whether it is on.
+int AsyncEndSetting();
+void SetAsyncEnd(bool on, const char* why);
+bool AsyncEndOn();
+// Headset frames sent and display slots missed since the start (any thread).
+void HeadsetFrameTotals(long long* sent, long long* missed);
 
 struct EyeView {
     XrPosef pose;  // in tracking space

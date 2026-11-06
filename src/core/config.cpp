@@ -756,6 +756,18 @@ const Block kBlocks[] = {
      "square_watch=0\n"
      "square_watch_every=4\n"
      "square_test=0\n"},
+    {"xr_end_async",
+     "\n"
+     "; Frame times: hand each frame to the headset (xrEndFrame) on a thread of the\n"
+     "; mod's own, so the game's Present thread doesn't wait on it. 0 = never,\n"
+     "; 1 = always, 2 = decided each run by the GPU cost test (on only if the\n"
+     "; headset missed fewer frames with it).\n"
+     "xr_end_async=2\n"},
+    {"vr_lumen_gi_quality",
+     "\n"
+     "; Lumen indirect lighting quality in VR. Levels ask for 2; 1 looks nearly the\n"
+     "; same and saves about 0.7 ms of GPU time a frame. 0 = the game's own.\n"
+     "vr_lumen_gi_quality=1\n"},
     {"process_metrics",
      "\n"
      "; Every 30 s log the game process's memory, handles, CPU and disk use (game\n"
