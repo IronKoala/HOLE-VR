@@ -3949,6 +3949,95 @@ void HookPlayerRecoil(UObject player) {
     log::Info("controls: game camera/aim recoil blocked (%d steps hooked)", n);
 }
 
+// The game's own movement and look axes (BP_Player InpAxisEvt_*), fed by
+// the keyboard and any gamepad the game reads. Steam Input hands HOLE a
+// virtual Xbox pad built from the Steam Frame controllers and the Steam
+// Controller puck (Steam's controller.txt, 2026-11-06 08:16: "Controller 5
+// uses xinput : true (warmed config for app 2971610)"), so the game could
+// walk the character on its own, outside this mod's stick handling. Owner
+// 2026-11-06 14:17: "why is my character walking non-stop?", hands off both
+// sticks; that run's sprint check read the mod's stick as 0.00 at 627 cm/s.
+// In VR the left stick moves you only through Locomotion, so the game's
+// move axes are dropped (game_move_input=1 lets them through). The look
+// axes are only logged: nothing so far says they misbehave.
+struct GameAxis {
+    const char* name;
+    const char* label;
+    bool block;
+    UObject fn = 0;
+    int32_t value_offset = -1;
+    double peak = 0;
+    long long frames = 0, nonzero = 0;
+    double window_start_ms = 0;
+    bool reported_first = false;
+};
+GameAxis g_game_axes[] = {
+    {"InpAxisEvt_MoveForward/Backwards_K2Node_InputAxisEvent_0", "move forward/back", true},
+    {"InpAxisEvt_MoveRight/Left_K2Node_InputAxisEvent_1", "move right/left", true},
+    {"InpAxisEvt_LookLeft/Right_K2Node_InputAxisEvent_3", "look left/right", false},
+    {"InpAxisEvt_LookUp/Down_K2Node_InputAxisEvent_2", "look up/down", false},
+};
+bool g_game_move_input = false;  // game_move_input=1: let the game's own move axes through
+
+bool BeforeGameAxis(UObject, UObject fn, void* params) {
+    GameAxis* a = nullptr;
+    for (GameAxis& g : g_game_axes)
+        if (g.fn == fn) a = &g;
+    if (!a) return true;
+    const bool drop = g_set.enabled && a->block && !g_game_move_input;
+    float value = 0;
+    if (a->value_offset >= 0 && params)
+        value = mem::ReadOr<float>(reinterpret_cast<uintptr_t>(params) + a->value_offset, 0.f);
+    const double now = perf::NowMs();
+    if (a->window_start_ms == 0) a->window_start_ms = now;
+    ++a->frames;
+    if (std::fabs(value) > 0.01f) {
+        ++a->nonzero;
+        a->peak = std::fmax(a->peak, std::fabs(static_cast<double>(value)));
+        if (!a->reported_first) {
+            a->reported_first = true;
+            log::Info("controls: the game's own %s input is %.2f (a gamepad or keyboard the game reads itself, "
+                      "such as Steam Input's virtual pad), not the mod's stick; %s", a->label, value,
+                      drop ? "dropped: in VR the left stick moves you through the mod only" : "passed to the game");
+        }
+    }
+    static int summaries = 0;
+    if (now - a->window_start_ms >= 5000.0) {
+        if (a->nonzero > 0 && summaries < 40) {
+            ++summaries;
+            log::Info("controls: the game's own %s input was non-zero in %lld of %lld frames over the last %.0f s "
+                      "(up to %.2f); %s", a->label, a->nonzero, a->frames, (now - a->window_start_ms) / 1000.0,
+                      a->peak, drop ? "dropped" : "passed to the game");
+        }
+        a->window_start_ms = now;
+        a->frames = a->nonzero = 0;
+        a->peak = 0;
+    }
+    return !drop;
+}
+
+void HookGameAxes(UObject player) {
+    static UObject hooked_class = 0;
+    static int classes_hooked = 0;  // each new player class takes 4 of the 64 hook slots
+    if (!player) return;
+    const UObject cls = ue::GetClass(player);
+    if (!cls || cls == hooked_class || classes_hooked >= 4) return;
+    hooked_class = cls;
+    ++classes_hooked;
+    g_game_move_input = config::GetBool("game_move_input", false);
+    int n = 0;
+    for (GameAxis& a : g_game_axes) {
+        a.fn = ue::FindFunction(cls, a.name);
+        if (!a.fn) continue;
+        const auto p = ue::reflection::FindProperty(a.fn, "AxisValue");
+        a.value_offset = p.valid() && p.type == "FloatProperty" ? p.offset : -1;
+        if (ue::process_event::On(a.fn, &BeforeGameAxis, nullptr)) ++n;
+    }
+    log::Info("controls: the game's own move and look inputs watched (%d of %zu found); its move input is %s", n,
+              sizeof(g_game_axes) / sizeof(g_game_axes[0]),
+              g_game_move_input ? "passed to the game (game_move_input=1)" : "dropped while VR controls are on");
+}
+
 // The game's own "camera shake" option (BP_Player.CameraShake): off in VR
 // unless the ini asks for it. Re-applied now and then in case the game's
 // settings menu writes it back.
@@ -5510,6 +5599,7 @@ void OnTick(UObject player, float dt) {
     ++g_controls_frame;
     RefreshKick(player);
     g_dt = dt;
+    HookGameAxes(player);
     input::Snapshot s = input::Consume();
     const double tracking_ms = perf::NowMs();
     if (s.valid && s.time != g_last_tracking_time) {
