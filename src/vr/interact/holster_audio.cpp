@@ -6,6 +6,27 @@
 #include <audioclient.h>
 #include <endpointvolume.h>
 #include <wrl/client.h>
+// MinGW-w64's endpointvolume.h only forward-declares IAudioMeterInformation.
+// Same layout and IID as the Windows SDK, so the MinGW build matches the
+// clang-cl build this file was written with.
+#if defined(__MINGW32__) && !defined(__IAudioMeterInformation_INTERFACE_DEFINED__)
+#define __IAudioMeterInformation_INTERFACE_DEFINED__
+struct IAudioMeterInformation : public IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE GetPeakValue(float* peak) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetMeteringChannelCount(UINT* count) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetChannelsPeakValues(UINT32 count, float* peaks) = 0;
+    virtual HRESULT STDMETHODCALLTYPE QueryHardwareSupport(DWORD* mask) = 0;
+};
+__CRT_UUID_DECL(IAudioMeterInformation, 0xC02216F6, 0x8C67, 0x4B5B, 0x9D, 0x00, 0xD0, 0x08, 0xE7, 0x3E, 0x00,
+                0x64)
+#endif
+// MinGW-w64 declares PKEY_Device_FriendlyName but no library defines it.
+#if defined(__MINGW32__)
+static const PROPERTYKEY kDeviceFriendlyName = {
+    {0xa45c254e, 0xdf1c, 0x4efd, {0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0}}, 14};
+#else
+#define kDeviceFriendlyName PKEY_Device_FriendlyName
+#endif
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -54,7 +75,7 @@ std::wstring FriendlyName(IMMDevice* device) {
     if (FAILED(device->OpenPropertyStore(STGM_READ, &properties))) return {};
     PROPVARIANT name{};
     std::wstring result;
-    if (SUCCEEDED(properties->GetValue(PKEY_Device_FriendlyName, &name)) && name.vt == VT_LPWSTR && name.pwszVal)
+    if (SUCCEEDED(properties->GetValue(kDeviceFriendlyName, &name)) && name.vt == VT_LPWSTR && name.pwszVal)
         result = name.pwszVal;
     PropVariantClear(&name);
     return result;

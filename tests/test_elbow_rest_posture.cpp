@@ -116,11 +116,14 @@ static void BodyRotationAndContinuity(){const auto yaw=YawOnly(137);
    const auto r=Solve(in,&state);Geometry(in,r);EXPECT(AngleBetween(Arc(previous.axis,state.axis).Rotate(previous.pole),r.pole)<=360*kDegToRad/hz+1e-6);}
  }
 }
+static constexpr double kBoundaryFractions[3][2]={{.15,.70},{.35,.85},{.15,.40}};
 static void PreferenceBoundaryJitter(){
  // Small tracking variation near the transition to side/overhead reaching
  // must not turn a soft rest preference into a new abrupt elbow plane.
  for(double hz:{7.,90.,144.})for(int side=0;side<2;++side)for(int direction=0;direction<3;++direction)
-  for(double fraction:direction==0?std::initializer_list<double>{.15,.70}:direction==1?std::initializer_list<double>{.35,.85}:std::initializer_list<double>{.15,.40}){
+  // A named table: the arrays behind a ?: of initializer_lists end with the
+  // range expression (GCC reads freed stack here; clang happened not to).
+  for(double fraction:kBoundaryFractions[direction]){
    auto in=Pose(side,{30,0,0});in.dt=1/hz;State state;
    for(int n=0;n<240;++n){
     const double component=58*(fraction+.001*std::sin(n*.39));
