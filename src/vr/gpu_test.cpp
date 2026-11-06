@@ -39,6 +39,11 @@ Phase g_phase = Phase::kWaiting;
 double g_clock = 0.0, g_window_start = 0.0;
 int g_index = 0, g_window = 0;  // windows per suspect: base, test, base, test, ...
 bool g_settled = false;
+// Seconds played in the current level, which must not be the home base
+// (Area000_Home draws far less than a run's level, so its numbers say little).
+UObject g_level_player = 0;
+bool g_level_counts = false;
+double g_level_clock = 0.0;
 constexpr double kWindowS = 1.5, kSettleS = 0.4;
 constexpr int kCycles = 3;
 
@@ -117,16 +122,38 @@ void FinishSuspect(UObject player) {
     BeginSuspect(player);
 }
 
+std::string MapOf(UObject object) {
+    for (int i = 0; object && i < 8; ++i, object = ue::GetOuter(object))
+        if (ue::GetName(ue::GetClass(object)) == "World") return ue::GetName(object);
+    return {};
+}
+
 void OnTick(UObject player, float dt) {
     if (g_phase == Phase::kDone || !player) return;
     g_clock += dt;
+    if (player != g_level_player) {
+        g_level_player = player;
+        const std::string map = MapOf(player);
+        g_level_counts = !map.empty() && (map.find("Area000_Home") == std::string::npos ||
+                                          config::GetBool("gpu_cost_test_at_home", false));
+        g_level_clock = 0.0;
+        if (g_phase == Phase::kRunning) {
+            // A new level: put this setting back, and start it again once
+            // 45 s into a run level.
+            Set(player, g_suspects[g_index], false);
+            g_phase = Phase::kWaiting;
+            log::Info("GPU cost test: a new level (%s); waiting to start again", map.c_str());
+        }
+    }
+    if (g_level_counts) g_level_clock += dt;
     // A menu, or the square test switching its own suspects, changes what the
     // GPU draws.
     const bool menu = ui_panel::MenuOpen() || square_test::Busy();
     if (g_phase == Phase::kWaiting) {
-        if (menu || g_clock < config::GetFloat("gpu_cost_test_after_s", 45.f) || !gpu_timer::On()) return;
+        if (menu || g_level_clock < config::GetFloat("gpu_cost_test_after_s", 45.f) || !gpu_timer::On()) return;
         g_phase = Phase::kRunning;
-        g_index = 0;
+        // A restart after a level change goes on from the setting it was on
+        // (each setting is put back before the next one starts).
         log::Info("GPU cost test: starting; %zu settings, each switched off and on %d times for %.1f s "
                   "(about %.0f s in all; the picture changes while it runs; gpu_cost_test=0 turns it off)",
                   g_suspects.size(), kCycles, kWindowS, g_suspects.size() * kCycles * 2 * kWindowS);
@@ -199,7 +226,8 @@ void Init() {
     Add("screen-space AO", "r.AmbientOcclusionLevels", "0");
     Add("75% resolution", "r.ScreenPercentage", "75", true);
     game::AddTickListener(&OnTick);
-    log::Info("GPU cost test: ready; runs once, %.0f s into the first level, if the GPU timer is on",
+    log::Info("GPU cost test: ready; runs once, %.0f s into the first run level (not the home base), if the GPU "
+              "timer is on",
               config::GetFloat("gpu_cost_test_after_s", 45.f));
 }
 
