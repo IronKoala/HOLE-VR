@@ -11,6 +11,10 @@
 // DLL's own symbol table when the installed DLL has one (a build with debug
 // data), otherwise as dxgi+0x... offsets that the matching build names.
 //
+// Spikes: when a game frame or a Present comes more than profile_hitch_ms
+// (default 25) after the one before, a "profile hitch" line says what each
+// sampled thread was doing in that time (at most one such report a second).
+//
 // profile=0 in hole-vr.ini turns it off; profile_hz sets the rate per thread
 // (default 500). While a thread is stopped the sampler takes no locks and
 // allocates nothing, so it can't deadlock with it.

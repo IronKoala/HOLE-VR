@@ -30,6 +30,27 @@ std::atomic<DWORD> g_game_tid{0}, g_present_tid{0};
 std::atomic<long> g_game_frames{0}, g_present_frames{0};
 std::atomic<bool> g_started{false};
 
+// Hitches: a game frame (player tick to player tick) or a Present that came
+// much later than the one before. One ring per producer thread; the sampler
+// thread reads them and logs what each sampled thread did in that time.
+struct Hitch {
+    double start = 0.0, end = 0.0;
+};
+struct HitchRing {
+    static constexpr unsigned kSize = 16;
+    Hitch h[kSize];
+    std::atomic<unsigned> written{0};
+    unsigned read = 0;  // sampler thread
+    long seen = 0;      // sampler thread, this window
+    void Push(double start, double end) {
+        const unsigned w = written.load(std::memory_order_relaxed);
+        h[w % kSize] = Hitch{start, end};
+        written.store(w + 1, std::memory_order_release);
+    }
+};
+HitchRing g_game_hitches, g_present_hitches;
+double g_hitch_ms = 25.0;  // set before the sampler thread starts
+
 // ------------------------------------------------------------- modules --
 // Only the sampler thread touches these.
 struct Export {
@@ -245,6 +266,8 @@ struct ThreadBasicInfo {
 constexpr size_t kStackCopy = 512 * 1024;
 constexpr size_t kStackPad = 512 * 1024;  // reads past the copy find stale data, never unmapped memory
 constexpr int kMaxFrames = 96;
+constexpr int kRecFrames = 32;    // frames kept per sample for hitch reports, leaf first
+constexpr size_t kRecs = 2048;    // samples kept per thread (about 4 s at 500 a second)
 
 // What one sample's frames say, per mod function.
 struct FnStat {
@@ -268,6 +291,15 @@ struct Target {
     std::unordered_map<std::string, long> mod_syscalls;  // system calls made directly by mod code
     std::unordered_map<std::string, long> leaf_modules;  // module the thread was in, outside waits
     std::unordered_map<uint32_t, long> exe_leaf;       // game exe function rva (innermost) -> samples, outside waits
+    // The last few seconds of samples, for hitches.
+    struct Rec {
+        double at = 0.0;
+        bool waiting = false;
+        uint8_t n = 0;
+        uintptr_t f[kRecFrames];
+    };
+    std::vector<Rec> recs;
+    size_t rec_next = 0;
 };
 
 Target g_targets[4];  // 0 game, 1 render, 2 rhi, 3 present (when not one of the others)
@@ -448,6 +480,7 @@ void Sample(Target& t) {
     }
     ResumeThread(t.h);
     // ---- running again ----
+    const double at = perf::NowMs();
     if (!got) {
         ++t.failed;
         return;
@@ -461,6 +494,14 @@ void Sample(Target& t) {
     const bool waiting = !sys.empty() && IsWaitName(sys);
     if (!sys.empty()) t.syscalls[sys]++;
     if (waiting) ++t.waiting;
+
+    if (t.recs.empty()) t.recs.resize(kRecs);
+    Target::Rec& rec = t.recs[t.rec_next];
+    t.rec_next = (t.rec_next + 1) % kRecs;
+    rec.at = at;
+    rec.waiting = waiting;
+    rec.n = static_cast<uint8_t>(std::min(n, kRecFrames));
+    std::memcpy(rec.f, frames, rec.n * sizeof(uintptr_t));
 
     // Mod frames, leaf first.
     uint32_t mod_fns[kMaxFrames];
@@ -608,6 +649,129 @@ void Report(Target& t, double span_ms, long frames, const char* frame_kind) {
     log::Info("%s", line.c_str());
 }
 
+// "controls::OnTick", "exe+0x1a2b30", "nvwgf2umx.dll", "ntdll!NtWaitForSingleObject".
+std::string FrameName(uintptr_t addr, bool leaf) {
+    const uintptr_t pc = leaf ? addr : addr - 1;
+    if (pc >= g_self_base && pc < g_self_end) {
+        DWORD64 image_base = 0;
+        PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(pc, &image_base, nullptr);
+        return ModFunctionName(rf ? rf->BeginAddress : static_cast<uint32_t>(pc - g_self_base));
+    }
+    Module* m = ModuleAt(pc);
+    if (!m) return "?";
+    char b[48];
+    if (m->base == g_exe_base) {
+        DWORD64 image_base = 0;
+        PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(pc, &image_base, nullptr);
+        std::snprintf(b, sizeof(b), "exe+0x%x", static_cast<unsigned>(rf ? rf->BeginAddress : pc - g_exe_base));
+        return b;
+    }
+    if (m->system) {
+        const std::string* e = ExportAt(*m, pc);
+        if (e) return m->name.substr(0, m->name.find('.')) + "!" + *e;
+    }
+    return m->name;
+}
+
+// A short stack, leaf first: up to 6 places. A run of frames in Windows'
+// own DLLs shows as its outermost one ("ntdll!RtlQueryPerformanceCounter"),
+// a run in another DLL (a driver) as that DLL's name. Then the innermost mod
+// function further out, if any.
+std::string StackKey(const Target::Rec& r) {
+    struct Item {
+        std::string group, shown;
+    };
+    std::vector<Item> items;
+    int mod_at = -1;
+    for (int i = 0; i < r.n && items.size() < 7; ++i) {
+        const uintptr_t pc = i == 0 ? r.f[i] : r.f[i] - 1;
+        const bool mod = pc >= g_self_base && pc < g_self_end;
+        if (mod && mod_at < 0) mod_at = i;
+        Module* m = mod ? nullptr : ModuleAt(pc);
+        Item it;
+        if (!mod && (!m || m->system)) {
+            it.group = "windows";
+            it.shown = m ? FrameName(r.f[i], i == 0) : "?";
+        } else if (m && m->base != g_exe_base) {
+            it.group = it.shown = m->name;
+        } else {
+            it.group = it.shown = FrameName(r.f[i], i == 0);
+        }
+        if (!items.empty() && items.back().group == it.group) {
+            if (it.shown != "?") items.back().shown = it.shown;  // keep the outermost of the run
+            continue;
+        }
+        items.push_back(it);
+    }
+    if (items.size() > 6) items.resize(6);
+    std::string key;
+    for (const Item& it : items) key += (key.empty() ? "" : " < ") + it.shown;
+    if (mod_at < 0)
+        for (int i = 0; i < r.n; ++i)
+            if (r.f[i] - (i ? 1 : 0) >= g_self_base && r.f[i] - (i ? 1 : 0) < g_self_end) {
+                mod_at = i;
+                break;
+            }
+    if (mod_at >= 0) {
+        const std::string mod = FrameName(r.f[mod_at], mod_at == 0);
+        if (key.find(mod) == std::string::npos) key += " ... [mod: " + mod + "]";
+    }
+    return key;
+}
+
+void ReportHitch(const Hitch& h, const char* what) {
+    char b[400];
+    for (Target& t : g_targets) {
+        if (!t.h || t.recs.empty()) continue;
+        long busy = 0, waiting = 0;
+        std::unordered_map<std::string, long> keys;
+        for (const Target::Rec& r : t.recs) {
+            if (!r.n || r.at < h.start || r.at > h.end) continue;
+            if (r.waiting) {
+                ++waiting;
+                continue;
+            }
+            ++busy;
+            keys[StackKey(r)]++;
+        }
+        const long all = busy + waiting;
+        if (!all) continue;
+        const double ms_each = (h.end - h.start) / all;
+        std::snprintf(b, sizeof(b), "profile hitch: %s took %.0f ms; %s busy %.0f ms, waiting %.0f ms:", what,
+                      h.end - h.start, t.label, busy * ms_each, waiting * ms_each);
+        std::string head = b;
+        std::string line = head;
+        for (const auto& [key, c] : Top(keys, 5)) {
+            std::snprintf(b, sizeof(b), " | %.0f ms ", c * ms_each);
+            Emit(line, head, b + key);
+        }
+        log::Info("%s", line.c_str());
+    }
+}
+
+// Logs hitches whose samples are all in, at most one a second.
+void CheckHitches(double now) {
+    static double s_last_report = 0.0;
+    struct Src {
+        HitchRing* ring;
+        const char* what;
+    } srcs[] = {{&g_game_hitches, "a game frame"}, {&g_present_hitches, "a Present (frame to frame)"}};
+    for (const Src& src : srcs) {
+        HitchRing& r = *src.ring;
+        const unsigned w = r.written.load(std::memory_order_acquire);
+        if (w - r.read > HitchRing::kSize) r.read = w - HitchRing::kSize;
+        while (r.read != w) {
+            const Hitch h = r.h[r.read % HitchRing::kSize];
+            if (now < h.end + 20.0) break;  // the samples just after it aren't in yet
+            ++r.read;
+            ++r.seen;
+            if (now - s_last_report < 1000.0 || h.end - h.start > 3000.0) continue;  // rate limit; loads aren't hitches
+            s_last_report = now;
+            ReportHitch(h, src.what);
+        }
+    }
+}
+
 void ResetWindow(Target& t) {
     t.samples = t.failed = t.in_mod = t.waiting = 0;
     t.fns.clear();
@@ -648,6 +812,7 @@ DWORD WINAPI SamplerThread(LPVOID) {
         if (pt && pt != g_targets[0].tid && pt != g_targets[1].tid && pt != g_targets[2].tid && g_targets[3].tid != pt)
             OpenTarget(g_targets[3], pt, "present thread");
         for (Target& t : g_targets) Sample(t);
+        CheckHitches(perf::NowMs());
 
         const DWORD now_tick = GetTickCount();
         if (now_tick - last_refresh > 5000) {
@@ -665,7 +830,11 @@ DWORD WINAPI SamplerThread(LPVOID) {
                 Report(g_targets[1], span, present_frames, "presented");
                 Report(g_targets[2], span, present_frames, "presented");
                 Report(g_targets[3], span, present_frames, "presented");
+                log::Info("profile: %ld game frames and %ld Presents came over %.0f ms after the one before in this "
+                          "window (the first in each second has a \"profile hitch\" line; profile_hitch_ms)",
+                          g_game_hitches.seen, g_present_hitches.seen, g_hitch_ms);
             }
+            g_game_hitches.seen = g_present_hitches.seen = 0;
             for (Target& t : g_targets) ResetWindow(t);
             window_start = now;
             game_frames0 = gf;
@@ -696,6 +865,7 @@ void Start() {
         GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetThreadDescription"));
     g_query_thread = reinterpret_cast<NtQueryInformationThreadFn>(
         GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
+    g_hitch_ms = std::clamp(config::GetFloat("profile_hitch_ms", 25.f), 15.f, 1000.f);
     if (!g_self_base || !g_query_thread) {
         log::Warn("profile: could not start (module or thread information unavailable)");
         return;
@@ -710,6 +880,10 @@ void NoteGameFrame() {
         g_game_tid.store(GetCurrentThreadId());
     }
     g_game_frames.fetch_add(1, std::memory_order_relaxed);
+    static double s_last = 0.0;  // game thread only
+    const double now = perf::NowMs();
+    if (s_last > 0.0 && now - s_last > g_hitch_ms) g_game_hitches.Push(s_last, now);
+    s_last = now;
 }
 
 void NotePresentThread() {
@@ -719,6 +893,10 @@ void NotePresentThread() {
         g_present_tid.store(GetCurrentThreadId());
     }
     g_present_frames.fetch_add(1, std::memory_order_relaxed);
+    static double s_last = 0.0;  // present thread only
+    const double now = perf::NowMs();
+    if (s_last > 0.0 && now - s_last > g_hitch_ms) g_present_hitches.Push(s_last, now);
+    s_last = now;
 }
 
 }  // namespace holevr::sampler
