@@ -127,3 +127,50 @@ real holster:
 
 Still to come: `kRifleMag` (rifle magazine slot). The pouch holds the current
 gun's magazines and is moved only with the pistol out.
+
+## Either hand (owner 2026-11-06)
+
+"i want to be able to grab either gun (and mag) with either hand whenever."
+`either_hand_guns=1` (default; 0 = right hand holds the gun, left takes the
+magazines, as before).
+
+- **Two roles instead of two hands.** The gun hand holds the current gun by
+  its grip: its trigger fires, its A / X drops the magazine, its B / Y
+  releases the slide (the left Y tap no longer switches weapons while the left
+  hand holds the gun). The other hand racks, reloads, holds the handguard,
+  works the light (its trigger next to the gun) or holds the rifle by itself.
+  `GunHand()` / `OtherHand()` in `controls.cpp`; the weapon code reads the
+  same whichever hand has the gun.
+- **Who is the gun hand** (`ChooseGunHand`): only a fresh squeeze of the other
+  hand, free of anything else, that takes a gun changes it: the pistol from its
+  holster (or the workbench) while no hand holds a gun, the rifle by its grip
+  or anywhere in its holster zone off the handguard while the gun hand holds no
+  gun, or the pistol from its holster while the gun hand holds the rifle alone.
+  The left hand holds a gun mirrored (grip offset and the 5 degree yaw
+  flipped).
+- **Last gun drawn fires.** The game has one current weapon. With the rifle
+  in one hand alone, squeezing the other hand at the pistol holster leaves the
+  rifle in the first hand by its grip and draws the pistol in the second
+  (`rifle carry: the left hand draws the pistol; the right hand keeps the rifle
+  by its grip`). Holding the pistol, the free hand can take the rifle by its
+  grip too (`rifle carry: the right hand took the rifle by its grip while ...`).
+  Put the pistol away (holster it or let go) and the game switches to the
+  rifle, which comes out in the hand that holds it.
+- **Magazines.** Any free hand takes one from the pouch (the nearer if both
+  squeeze); only the hand that is not holding the gun seats it. Haptic tick
+  per hand at the pouch.
+- **Holster lid and hand snap** follow the gun hand while it holds the
+  pistol, else the nearer free hand. The rifle holster buzzes for either
+  free hand.
+- **Moving holsters** works with either hand: the gun in the gun hand, a
+  magazine in whichever hand holds it.
+- **Hand poses.** A hand holding what the other hand usually holds (the gun's
+  grip: right; slide, magazine, handguard: left) uses the usual hand's saved
+  pose mirrored, and the grip editor saves its own pose under the same name
+  plus `-left` / `-right` (e.g. `grips/BP_HG_C.grip-left.ini`), so the
+  right-hand grips are never overwritten. `grip_record::SideKey` / `UsualKey`,
+  tested in `tests/test_grip.cpp`.
+- Log: `controls: the left hand is the gun hand now (it draws the pistol)`,
+  `holster: pistol drawn by the left hand`, `controls: left hand took the pouch
+  magazine`, `controls: mag release (left hand)`, `body: BP_HG_C.grip-left not
+  posed yet: using BP_HG_C.grip, mirrored`.

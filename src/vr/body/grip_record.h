@@ -69,6 +69,14 @@ bool Parse(const std::string& text, Record* r);
 // The same grip for the other hand (mirror across the object's X/Z plane).
 Record Mirror(const Record& r);
 
+// Either hand can hold either gun and the magazines (owner 2026-11-06). A
+// hand holding something the other hand usually holds saves its pose under
+// its own name: `base` + "-left" / "-right" (usual_hand false), so it never
+// changes the usual hand's file. UsualKey gives back the usual hand's name
+// (a rifle's ".charging-left" / ".charging-right" are both usual names).
+std::string SideKey(const std::string& base, bool right_hand, bool usual_hand);
+std::string UsualKey(const std::string& key);
+
 // The hand's anatomy in hand-bone space.
 struct HandGeo {
     FVector knuckle;  // middle knuckle from the wrist
