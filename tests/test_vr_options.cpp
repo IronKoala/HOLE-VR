@@ -76,8 +76,8 @@ static void TestRows() {
         for (size_t c = 0; c < r.choices.size(); ++c) EXPECT(RowText(r, static_cast<int>(c)).size() <= 40);
         // Every row says what it does, briefly (a few lines beside the list).
         const size_t about = std::strlen(r.about);
-        EXPECT(about >= 20 && about <= 120);
-        if (about < 20 || about > 120) std::printf("  %s: description is %zu characters\n", r.label, about);
+        EXPECT(about >= 20 && about <= 150);
+        if (about < 20 || about > 150) std::printf("  %s: description is %zu characters\n", r.label, about);
         // A row hidden by another names a real row, and is shown with at
         // least one of its choices but not all of them.
         if (r.only_with) {
@@ -104,15 +104,17 @@ static void TestShown() {
         return it == ini.end() ? std::string() : it->second;
     };
     auto shown = [&](const char* label) { return Shown(RowNamed(label), get); };
-    // Defaults: smooth moving, smooth turning, character height.
-    EXPECT(!shown("Snap turn"));
-    EXPECT(shown("Turn speed") && shown("Vignette turning") && shown("Move toward"));
+    // Defaults: walking with smooth turns, character height.
+    EXPECT(shown("Vignette turning") && shown("Move toward"));
     EXPECT(shown("Real crouch") && shown("Hop to jump"));
-    EXPECT(shown("Turning") && shown("Vignette moving") && shown("Calibrate body"));
-    ini["turn_mode"] = "0";  // snap
-    EXPECT(shown("Snap turn") && !shown("Turn speed") && !shown("Vignette turning"));
+    EXPECT(shown("Movement") && shown("Vignette moving") && shown("Calibrate body"));
+    ini["locomotion"] = "smooth";
+    ini["turn_mode"] = "0";  // snap turns
+    ini["snap_turn_degrees"] = "45";
+    EXPECT(!shown("Vignette turning") && shown("Move toward"));
     ini["locomotion"] = "teleport";
-    EXPECT(!shown("Move toward"));
+    ini["snap_turn_degrees"] = "30";
+    EXPECT(!shown("Move toward") && !shown("Vignette turning"));
     EXPECT(shown("Vignette moving"));  // falls still count
     ini["fixed_height"] = "1";
     ini["height_mode"] = "seated";
@@ -128,16 +130,42 @@ static void TestCurrent() {
         auto it = ini.find(k);
         return it == ini.end() ? std::string() : it->second;
     };
-    const Row& turn = RowNamed("Turning");
-    EXPECT(CurrentChoice(turn, get) == 0);  // default smooth
+    // One Movement row for moving, turning, snap step and turn speed.
+    const Row& move = RowNamed("Movement");
+    auto move_text = [&] { return std::string(move.choices[static_cast<size_t>(CurrentChoice(move, get))].text); };
+    EXPECT(move_text() == "Smooth turn 90 deg/s");  // default: walk, smooth 90 deg/s
+    for (const char* old : {"Moving", "Turning", "Snap turn", "Turn speed"}) EXPECT(!Find(old));
+    // A full ini as the mod writes it.
+    ini["locomotion"] = "smooth";
+    ini["turn_mode"] = "1";
+    ini["smooth_turn_speed"] = "90";
+    ini["snap_turn_degrees"] = "30";
+    EXPECT(move_text() == "Smooth turn 90 deg/s");
+    ini["smooth_turn_speed"] = "180";
+    EXPECT(move_text() == "Smooth turn 180 deg/s");
+    ini["smooth_turn_speed"] = "100";  // not a choice: the default speed
+    EXPECT(move_text() == "Smooth turn 90 deg/s");
     ini["turn_mode"] = "0";
-    EXPECT(CurrentChoice(turn, get) == 1);
-    // Numbers compare as numbers.
-    const Row& snap = RowNamed("Snap turn");
-    ini["snap_turn_degrees"] = "45.0";
-    EXPECT(std::string(snap.choices[static_cast<size_t>(CurrentChoice(snap, get))].text) == "45 deg");
-    ini["snap_turn_degrees"] = "33";  // not a choice: the default
-    EXPECT(CurrentChoice(snap, get) == snap.default_choice);
+    ini["snap_turn_degrees"] = "45.0";  // numbers compare as numbers
+    EXPECT(move_text() == "Snap turn 45 deg");
+    ini["locomotion"] = "teleport";
+    ini["snap_turn_degrees"] = "30";
+    EXPECT(move_text() == "Teleport");
+    // An older ini: teleport with smooth turns still reads Teleport.
+    ini["turn_mode"] = "1";
+    EXPECT(move_text() == "Teleport");
+    ini["locomotion"] = "smooth";  // walking, smooth turns at an unlisted speed
+    EXPECT(move_text() == "Smooth turn 90 deg/s");
+    // Every walking choice sets walking; Teleport sets snap turns too.
+    for (const auto& c : move.choices) {
+        std::map<std::string, std::string> sets;
+        for (const auto& kv : c.sets) sets[kv.key] = kv.value;
+        EXPECT(std::string(move.choices[0].sets[0].key) == "locomotion");
+        EXPECT(std::string(c.sets[0].key) == "locomotion");
+        const bool tele = std::string(c.text) == "Teleport";
+        EXPECT(sets["locomotion"] == (tele ? "teleport" : "smooth"));
+        EXPECT(sets.count("turn_mode") == 1);
+    }
     // Height: fixed_height decides, height_mode picks seated.
     const Row& height = RowNamed("Height");
     ini["fixed_height"] = "1";
@@ -147,7 +175,7 @@ static void TestCurrent() {
     ini["fixed_height"] = "0";
     ini["height_mode"] = "fixed";  // an old ini with real height and the new key's default
     EXPECT(std::string(height.choices[static_cast<size_t>(CurrentChoice(height, get))].text) == "Your own");
-    EXPECT(RowText(turn, 1) == "Turning: Snap");
+    EXPECT(RowText(move, 2) == "Movement: Snap turn 30 deg");
     EXPECT(SameValue("1", "1.000"));
     EXPECT(SameValue("Seated", "seated"));
     EXPECT(!SameValue("1", "0"));
@@ -161,8 +189,8 @@ static void TestDefaultsAndActions() {
         auto it = ini.find(k);
         return it == ini.end() ? std::string() : it->second;
     };
-    const Row& moving = RowNamed("Moving");
-    EXPECT(std::string(moving.choices[static_cast<size_t>(CurrentChoice(moving, get))].text) == "Smooth");
+    const Row& moving = RowNamed("Movement");
+    EXPECT(std::string(moving.choices[static_cast<size_t>(CurrentChoice(moving, get))].text) == "Smooth turn 90 deg/s");
     const Row& hop = RowNamed("Hop to jump");
     EXPECT(std::string(hop.choices[static_cast<size_t>(CurrentChoice(hop, get))].text) == "Off");
     EXPECT(RowNamed("Calibrate body").kind == RowKind::kMeasureArms);

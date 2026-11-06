@@ -33,14 +33,11 @@ whatever the laser is on). A step writes the ini key(s) into `hole-vr.ini` in pl
 
 | Row | Choices | ini key(s) |
 |---|---|---|
-| Moving | Smooth, Teleport | `locomotion` |
-| Turning | Smooth, Snap | `turn_mode` |
-| Snap turn (Snap turning only) | 15, 30, 45, 60, 90 deg | `snap_turn_degrees` |
-| Turn speed (Smooth turning only) | 60, 90, 120, 180, 240 deg/s | `smooth_turn_speed` |
+| Movement | Teleport; Snap turn 15, 30, 45, 60, 90 deg; Smooth turn 60, 90, 120, 180, 240 deg/s (default 90) | `locomotion` + `turn_mode` + `snap_turn_degrees` / `smooth_turn_speed`; Teleport also sets snap turns of 30 deg |
 | Move stick | Left, Right | `move_stick` |
-| Move toward (Smooth moving only) | Where you look, Stick hand | `move_direction` |
+| Move toward (not with Teleport) | Where you look, Stick hand | `move_direction` |
 | Vignette moving | Off, Light, Medium, Strong | `comfort_vignette_move` (0, 0.35, 0.6, 0.85) |
-| Vignette turning (Smooth turning only) | Off, Light, Medium, Strong | `comfort_vignette_turn` |
+| Vignette turning (Smooth turn only) | Off, Light, Medium, Strong | `comfort_vignette_turn` |
 | Wall fade | Off, 5, 10, 15, 20, 25 cm away | `head_wall_fade` + `head_wall_fade_start_cm` (on, 15) |
 | Height | Character, Your own, Seated | `fixed_height` + `height_mode` |
 | Real crouch (not Seated) | On, Off | `physical_crouch` |
@@ -76,19 +73,23 @@ of the rows`, `descriptions follow N row button event(s)`, and `describing
 
 **Hidden rows** (owner 2026-11-06: "are any of them redundant/moot?"). A
 row that does nothing with another row's current choice is collapsed
-(`Row::only_with`): Snap turn unless turning is Snap; Turn speed and
-Vignette turning with Snap turning (a snap is instant, so there is nothing
-to darken); Move toward with Teleport (the arc follows the stick hand);
-Real crouch and Hop to jump when Seated (they are off then). Changing the
-deciding row shows or hides them at once. Log: `vr options: Turning:
-hidden (they do nothing now): Turn speed, Vignette turning; shown again:
-Snap turn`.
+(`Row::only_with`): Vignette turning unless Movement is a Smooth turn (a
+snap is instant, so there is nothing to darken); Move toward with Teleport
+(the arc follows the stick hand); Real crouch and Hop to jump when Seated
+(they are off then). Changing the deciding row shows or hides them at
+once. Log: `vr options: Movement: hidden (they do nothing now): Vignette
+turning`.
 
 **Removed and merged** (2026-11-06): "Aiming eye" is off the tab: since
 6DoF aiming it only chose which eye the rifle's shoulder lock lines the
 sights up with. `dominant_eye_right` still works in the ini (right unless
 set) for a later left-handed mode. "Head in a wall" and "Wall fade starts"
-are one row, Wall fade: Off or the distance the fade starts at.
+are one row, Wall fade: Off or the distance the fade starts at. Owner's
+answer the same day: "Smooth turn, snap turn, teleport all merge into row":
+Moving, Turning, Snap turn and Turn speed are one row, Movement, stepping
+Teleport, Snap turn 15-90 deg, Smooth turn 60-240 deg/s. `locomotion` is
+each choice's first key, so it decides which choice is shown; an older ini
+with teleport and smooth turns reads Teleport.
 
 Move holsters is here because the right stick click (which used to be held
 for it) is now the kick. The grip editor (left Y hold) and the arm measure

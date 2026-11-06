@@ -9,47 +9,51 @@ namespace holevr::vr::vr_menu {
 
 const std::vector<Row>& Rows() {
     using K = RowKind;
-    // Hidden while they do nothing: Snap turn with smooth turning, Turn speed
-    // and Vignette turning with snap turning (a snap is instant), Move toward
-    // with teleport (the arc goes where the stick hand points), Real crouch
-    // and Hop to jump when seated (controls.cpp turns both off then).
-    constexpr unsigned kSmooth = 1u << 0, kSnap = 1u << 1;          // Turning
-    constexpr unsigned kWalk = 1u << 0;                              // Moving
-    constexpr unsigned kStanding = (1u << 0) | (1u << 1);           // Height: Character, Your own
+    // Owner 2026-11-06: "Smooth turn, snap turn, teleport all merge into
+    // row". One row, Movement, for what were Moving (smooth/teleport),
+    // Turning (smooth/snap), Snap turn (how far) and Turn speed: Teleport,
+    // then walking with snap turns of 15-90 deg, then walking with smooth
+    // turns of 60-240 deg/s (more comfortable to the left, the right arrow
+    // steps toward smooth and faster). Teleport turns in 30 deg snaps.
+    // locomotion is every choice's first key, so it decides first; a tie
+    // goes to the default (walk, smooth 90 deg/s).
+    //
+    // Hidden while they do nothing: Move toward with Teleport (the arc goes
+    // where the stick hand points), Vignette turning unless turning is
+    // smooth (a snap is instant), Real crouch and Hop to jump when seated
+    // (controls.cpp turns both off then).
+    constexpr unsigned kWalk = 0x7FEu;          // Movement: every choice but Teleport
+    constexpr unsigned kSmoothTurn = 0x7C0u;    // Movement: the smooth turn choices
+    constexpr unsigned kStanding = (1u << 0) | (1u << 1);  // Height: Character, Your own
     // "Aiming eye" (dominant_eye_right) is gone from the tab (owner
     // 2026-11-06: useful before 6DoF aiming, not now): it only chose which
     // eye the rifle's shoulder lock lines the sights up with. The ini key
     // still works (right eye unless set), for a later left-handed mode.
     static const std::vector<Row> rows = {
-        {"Moving", K::kChoice,
-         {{"Smooth", {{"locomotion", "smooth"}}}, {"Teleport", {{"locomotion", "teleport"}}}}, 0,
-         "Smooth: the stick walks you. Teleport: the stick aims an arc; let go and you move to where it lands."},
-        {"Turning", K::kChoice, {{"Smooth", {{"turn_mode", "1"}}}, {"Snap", {{"turn_mode", "0"}}}}, 0,
-         "Smooth: holding the turn stick turns you steadily. Snap: each flick turns you one step at once."},
-        {"Snap turn",
+        {"Movement",
          K::kChoice,
-         {{"15 deg", {{"snap_turn_degrees", "15"}}},
-          {"30 deg", {{"snap_turn_degrees", "30"}}},
-          {"45 deg", {{"snap_turn_degrees", "45"}}},
-          {"60 deg", {{"snap_turn_degrees", "60"}}},
-          {"90 deg", {{"snap_turn_degrees", "90"}}}},
-         1, "How far one flick of the turn stick turns you.", "Turning", kSnap},
-        {"Turn speed",
-         K::kChoice,
-         {{"60 deg/s", {{"smooth_turn_speed", "60"}}},
-          {"90 deg/s", {{"smooth_turn_speed", "90"}}},
-          {"120 deg/s", {{"smooth_turn_speed", "120"}}},
-          {"180 deg/s", {{"smooth_turn_speed", "180"}}},
-          {"240 deg/s", {{"smooth_turn_speed", "240"}}}},
-         1, "How fast you turn while you hold the turn stick over.", "Turning", kSmooth},
+         {{"Teleport", {{"locomotion", "teleport"}, {"turn_mode", "0"}, {"snap_turn_degrees", "30"}}},
+          {"Snap turn 15 deg", {{"locomotion", "smooth"}, {"turn_mode", "0"}, {"snap_turn_degrees", "15"}}},
+          {"Snap turn 30 deg", {{"locomotion", "smooth"}, {"turn_mode", "0"}, {"snap_turn_degrees", "30"}}},
+          {"Snap turn 45 deg", {{"locomotion", "smooth"}, {"turn_mode", "0"}, {"snap_turn_degrees", "45"}}},
+          {"Snap turn 60 deg", {{"locomotion", "smooth"}, {"turn_mode", "0"}, {"snap_turn_degrees", "60"}}},
+          {"Snap turn 90 deg", {{"locomotion", "smooth"}, {"turn_mode", "0"}, {"snap_turn_degrees", "90"}}},
+          {"Smooth turn 60 deg/s", {{"locomotion", "smooth"}, {"turn_mode", "1"}, {"smooth_turn_speed", "60"}}},
+          {"Smooth turn 90 deg/s", {{"locomotion", "smooth"}, {"turn_mode", "1"}, {"smooth_turn_speed", "90"}}},
+          {"Smooth turn 120 deg/s", {{"locomotion", "smooth"}, {"turn_mode", "1"}, {"smooth_turn_speed", "120"}}},
+          {"Smooth turn 180 deg/s", {{"locomotion", "smooth"}, {"turn_mode", "1"}, {"smooth_turn_speed", "180"}}},
+          {"Smooth turn 240 deg/s", {{"locomotion", "smooth"}, {"turn_mode", "1"}, {"smooth_turn_speed", "240"}}}},
+         7,
+         "Teleport: aim an arc with the stick, let go to move there; turns are 30 deg snaps. Snap or Smooth turn: "
+         "walk, and turn by that step or speed."},
         {"Move stick", K::kChoice,
          {{"Left", {{"move_stick", "left"}}}, {"Right", {{"move_stick", "right"}}}}, 0,
          "Which hand's stick moves you. The other stick turns, jumps and crouches."},
         {"Move toward",
          K::kChoice,
          {{"Where you look", {{"move_direction", "0"}}}, {"Stick hand", {{"move_direction", "1"}}}},
-         0, "Pushing the stick forward walks the way your head faces, or the way the moving hand points.", "Moving",
-         kWalk},
+         0, "Pushing the stick forward walks the way your head faces, or the way the moving hand points.",
+         "Movement", kWalk},
         {"Vignette moving",
          K::kChoice,
          {{"Off", {{"comfort_vignette_move", "0"}}},
@@ -63,8 +67,8 @@ const std::vector<Row>& Rows() {
           {"Light", {{"comfort_vignette_turn", "0.35"}}},
           {"Medium", {{"comfort_vignette_turn", "0.6"}}},
           {"Strong", {{"comfort_vignette_turn", "0.85"}}}},
-         0, "Darkens the edges of your view while the stick turns you, to ease motion sickness.", "Turning",
-         kSmooth},
+         0, "Darkens the edges of your view while the stick turns you smoothly, to ease motion sickness.",
+         "Movement", kSmoothTurn},
         // One row for what were "Head in a wall" (on/off) and "Wall fade
         // starts" (how far): the distance only mattered with the fade on.
         // On/off comes first so it outweighs the distance; among the
