@@ -1232,6 +1232,15 @@ bool PinnedObject(const hands::HandGrab& grab, hands::Pose* out) {
     return true;
 }
 
+// The grab of the hand that holds `on`'s gun by its grip (either hand can,
+// controls' either_hand_guns): slide and support grabs on that gun take its
+// frame from it. The right hand's grab when neither does.
+const hands::HandGrab& GunGrab(const hands::HandGrab grab[2], const hands::HandGrab& on) {
+    for (int s : {kR, kL})
+        if (grab[s].kind == hands::GrabKind::kGunGrip && grab[s].object == on.object) return grab[s];
+    return grab[kR];
+}
+
 bool ObjectFrame(const hands::HandGrab& grab, const hands::HandGrab& right, hands::Pose* out) {
     if ((grab.kind == hands::GrabKind::kMagHeld || grab.kind == hands::GrabKind::kMagInsert) && PinnedObject(grab, out))
         return true;
@@ -1329,7 +1338,7 @@ int PickSlideHold(const hands::HandState& h, const hands::Pose& gun, UObject gun
     return best;
 }
 
-std::string RecordKey(int side, const hands::HandGrab& grab) {
+std::string BaseRecordKey(int side, const hands::HandGrab& grab) {
     std::string cls = grab.object ? ue::GetName(ue::GetClass(grab.object)) : "unknown";
     switch (grab.kind) {
         case hands::GrabKind::kGunGrip: return cls + ".grip";
@@ -1344,6 +1353,19 @@ std::string RecordKey(int side, const hands::HandGrab& grab) {
             return grab.point >= 0 ? cls + ".support-" + interact::PointKey(grab.point) : cls + ".support";
         default: return cls + ".mag";
     }
+}
+
+// Either hand can hold either gun and the magazines (controls,
+// either_hand_guns, owner 2026-11-06). A hand holding something the other
+// hand usually holds (the gun's grip: the right; the slide, a magazine or the
+// handguard: the left) has its own saved pose, "-left" / "-right" after the
+// name, so posing it never changes the usual hand's. Until it is posed it
+// uses the usual hand's pose, mirrored. (The charging handle already has one
+// pose per hand.)
+std::string RecordKey(int side, const hands::HandGrab& grab) {
+    const bool charging = grab.kind == hands::GrabKind::kSlideGrab && grab.point >= 0;
+    const int usual = grab.kind == hands::GrabKind::kGunGrip ? kR : kL;
+    return gr::SideKey(BaseRecordKey(side, grab), side == kR, charging || side == usual);
 }
 
 std::wstring RecordPath(const std::string& key) { return ModPath(L"grips\\" + Widen(key) + L".ini"); }
@@ -1784,6 +1806,9 @@ bool GripRecord(int side, hands::GrabKind kind, UObject object, const std::strin
     gr::Record rec;
     bool have = false;
     *from_file = false;
+    // This hand's own pose if it has one, else the usual hand's (RecordKey).
+    const std::string usual = gr::UsualKey(key);
+    std::string file_key = key;
     if (kind == hands::GrabKind::kGunGrip) {
         rec = gr::DefaultPistol();
         rec.name = key;
@@ -1799,11 +1824,23 @@ bool GripRecord(int side, hands::GrabKind kind, UObject object, const std::strin
         have = true;
     }
     bool found = ReadText(RecordPath(key), &text);
+    if (!found && usual != key) {
+        found = ReadText(RecordPath(usual), &text);
+        if (found) {
+            file_key = usual;
+            static std::set<std::string> told;
+            if (told.insert(key).second)
+                log::Info("body: %s not posed yet: using %s, mirrored (tap Y in the grip editor to save this hand's "
+                          "own pose as %s)",
+                          key.c_str(), usual.c_str(), key.c_str());
+        }
+    }
     // A slide grip saved before there were three slide holds: use it for any
     // hold not posed yet.
-    if (!found && kind == hands::GrabKind::kSlideGrab && object && key.find(".charging-") == std::string::npos) {
+    if (!found && kind == hands::GrabKind::kSlideGrab && object && usual.find(".charging-") == std::string::npos) {
         std::string cls = ue::GetName(ue::GetClass(object));
         found = ReadText(RecordPath(cls + ".slide"), &text);
+        if (found) file_key = cls + ".slide";
     }
     // The left hand on a rifle's charging handle, not posed yet: a slide
     // hold posed on it before it had a pose per hand (owner, 2026-11-04
@@ -1820,6 +1857,7 @@ bool GripRecord(int side, hands::GrabKind kind, UObject object, const std::strin
             const std::string old_key = cls + ".slide-" + kSlideHoldKey[h];
             if (!ReadText(RecordPath(old_key), &text)) continue;
             found = shifted = true;
+            file_key = old_key;
             log::Info("body: %s not posed yet: using %s, posed on the old grab point (the grab point moved (%.1f "
                       "%.1f %.1f) cm in the gun frame; the hand stays where it was posed; tap Y in the grip editor "
                       "to save it as %s)",
@@ -1830,12 +1868,17 @@ bool GripRecord(int side, hands::GrabKind kind, UObject object, const std::strin
     // A grip point not posed yet: the scope rail's end takes the pose behind
     // the light (the same hold on the handguard, a little further back);
     // any point takes the support grip saved before there were grip points.
-    if (!found && kind == hands::GrabKind::kSupportGrip && object && key.find(".support-") != std::string::npos) {
+    if (!found && kind == hands::GrabKind::kSupportGrip && object && usual.find(".support-") != std::string::npos) {
         std::string cls = ue::GetName(ue::GetClass(object));
         const std::string scope = std::string(".support-") + interact::PointKey(interact::kPointScopeRail);
-        if (key.size() >= scope.size() && key.compare(key.size() - scope.size(), scope.size(), scope) == 0)
+        if (usual.size() >= scope.size() && usual.compare(usual.size() - scope.size(), scope.size(), scope) == 0) {
             found = ReadText(RecordPath(cls + ".support-" + interact::PointKey(interact::kPointLight)), &text);
-        if (!found) found = ReadText(RecordPath(cls + ".support"), &text);
+            if (found) file_key = cls + ".support-" + interact::PointKey(interact::kPointLight);
+        }
+        if (!found) {
+            found = ReadText(RecordPath(cls + ".support"), &text);
+            if (found) file_key = cls + ".support";
+        }
     }
     if (found) {
         if (!have || is_mag) rec.right_hand = side == kR;
@@ -1865,7 +1908,9 @@ bool GripRecord(int side, hands::GrabKind kind, UObject object, const std::strin
     }
     if (!have) return false;
     if (rec.right_hand != (side == kR)) rec = gr::Mirror(rec);
-    LimitRecord(side, key, &rec, *from_file ? &text : nullptr);
+    // Saving from the editor writes this hand's own key, never the file read.
+    rec.name = key;
+    LimitRecord(side, file_key, &rec, *from_file ? &text : nullptr);
     *out = rec;
     return true;
 }
@@ -1916,8 +1961,10 @@ void PrewarmGrips() {
     int started = 0;
     do {
         std::wstring file = fd.cFileName;
-        std::string key(file.begin(), file.end() - 4);  // drop ".ini"; grip files are named by class (ASCII)
+        const std::string base(file.begin(), file.end() - 4);  // drop ".ini"; grip files are named by class (ASCII)
         for (int side : {kR, kL}) {
+            // The left hand's own gun grip (RecordKey), the right's mirrored until posed.
+            const std::string key = side == kL ? base + "-left" : base;
             if (!G.rig[side].ok || g_grip_cache.count(CacheKey(side, key))) continue;
             ActiveGrip g;
             g.key = key;
@@ -2152,15 +2199,18 @@ struct JointDrag {
 void UpdateEditor(const hands::HandGrab grab[2], const hands::HandState hs[2], const hands::HandState live[2],
                   double dt) {
     const hands::EditButtons b = hands::GetEditButtons();
-    // Which grip: a magazine or the slide in the left hand first (the right
-    // controller edits), else the gun in the right hand (the left edits).
-    // The right hand on a rifle's charging handle (the left holds the rifle
-    // by itself) comes first: the left controller edits it.
+    // Which grip: the slide or charging handle first (right hand, then
+    // left), then a magazine or the handguard (left hand, then right), then
+    // a gun by its grip (right hand, then left). The other controller edits.
+    // Either hand can hold either (controls' either_hand_guns); each hand's
+    // pose is saved under its own name (RecordKey).
     int side = -1;
     const auto left_kind = hands::HeldGrabKind(grab[kL]), right_kind = hands::HeldGrabKind(grab[kR]);
     if (right_kind == hands::GrabKind::kSlideGrab) side = kR;
     else if (IsGrab(left_kind) && left_kind != hands::GrabKind::kGunGrip) side = kL;
+    else if (IsGrab(right_kind) && right_kind != hands::GrabKind::kGunGrip) side = kR;
     else if (right_kind == hands::GrabKind::kGunGrip) side = kR;
+    else if (left_kind == hands::GrabKind::kGunGrip) side = kL;
     if (g_editor.Active() && (side != g_edit_side || side < 0 || G.grip[side].object != grab[side].object)) {
         log::Info("body: grip editor stopped (the held object changed)");
         StopEditor();
@@ -2172,7 +2222,7 @@ void UpdateEditor(const hands::HandGrab grab[2], const hands::HandState hs[2], c
     const int ctrl = 1 - side;
     const bool is_mag = grab[side].kind == hands::GrabKind::kMagHeld || grab[side].kind == hands::GrabKind::kMagInsert;
     hands::Pose obj;
-    if (!ObjectFrame(grab[side], grab[kR], &obj) || !live[ctrl].valid) return;
+    if (!ObjectFrame(grab[side], GunGrab(grab, grab[side]), &obj) || !live[ctrl].valid) return;
     const FQuat inv = obj.rotation.Inverse();
     auto local = [&](const FVector& w) { return inv.Rotate(w - obj.location); };
 
@@ -4465,7 +4515,7 @@ void OnTick(UObject player, float dt_f) {
             G.posture_state[side] = {}; G.twist_state[side] = {};
         }
         G.arm_tracked[side] = true;
-        SolveArm(side, hs[side], grab[side], grab[kR], body_fwd, body_right, dt);
+        SolveArm(side, hs[side], grab[side], GunGrab(grab, grab[side]), body_fwd, body_right, dt);
     }
     g_perf_arms.Add(perf::NowMs() - t_arms);
 
@@ -4542,7 +4592,12 @@ bool GetForearm(int side, watch::Forearm* out) {
 }
 
 bool SlideMarks(uintptr_t gun, FVector* rear_sight, FVector* rear_end, FVector* front_end) {
-    const hands::HandGrab r = hands::GetGrab(hands::kRight);
+    // The hand that holds the gun by its grip (either hand can).
+    hands::HandGrab r = hands::GetGrab(hands::kRight);
+    const hands::HandGrab l = hands::GetGrab(hands::kLeft);
+    if (!(hands::HeldGrabKind(r) == hands::GrabKind::kGunGrip && r.object == gun) &&
+        hands::HeldGrabKind(l) == hands::GrabKind::kGunGrip && l.object == gun)
+        r = l;
     if (!gun) return false;
     // Measured a little each frame (see SlideShape); until then, false.
     static const double budget = config::GetFloat("slide_measure_ms_per_frame", 1.0f);

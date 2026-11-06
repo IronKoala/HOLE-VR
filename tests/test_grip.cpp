@@ -346,7 +346,29 @@ static void TestHolsterApproach() {
     }
 }
 
+// Either hand (owner 2026-11-06): the hand that does not usually hold a
+// thing saves its pose under its own name, and finds the usual one from it.
+static void TestSideKeys() {
+    using grip_record::SideKey;
+    using grip_record::UsualKey;
+    EXPECT(SideKey("BP_HG_C.grip", true, true) == "BP_HG_C.grip");
+    EXPECT(SideKey("BP_HG_C.grip", false, false) == "BP_HG_C.grip-left");
+    EXPECT(SideKey("BP_HG_C.slide-rear-pinch", true, false) == "BP_HG_C.slide-rear-pinch-right");
+    EXPECT(SideKey("BP_AR_C.charging-left", false, true) == "BP_AR_C.charging-left");
+    EXPECT(UsualKey("BP_HG_C.grip-left") == "BP_HG_C.grip");
+    EXPECT(UsualKey("BP_HG_C.grip") == "BP_HG_C.grip");
+    EXPECT(UsualKey("BP_HG_C.slide-rear-pinch-behind-right") == "BP_HG_C.slide-rear-pinch-behind");
+    EXPECT(UsualKey("BP_AR_C.support-scoperail-right") == "BP_AR_C.support-scoperail");
+    EXPECT(UsualKey("BP_Mag_C.mag-right") == "BP_Mag_C.mag");
+    EXPECT(UsualKey("BP_AR_C.charging-left") == "BP_AR_C.charging-left");
+    EXPECT(UsualKey("BP_AR_C.charging-right") == "BP_AR_C.charging-right");
+    for (bool right : {false, true})
+        for (const char* base : {"BP_HG_C.grip", "BP_AR_C.support-light", "BP_HG_C.slide-front-flat", "M.mag"})
+            EXPECT(UsualKey(SideKey(base, right, false)) == base);
+}
+
 int main() {
+    TestSideKeys();
     TestHolsterApproach();
     TestPosedJoints();
     TestEditor();
