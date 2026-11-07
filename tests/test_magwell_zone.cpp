@@ -61,11 +61,11 @@ void ArTenRound() {
     Check(Near(z.bottom, 0.0), "AR 10R: bottom at its seat");
     Check(Near(z.opening, 0.6), "AR 10R: opening 0.6 cm above its seat");
     Check(Near(z.insert, 9.6), "AR 10R: goes 9.6 cm into the gun");
-    // It lines up with its top 1 cm under the opening: 10.6 cm below the
-    // seat, not the old 16 (which left its top ~5 cm under the gun).
-    Check(Near(SnapBelow(z, 1.0, 16.0), 10.6), "AR 10R: lines up 10.6 cm below its seat");
-    Check(Near(SeatFinish(z, 6.0), 4.8), "AR 10R: seats itself from half its travel at most");
-    Check(Near(SeatFinish(z, 2.0), 2.0), "a smaller finish is kept");
+    // It lines up with its top an inch under the opening: 12.14 cm below
+    // the seat, not the old 16 (which left its top ~5 cm under the gun).
+    Check(Near(LineUpBelow(z, 2.54, 16.0), 12.14), "AR 10R: lines up 12.14 cm below its seat");
+    Check(Near(SeatLast(z, 6.0), 4.8), "AR 10R: seats itself from half its travel at most");
+    Check(Near(SeatLast(z, 1.0), 1.0), "the last centimetre: kept");
 
     // A 30 round magazine sticks out below the gun: same opening, longer travel only if its top is higher.
     const FVector seat30{11.7, -1.65, -14.0};
@@ -112,9 +112,9 @@ void Edges() {
     // No parts beside it.
     const MagwellZone none = MeasureMagwell(mag, {0, 0, 0}, {0, 0, 1}, {});
     Check(!none.ok, "no parts: not measured");
-    Check(Near(SnapBelow(none, 1.0, 16.0), 16.0), "not measured: the old window");
-    Check(Near(SeatFinish(none, 6.0), 6.0), "not measured: the old self-seat point");
-    Check(Near(SeatFinish(none, -2.0), 0.0), "negative finish clamps to 0");
+    Check(Near(LineUpBelow(none, 2.54, 16.0), 16.0), "not measured: the old window");
+    Check(Near(SeatLast(none, 1.0), 1.0), "not measured: the given self-seat point");
+    Check(Near(SeatLast(none, -2.0), 0.0), "negative self-seat point clamps to 0");
     // A part ending above the magazine top is not its magwell.
     Check(!MeasureMagwell(mag, {0, 0, 0}, {0, 0, 1}, {{"Slide", {-3, -3, 9.5}, {3, 3, 14}}}).ok,
           "part above the magazine's top ignored");
@@ -133,17 +133,56 @@ void Edges() {
 }
 
 void Progress() {
+    // The owner's pistol 10 round magazine: 11.9 cm of travel, lines up an
+    // inch further out (14.44), seats itself 1 cm from seated. The reload
+    // plays out over the push in between (owner 2026-11-07: "by the time the
+    // mag is fully inserted i want the animation to finish playing"); before,
+    // it ran from the opening to seated and the magazine seated itself half
+    // way, so the hand only got half way through it.
     MagwellZone z;
     z.ok = true;
-    z.insert = 9.6;
-    Check(Near(InsertProgress(z, 9.6, 16.0), 0.0), "top at the opening: 0");
-    Check(Near(InsertProgress(z, 12.0, 16.0), 0.0), "further out: still 0");
-    Check(Near(InsertProgress(z, 4.8, 16.0), 0.5), "half way: 0.5");
-    Check(Near(InsertProgress(z, 0.0, 16.0), 1.0), "seated: 1");
-    Check(Near(InsertProgress(z, -1.0, 16.0), 1.0), "past the seat: 1");
-    MagwellZone none;
-    Check(Near(InsertProgress(none, 8.0, 16.0), 0.5), "not measured: progress over the old window");
-    Check(Near(InsertProgress(none, 8.0, 0.0), 0.0), "no window at all: 0");
+    z.insert = 11.9;
+    const double line_up = LineUpBelow(z, 2.54, 14.0), last = SeatLast(z, 1.0);
+    Check(Near(line_up, 14.44) && Near(last, 1.0), "pistol 10R: lines up at 14.44, seats itself at 1");
+    Check(Near(InsertProgress(line_up, line_up, last), 0.0), "lined up: 0");
+    Check(Near(InsertProgress(20.0, line_up, last), 0.0), "further out: still 0");
+    Check(Near(InsertProgress((line_up + last) / 2, line_up, last), 0.5), "half way: 0.5");
+    Check(Near(InsertProgress(last, line_up, last), 1.0), "where it seats itself: 1 (played out)");
+    Check(Near(InsertProgress(0.0, line_up, last), 1.0), "seated: 1");
+    Check(Near(InsertProgress(-1.0, line_up, last), 1.0), "past the seat: 1");
+    Check(Near(InsertProgress(5.0, 3.0, 3.0), 0.0) && Near(InsertProgress(2.0, 3.0, 3.0), 1.0), "no span: a step");
+}
+
+void Probe() {
+    // The AR 10R: its origin 16.7 cm under its top, going straight up into
+    // the magwell (out = down). Seated: origin at the seat, turned seat_rot.
+    const FVector seat{3.0, -1.0, 2.0};
+    const FQuat seat_rot = AxisAngle(FVector{0.2, 0.1, 1.0}, 0.9);  // any turn
+    const FVector out{0, 0, -1};
+    const double top = 16.7;
+    TopProbe t = ProbeTop(seat, seat_rot, out, top, seat, seat_rot);
+    Check(Near(t.below, 0.0) && Near(t.side, 0.0) && Near(t.tilt, 0.0), "seated: top in place");
+    t = ProbeTop(seat, seat_rot, out, top, seat + FVector{0, 0, -12.14}, seat_rot);
+    Check(Near(t.below, 12.14) && Near(t.side, 0.0) && Near(t.tilt, 0.0), "straight below: its top below by as much");
+    t = ProbeTop(seat, seat_rot, out * 3.0, top, seat + FVector{2.0, 0, -11.0}, seat_rot);
+    Check(Near(t.below, 11.0) && Near(t.side, 2.0), "beside the axis: its top beside it (out of any length)");
+    // Leaning 30 deg about the origin, held 10 cm below: its top swings
+    // 16.7 sin 30 = 8.35 cm to the side and 16.7 (1 - cos 30) = 2.24 cm
+    // lower. The origin alone (10 below, 0 off) said it was lined up.
+    const double r = 30.0 * kDegToRad;
+    const FQuat lean = AxisAngle(FVector{0, 1, 0}, r);
+    t = ProbeTop(seat, seat_rot, out, top, seat + FVector{0, 0, -10.0}, lean * seat_rot);
+    Check(Near(t.tilt, 30.0, 1e-6), "leaning: its tilt");
+    Check(Near(t.side, top * std::sin(r), 1e-6), "leaning: its top swings to the side");
+    Check(Near(t.below, 10.0 + top * (1.0 - std::cos(r)), 1e-6), "leaning: its top drops");
+    // A turn about its own axis does not move its top or lean it.
+    const FQuat spin = AxisAngle(FVector{0, 0, 1}, 1.2);
+    t = ProbeTop(seat, seat_rot, out, top, seat + FVector{0, 0, -5.0}, spin * seat_rot);
+    Check(Near(t.below, 5.0) && Near(t.side, 0.0) && Near(t.tilt, 0.0), "turned about its axis: unchanged");
+    // A raked pistol axis.
+    const FVector raked = Normalize(FVector{-std::sin(24.0 * kDegToRad), 0, -std::cos(24.0 * kDegToRad)});
+    t = ProbeTop(seat, seat_rot, raked, 11.8, seat + raked * 7.0, seat_rot);
+    Check(Near(t.below, 7.0) && Near(t.side, 0.0), "along a raked axis");
 }
 
 void Animation() {
@@ -188,6 +227,7 @@ int main() {
     PistolRaked();
     Edges();
     Progress();
+    Probe();
     Animation();
     std::printf("magwell_zone: %d checks passed\n", checks);
     return 0;
