@@ -316,7 +316,7 @@ const Block kBlocks[] = {
      "; --- Motion controls ---\n"
      "; 1 = use the VR controllers, 0 = keyboard/mouse/gamepad only.\n"
      "vr_controls=1\n"
-     "; Turning on the right stick: 0 = snap, 1 = smooth.\n"
+     "; Turning on the right stick: 0 = snap, 1 = smooth, 2 = no stick turning (turn with your body).\n"
      "turn_mode=1\n"
      "snap_turn_degrees=30\n"
      "; Degrees per second at full stick for smooth turning.\n"
@@ -379,7 +379,7 @@ const Block kBlocks[] = {
      "; Room-scale: the character follows you when you walk around the room\n"
      "; (1 = on; walls stop it).\n"
      "room_scale_follow=1\n"
-     "; Aiming eye: 1 = right, 0 = left.\n"
+     "; Eye the rifle's shoulder lock lines the sights up with (not on the VR tab): 1 = right, 0 = left.\n"
      "dominant_eye_right=1\n"
      "; Pistol slide can be grabbed this far forward of its rear (front serrations, press checks)\n"
      "slide_grab_forward_cm=16\n"
@@ -483,6 +483,15 @@ const Block kBlocks[] = {
      "; goes back to its holster by itself, like the pistol. With the left hand on the\n"
      "; handguard the left hand keeps it. 0 = the rifle stays in the right hand.\n"
      "rifle_right_let_go=1\n"},
+    {"either_hand_guns",
+     "\n"
+     "; --- Either hand for guns and magazines ---\n"
+     "; 1 = any free hand can draw the pistol, take the rifle from its holster or by\n"
+     "; its grip, and take a magazine from the pouch. The hand that holds a gun by its\n"
+     "; grip fires it (its trigger), drops the magazine (A or X) and releases the slide\n"
+     "; (B or Y); the other hand racks, reloads, holds the handguard and works the light.\n"
+     "; 0 = the right hand always holds the gun and the left hand takes the magazines.\n"
+     "either_hand_guns=1\n"},
     {"rifle_charging_handle_grab_cm",
      "\n"
      "; --- The rifle's charging handle ---\n"
@@ -490,6 +499,47 @@ const Block kBlocks[] = {
      "; close to it (cm). The right hand can do it while the left hand holds the rifle\n"
      "; by the handguard. Each hand has its own pose in the grip editor.\n"
      "rifle_charging_handle_grab_cm=9\n"},
+    {"mag_exact_seat",
+     "\n"
+     "; --- Reloading: a magazine into the magwell ---\n"
+     "; 1 = each magazine seats where the game itself puts that magazine.\n"
+     "mag_exact_seat=1\n"
+     "; While a magazine is lined up the hand holding it has a second pose (pose it\n"
+     "; in the grip editor then). 1 = until it is posed, the game's own reload hold.\n"
+     "mag_insert_game_hold=1\n"
+     "; 1 = with a pistol magazine, the game's own left-hand pistol reload plays as\n"
+     "; you push it in (done by the time it is in), and backwards as you pull it out.\n"
+     "mag_insert_anim=1\n"},
+    {"mag_line_up_cm",
+     "\n"
+     "; --- Reloading: where a magazine lines up with the magwell ---\n"
+     "; Its top must come into a box under the gun's magwell opening, measured for\n"
+     "; each magazine in each gun: this deep (cm; 2.54 = an inch; rifles),\n"
+     "mag_line_up_cm=2.54\n"
+     "; its top at most this far off the magwell's line (cm),\n"
+     "mag_line_up_side_cm=3.5\n"
+     "; and the magazine leaning at most this far off it (degrees).\n"
+     "mag_line_up_tilt_deg=35\n"
+     "; Pushed in to this close to seated (cm), it clicks in by itself.\n"
+     "mag_seat_last_cm=1\n"},
+    {"mag_line_up_pistol_cm",
+     "\n"
+     "; --- Reloading the pistol ---\n"
+     "; A pistol magazine lines up from this deep under the magwell (cm; 3.81 = an\n"
+     "; inch and a half). mag_line_up_cm above is the rifle's.\n"
+     "mag_line_up_pistol_cm=3.81\n"
+     "; With the gun in the left hand the real controllers knock together under the\n"
+     "; grip: near the gun the magazine is drawn this far (cm) out of the right hand\n"
+     "; along its own length, so the controllers stay apart. 0 = off.\n"
+     "mag_reach_left_gun_cm=6\n"},
+    {"mag_insert_anim_ar",
+     "\n"
+     "; --- Reloading the AR ---\n"
+     "; off = an AR magazine only takes your two poses: the grab pose, then the pose\n"
+     "; for when it lines up with the magwell (pose that one in the grip editor\n"
+     "; while it is lined up; until then it keeps the grab pose).\n"
+     "; pistol / rifle = also play the game's pistol or AR reload on the left hand.\n"
+     "mag_insert_anim_ar=off\n"},
     {"fixed_height",
      "\n"
      "; 1 = your in-game height is always the character's, seated or standing\n"
@@ -690,6 +740,14 @@ const Block kBlocks[] = {
      "touch_interact_point_min_cm=6\n"
      "; 1 = log where each item that appears during a level goes (first 80 a level).\n"
      "touch_interact_loot_log=1\n"},
+    {"touch_interact_point_pitch_deg",
+     "\n"
+     "; Where the trigger interact's ray points, turned from the controller's aim\n"
+     "; pose (degrees; minus = down; yaw is for the right hand, mirrored for the\n"
+     "; left). The aim pose sits about 30 degrees above where a hand points, the\n"
+     "; same offset the held pistol uses.\n"
+     "touch_interact_point_pitch_deg=-30\n"
+     "touch_interact_point_yaw_deg=5\n"},
     {"drinks_by_hand",
      "\n"
      "; --- Drink machine by hand (hub) ---\n"
@@ -732,10 +790,51 @@ const Block kBlocks[] = {
      "; the next frame's whole picture before the headset copy plus both copied eye\n"
      "; pictures, and check the copies match it pixel for pixel. Ctrl+F11 asks for\n"
      "; one by hand. At most paired_capture_limit per run (8 max). Each costs a\n"
-     "; short hitch, so 0 for performance comparisons. See docs/WHITE_SQUARE_CAPTURE.md.\n"
-     "paired_capture_enabled=1\n"
+     "; short hitch. Off by default: 7 captures already showed the copies exact.\n"
+     "; See docs/WHITE_SQUARE_CAPTURE.md.\n"
+     "paired_capture_enabled=0\n"
      "paired_capture_limit=3\n"
      "paired_capture_on_dots=1\n"},
+    {"square_watch",
+     "\n"
+     "; White squares (diagnostic): compare the two eyes for white squares and dots\n"
+     "; drawn into one eye only, and save pictures when they show (square_watch=1).\n"
+     "; It reads one strip of the picture on one frame in square_watch_every (1 to\n"
+     "; 8; fewer frames cost less). square_test=1 also switches game effects off\n"
+     "; one at a time when the dots show, to find which draws them (needs the watch).\n"
+     "; Both cost frame time, so they are off for play.\n"
+     "square_watch=0\n"
+     "square_watch_every=4\n"
+     "square_test=0\n"},
+    {"vr_gpu_memory_sharing",
+     "\n"
+     "; White/yellow squares in one eye: the engine reuses video memory between\n"
+     "; drawing steps and runs some steps alongside the frame (async compute).\n"
+     "; With both off in VR the squares were gone (2026-11-07). 1 = the game's own\n"
+     "; (saves video memory / GPU time but may bring the squares back).\n"
+     "vr_gpu_memory_sharing=0\n"
+     "vr_async_compute=0\n"},
+    {"xr_end_async",
+     "\n"
+     "; Frame times: hand each frame to the headset (xrEndFrame) on a thread of the\n"
+     "; mod's own, so the game's Present thread doesn't wait on it. 0 = never,\n"
+     "; 1 = always, 2 = decided each run by the GPU cost test (on only if the\n"
+     "; headset missed fewer frames with it).\n"
+     "xr_end_async=2\n"},
+    {"vr_lumen_gi_quality",
+     "\n"
+     "; Lumen indirect lighting quality in VR. Levels ask for 2; 1 looks nearly the\n"
+     "; same and saves about 0.7 ms of GPU time a frame. 0 = the game's own.\n"
+     "vr_lumen_gi_quality=1\n"},
+    {"vr_shadow_quality",
+     "\n"
+     "; Frame times in VR (72 Hz needs the GPU under about 12 ms a frame):\n"
+     "; shadow quality low / medium / high / epic / game (the game's own, Epic).\n"
+     "; High saves about 0.7 ms a frame against Epic.\n"
+     "vr_shadow_quality=high\n"
+     "; Lumen indirect lighting probes: half (half as many, saves about 0.9 ms a\n"
+     "; frame) / full / game.\n"
+     "vr_lumen_probes=half\n"},
     {"process_metrics",
      "\n"
      "; Every 30 s log the game process's memory, handles, CPU and disk use (game\n"

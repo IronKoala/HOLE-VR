@@ -5,13 +5,25 @@ the OpenXR eyes with the two images immediately after that copy. It does not
 identify an Unreal shader and does not capture runtime reprojection or later
 OpenXR composition layers.
 
+## Cause and fix (2026-11-07)
+
+The white (later also yellow) squares were scraps of UI text in the left four
+columns of 8 px tiles, in one eye at a time: a render pass reading video memory
+it had not written that frame, memory that last held UI. With the render
+graph's transient memory sharing (`r.RDG.TransientAllocator`) and async compute
+(`r.RDG.AsyncCompute`) both off, the owner's run had none. The mod now turns
+both off in VR by default (`vr_gpu_memory_sharing=0`, `vr_async_compute=0` in
+hole-vr.ini; 1 gives the game's own back). Ruled out on the way: our eye copy
+(seven exact paired captures), SSR, flat UI, Lumen screen probe tile
+classification / short-range AO / screen traces, and VSM one-pass projection.
+
 ## Settings
 
 The startup log line `build: <git revision>` names the code that ran (the
 revision is generated at every build; `-dirty` means uncommitted changes).
-These hole-vr.ini lines are added on while the white squares are being
-investigated; set paired_capture_enabled=0 for performance comparisons and
-once the squares are fixed:
+It is off by default since 2026-11-06: seven captures in three runs showed
+the eye copies exact, and each capture costs a hitch. To use it again, set
+in hole-vr.ini (on-dots requests also need square_watch=1):
 
 ```ini
 paired_capture_enabled=1

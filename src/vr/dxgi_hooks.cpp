@@ -8,7 +8,9 @@
 #include "core/config.h"
 #include "core/log.h"
 #include "core/perf.h"
+#include "core/sampler.h"
 #include "hooks/hooks.h"
+#include "vr/gpu_timer.h"
 #include "vr/openxr.h"
 #include "vr/spectator.h"
 
@@ -44,6 +46,7 @@ thread_local bool t_in_present = false;
 UINT BeforePresent(IDXGISwapChain* sc, UINT sync_interval) {
     if (t_in_present || sc != g_game_swapchain.load()) return sync_interval;
     t_in_present = true;
+    sampler::NotePresentThread();
     ID3D12Resource* back_buffer = nullptr;
     IDXGISwapChain3* sc3 = nullptr;
     if (SUCCEEDED(sc->QueryInterface(IID_PPV_ARGS(&sc3)))) {
@@ -77,19 +80,28 @@ void TimePresentEnd(double start) {
     if (start >= 0.0) g_perf_present.Add(perf::NowMs() - start);
 }
 
+// The game's own Present (not one we make, nor another swap chain's).
+bool IsGamePresent(IDXGISwapChain* sc) { return !t_in_present && sc == g_game_swapchain.load(); }
+
 HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* sc, UINT sync, UINT flags) {
+    const bool game = IsGamePresent(sc);
+    if (game) gpu_timer::PresentBegin();  // first: stamps the end of the game's own frame
     UINT interval = BeforePresent(sc, sync);
     double t = TimePresentStart(sc);
     HRESULT hr = o_present(sc, interval, flags);
     TimePresentEnd(t);
+    if (game) gpu_timer::PresentEnd();
     return hr;
 }
 
 HRESULT STDMETHODCALLTYPE HookPresent1(IDXGISwapChain1* sc, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* p) {
+    const bool game = IsGamePresent(sc);
+    if (game) gpu_timer::PresentBegin();
     UINT interval = BeforePresent(sc, sync);
     double t = TimePresentStart(sc);
     HRESULT hr = o_present1(sc, interval, flags, p);
     TimePresentEnd(t);
+    if (game) gpu_timer::PresentEnd();
     return hr;
 }
 
@@ -111,6 +123,7 @@ void OnSwapChainCreated(IUnknown* device, IDXGISwapChain* sc) {
         sc1->Release();
     }
     log::Info("Game swap chain hooked (D3D12 queue %p)", static_cast<void*>(queue));
+    gpu_timer::Init(queue);
 }
 
 HRESULT STDMETHODCALLTYPE HookCreateSwapChain(IDXGIFactory* f, IUnknown* device, DXGI_SWAP_CHAIN_DESC* desc,

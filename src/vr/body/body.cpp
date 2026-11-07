@@ -6,6 +6,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <atomic>
 #include <map>
 #include <memory>
@@ -44,6 +45,7 @@
 #include "vr/body/calibration_hold.h"
 #include "vr/body/leg_pose.h"
 #include "vr/body/leg_world.h"
+#include "vr/body/reload_anim.h"
 #include "vr/body/torso_pose.h"
 #include "vr/body/skeleton.h"
 #include "vr/interact/grip_points.h"
@@ -109,6 +111,15 @@ struct Settings {
     bool press_flat = true;    // an empty hand pushed against a wall settles flat on it
     double press_push = 4.0;   // cm the real hand goes on past where it touched until the hand is flat
     double finger_drag = 1.0;  // fingertips trail along a surface the hand slides on (0 = off, 1 = normal)
+    // A magazine lined up with the magwell (owner 2026-11-06): its own hand
+    // pose (stage 2), the game's reload hold until it is posed, and the
+    // game's own left-hand reload animation played by how far it is in.
+    // Pistol magazines play the game's pistol reload; AR magazines only take
+    // the two poses (owner 2026-11-06 23:29 UTC: "reuse the games pistol
+    // reload for the pistol, not the AR. For the AR i want the multi-pose").
+    bool mag_insert_anim = true;
+    int mag_insert_ar_clip = -1;  // for AR magazines: -1 (poses only), kPistol or kRifle
+    bool mag_insert_game_hold = true;
 } S;
 
 void LoadSettings() {
@@ -154,6 +165,18 @@ void LoadSettings() {
     S.press_flat = config::GetBool("hand_press_flat_on_walls", true);
     S.press_push = std::clamp<double>(config::GetFloat("hand_press_flat_push_cm", 4.f), 0.5, 20.0);
     S.finger_drag = std::clamp<double>(config::GetFloat("hand_finger_drag", 1.f), 0.0, 3.0);
+    S.mag_insert_anim = config::GetBool("mag_insert_anim", true);
+    {
+        // A new key: mag_insert_anim_rifle (pistol by default) was the first
+        // reading of the owner's ask, and ini files keep what they were
+        // given.
+        std::string r = config::GetString("mag_insert_anim_ar", "off");
+        for (char& ch : r) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        S.mag_insert_ar_clip = r == "rifle" || r == "ar" ? reload_anim::kRifle
+                               : r == "pistol" || r == "hg" ? reload_anim::kPistol
+                                                            : -1;
+    }
+    S.mag_insert_game_hold = config::GetBool("mag_insert_game_hold", true);
 }
 
 // ---- small files beside the ini ----
@@ -1232,6 +1255,15 @@ bool PinnedObject(const hands::HandGrab& grab, hands::Pose* out) {
     return true;
 }
 
+// The grab of the hand that holds `on`'s gun by its grip (either hand can,
+// controls' either_hand_guns): slide and support grabs on that gun take its
+// frame from it. The right hand's grab when neither does.
+const hands::HandGrab& GunGrab(const hands::HandGrab grab[2], const hands::HandGrab& on) {
+    for (int s : {kR, kL})
+        if (grab[s].kind == hands::GrabKind::kGunGrip && grab[s].object == on.object) return grab[s];
+    return grab[kR];
+}
+
 bool ObjectFrame(const hands::HandGrab& grab, const hands::HandGrab& right, hands::Pose* out) {
     if ((grab.kind == hands::GrabKind::kMagHeld || grab.kind == hands::GrabKind::kMagInsert) && PinnedObject(grab, out))
         return true;
@@ -1329,10 +1361,13 @@ int PickSlideHold(const hands::HandState& h, const hands::Pose& gun, UObject gun
     return best;
 }
 
-std::string RecordKey(int side, const hands::HandGrab& grab) {
+std::string BaseRecordKey(int side, const hands::HandGrab& grab) {
     std::string cls = grab.object ? ue::GetName(ue::GetClass(grab.object)) : "unknown";
     switch (grab.kind) {
-        case hands::GrabKind::kGunGrip: return cls + ".grip";
+        // A hand reaching for the holstered pistol with its own pose
+        // (kPointHolster): one per hand, see RecordKey.
+        case hands::GrabKind::kGunGrip:
+            return grab.point == hands::kPointHolster ? cls + ".holster" : cls + ".grip";
         // A rifle's charging handle (grab.point = kPointChargingHandle): one
         // pose for each hand (owner, 2026-11-04: "one for left hand, one for
         // right hand, at the rear of the charging handle").
@@ -1342,8 +1377,26 @@ std::string RecordKey(int side, const hands::HandGrab& grab) {
         // One pose per grip point on the handguard (vr/interact/grip_points.h).
         case hands::GrabKind::kSupportGrip:
             return grab.point >= 0 ? cls + ".support-" + interact::PointKey(grab.point) : cls + ".support";
+        // Stage 2: the magazine lined up with the magwell, going in.
+        case hands::GrabKind::kMagInsert: return cls + ".mag-insert";
         default: return cls + ".mag";
     }
+}
+
+// Either hand can hold either gun and the magazines (controls,
+// either_hand_guns, owner 2026-11-06). A hand holding something the other
+// hand usually holds (the gun's grip: the right; the slide, a magazine or the
+// handguard: the left) has its own saved pose, "-left" / "-right" after the
+// name, so posing it never changes the usual hand's. Until it is posed it
+// uses the usual hand's pose, mirrored. (The charging handle already has one
+// pose per hand.)
+std::string RecordKey(int side, const hands::HandGrab& grab) {
+    const bool charging = grab.kind == hands::GrabKind::kSlideGrab && grab.point >= 0;
+    // The reach for the holstered pistol always has the hand's own name
+    // (BP_HG_C.holster-left): GripRecord never mirrors it from the other hand.
+    const bool holster = grab.kind == hands::GrabKind::kGunGrip && grab.point == hands::kPointHolster;
+    const int usual = grab.kind == hands::GrabKind::kGunGrip ? kR : kL;
+    return gr::SideKey(BaseRecordKey(side, grab), side == kR, !holster && (charging || side == usual));
 }
 
 std::wstring RecordPath(const std::string& key) { return ModPath(L"grips\\" + Widen(key) + L".ini"); }
@@ -1778,13 +1831,107 @@ void LimitRecord(int side, const std::string& key, gr::Record* rec, const std::s
         log::Error("body: could not copy grips\\%s.ini to grips\\before-joint-limits", key.c_str());
 }
 
+// ---- a magazine going into the magwell (stage 2) ----
+// Which of the game's reload animations plays for a magazine: the pistol's
+// for pistol magazines (BPC_Mag_HG_...); none for AR magazines
+// (BPC_Mag_AR_...), which take the two poses only, unless
+// mag_insert_anim_ar says otherwise; none for any other magazine. -1: none.
+bool IsArMag(UObject mag) { return mag && ue::GetName(ue::GetClass(mag)).find("_AR_") != std::string::npos; }
+bool IsPistolMag(UObject mag) { return mag && ue::GetName(ue::GetClass(mag)).find("_HG_") != std::string::npos; }
+int InsertClip(UObject mag) {
+    if (!S.mag_insert_anim || !mag) return -1;
+    if (IsPistolMag(mag)) return reload_anim::kPistol;
+    if (IsArMag(mag)) return S.mag_insert_ar_clip;
+    return -1;
+}
+// Why InsertClip gave none (for the log).
+const char* NoClipWhy(UObject mag) {
+    if (!S.mag_insert_anim) return "the game's reload is off (mag_insert_anim=0)";
+    if (IsArMag(mag)) return "AR magazines take your own poses only (mag_insert_anim_ar=off)";
+    return "the game has no reload animation for this magazine";
+}
+
+// The game's own hold of a magazine while it reloads (BP_GunBase
+// Gun_MagazineCreate): the magazine hangs from the hand socket
+// HandItemPoint_L by its AttachPoint_ReloadHand, i.e. that point of the
+// magazine sits on the socket. So the hand bone, in the magazine's frame, is
+// the socket's place in the hand undone from that point. Fingers: the
+// reload animation's pose where the insert begins. A left-hand record.
+bool GameInsertHold(UObject mag, gr::Record* rec, std::string* why) {
+    const HandRig& r = G.rig[kL];
+    const int clip = InsertClip(mag);
+    if (!r.ok) {
+        *why = "the left hand is not rigged";
+        return false;
+    }
+    if (clip < 0) {
+        *why = NoClipWhy(mag);
+        return false;
+    }
+    const reload_anim::ClipData& d = reload_anim::Get(static_cast<reload_anim::Clip>(clip));
+    if (!d.ready || !d.have_socket) {
+        *why = d.failed ? "the game's reload animation could not be read: " + d.why
+                        : "the game's reload animation is not read yet";
+        return false;
+    }
+    UObject point = 0;
+    if (!ue::GetProp(mag, "AttachPoint_ReloadHand", point) || !point) {
+        *why = "the magazine has no AttachPoint_ReloadHand";
+        return false;
+    }
+    ue::Call rt(point, "GetRelativeTransform");
+    if (!rt.Invoke()) {
+        *why = "its AttachPoint_ReloadHand could not be read";
+        return false;
+    }
+    Xf point_in_mag = rt.Result<Xf>();
+    point_in_mag.scale = FVector{1, 1, 1};
+    Xf socket_in_hand;
+    socket_in_hand.rotation = d.socket_rot;
+    socket_in_hand.translation = d.socket_pos;
+    const Xf hand_in_socket = skel::Relative(Xf{}, socket_in_hand);
+    const Xf hand = skel::Compose(hand_in_socket, point_in_mag);
+    if (!std::isfinite(Length(hand.translation)) || Length(hand.translation) > 60.0) {
+        *why = "the hold came out more than 60 cm from the magazine";
+        return false;
+    }
+    *rec = gr::Record{};
+    rec->right_hand = false;
+    gr::StoreHand(rec, r.geo, Normalized(hand.rotation), hand.translation);
+    for (int t = 0; t < gr::kTipCount; ++t) {
+        const int f = TipFinger(t);
+        fingers::Angles a;
+        for (int j = 0; j < 3; ++j) {
+            rec->joint[t][j] = Normalized(r.chain[f].ref[j].rotation.Inverse() * d.pose[0].joint[f][j]);
+            a.extra[j] = rec->joint[t][j];
+        }
+        rec->posed[t] = true;
+        Xf joints[3];
+        FVector tip;
+        fingers::Fk(r.chain[f], a, joints, &tip);
+        rec->tip[t] = hand.translation + Normalized(hand.rotation).Rotate(tip);
+    }
+    return true;
+}
+
 bool GripRecord(int side, hands::GrabKind kind, UObject object, const std::string& key, gr::Record* out,
                 bool* from_file) {
     std::string text;
     gr::Record rec;
     bool have = false;
     *from_file = false;
-    if (kind == hands::GrabKind::kGunGrip) {
+    // This hand's own pose if it has one, else the usual hand's (RecordKey).
+    const std::string usual = gr::UsualKey(key);
+    std::string file_key = key;
+    // The reach for the holstered pistol (kPointHolster): the hand's own pose
+    // only. The right hand uses its gun grip until it has one; the left hand
+    // has none (the right hand's grip mirrored twisted the left arm, owner
+    // 2026-11-07), so it stays on the controller until it is posed.
+    const std::string holster_tail = ".holster";
+    const bool holster = kind == hands::GrabKind::kGunGrip && usual.size() > holster_tail.size() &&
+                         usual.compare(usual.size() - holster_tail.size(), holster_tail.size(), holster_tail) == 0;
+    const std::string grip_key = holster ? usual.substr(0, usual.size() - holster_tail.size()) + ".grip" : key;
+    if (kind == hands::GrabKind::kGunGrip && !(holster && side == kL)) {
         rec = gr::DefaultPistol();
         rec.name = key;
         have = true;
@@ -1799,11 +1946,36 @@ bool GripRecord(int side, hands::GrabKind kind, UObject object, const std::strin
         have = true;
     }
     bool found = ReadText(RecordPath(key), &text);
+    if (!found && holster) {
+        if (side == kR) {
+            found = ReadText(RecordPath(grip_key), &text);
+            if (found) file_key = grip_key;
+        } else {
+            static std::set<std::string> told;
+            if (told.insert(key).second)
+                log::Info("body: %s not posed yet: the left hand stays on the controller near the holstered pistol "
+                          "(to pose it: left hand on the pistol in its holster, hold left Y 1 s, pose it with the "
+                          "right controller, tap Y to save)",
+                          key.c_str());
+        }
+    }
+    if (!found && usual != key && !holster) {
+        found = ReadText(RecordPath(usual), &text);
+        if (found) {
+            file_key = usual;
+            static std::set<std::string> told;
+            if (told.insert(key).second)
+                log::Info("body: %s not posed yet: using %s, mirrored (tap Y in the grip editor to save this hand's "
+                          "own pose as %s)",
+                          key.c_str(), usual.c_str(), key.c_str());
+        }
+    }
     // A slide grip saved before there were three slide holds: use it for any
     // hold not posed yet.
-    if (!found && kind == hands::GrabKind::kSlideGrab && object && key.find(".charging-") == std::string::npos) {
+    if (!found && kind == hands::GrabKind::kSlideGrab && object && usual.find(".charging-") == std::string::npos) {
         std::string cls = ue::GetName(ue::GetClass(object));
         found = ReadText(RecordPath(cls + ".slide"), &text);
+        if (found) file_key = cls + ".slide";
     }
     // The left hand on a rifle's charging handle, not posed yet: a slide
     // hold posed on it before it had a pose per hand (owner, 2026-11-04
@@ -1820,6 +1992,7 @@ bool GripRecord(int side, hands::GrabKind kind, UObject object, const std::strin
             const std::string old_key = cls + ".slide-" + kSlideHoldKey[h];
             if (!ReadText(RecordPath(old_key), &text)) continue;
             found = shifted = true;
+            file_key = old_key;
             log::Info("body: %s not posed yet: using %s, posed on the old grab point (the grab point moved (%.1f "
                       "%.1f %.1f) cm in the gun frame; the hand stays where it was posed; tap Y in the grip editor "
                       "to save it as %s)",
@@ -1830,12 +2003,48 @@ bool GripRecord(int side, hands::GrabKind kind, UObject object, const std::strin
     // A grip point not posed yet: the scope rail's end takes the pose behind
     // the light (the same hold on the handguard, a little further back);
     // any point takes the support grip saved before there were grip points.
-    if (!found && kind == hands::GrabKind::kSupportGrip && object && key.find(".support-") != std::string::npos) {
+    if (!found && kind == hands::GrabKind::kSupportGrip && object && usual.find(".support-") != std::string::npos) {
         std::string cls = ue::GetName(ue::GetClass(object));
         const std::string scope = std::string(".support-") + interact::PointKey(interact::kPointScopeRail);
-        if (key.size() >= scope.size() && key.compare(key.size() - scope.size(), scope.size(), scope) == 0)
+        if (usual.size() >= scope.size() && usual.compare(usual.size() - scope.size(), scope.size(), scope) == 0) {
             found = ReadText(RecordPath(cls + ".support-" + interact::PointKey(interact::kPointLight)), &text);
-        if (!found) found = ReadText(RecordPath(cls + ".support"), &text);
+            if (found) file_key = cls + ".support-" + interact::PointKey(interact::kPointLight);
+        }
+        if (!found) {
+            found = ReadText(RecordPath(cls + ".support"), &text);
+            if (found) file_key = cls + ".support";
+        }
+    }
+    // A magazine lined up with the magwell, its stage 2 not posed yet: the
+    // game's own reload hold, else the magazine's grab pose (stage 1).
+    if (!found && kind == hands::GrabKind::kMagInsert && object) {
+        static std::set<std::string> told;
+        std::string why;
+        if (S.mag_insert_game_hold && GameInsertHold(object, &rec, &why)) {
+            have = true;
+            if (told.insert(key + "#game").second)
+                log::Info("body: %s not posed yet: the game's own reload hold (HandItemPoint_L on the magazine's "
+                          "AttachPoint_ReloadHand); pose it in the grip editor while the magazine is lined up to "
+                          "change it",
+                          key.c_str());
+        } else {
+            const std::string tail = ".mag-insert";
+            auto grab_key = [&](const std::string& k) {
+                const size_t at = k.rfind(tail);
+                return at == std::string::npos ? k : k.substr(0, at) + ".mag" + k.substr(at + tail.size());
+            };
+            for (const std::string& k : {grab_key(key), grab_key(usual)}) {
+                if (ReadText(RecordPath(k), &text)) {
+                    found = true;
+                    file_key = k;
+                    break;
+                }
+            }
+            if (told.insert(key + "#grab").second)
+                log::Info("body: %s not posed yet and %s: using the magazine's grab pose%s", key.c_str(),
+                          S.mag_insert_game_hold ? why.c_str() : "the game's hold is off (mag_insert_game_hold=0)",
+                          found ? (" (" + file_key + ")").c_str() : " (none saved: the hand stays on the controller)");
+        }
     }
     if (found) {
         if (!have || is_mag) rec.right_hand = side == kR;
@@ -1865,7 +2074,9 @@ bool GripRecord(int side, hands::GrabKind kind, UObject object, const std::strin
     }
     if (!have) return false;
     if (rec.right_hand != (side == kR)) rec = gr::Mirror(rec);
-    LimitRecord(side, key, &rec, *from_file ? &text : nullptr);
+    // Saving from the editor writes this hand's own key, never the file read.
+    rec.name = key;
+    LimitRecord(side, file_key, &rec, *from_file ? &text : nullptr);
     *out = rec;
     return true;
 }
@@ -1916,8 +2127,10 @@ void PrewarmGrips() {
     int started = 0;
     do {
         std::wstring file = fd.cFileName;
-        std::string key(file.begin(), file.end() - 4);  // drop ".ini"; grip files are named by class (ASCII)
+        const std::string base(file.begin(), file.end() - 4);  // drop ".ini"; grip files are named by class (ASCII)
         for (int side : {kR, kL}) {
+            // The left hand's own gun grip (RecordKey), the right's mirrored until posed.
+            const std::string key = side == kL ? base + "-left" : base;
             if (!G.rig[side].ok || g_grip_cache.count(CacheKey(side, key))) continue;
             ActiveGrip g;
             g.key = key;
@@ -2152,15 +2365,26 @@ struct JointDrag {
 void UpdateEditor(const hands::HandGrab grab[2], const hands::HandState hs[2], const hands::HandState live[2],
                   double dt) {
     const hands::EditButtons b = hands::GetEditButtons();
-    // Which grip: a magazine or the slide in the left hand first (the right
-    // controller edits), else the gun in the right hand (the left edits).
-    // The right hand on a rifle's charging handle (the left holds the rifle
-    // by itself) comes first: the left controller edits it.
+    // Which grip: the slide or charging handle first (right hand, then
+    // left), then a magazine or the handguard (left hand, then right), then
+    // a gun by its grip (right hand, then left). The other controller edits.
+    // Either hand can hold either (controls' either_hand_guns); each hand's
+    // pose is saved under its own name (RecordKey).
+    // The left hand reaching for the holstered pistol (its own pose,
+    // kPointHolster) comes before the gun grips, once it is fully on it.
     int side = -1;
     const auto left_kind = hands::HeldGrabKind(grab[kL]), right_kind = hands::HeldGrabKind(grab[kR]);
-    if (right_kind == hands::GrabKind::kSlideGrab) side = kR;
+    auto holster_reach = [&](int s) {
+        return grab[s].holster_preview && grab[s].kind == hands::GrabKind::kGunGrip &&
+               grab[s].point == hands::kPointHolster && grab[s].object && grab[s].pose_blend > 0.95;
+    };
+    if (g_editor.Active() && g_edit_side >= 0 && IsGrab(grab[g_edit_side].kind)) side = g_edit_side;
+    else if (right_kind == hands::GrabKind::kSlideGrab) side = kR;
     else if (IsGrab(left_kind) && left_kind != hands::GrabKind::kGunGrip) side = kL;
+    else if (IsGrab(right_kind) && right_kind != hands::GrabKind::kGunGrip) side = kR;
+    else if (holster_reach(kL)) side = kL;
     else if (right_kind == hands::GrabKind::kGunGrip) side = kR;
+    else if (left_kind == hands::GrabKind::kGunGrip) side = kL;
     if (g_editor.Active() && (side != g_edit_side || side < 0 || G.grip[side].object != grab[side].object)) {
         log::Info("body: grip editor stopped (the held object changed)");
         StopEditor();
@@ -2172,7 +2396,7 @@ void UpdateEditor(const hands::HandGrab grab[2], const hands::HandState hs[2], c
     const int ctrl = 1 - side;
     const bool is_mag = grab[side].kind == hands::GrabKind::kMagHeld || grab[side].kind == hands::GrabKind::kMagInsert;
     hands::Pose obj;
-    if (!ObjectFrame(grab[side], grab[kR], &obj) || !live[ctrl].valid) return;
+    if (!ObjectFrame(grab[side], GunGrab(grab, grab[side]), &obj) || !live[ctrl].valid) return;
     const FQuat inv = obj.rotation.Inverse();
     auto local = [&](const FVector& w) { return inv.Rotate(w - obj.location); };
 
@@ -2206,6 +2430,14 @@ void UpdateEditor(const hands::HandGrab grab[2], const hands::HandState hs[2], c
     if (out.entered) {
         g_freeze.on = true;
         for (int i = 0; i < 2; ++i) g_freeze.hs[i] = hs[i], g_freeze.grab[i] = grab[i];
+        if (g_freeze.grab[side].holster_preview) {
+            // Posing the reach for the holstered pistol: show the pose itself
+            // (not the blend toward it) while editing.
+            g_freeze.grab[side].holster_preview = false;
+            g_freeze.grab[side].pose_blend = 1.0;
+            log::Info("body: grip editor: posing the %s hand's reach for the holstered pistol (%s)",
+                      side == kL ? "left" : "right", RecordKey(side, grab[side]).c_str());
+        }
         log::Info("body: grip editor: hands and %s frozen in place; the %s controller's grab point is live",
                   is_mag ? "magazine" : "gun", ctrl == kR ? "right" : "left");
         g_edit_side = side;
@@ -3416,6 +3648,19 @@ int PickRearPinch(int side, const hands::HandState& h, const hands::Pose& obj, c
     return pick;
 }
 
+// The hand moving between a magazine's grab pose and its pose in the
+// magwell (stage 2), and back: over a short moment instead of a jump.
+struct MagStageBlend {
+    bool on = false;
+    UObject object = 0;
+    FQuat rot;     // the hand in the magazine's frame, before the change
+    FVector pos;
+    double t0_ms = 0;
+} g_mag_stage[2];
+constexpr double kMagStageMs = 120.0;
+
+bool IsMagKind(hands::GrabKind k) { return k == hands::GrabKind::kMagHeld || k == hands::GrabKind::kMagInsert; }
+
 void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, const hands::HandGrab& right_grab,
               const FVector& body_fwd, const FVector& body_right, double dt) {
     const Skeleton& k = G.skel;
@@ -3444,7 +3689,25 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
             g_slide_hold[side] = PickSlideHold(h, gun, grab.object);
             if (g_slide_hold[side] == kSlideRear) g_slide_hold[side] = PickRearPinch(side, h, gun, grab);
         }
+        // Into or out of the magwell with the same magazine: from where the
+        // hand was on it.
+        const bool mag_stage = grab.object && grab.object == g.object && IsMagKind(grab.kind) && IsMagKind(g.kind) &&
+                               g.have && !g.pending;
+        if (mag_stage) g_mag_stage[side] = {true, grab.object, g.hand_rot, g.hand_pos, perf::NowMs()};
+        else g_mag_stage[side].on = false;
         LoadGrip(side, grab);
+        if (grab.kind == hands::GrabKind::kMagInsert) {
+            const int clip = InsertClip(grab.object);
+            const bool anim = side == kL && clip >= 0 && reload_anim::Get(static_cast<reload_anim::Clip>(clip)).ready;
+            log::Info("body: %s hand's magazine lined up with the magwell: pose %s %s; fingers %s",
+                      side == kL ? "left" : "right", g.key.c_str(),
+                      g.have || g.pending ? (g.from_file ? "(saved)" : "(built in)") : "(none: hand on the controller)",
+                      anim ? (clip == reload_anim::kRifle ? "play the game's AR reload as it goes in"
+                                                          : "play the game's pistol reload as it goes in")
+                           : side == kR ? "held (the game's reload animation is for the left hand)"
+                           : clip < 0   ? (std::string("held: ") + NoClipWhy(grab.object)).c_str()
+                                        : "held (the game's reload animation is not read)");
+        }
         g_free_slide[side].on = false;
         // Not posed yet: the hand stays where the controller grabbed (the
         // pistol builds a pinch or overhand from the slide's shape first).
@@ -3486,7 +3749,11 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
     }
     hands::Pose obj;
     const bool recorded = g.have && rig.ok && ObjectFrame(grab, right_grab, &obj);
-    if (recorded && grab.holster_preview && !g.approach_ready) {
+    // The left hand's own reach for the holstered pistol (kPointHolster) is
+    // posed by the owner on the holstered pistol: shown as posed, not fitted
+    // like the right hand's gun grip (holster_pose::Fit is for that hold).
+    const bool own_reach = grab.holster_preview && grab.point == hands::kPointHolster;
+    if (recorded && grab.holster_preview && !own_reach && !g.approach_ready) {
         g.approach = holster_pose::Fit(g.rec, rig.chain, g.hand_rot, g.hand_pos, S.finger_radius);
         g.approach_ready = true;
     }
@@ -3496,8 +3763,22 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
     FVector hand_pos;
     double flat = 0.0;  // how flat an empty hand is pressed on a wall
     if (recorded) {
-        hand_rot = Normalized(obj.rotation * g.hand_rot);
-        hand_pos = obj.location + obj.rotation.Rotate(grab.holster_preview ? g.approach.hand_position : g.hand_pos);
+        FQuat in_rot = g.hand_rot;
+        FVector in_pos = g.hand_pos;
+        MagStageBlend& mb = g_mag_stage[side];
+        if (mb.on) {
+            const double t = (perf::NowMs() - mb.t0_ms) / kMagStageMs;
+            if (t >= 1.0 || t < 0.0 || mb.object != grab.object || !IsMagKind(grab.kind)) {
+                mb.on = false;
+            } else {
+                const double e = t * t * (3.0 - 2.0 * t);
+                in_pos = mb.pos + (g.hand_pos - mb.pos) * e;
+                in_rot = Normalized(mb.rot * Scale(Normalized(mb.rot.Inverse() * g.hand_rot), e));
+            }
+        }
+        hand_rot = Normalized(obj.rotation * in_rot);
+        hand_pos = obj.location +
+                   obj.rotation.Rotate(grab.holster_preview && !own_reach ? g.approach.hand_position : in_pos);
     } else {
         // Unposed slide hold: a controller carried along with the slide.
         hands::HandState hv = h;
@@ -3533,7 +3814,9 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
         FQuat free_rot;
         FVector free_pos;
         FreeHand(side, h, h.grip.location, &free_rot, &free_pos);
-        const double blend = std::clamp(grab.pose_blend, 0.0, 1.0);
+        // Not posed (the left hand's own reach, BP_HG_C.holster-left): the
+        // hand stays where the controller is.
+        const double blend = recorded ? std::clamp(grab.pose_blend, 0.0, 1.0) : 0.0;
         hand_pos = free_pos + (hand_pos - free_pos) * blend;
         hand_rot = Normalized(Scale(hand_rot * free_rot.Inverse(), blend) * free_rot);
     }
@@ -3744,6 +4027,15 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
         want[hand_pose::kPinky] = g.tip_angles[gr::kPinky];
         fingers::Angles idx = fingers::Blend(g.tip_angles[gr::kIndexOff], g.tip_angles[gr::kIndexRest], G.index_touch[side]);
         want[hand_pose::kIndex] = fingers::Blend(idx, g.tip_angles[gr::kIndexPull], G.index_pull[side]);
+        // The magazine going in: the game's own left-hand reload plays on
+        // top of the pose, by how far in it is (back out: backwards).
+        const int clip = grab.kind == hands::GrabKind::kMagInsert && side == kL ? InsertClip(grab.object) : -1;
+        if (clip >= 0 && reload_anim::Get(static_cast<reload_anim::Clip>(clip)).ready) {
+            reload_anim::Pose turn;
+            reload_anim::Delta(reload_anim::Get(static_cast<reload_anim::Clip>(clip)), grab.insert, &turn);
+            for (int f = 0; f < hand_pose::kFingerCount && f < reload_anim::kFingers; ++f)
+                for (int j = 0; j < 3; ++j) want[f].extra[j] = Normalized(want[f].extra[j] * turn.joint[f][j]);
+        }
     } else if (segment_contact) {
         perf::Scope contact_timer(g_perf_finger_contact);
         const hand_pose::Curl curl = hand_pose::Target(grab.kind, fin);
@@ -3883,7 +4175,7 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
             FingerBounds(rig, hand_pose::kThumb));
     }
     if (grab.holster_preview) {
-        if (recorded) {
+        if (recorded && grab.point != hands::kPointHolster) {
             for (int f = 0; f < hand_pose::kFingerCount; ++f) want[f] = g.approach.finger[f];
         }
         const hand_pose::Curl free_curl = hand_pose::Target(hands::GrabKind::kNone, hands::GetFingers(hs));
@@ -4163,6 +4455,32 @@ void OnTick(UObject player, float dt_f) {
     G.pose.SetAllLocal(G.frame_local.data(), static_cast<int>(G.frame_local.size()));
     G.pose.ClearChanged();
     ++G.frames;
+
+    // The game's left-hand reload animation, read once a few seconds into
+    // the level (reload_anim.h); magazine poses in the magwell built before
+    // it was read are built again.
+    if (S.mag_insert_anim && G.frames > 200 && k.fingers_ok[kL]) {
+        reload_anim::Bones bones;
+        auto fname = [](const FName& n) {
+            uint64_t v = 0;
+            std::memcpy(&v, &n, sizeof(v));
+            return v;
+        };
+        bones.hand = fname(G.engine.names[k.hand[kL]]);
+        for (int f = 0; f < hand_pose::kFingerCount && f < reload_anim::kFingers; ++f)
+            for (int j = 0; j < 3; ++j) bones.finger[f][j] = fname(G.engine.names[k.finger[kL][f][j]]);
+        unsigned clips = 1u << reload_anim::kPistol;
+        if (S.mag_insert_ar_clip >= 0) clips |= 1u << S.mag_insert_ar_clip;
+        reload_anim::Tick(player, G.anim_src ? G.anim_src : G.source, bones, clips);
+        static uint64_t seen = 0;
+        if (reload_anim::Generation() != seen) {
+            seen = reload_anim::Generation();
+            for (auto it = g_grip_cache.begin(); it != g_grip_cache.end();)
+                it = it->first.find(".mag-insert") != std::string::npos ? g_grip_cache.erase(it) : std::next(it);
+            for (int side = 0; side < 2; ++side)
+                if (G.grip[side].kind == hands::GrabKind::kMagInsert) G.grip[side].object = 0;  // reload next frame
+        }
+    }
 
     CollectSolves();
     const hands::HandState live[2] = {hands::Get(hands::kLeft), hands::Get(hands::kRight)};
@@ -4465,7 +4783,7 @@ void OnTick(UObject player, float dt_f) {
             G.posture_state[side] = {}; G.twist_state[side] = {};
         }
         G.arm_tracked[side] = true;
-        SolveArm(side, hs[side], grab[side], grab[kR], body_fwd, body_right, dt);
+        SolveArm(side, hs[side], grab[side], GunGrab(grab, grab[side]), body_fwd, body_right, dt);
     }
     g_perf_arms.Add(perf::NowMs() - t_arms);
 
@@ -4542,7 +4860,12 @@ bool GetForearm(int side, watch::Forearm* out) {
 }
 
 bool SlideMarks(uintptr_t gun, FVector* rear_sight, FVector* rear_end, FVector* front_end) {
-    const hands::HandGrab r = hands::GetGrab(hands::kRight);
+    // The hand that holds the gun by its grip (either hand can).
+    hands::HandGrab r = hands::GetGrab(hands::kRight);
+    const hands::HandGrab l = hands::GetGrab(hands::kLeft);
+    if (!(hands::HeldGrabKind(r) == hands::GrabKind::kGunGrip && r.object == gun) &&
+        hands::HeldGrabKind(l) == hands::GrabKind::kGunGrip && l.object == gun)
+        r = l;
     if (!gun) return false;
     // Measured a little each frame (see SlideShape); until then, false.
     static const double budget = config::GetFloat("slide_measure_ms_per_frame", 1.0f);

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -18,6 +19,7 @@
 #include "core/perf.h"
 #include "version.h"
 #include "vr/frame_capture.h"
+#include "vr/gpu_timer.h"
 #include "vr/square_watch.h"
 #include "vr/swapchain_hold.h"
 
@@ -1275,6 +1277,7 @@ perf::Counter g_perf_end{"  xrEndFrame"};
 // render thread reported from inside RunFrame and waited on itself.
 XrTime g_last_display_time = 0;
 std::atomic<long long> g_sent{0}, g_missed{0}, g_missed_runs{0};
+std::atomic<long long> g_sent_total{0}, g_missed_total{0};  // never reset (the GPU cost test)
 std::atomic<XrDuration> g_display_period{0};
 
 void CountDisplaySlot(const XrFrameState& fs) {
@@ -1284,11 +1287,13 @@ void CountDisplaySlot(const XrFrameState& fs) {
         long long slots = (fs.predictedDisplayTime - g_last_display_time + period / 2) / period;
         if (slots > 1 && slots < 1000) {
             g_missed += slots - 1;
+            g_missed_total += slots - 1;
             ++g_missed_runs;
         }
     }
     g_last_display_time = fs.predictedDisplayTime;
     ++g_sent;
+    ++g_sent_total;
 }
 
 std::string HeadsetReport(double span_s) {
@@ -1363,12 +1368,119 @@ void ReleaseEyeImages() {
         });
 }
 
+// ---- xrEndFrame on its own thread (xr_end_async, 2026-11-06) ----
+// In the 08:49 run's level, SteamVR's xrEndFrame blocked 1.4-5.3 ms a frame
+// (waiting on the GPU) on the game's Present thread, which queues nothing
+// for the GPU meanwhile, and the GPU sat idle about 1.5 ms every frame.
+// With this on, Present queues our copy, releases the images and hands the
+// frame to a thread of ours that calls xrEndFrame. The next frame's
+// xrWaitFrame/xrBeginFrame wait for that call to return first (OpenXR: a
+// frame is ended before the next one begins), as does the keep-alive.
+// xr_end_async: 0 off, 1 on, 2 (default) off until the GPU cost test has
+// measured it both ways in a level, then whichever was better.
+struct PendingEnd {
+    XrTime display_time = 0;
+    XrCompositionLayerProjection layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+    XrCompositionLayerProjectionView views[2] = {{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},
+                                                 {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
+    // Ours point at `layer`; the listeners' at storage of theirs that lives
+    // until their next AddLayers, which comes after this frame has ended.
+    std::vector<const XrCompositionLayerBaseHeader*> layers;
+    uint64_t frame = 0;       // g_frames
+    long long gpu_frame = 0;  // gpu_timer::Frame()
+    XrResult result = XR_SUCCESS;
+    bool result_unread = false;
+};
+// Written by the frame thread only while nothing is posted; read by the end
+// thread only while posted. g_end_mutex hands it over.
+PendingEnd g_end;
+std::mutex g_end_mutex;  // leaf lock
+std::condition_variable g_end_cv;
+bool g_end_posted = false;  // g_end waits for, or is in, xrEndFrame
+std::atomic<bool> g_end_thread_started{false};
+std::atomic<bool> g_async_end{false};
+std::atomic<int> g_async_setting{2};
+uint64_t g_async_end_failures = 0;  // under g_frame_mutex
+perf::Counter g_perf_end_async{"  xrEndFrame on its own thread"};
+perf::Counter g_perf_end_wait{"  waiting for the last frame's xrEndFrame"};
+
+void EndLoop() {
+    gpu_timer::MarkOwnThread();
+    std::unique_lock<std::mutex> lock(g_end_mutex);
+    for (;;) {
+        g_end_cv.wait(lock, [] { return g_end_posted; });
+        lock.unlock();
+        const double t0 = perf::NowMs();
+        XrFrameEndInfo ei{XR_TYPE_FRAME_END_INFO};
+        ei.displayTime = g_end.display_time;
+        ei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+        ei.layerCount = static_cast<uint32_t>(g_end.layers.size());
+        ei.layers = g_end.layers.data();
+        g_end.result = Proc<PFN_xrEndFrame>("xrEndFrame")(g_session, &ei);
+        g_end.result_unread = true;
+        g_perf_end_async.Add(perf::NowMs() - t0);
+        gpu_timer::AfterHandOff(g_end.gpu_frame);
+        MarkFrameDone();
+        lock.lock();
+        g_end_posted = false;
+        g_end_cv.notify_all();
+    }
+}
+
+// g_frame_mutex held. Waits until no frame is posted to the end thread.
+// `present_thread`: also reads the posted frame's result (the paired capture
+// is the Present thread's).
+void WaitPendingEnd(bool present_thread) {
+    std::unique_lock<std::mutex> lock(g_end_mutex);
+    if (g_end_posted) {
+        const double t0 = perf::NowMs();
+        g_end_cv.wait(lock, [] { return !g_end_posted; });
+        if (present_thread) g_perf_end_wait.Add(perf::NowMs() - t0);
+    } else if (present_thread && g_async_end.load()) {
+        g_perf_end_wait.Add(0.0);
+    }
+    if (!present_thread || !g_end.result_unread) return;
+    g_end.result_unread = false;
+    if (g_pair_capture && g_pair_capture->frame == g_end.frame) {
+        g_pair_capture->end_result = g_end.result;
+        g_pair_capture->end_known = true;
+    }
+    if (XR_FAILED(g_end.result) && g_async_end_failures++ == 0)
+        log::Warn("OpenXR: xrEndFrame on its own thread failed (%d); logged once", static_cast<int>(g_end.result));
+}
+
+// Frame thread, g_frame_mutex held, WaitPendingEnd already done this frame.
+// `projection`: our projection layer if `layers` holds it (copied, since it
+// lives on RunFrame's stack).
+void PostEnd(XrTime display_time, const std::vector<const XrCompositionLayerBaseHeader*>& layers,
+             const XrCompositionLayerProjection* projection) {
+    std::unique_lock<std::mutex> lock(g_end_mutex);
+    g_end_cv.wait(lock, [] { return !g_end_posted; });
+    g_end.display_time = display_time;
+    g_end.layers.clear();
+    for (const XrCompositionLayerBaseHeader* l : layers) {
+        if (projection && l == reinterpret_cast<const XrCompositionLayerBaseHeader*>(projection)) {
+            g_end.layer = *projection;
+            for (uint32_t i = 0; i < 2 && i < projection->viewCount; ++i) g_end.views[i] = projection->views[i];
+            g_end.layer.views = g_end.views;
+            g_end.layers.push_back(reinterpret_cast<const XrCompositionLayerBaseHeader*>(&g_end.layer));
+        } else {
+            g_end.layers.push_back(l);
+        }
+    }
+    g_end.frame = g_frames;
+    g_end.gpu_frame = gpu_timer::Frame();
+    g_end_posted = true;
+    g_end_cv.notify_all();
+}
+
 void RunFrame() {
     static bool registered = [] {
         perf::Register(&g_perf_game);
         perf::Register(&g_perf_wait);
         perf::Register(&g_perf_submit);
-        for (perf::Counter* c : {&g_perf_begin, &g_perf_locate, &g_perf_images, &g_perf_copy, &g_perf_layers, &g_perf_end})
+        for (perf::Counter* c : {&g_perf_begin, &g_perf_locate, &g_perf_images, &g_perf_copy, &g_perf_layers,
+                                 &g_perf_end, &g_perf_end_async, &g_perf_end_wait})
             perf::Register(c);
         perf::AddReportLine(&HeadsetReport);
         perf::AddReportLine(&PairReport);
@@ -1447,6 +1559,7 @@ void RunFrame() {
         // Only images that now hold this frame's pictures are released. Any
         // other held image stays with us for the next frame.
         if (ok) ReleaseEyeImages();
+        if (ok) gpu_timer::AfterCopy();
         if (!ok && g_have_last_layer) {
             // Show the last picture again (as a missed frame would) rather
             // than send no picture. The swapchains' last released images are
@@ -1501,12 +1614,17 @@ void RunFrame() {
     if (fs.shouldRender)
         for (Listener* l : Listeners()) l->AddLayers(g_session, g_space, fs.predictedDisplayTime, layers);
     step(g_perf_layers);
+    if (g_async_end.load() && g_end_thread_started.load()) {
+        PostEnd(fs.predictedDisplayTime, layers, &layer);
+        return;
+    }
     XrFrameEndInfo ei{XR_TYPE_FRAME_END_INFO};
     ei.displayTime = fs.predictedDisplayTime;
     ei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
     ei.layerCount = static_cast<uint32_t>(layers.size());
     ei.layers = layers.data();
     const XrResult end_result = Proc<PFN_xrEndFrame>("xrEndFrame")(g_session, &ei);
+    gpu_timer::AfterHandOff(gpu_timer::Frame());
     if (g_pair_capture && g_pair_capture->frame == g_frames) {
         g_pair_capture->end_result = end_result;
         g_pair_capture->end_known = true;
@@ -1554,6 +1672,7 @@ void KeepAliveLoop() {
         if (!g_running || !last) continue;
         if (MsSince(last) < config::GetFloat("keep_alive_after_ms", 250.0f)) continue;
         std::lock_guard<std::mutex> lock(g_frame_mutex);
+        WaitPendingEnd(false);
         // Re-check under the lock: the game may have submitted meanwhile.
         if (!g_running || MsSince(g_last_frame_qpc.load()) < config::GetFloat("keep_alive_after_ms", 250.0f))
             continue;
@@ -1654,8 +1773,26 @@ void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* back_buffer) {
     if (!g_qpc_freq.QuadPart) QueryPerformanceFrequency(&g_qpc_freq);
     if (!g_keepalive_started.exchange(true) && config::GetBool("keep_alive", true))
         std::thread(KeepAliveLoop).detach();
+    static bool s_end_setup = false;  // Present thread
+    if (!s_end_setup) {
+        s_end_setup = true;
+        const int setting = std::clamp(config::GetInt("xr_end_async", 2), 0, 2);
+        g_async_setting = setting;
+        if (setting) {
+            g_end_thread_started = true;
+            std::thread(EndLoop).detach();
+            if (setting == 1) SetAsyncEnd(true, "xr_end_async=1");
+            else if (config::GetBool("gpu_cost_test", true))
+                log::Info("OpenXR: xrEndFrame stays on the Present thread until the GPU cost test has measured it "
+                          "on its own thread (xr_end_async=2; 1 = always, 0 = never)");
+            else
+                log::Info("OpenXR: xrEndFrame stays on the Present thread (xr_end_async=2 waits for the GPU cost "
+                          "test, which is off; xr_end_async=1 puts it on its own thread)");
+        }
+    }
     {
         std::lock_guard<std::mutex> lock(g_frame_mutex);
+        WaitPendingEnd(true);
         PollEvents();
         if (g_running) RunFrame();
     }
@@ -1664,6 +1801,21 @@ void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* back_buffer) {
 }
 
 void SetEyeTexture(ID3D12Resource* texture) { g_eye_texture = texture; }
+
+int AsyncEndSetting() { return g_end_thread_started.load() ? g_async_setting.load() : -1; }
+
+void SetAsyncEnd(bool on, const char* why) {
+    if (on && !g_end_thread_started.load()) return;
+    if (g_async_end.exchange(on) == on) return;
+    log::Info("OpenXR: xrEndFrame now %s (%s)", on ? "on its own thread" : "on the Present thread", why);
+}
+
+bool AsyncEndOn() { return g_async_end.load(); }
+
+void HeadsetFrameTotals(long long* sent, long long* missed) {
+    *sent = g_sent_total.load();
+    *missed = g_missed_total.load();
+}
 
 XrDuration PredictAhead() { return g_ahead_ns.load(); }
 
@@ -1733,7 +1885,7 @@ bool RequestPairedCapture(const char* tag) {
     // Default matches the ini block: config appends a missing block to the
     // file but reads it only from the next launch, so the first launch after
     // an update runs on this default.
-    if (!config::GetBool("paired_capture_enabled", true)) return false;
+    if (!config::GetBool("paired_capture_enabled", false)) return false;
     std::lock_guard<std::mutex> lock(g_pair_capture_mutex);
     if (g_pair_capture_busy.load()) return false;
     const unsigned limit = static_cast<unsigned>(std::clamp(config::GetInt("paired_capture_limit", 3), 1, 8));
