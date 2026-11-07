@@ -76,6 +76,18 @@ Record Mirror(const Record& r);
 // (a rifle's ".charging-left" / ".charging-right" are both usual names).
 std::string SideKey(const std::string& base, bool right_hand, bool usual_hand);
 std::string UsualKey(const std::string& key);
+// The off hand on the pistol in the other hand (body: kSupportGrip at
+// hands::kPointOffhand / kPointOffhandChest): "<class>.offhand" or
+// "<class>.offhand-chest" (UsualKey of the hand's own key).
+bool OffhandKey(const std::string& usual_key);
+// Poses to use for an off-hand key ("<class>.offhand-chest-left") not posed
+// yet, best first: this hand's other pose, then the other hand's same pose
+// and other pose (other_hand: mirrored onto this hand).
+struct Fallback {
+    std::string key;
+    bool other_hand = false;
+};
+std::vector<Fallback> OffhandFallbacks(const std::string& key);
 
 // The hand's anatomy in hand-bone space.
 struct HandGeo {

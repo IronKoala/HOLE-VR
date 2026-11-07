@@ -52,7 +52,8 @@ whatever the laser is on). A step writes the ini key(s) into `hole-vr.ini` in pl
 | Rifle stock | On, Off | `rifle_virtual_stock` |
 | Gun stops at walls | On, Off | `gun_wall_collision` |
 | Hands stop at walls | On, Off | `hand_wall_collision` |
-| Pistol kick, one hand | Off, Light, Normal, Strong, Stronger, Heavy, Heavier, Brutal, Extreme (default Stronger) | `gun_kick_pistol_one_hand` (0, 0.5, 1, 1.5, 2.4, 3.3, 4.2, 5.1, 6: Extreme is 4x Strong) |
+| Gun kick (every other gun: shotgun, sniper rifle) | Off, Light, Normal, Strong, Stronger, Heavy, Heavier, Brutal, Extreme (default Normal) | `gun_recoil_kick` (0, 0.5, 1, 1.5, 2.4, 3.3, 4.2, 5.1, 6: Extreme is 4x Strong) |
+| Pistol kick, one hand | the same (default Stronger) | `gun_kick_pistol_one_hand` |
 | Pistol kick, two hands | the same (default Normal) | `gun_kick_pistol_two_hands` |
 | Rifle kick, one hand | the same (default Heavy) | `gun_kick_rifle_one_hand` |
 | Rifle kick, two hands | the same (default Strong) | `gun_kick_rifle_two_hands` |
@@ -123,9 +124,11 @@ mostly settled again within 0.2 s (the same timing as every level).
 **Kick by gun and grip** (owner, later on 2026-11-07: "when the AR is being
 one handed i want the recoil at heavy, when its two handed set to strong.
 when the pistol is being one handed, stronger, when the gun is two handed,
-normal"). Gun kick is four rows with the same nine strengths, those four as
-defaults; `gun_recoil_kick` is no longer read. The strength is chosen once
-a shot. The rifle is two-handed while the other hand holds its front (the
+normal"). Four rows with the same nine strengths, those four as defaults.
+Gun kick stays for every other gun (owner: "i never told you to remove them
+in the first place, we still have two more guns to test"): the shotgun
+(`BP_SG`) and sniper rifle (`BP_SR`); the rifle rows are for `BP_AR` only.
+The strength is chosen once a shot. The rifle is two-handed while the other hand holds its front (the
 support grip; on the shoulder or not). The pistol has no support grip yet,
 so it counts as two-handed while the other controller is "basically
 touching" the gun hand's: grip centres under `pistol_both_hands_cm` (13)

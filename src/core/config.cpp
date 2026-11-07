@@ -362,7 +362,10 @@ const Block kBlocks[] = {
      "; Strength of the gun's kick in your hand when it fires, by gun and grip\n"
      "; (0 = off, 1 = normal, 1.5 strong, 6 = 4x strong). The pistol counts as in\n"
      "; both hands while the other controller is within pistol_both_hands_cm of\n"
-     "; the gun hand's; the rifle while the other hand holds its front.\n"
+     "; the gun hand's (with offhand_snap=1: while the off hand is drawn on it); the\n"
+     "; rifle while the other hand holds its front. Every other gun (shotgun,\n"
+     "; sniper rifle) uses gun_recoil_kick.\n"
+     "gun_recoil_kick=1\n"
      "gun_kick_pistol_one_hand=2.4\n"
      "gun_kick_pistol_two_hands=1\n"
      "gun_kick_rifle_one_hand=3.3\n"
@@ -499,6 +502,19 @@ const Block kBlocks[] = {
      "; (B or Y); the other hand racks, reloads, holds the handguard and works the light.\n"
      "; 0 = the right hand always holds the gun and the left hand takes the magazines.\n"
      "either_hand_guns=1\n"},
+    {"offhand_snap",
+     "\n"
+     "; --- The off hand on the pistol ---\n"
+     "; 1 = when the off hand's controller nearly touches the gun hand's controller, the\n"
+     "; off hand is drawn holding the pistol too (the way a hand snaps onto the pistol\n"
+     "; in its holster). It has two poses, set in the grip editor: one with the gun\n"
+     "; near the chest, one for the rest of the time. The pistol then counts as held\n"
+     "; in two hands (its kick: gun_kick_pistol_two_hands).\n"
+     "; How close the two controllers come for it: pistol_both_hands_cm (it lets go\n"
+     "; 4 cm further out). offhand_chest_cm: the gun this close to the chest takes the\n"
+     "; chest pose.\n"
+     "offhand_snap=1\n"
+     "offhand_chest_cm=35\n"},
     {"rifle_charging_handle_grab_cm",
      "\n"
      "; --- The rifle's charging handle ---\n"

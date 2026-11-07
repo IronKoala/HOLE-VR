@@ -226,4 +226,23 @@ std::string UsualKey(const std::string& key) {
     return key;
 }
 
+bool OffhandKey(const std::string& usual_key) {
+    auto ends = [&](const std::string& tail) {
+        return usual_key.size() > tail.size() &&
+               usual_key.compare(usual_key.size() - tail.size(), tail.size(), tail) == 0;
+    };
+    return ends(".offhand") || ends(".offhand-chest");
+}
+
+std::vector<Fallback> OffhandFallbacks(const std::string& key) {
+    const std::string usual = UsualKey(key);
+    if (usual == key || !OffhandKey(usual)) return {};
+    const bool left = key.compare(usual.size(), std::string::npos, "-left") == 0;
+    const std::string chest_tail = "-chest";
+    const bool chest = usual.compare(usual.size() - chest_tail.size(), chest_tail.size(), chest_tail) == 0;
+    const std::string other_pose = chest ? usual.substr(0, usual.size() - chest_tail.size()) : usual + chest_tail;
+    const std::string mine = left ? "-left" : "-right", theirs = left ? "-right" : "-left";
+    return {{other_pose + mine, false}, {usual + theirs, true}, {other_pose + theirs, true}};
+}
+
 }  // namespace holevr::vr::grip_record

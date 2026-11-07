@@ -42,6 +42,7 @@
 #include "vr/interact/holster_audio.h"
 #include "vr/interact/holster_model.h"
 #include "vr/interact/magwell_zone.h"
+#include "vr/interact/offhand_snap.h"
 #include "vr/interact/rifle_carry.h"
 #include "vr/interact/slide.h"
 #include "vr/interact/touch.h"
@@ -143,7 +144,10 @@ struct Settings {
     bool wall_collision = true;    // keep the gun out of walls
     // In-hand recoil kick strength by gun and grip (VR tab; owner 2026-11-07:
     // rifle one hand Heavy, two hands Strong; pistol one hand Stronger, two
-    // hands Normal). 1 = Normal, 0 = off.
+    // hands Normal). 1 = Normal, 0 = off. Every other gun (shotgun, sniper
+    // rifle) keeps the one Gun kick (owner, same day: "we still have two
+    // more guns to test").
+    double recoil_kick = 1.0;
     double kick_pistol_one = 2.4, kick_pistol_two = 1.0;
     double kick_rifle_one = 3.3, kick_rifle_two = 1.5;
     double pistol_both_hands_cm = 13.0;  // other controller this near the gun hand's: both hands
@@ -187,6 +191,12 @@ struct Settings {
     // Either free hand draws a gun (and holds and fires it) or takes a
     // magazine; false: the right hand holds the gun, the left takes magazines.
     bool either_hand = true;
+    // The off hand snaps onto the pistol (vr/interact/offhand_snap.h) when
+    // its controller comes within pistol_both_hands_cm of the gun hand's;
+    // lets go 4 cm further out. The chest pose while the gun is within
+    // offhand_chest of the chest (5 cm hysteresis).
+    bool offhand_snap = true;
+    double offhand_chest_cm = 35.0;
     double handle_grab_radius = 9.0;      // either hand grabs the AR charging handle this close to its rear end, cm
     // Magazines (owner 2026-11-06: the AR's 10 round magazine snapped "way to
     // early"; "make custom sized detection zones for all mags"; 2026-11-07:
@@ -231,6 +241,7 @@ void LoadSettings() {
     g_set.gun_yaw = config::GetFloat("gun_yaw_offset", 0.f);
     g_set.gun_roll = config::GetFloat("gun_roll_offset", 0.f);
     g_set.wall_collision = config::GetBool("gun_wall_collision", true);
+    g_set.recoil_kick = config::GetFloat("gun_recoil_kick", 1.f);
     g_set.kick_pistol_one = config::GetFloat("gun_kick_pistol_one_hand", 2.4f);
     g_set.kick_pistol_two = config::GetFloat("gun_kick_pistol_two_hands", 1.f);
     g_set.kick_rifle_one = config::GetFloat("gun_kick_rifle_one_hand", 3.3f);
@@ -284,6 +295,8 @@ void LoadSettings() {
     g_set.grip_point_inset = std::clamp(config::GetFloat("rifle_grip_point_inset_cm", 4.5f), 0.f, 10.f);
     g_set.rifle_right_let_go = config::GetBool("rifle_right_let_go", true);
     g_set.either_hand = config::GetBool("either_hand_guns", true);
+    g_set.offhand_snap = config::GetBool("offhand_snap", true);
+    g_set.offhand_chest_cm = std::clamp(config::GetFloat("offhand_chest_cm", 35.f), 5.f, 100.f);
     g_set.handle_grab_radius = std::clamp(config::GetFloat("rifle_charging_handle_grab_cm", 9.f), 3.f, 15.f);
     // New keys (2026-11-07): ini files keep mag_snap_slack_cm and
     // mag_seat_finish_cm as they were given, and those meant the old zone.
@@ -716,6 +729,7 @@ struct WeaponState {
     // of the upper receiver, a bolt catch on the left, a vertical magwell
     // and a handguard for the support hand.
     bool is_pistol = true;
+    bool is_ar = false;           // BP_AR_*: its own kick rows (the shotgun and sniper rifle use Gun kick)
     double muzzle_dist = 18.0;    // grip to muzzle along the bore, cm
     FVector slide_axis{-1, 0, 0}; // bolt/slide pull direction in its parent's space
     bool two_hand = false;        // support hand on the handguard
@@ -1275,10 +1289,15 @@ FQuat OneHandFrame(const hands::HandState& h, int hand) {
            ToQuat(FRotator{kBasePitch + g_set.gun_pitch, side * (kBaseYaw + g_set.gun_yaw), side * g_set.gun_roll});
 }
 
+bool OffhandOnPistol();  // below, with the off hand's snap
+
 // The pistol counts as held in both hands while the other controller is
 // "basically touching" the gun hand's (owner 2026-11-07) and that hand holds
-// nothing: grip centres closer than pistol_both_hands_cm.
+// nothing: grip centres closer than pistol_both_hands_cm. With offhand_snap
+// on, exactly while the off hand is drawn on the pistol (the same distance,
+// letting go 4 cm further out), so the kick matches what you see.
 bool PistolInBothHands(const hands::HandState& gun_hand, const hands::HandState& other) {
+    if (g_set.offhand_snap) return OffhandOnPistol();
     if (!gun_hand.valid || !other.valid || HandHoldsMag(OtherHand())) return false;
     const hands::Hand oh = HandOf(OtherHand());
     if (hands::GetInteraction(oh).owner != hands::GripOwner::kNone) return false;
@@ -1289,15 +1308,15 @@ bool PistolInBothHands(const hands::HandState& gun_hand, const hands::HandState&
 // The first shots, and every change of gun or grip after, log the strength
 // they kicked with (and how far apart the hands were, to tune the pistol's
 // both-hands distance).
-void LogKickLevel(bool pistol, bool both, double level, double apart_cm) {
-    static int shots = 0, last = -1;
-    const int kind = (pistol ? 2 : 0) + (both ? 1 : 0);
+void LogKickLevel(const char* gun, bool both, double level, double apart_cm) {
+    static int shots = 0;
+    static std::string last;
+    const std::string kind = std::string(gun) + (both ? "2" : "1");
     if (++shots > 3 && kind == last) return;
     last = kind;
     char apart[48] = "the other hand not tracked";
     if (apart_cm >= 0) std::snprintf(apart, sizeof(apart), "hands %.0f cm apart", apart_cm);
-    log::Info("controls: gun kick %.1f (%s, %s; %s)", level, pistol ? "pistol" : "rifle",
-              both ? "both hands" : "one hand", apart);
+    log::Info("controls: gun kick %.1f (%s, %s; %s)", level, gun, both ? "both hands" : "one hand", apart);
 }
 
 void HoldGun(game::Gun& gun, const hands::HandState& rh) {
@@ -1393,8 +1412,10 @@ void HoldGun(game::Gun& gun, const hands::HandState& rh) {
             const double apart = lh2.valid ? Len(lh2.grip.location - rh.grip.location) : -1.0;
             const bool both = W.is_pistol ? PistolInBothHands(rh, lh2) : two;
             W.kick_level = W.is_pistol ? (both ? g_set.kick_pistol_two : g_set.kick_pistol_one)
-                                       : (both ? g_set.kick_rifle_two : g_set.kick_rifle_one);
-            LogKickLevel(W.is_pistol, both, W.kick_level, apart);
+                           : W.is_ar   ? (both ? g_set.kick_rifle_two : g_set.kick_rifle_one)
+                                       : g_set.recoil_kick;
+            LogKickLevel(W.is_pistol ? "pistol" : W.is_ar ? "rifle" : "other gun (Gun kick)", both, W.kick_level,
+                         apart);
         }
         double t = g_clock - W.kick_t0;
         if (t > 0.4) W.kick_t0 = -1;
@@ -4328,6 +4349,14 @@ interact::HolsterVisual g_holster_visual;
 interact::HolsterFeedback g_holster_feedback;
 hands::HandGrab g_holster_reach;
 int g_holster_reach_hand = input::kRight;   // the hand the holster's hand snap is for
+// The off hand drawn holding the pistol in the other hand (offhand_snap,
+// UpdateOffhandSnap): published on OtherHand() when it holds nothing.
+interact::OffhandSnap g_offhand;
+hands::HandGrab g_offhand_reach;
+
+// The off hand is drawn on the pistol: it is held in both hands
+// (PistolInBothHands, for its kick).
+bool OffhandOnPistol() { return g_offhand.TwoHands(); }
 UObject g_holster_owner = 0;
 void UpdateHolsterVisual(UObject player, const hands::HandState hs[2]);
 void DrawHolsterModel(UObject player);
@@ -4421,6 +4450,9 @@ void PublishGrabs(game::Gun& gun, const hands::HandState hs[2]) {
     // grab, including a gun-hand charging handle, wins.
     const int sh = g_holster_reach_hand;
     if (g[sh].kind == hands::GrabKind::kNone && hs[sh].valid && !ControlsHoldsGrip(sh)) g[sh] = g_holster_reach;
+    // The off hand snapped onto the pistol in the gun hand (offhand_snap).
+    if (g_offhand_reach.object && g[oh].kind == hands::GrabKind::kNone && lh.valid && !ControlsHoldsGrip(oh))
+        g[oh] = g_offhand_reach;
     std::lock_guard<std::mutex> lock(g_hands_mutex);
     g_grab[0] = g[0];
     g_grab[1] = g[1];
@@ -6430,6 +6462,83 @@ void UpdateHolsterVisual(UObject player, const hands::HandState hs[2]) {
     }
 }
 
+// The off hand on the pistol (owner 2026-11-07): when the off hand's
+// controller nearly touches the gun hand's, the off hand is drawn holding the
+// pistol too, the way a hand snaps onto the pistol in its holster. Two poses,
+// both posed by the owner in the grip editor: the gun near the chest, and
+// the rest of the time (BP_HG_C.offhand-chest-left / BP_HG_C.offhand-left).
+// Presentation only: the controller and the gun are not moved, and any real
+// grab (slide, magazine, light) takes the hand. While it is on the pistol
+// counts as held in two hands (PistolHeldInTwoHands).
+void UpdateOffhandSnap(game::Gun& gun, const hands::HandState hs[2]) {
+    g_offhand_reach = {};
+    const int G = GunHand(), O = OtherHand();
+    const hands::HandState& gh = hs[G];
+    const hands::HandState& oh = hs[O];
+    const bool pistol = gun.Valid() && gun.Object() == W.gun && W.is_pistol && W.in_hand && W.have_pose;
+    const bool free = oh.valid && !ControlsHoldsGrip(O) && !workbench::HoldsGrip(O) && !drinks::HoldsGrip(O) &&
+                      hands::GetInteraction(HandOf(O)).AllowsControls();
+    interact::OffhandSnapInput in;
+    in.allowed = g_set.offhand_snap && pistol && gh.valid && free && !ui_panel::MenuOpen() &&
+                 hands::EditorHand() < 0 && !body::CalibrationActive() && !W.edit_frozen;
+    in.hands_apart = gh.valid && oh.valid ? Len(oh.grip.location - gh.grip.location) : 1e9;
+    in.gun_to_chest =
+        g_hw.valid ? Len(W.grip_world - g_hw.anchor[static_cast<int>(interact::HolsterAnchor::kChest)].location) : 1e9;
+    // One distance for the snap and for the pistol's two-hand kick.
+    in.snap_cm = g_set.pistol_both_hands_cm;
+    in.release_cm = g_set.pistol_both_hands_cm + 4.0;
+    in.chest_cm = g_set.offhand_chest_cm;
+    in.chest_release_cm = g_set.offhand_chest_cm + 5.0;
+    in.dt = g_dt;
+    const bool was_near = g_offhand.Near(), was_chest = g_offhand.Chest();
+    g_offhand.Update(in);
+    // The log says how close the controllers came, so the distance can be
+    // set from a run (pistol_both_hands_cm).
+    static double since = 0, closest = 1e9, told_closest_at = -1e9;
+    if (g_offhand.Near() != was_near) {
+        if (g_offhand.Near()) {
+            since = g_clock;
+            log::Info("controls: %s hand on the pistol (controllers %.1f cm apart, snaps within %.0f); gun %.0f cm "
+                      "from the chest: %s pose",
+                      HandName(O), in.hands_apart, in.snap_cm, in.gun_to_chest < 1e8 ? in.gun_to_chest : -1.0,
+                      g_offhand.Chest() ? "chest" : "held-out");
+        } else {
+            log::Info("controls: %s hand off the pistol after %.1f s (controllers %.1f cm apart%s)", HandName(O),
+                      g_clock - since, in.hands_apart < 1e8 ? in.hands_apart : -1.0,
+                      in.allowed ? "" : "; the hand took something, a menu or the editor opened, or tracking was lost");
+        }
+    } else if (g_offhand.Near() && g_offhand.Chest() != was_chest) {
+        log::Info("controls: %s hand on the pistol: %s pose (gun %.0f cm from the chest, changes at %.0f)", HandName(O),
+                  g_offhand.Chest() ? "chest" : "held-out", in.gun_to_chest, in.chest_cm);
+    }
+    if (in.allowed && !g_offhand.Near() && in.hands_apart < 25.0) {
+        closest = std::fmin(closest, in.hands_apart);
+    } else if (closest < 1e8) {
+        // Came near without snapping: worth knowing if the snap distance is
+        // too small for these controllers (at most every 10 s).
+        if (!g_offhand.Near() && g_clock - told_closest_at > 10.0) {
+            told_closest_at = g_clock;
+            log::Info("controls: %s controller came within %.1f cm of the gun hand's without snapping (snaps within "
+                      "%.0f, pistol_both_hands_cm)",
+                      HandName(O), closest, in.snap_cm);
+        }
+        closest = 1e9;
+    }
+    if (!in.allowed || g_offhand.Blend() <= 0 || !W.gun) return;
+    g_offhand_reach.kind = hands::GrabKind::kSupportGrip;
+    g_offhand_reach.object = W.gun;
+    // The gun frame at its grip point: the pose is stored relative to it.
+    g_offhand_reach.target = {W.grip_world, W.frame_rot};
+    g_offhand_reach.point = g_offhand.Chest() ? hands::kPointOffhandChest : hands::kPointOffhand;
+    g_offhand_reach.holster_preview = true;
+    g_offhand_reach.pose_blend = g_offhand.Blend();
+}
+
+void ClearOffhandSnap() {
+    g_offhand.Reset();
+    g_offhand_reach = {};
+}
+
 // Named parts of the holster work, so the 10 s perf report says which part
 // costs time (tick 3 alone was 8 ms a frame on 2026-11-06).
 perf::Counter g_perf_holster_place{"holsters: guns and pouch placed"};
@@ -6482,6 +6591,7 @@ void OnTick(UObject player, float dt) {
         if (body::CalibrationActive()) body::SetCalibrationTriggers(false, false, false);
         InvalidateHands();
         ClearHolsterVisual();
+        ClearOffhandSnap();
         ResolveHandOwnership(false);
         ReleaseTrigger(player);
         ReleaseModalActions(player, "tracking unavailable");
@@ -6492,6 +6602,7 @@ void OnTick(UObject player, float dt) {
     UpdateHands(s);
     if (body::CalibrationActive()) {
         ClearHolsterVisual();
+        ClearOffhandSnap();
         // Keep raw tracked poses available to calibration, but give this pose
         // sequence exclusive input ownership. It must not sprint, shoot, grab,
         // crouch or turn the tracking frame while collecting measurements.
@@ -6574,6 +6685,7 @@ void OnTick(UObject player, float dt) {
         W.gun = gun.Object();
         if (gun.Valid()) {
             W.is_pistol = gun.ClassName().find("HG") != std::string::npos;
+            W.is_ar = gun.ClassName().find("BP_AR") != std::string::npos;
             W.uses_holster = W.is_pistol && g_set.holster_pistol && g_spots[kPistolSpot].enabled;
             W.holster.Configure(g_spots[kPistolSpot].radius,
                                 g_set.holster_toggle ? interact::DrawMode::kToggle : interact::DrawMode::kHold);
@@ -6595,6 +6707,7 @@ void OnTick(UObject player, float dt) {
     if (!gun.Valid()) {
         g_late_ok = false;
         ClearHolsterVisual();
+        ClearOffhandSnap();
         const hands::HandState none[2];
         PublishGrabs(gun, none);
         return;
@@ -6761,6 +6874,7 @@ void OnTick(UObject player, float dt) {
         perf::Scope t(g_perf_holster_visual);
         UpdateHolsterVisual(player, hs);
     }
+    UpdateOffhandSnap(gun, hs);
     PublishGrabs(gun, hs);
     RackTrace(gun, dt);
 }

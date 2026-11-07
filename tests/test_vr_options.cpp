@@ -197,12 +197,13 @@ static void TestCurrent() {
     EXPECT(RowText(*snap_step, 1) == "Turn speed: 30 deg a flick");
     // Gun kick by gun and grip, each with nine strengths, the last 4x
     // Strong; defaults as the owner set them (2026-11-07).
-    EXPECT(!Find("Gun kick"));
+    // Gun kick stays, for the other guns (shotgun, sniper rifle).
     const struct {
         const char* row;
         const char* key;
         const char* def;
-    } kicks[] = {{"Pistol kick, one hand", "gun_kick_pistol_one_hand", "Stronger"},
+    } kicks[] = {{"Gun kick", "gun_recoil_kick", "Normal"},
+                 {"Pistol kick, one hand", "gun_kick_pistol_one_hand", "Stronger"},
                  {"Pistol kick, two hands", "gun_kick_pistol_two_hands", "Normal"},
                  {"Rifle kick, one hand", "gun_kick_rifle_one_hand", "Heavy"},
                  {"Rifle kick, two hands", "gun_kick_rifle_two_hands", "Strong"}};
