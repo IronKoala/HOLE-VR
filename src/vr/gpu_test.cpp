@@ -1,6 +1,7 @@
 #include "vr/gpu_test.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -104,6 +105,17 @@ void Summary() {
         line += b;
     }
     log::Info("%s", line.c_str());
+    // GPU frame = fixed part + per-pixel part x (resolution share)^2, from
+    // each resolution point against the full-resolution windows.
+    for (const Suspect& s : g_suspects) {
+        if (!s.cvar || std::string(s.cvar) != "r.ScreenPercentage" || s.base_n == 0 || s.test_n == 0) continue;
+        const double f = std::atof(s.test) / 100.0;
+        const double base = s.base_ms / s.base_n;
+        const double pixel = s.saved / (1.0 - f * f);
+        log::Info("GPU cost test: from the %s point, about %.1f ms of the %.1f ms GPU frame follows the number of "
+                  "pixels and %.1f ms does not",
+                  s.what, pixel, base, base - pixel);
+    }
 }
 
 void FinishSuspect(UObject player) {
@@ -269,7 +281,13 @@ void Init() {
     Add("Lumen lighting of see-through things", "r.Lumen.TranslucencyVolume.Enable", "0");
     Add("Lumen short-range AO", "r.Lumen.ScreenProbeGather.ShortRangeAO", "0");
     Add("shadow quality high instead of epic", "sg.ShadowQuality", "2");
+    // 2026-11-07: 75% resolution saved only 2.3 of ~14 ms, so most of the
+    // frame does not follow the pixel count. A second resolution point splits
+    // the frame into its per-pixel and fixed parts (summary line), and all
+    // shadows off for a moment shows how much of the fixed part is shadows.
+    Add("all shadows off", "r.ShadowQuality", "0");
     Add("75% resolution", "r.ScreenPercentage", "75", true);
+    Add("50% resolution", "r.ScreenPercentage", "50", true);
     game::AddTickListener(&OnTick);
     log::Info("GPU cost test: ready; runs once, %.0f s into the first run level (not the home base), if the GPU "
               "timer is on",
