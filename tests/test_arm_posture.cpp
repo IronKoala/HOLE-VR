@@ -339,6 +339,68 @@ static void RifleAimKeepsElbowsDown() {
     }
 }
 
+// Arm samples logged in the owner's 2026-11-07 09:21 run (body yaw frame,
+// cm, shoulder at the origin; hand frames fitted from the logged wrist bends).
+struct Logged { int side, grab; double upper, forearm; FVector head, wrist; FQuat hand; FVector e1, e2, e3; };
+static Input FromLog(const Logged& l) {
+    Input in;
+    const double sign=l.side==0?-1:1;
+    in.shoulder={0,0,0}; in.wrist=l.wrist;
+    in.outward={0,sign,0}; in.forward={1,0,0}; in.down={0,0,-1};
+    in.upper_cm=l.upper; in.forearm_cm=l.forearm; in.dt=1.0/72;
+    in.reference=arm_pose::MeasureReference(At(in.shoulder),At(in.outward*l.upper),
+        At(in.outward*(l.upper+l.forearm)),in.down);
+    in.hand_rotation=l.hand;
+    in.forearm_axis_hand=l.e1; in.palm_axis_hand=l.e2;
+    in.radial_axis_hand=l.side==1?l.e3*-1.0:l.e3;
+    in.torso_center_valid=true; in.torso_center=l.head;
+    in.wrist_relief=true; in.gun_hold=true;
+    return in;
+}
+static void LoggedRifleAimElbowHangs() {
+    const FVector re1{-.99902,-.04063,-.01727},re2{-.04216,.99406,.10035},re3{.01309,.10098,-.99480};
+    const FVector le1{.99902,.04067,.01728},le2{.04220,-.99406,-.10030},le3{.01310,.10093,-.99481};
+    // Rifle shouldered: the trigger hand 13-16 cm ahead of the shoulder. The
+    // 872c72a solver put this elbow out at shoulder height, ahead of the hand.
+    const Logged trigger[]={
+        {1,1,33.11,29.44,{13.23,-11.22,18.44},{15.96,-5.04,1.75},{-.0372,-.1618,.9683,.1864},re1,re2,re3},
+        {1,1,33.11,29.44,{13.23,-11.22,18.44},{12.34,2.72,-2.34},{-.0421,-.1704,.9812,.0806},re1,re2,re3}};
+    for(const Logged& l:trigger) {
+        const Input in=FromLog(l);
+        Input before=in; before.gun_hold=false;
+        const auto r=Settled(in), old=Settled(before);
+        Geometry(in,r);
+        EXPECT(Up(in,r)<-.25*in.upper_cm);
+        EXPECT(Dot(r.solved.mid-in.wrist,in.forward)<5);
+        EXPECT(r.elbow_over_cm<1e-9);
+        std::printf("logged shouldered rifle: elbow %.1f cm below the shoulder, %.1f out, %.1f ahead of the hand "
+                    "(holding nothing: %.1f below, %.1f out, %.1f ahead)\n",-Up(in,r),Dot(r.solved.mid,in.outward),
+                    Dot(r.solved.mid-in.wrist,in.forward),-Up(before,old),Dot(old.solved.mid,in.outward),
+                    Dot(old.solved.mid-in.wrist,in.forward));
+    }
+    {   // Without a gun the same hand may still take the shoulder-height elbow.
+        const Input in=FromLog(trigger[0]); Input free=in; free.gun_hold=false;
+        EXPECT(Up(free,Settled(free))>-.15*in.upper_cm);
+    }
+    // Support hand on the handguard, arm nearly straight: no elbow can reach
+    // the hanging height, so the limit starts just above the lowest one.
+    const Logged support{0,6,38.62,20.82,{10.41,14.58,19.86},{54.36,10.85,-.71},{.6640,.2503,-.3535,-.6095},le1,le2,le3};
+    const Input in=FromLog(support);
+    const auto r=Settled(in);
+    Geometry(in,r);
+    EXPECT(r.elbow_over_cm<1e-9 && Up(in,r)<0);
+    double lowest=1e9;
+    for(int i=0;i<360;++i) {
+        const double a=i*kPi/180;
+        const FVector axis=Normalize(in.wrist-in.shoulder), zero=Normalize(Reject(in.outward,axis));
+        const auto t=SolveTwoBone(in.shoulder,in.wrist,in.upper_cm,in.forearm_cm,zero*std::cos(a)+Cross(axis,zero)*std::sin(a));
+        lowest=std::min(lowest,Dot(t.mid-in.shoulder,in.down*-1));
+    }
+    EXPECT(Near(r.elbow_cap_cm,lowest+.06*in.upper_cm,.05));
+    std::printf("logged rifle support: elbow %.1f cm below the shoulder, lowest reachable %.1f, limit %.1f\n",
+                -Up(in,r),-lowest,r.elbow_cap_cm);
+}
+
 static void RaisedHandsStillRaiseElbows() {
     for(int side=0;side<2;++side) {
         // Hand on top of the head and behind the head (reaching over the
@@ -529,7 +591,7 @@ int main() {
     FreeWristDoesNotMeasureElbow(); ExtensionKeepsTransportedPlane();
     TurningExtendedArmThenRetracting();
     RifleAimKeepsElbowsDown(); RaisedHandsStillRaiseElbows(); ExtensionLockWithLimits(); ForearmRotationMeasure();
-    JointLimitsMoveElbow();
+    JointLimitsMoveElbow(); LoggedRifleAimElbowHangs();
     std::printf("arm posture: %s (%d checks, %d failures)\n",failures?"FAIL":"PASS",checks,failures);
     return failures?1:0;
 }

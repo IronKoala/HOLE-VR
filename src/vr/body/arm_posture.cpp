@@ -89,7 +89,12 @@ Result Solve(const Input& in, State* state) {
     const double wrist_up = Dot(to,up), wrist_forward = Dot(to,forward);
     const double raised = std::max(0.0,wrist_up-.35*in.upper_cm) +
                           std::max(0.0,std::min(wrist_up,-wrist_forward));
-    const double elbow_cap = .10*in.upper_cm + 1.3*raised;
+    // A hand on a gun (grip or support) is held with the elbow hanging: when
+    // the hand is near shoulder height the elbow stays well below it, about
+    // 45 deg down, rather than out at shoulder height (owner, 2026-11-07:
+    // elbows rose while aiming the rifle). The cap rises with the hand.
+    const double hold_cap = std::clamp(.5*wrist_up-.45*in.upper_cm,-.57*in.upper_cm,.10*in.upper_cm);
+    const double elbow_cap = (in.gun_hold ? hold_cap : .10*in.upper_cm) + 1.3*raised;
     // +1 for a right arm (outward = forward x down), -1 for a left arm.
     const double side_sign = Dot(Cross(forward,down),outward) >= 0 ? 1.0 : -1.0;
     // Forearm turn range around thumb-up (pi/2): about 85 deg toward palm-up,
@@ -154,6 +159,19 @@ Result Solve(const Input& in, State* state) {
         } else clearance_limited = centre < minimum;
     }
     const double half = out_length > .05 ? std::acos(std::clamp(threshold,-.8,1.0)) : 110*kDegToRad;
+    // The height cap cannot ask for an elbow lower than the arm can put it:
+    // with the hand high or the arm nearly straight, every plane is over.
+    // Measure from the lowest reachable elbow plus a little room instead, so
+    // the cap does not pin the plane to that one point and the forearm's
+    // turn range still counts (a rifle's support arm, nearly straight).
+    double cap = elbow_cap;
+    {
+        const auto triangle = SolveTwoBone(in.shoulder,in.wrist,in.upper_cm,in.forearm_cm,zero,in.max_stretch_cm);
+        const FVector along = axis*Dot(triangle.mid-in.shoulder,axis);
+        const double radius = Length(triangle.mid-in.shoulder-along);
+        const double lowest = Dot(along,up)-radius*Length(Reject(up,axis));
+        if (std::isfinite(lowest)) cap = std::max(cap,lowest+.06*in.upper_cm);
+    }
     // Optional authored-pose preferences fade at the straight-arm
     // singularity. Free hand orientation is used only for diagnostics/twist.
     const double hand_weight = 1-Ramp(distance/reach,.90,.995);
@@ -193,15 +211,46 @@ Result Solve(const Input& in, State* state) {
         r.rotations = arm_pose::Orient(in.reference,in.shoulder,r.solved,r.pole);
         if (!r.rotations.valid) return r;
         r.raw_roll = arm_pose::WristTwist(in.reference,r.rotations.forearm,hand);
+        // Wrist bend, from the forearm's direction in the hand: toward the
+        // back of the hand (> 0) or the palm within the palm plane, the side
+        // bend out of that plane, and the whole bend angle. An atan2 side
+        // angle flips by 180 deg once a bend passes 90 deg, which made a
+        // forearm arriving from the back of a folded rifle hand look like a
+        // small bend (2026-11-07 run: trigger elbow out at shoulder height).
+        double wrist_total = 0, wrist_side_share = 0, wrist_over = 0, legacy_side = 0;
         if (in.hand_frame_valid) {
             const FVector d = hand.Inverse().Rotate(Normalize(r.solved.end-r.solved.mid));
-            r.flex = std::atan2(Dot(d,e2),Dot(d,e1));
-            r.deviation = std::atan2(Dot(d,e3),Dot(d,e1));
+            const double c1 = Dot(d,e1), c2 = Dot(d,e2), c3 = Dot(d,e3);
+            const double across = std::sqrt(c2*c2+c3*c3);
+            r.flex = std::atan2(c2,c1);
+            r.deviation = std::asin(std::clamp(c3,-1.0,1.0));
+            legacy_side = std::atan2(c3,c1);
+            wrist_total = std::atan2(across,c1);
+            if (across > 1e-9) {
+                wrist_side_share = Square(c3/across);
+                // Human range: an ellipse around the straight wrist, 70 deg
+                // back, 80 toward the palm, 20 toward the thumb and 35 toward
+                // the little finger (25 either way without the thumb's side).
+                const double back_range = c2 >= 0 ? kWristBack : kWristPalm;
+                const double side_range = radial_sign == 0 ? kWristSide
+                    : -radial_sign*c3 > 0 ? kWristThumb : kWristLittle;
+                const double range = 1/std::sqrt(Square(c2/across/back_range)+Square(c3/across/side_range));
+                wrist_over = std::max(0.0,wrist_total-range);
+            }
         }
-        const double flex_over = std::max(0.0,std::fabs(r.flex)-55*kDegToRad);
-        const double side_over = std::max(0.0,std::fabs(r.deviation)-25*kDegToRad);
-        const double bend = Square(r.flex)+2*Square(r.deviation);
-        const double wrist_cost = in.straight_wrist ? bend : .12*bend+2*Square(flex_over)+4*Square(side_over);
+        double wrist_cost;
+        if (in.joint_limits) {
+            // Side bends count double: the wrist's side range is the smaller.
+            // Past the human range, hand_limit_cost below adds its own cost.
+            const double bend = Square(wrist_total)*(1+wrist_side_share);
+            wrist_cost = in.straight_wrist ? bend : .12*bend;
+        } else {
+            // The solver before joint ranges (body_arm_joint_limits=0).
+            const double flex_over = std::max(0.0,std::fabs(r.flex)-55*kDegToRad);
+            const double side_over = std::max(0.0,std::fabs(legacy_side)-25*kDegToRad);
+            const double bend = Square(r.flex)+2*Square(legacy_side);
+            wrist_cost = in.straight_wrist ? bend : .12*bend+2*Square(flex_over)+4*Square(side_over);
+        }
         // Roll is not evidence for the elbow plane. Let the hand and skin
         // twist follow it instead of moving the elbow to reduce a frame angle.
         const FVector elbow = r.solved.mid-in.shoulder;
@@ -219,8 +268,8 @@ Result Solve(const Input& in, State* state) {
                                   +2*Square(std::max(0.0,-elbow_forward-.15));
         double limit_cost = 0, hand_limit_cost = 0;
         r.elbow_height_cm = Dot(elbow,up);
-        r.elbow_cap_cm = elbow_cap;
-        r.elbow_over_cm = std::max(0.0,r.elbow_height_cm-elbow_cap);
+        r.elbow_cap_cm = cap;
+        r.elbow_over_cm = std::max(0.0,r.elbow_height_cm-cap);
         // The forearm's turn is read from the wrist's side-to-side axis (the
         // axis the wrist flexes about), so a bent wrist does not read as a turn:
         // with a straight wrist this is exactly the palm direction.
@@ -233,6 +282,10 @@ Result Solve(const Input& in, State* state) {
             // Steep enough that no wrist or rest preference buys a raised
             // elbow: 1 cm over costs about as much as a 90 deg swivel.
             limit_cost += 1000*Square(r.elbow_over_cm/in.upper_cm);
+            // A gun is held with the forearm reaching forward to it. With the
+            // hand close to the shoulder, an elbow out at the side ends up
+            // ahead of the hand, pointing the forearm back at the body.
+            if (in.gun_hold) limit_cost += 40*Square(std::max(0.0,Dot(r.solved.mid-in.wrist,forward)/in.upper_cm));
             if (in.hand_frame_valid) {
                 if (std::isfinite(r.forearm_rotation)) {
                     const double rho = r.forearm_rotation;
@@ -241,25 +294,9 @@ Result Solve(const Input& in, State* state) {
                         ? std::min(kSupinationEnd-rho,rho+kPi) : std::max(0.0,rho-kPronationEnd);
                     hand_limit_cost += share_weight*Square(from_thumb_up) + 12*Square(past);
                 }
-                // Wrist ranges for hands the controller turns. Recorded gun and
-                // support grips are posed on the gun and keep their own
-                // softer relief (body_elbow_relieves_wrist).
-                if (!wrist_preference) {
-                    // Bend toward the back of the hand (> 0) or the palm within
-                    // the palm plane, and the side bend as the angle out of that
-                    // plane: atan2 side angles flip by 180 deg past a 90 deg bend.
-                    const FVector d = hand.Inverse().Rotate(Normalize(r.solved.end-r.solved.mid));
-                    const double back = std::atan2(Dot(d,e2),Dot(d,e1));
-                    const double side_bend = std::asin(std::clamp(Dot(d,e3),-1.0,1.0));
-                    hand_limit_cost += 4*(Square(std::max(0.0,back-kWristBack))+
-                                          Square(std::max(0.0,-back-kWristPalm)));
-                    if (radial_sign != 0) {
-                        // The forearm arrives from the thumb side in a thumb-side bend.
-                        const double thumb = -radial_sign*side_bend;
-                        hand_limit_cost += 4*(Square(std::max(0.0,thumb-kWristThumb))+
-                                              Square(std::max(0.0,-thumb-kWristLittle)));
-                    } else hand_limit_cost += 4*Square(std::max(0.0,std::fabs(side_bend)-kWristSide));
-                }
+                // Wrist range, for every hand: free hands and hands posed on a
+                // gun alike.
+                hand_limit_cost += 4*Square(wrist_over);
             }
         }
         r.swivel = angle-preferred_angle;
