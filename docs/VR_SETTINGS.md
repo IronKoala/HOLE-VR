@@ -52,7 +52,10 @@ whatever the laser is on). A step writes the ini key(s) into `hole-vr.ini` in pl
 | Rifle stock | On, Off | `rifle_virtual_stock` |
 | Gun stops at walls | On, Off | `gun_wall_collision` |
 | Hands stop at walls | On, Off | `hand_wall_collision` |
-| Gun kick | Off, Light, Normal, Strong, Stronger, Heavy, Heavier, Brutal, Extreme | `gun_recoil_kick` (0, 0.5, 1, 1.5, 2.4, 3.3, 4.2, 5.1, 6: Extreme is 4x Strong) |
+| Pistol kick, one hand | Off, Light, Normal, Strong, Stronger, Heavy, Heavier, Brutal, Extreme (default Stronger) | `gun_kick_pistol_one_hand` (0, 0.5, 1, 1.5, 2.4, 3.3, 4.2, 5.1, 6: Extreme is 4x Strong) |
+| Pistol kick, two hands | the same (default Normal) | `gun_kick_pistol_two_hands` |
+| Rifle kick, one hand | the same (default Heavy) | `gun_kick_rifle_one_hand` |
+| Rifle kick, two hands | the same (default Strong) | `gun_kick_rifle_two_hands` |
 | Monitor shows | Right eye, Left eye, Both eyes | `monitor_view` (right, left, both) |
 | Calibrate body | (action) | height → arms forward → arms out → bent elbows → forward check; hold both triggers for 2s to record; left X keeps the current arms |
 | Edit hand grips | (action) | opens the grip editor once the menu closes; while it is open the row reads "open, click to close" and closes it |
@@ -116,6 +119,19 @@ Stronger, Heavy, Heavier, Brutal and Extreme in even steps from Strong
 (1.5) to Extreme (6). The kick's peak is about the setting, so Extreme flips
 a one-handed pistol up about 40 degrees and back about 12 cm a shot,
 mostly settled again within 0.2 s (the same timing as every level).
+
+**Kick by gun and grip** (owner, later on 2026-11-07: "when the AR is being
+one handed i want the recoil at heavy, when its two handed set to strong.
+when the pistol is being one handed, stronger, when the gun is two handed,
+normal"). Gun kick is four rows with the same nine strengths, those four as
+defaults; `gun_recoil_kick` is no longer read. The strength is chosen once
+a shot. The rifle is two-handed while the other hand holds its front (the
+support grip; on the shoulder or not). The pistol has no support grip yet,
+so it counts as two-handed while the other controller is "basically
+touching" the gun hand's: grip centres under `pistol_both_hands_cm` (13)
+apart, with nothing in that hand. Log: `controls: gun kick 2.4 (pistol, one
+hand; hands 31 cm apart)` for the first three shots and each change of gun
+or grip.
 
 Move holsters is here because the right stick click (which used to be held
 for it) is now the kick. The grip editor (left Y hold) and the arm measure
@@ -235,7 +251,23 @@ floor you can stand on: not steeper than about 45 degrees, not more than
 there: the view blinks black for 0.2 s and the character is moved with the
 engine's own teleport (`K2_TeleportTo`, which refuses a spot the capsule
 does not fit). Pull the stick back to cancel. Turning stays on the other
-stick. The balls and disc are the engine's sphere mesh, made once per level
+stick.
+
+**Landing footsteps** (owner 2026-11-07: "the payer needs to make a
+stepping sound when teleporting to the new location so the enemies can hear
+it, like with walking"). Walking's footsteps are the game's
+`Footstep_AnimNotify_C` (the locomotion system's footstep), fired by the
+walk animations on the character `Mesh`. Its `Received_Notify` picks the
+sound for the surface under the foot (`SelectSoundBySurface`), plays it
+(`SpawnSoundAttached`) and reports the noise enemies hear
+(`AISense_Hearing::ReportNoiseEvent`, with the player's footstep volume
+skill); the class dump of 2026-11-07 lists those calls. After a teleport the
+mod calls the walk-forward animation's own two footstep notifies
+(`ALS_N_Walk_F:Footstep_Notify_C_0`, then `_1` 0.28 s later) with the
+player's `Mesh`, at the new place: the same sound and the same noise as two
+walking steps. They are kept as `ue::ObjectRef`s (animation assets). Log:
+`teleport: moved N cm ...; footsteps as walking makes them`, or `teleport:
+no landing footstep (...)`. The balls and disc are the engine's sphere mesh, made once per level
 on the player, with no collision and no shadow.
 
 ## World size

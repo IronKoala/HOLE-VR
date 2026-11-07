@@ -195,18 +195,39 @@ static void TestCurrent() {
     EXPECT(std::string(height.choices[static_cast<size_t>(CurrentChoice(height, get))].text) == "Your own");
     EXPECT(RowText(style, 2) == "Turn style: Off");
     EXPECT(RowText(*snap_step, 1) == "Turn speed: 30 deg a flick");
-    // Gun kick: five steps past Strong, the last 4x Strong.
-    const Row& kick = RowNamed("Gun kick");
-    auto kick_value = [&](const char* name) {
-        for (const auto& c : kick.choices)
-            if (std::string(c.text) == name) return std::atof(c.sets[0].value);
-        return -1.0;
-    };
-    EXPECT(kick.choices.size() == 9);
-    EXPECT(std::string(kick.choices[static_cast<size_t>(kick.default_choice)].text) == "Normal");
-    EXPECT(std::fabs(kick_value("Extreme") - 4 * kick_value("Strong")) < 1e-9);
-    for (size_t c = 1; c < kick.choices.size(); ++c)
-        EXPECT(std::atof(kick.choices[c].sets[0].value) > std::atof(kick.choices[c - 1].sets[0].value));
+    // Gun kick by gun and grip, each with nine strengths, the last 4x
+    // Strong; defaults as the owner set them (2026-11-07).
+    EXPECT(!Find("Gun kick"));
+    const struct {
+        const char* row;
+        const char* key;
+        const char* def;
+    } kicks[] = {{"Pistol kick, one hand", "gun_kick_pistol_one_hand", "Stronger"},
+                 {"Pistol kick, two hands", "gun_kick_pistol_two_hands", "Normal"},
+                 {"Rifle kick, one hand", "gun_kick_rifle_one_hand", "Heavy"},
+                 {"Rifle kick, two hands", "gun_kick_rifle_two_hands", "Strong"}};
+    for (const auto& k : kicks) {
+        const Row& kick = RowNamed(k.row);
+        auto kick_value = [&](const char* name) {
+            for (const auto& c : kick.choices)
+                if (std::string(c.text) == name) return std::atof(c.sets[0].value);
+            return -1.0;
+        };
+        EXPECT(kick.choices.size() == 9);
+        EXPECT(std::string(kick.choices[static_cast<size_t>(kick.default_choice)].text) == k.def);
+        EXPECT(std::fabs(kick_value("Extreme") - 4 * kick_value("Strong")) < 1e-9);
+        EXPECT(kick_value("Normal") == 1.0 && kick_value("Off") == 0.0);
+        for (size_t c = 0; c < kick.choices.size(); ++c) {
+            EXPECT(kick.choices[c].sets.size() == 1 && std::string(kick.choices[c].sets[0].key) == k.key);
+            if (c > 0) EXPECT(std::atof(kick.choices[c].sets[0].value) > std::atof(kick.choices[c - 1].sets[0].value));
+        }
+        // No key in the ini: the default; a value the owner's ini has: that choice.
+        std::map<std::string, std::string> none;
+        auto get_none = [&](const char* key) { auto it = none.find(key); return it == none.end() ? std::string() : it->second; };
+        EXPECT(CurrentChoice(kick, get_none) == kick.default_choice);
+        none[k.key] = "3.3";
+        EXPECT(std::string(kick.choices[static_cast<size_t>(CurrentChoice(kick, get_none))].text) == "Heavy");
+    }
     EXPECT(Find("Roomscale") && !Find("Room walking"));
     EXPECT(SameValue("1", "1.000"));
     EXPECT(SameValue("Seated", "seated"));

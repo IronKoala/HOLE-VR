@@ -141,7 +141,12 @@ struct Settings {
     double finger_pinch_past_rear = 0.64;
     int slide_hold_log = 30;            // slide holds per run that log their frame-by-frame pull
     bool wall_collision = true;    // keep the gun out of walls
-    double recoil_kick = 1.0;      // scale of the in-hand recoil kick, 0 = off
+    // In-hand recoil kick strength by gun and grip (VR tab; owner 2026-11-07:
+    // rifle one hand Heavy, two hands Strong; pistol one hand Stronger, two
+    // hands Normal). 1 = Normal, 0 = off.
+    double kick_pistol_one = 2.4, kick_pistol_two = 1.0;
+    double kick_rifle_one = 3.3, kick_rifle_two = 1.5;
+    double pistol_both_hands_cm = 13.0;  // other controller this near the gun hand's: both hands
     bool game_recoil = false;      // let the game's camera/aim recoil run
     bool camera_shake = false;     // the game's camera shake option
     bool log_grabs = true;
@@ -226,7 +231,11 @@ void LoadSettings() {
     g_set.gun_yaw = config::GetFloat("gun_yaw_offset", 0.f);
     g_set.gun_roll = config::GetFloat("gun_roll_offset", 0.f);
     g_set.wall_collision = config::GetBool("gun_wall_collision", true);
-    g_set.recoil_kick = config::GetFloat("gun_recoil_kick", 1.f);
+    g_set.kick_pistol_one = config::GetFloat("gun_kick_pistol_one_hand", 2.4f);
+    g_set.kick_pistol_two = config::GetFloat("gun_kick_pistol_two_hands", 1.f);
+    g_set.kick_rifle_one = config::GetFloat("gun_kick_rifle_one_hand", 3.3f);
+    g_set.kick_rifle_two = config::GetFloat("gun_kick_rifle_two_hands", 1.5f);
+    g_set.pistol_both_hands_cm = config::GetFloat("pistol_both_hands_cm", 13.f);
     g_set.game_recoil = config::GetBool("game_camera_recoil", false);
     g_set.camera_shake = config::GetBool("game_camera_shake", false);
     g_set.gun_forward = config::GetFloat("gun_forward_offset_cm", 0.f);
@@ -735,6 +744,8 @@ struct WeaponState {
     double support_lost_for = 0;
     bool last_has_mag = false;
     double kick_t0 = -1;          // time of the last shot, for the in-hand kick
+    double kick_level_for = -1;   // the shot (kick_t0) kick_level was chosen for
+    double kick_level = 0;        // that shot's strength, from the gun and the grip
     double kick_side = 0;         // this shot's random sideways part, -1..1
     // Virtual stock (rifles): gun-frame points, from the grip.
     FVector stock_local;          // middle of the butt pad
@@ -1264,6 +1275,31 @@ FQuat OneHandFrame(const hands::HandState& h, int hand) {
            ToQuat(FRotator{kBasePitch + g_set.gun_pitch, side * (kBaseYaw + g_set.gun_yaw), side * g_set.gun_roll});
 }
 
+// The pistol counts as held in both hands while the other controller is
+// "basically touching" the gun hand's (owner 2026-11-07) and that hand holds
+// nothing: grip centres closer than pistol_both_hands_cm.
+bool PistolInBothHands(const hands::HandState& gun_hand, const hands::HandState& other) {
+    if (!gun_hand.valid || !other.valid || HandHoldsMag(OtherHand())) return false;
+    const hands::Hand oh = HandOf(OtherHand());
+    if (hands::GetInteraction(oh).owner != hands::GripOwner::kNone) return false;
+    if (hands::HeldGrabKind(hands::GetGrab(oh)) != hands::GrabKind::kNone) return false;
+    return Len(other.grip.location - gun_hand.grip.location) < g_set.pistol_both_hands_cm;
+}
+
+// The first shots, and every change of gun or grip after, log the strength
+// they kicked with (and how far apart the hands were, to tune the pistol's
+// both-hands distance).
+void LogKickLevel(bool pistol, bool both, double level, double apart_cm) {
+    static int shots = 0, last = -1;
+    const int kind = (pistol ? 2 : 0) + (both ? 1 : 0);
+    if (++shots > 3 && kind == last) return;
+    last = kind;
+    char apart[48] = "the other hand not tracked";
+    if (apart_cm >= 0) std::snprintf(apart, sizeof(apart), "hands %.0f cm apart", apart_cm);
+    log::Info("controls: gun kick %.1f (%s, %s; %s)", level, pistol ? "pistol" : "rifle",
+              both ? "both hands" : "one hand", apart);
+}
+
 void HoldGun(game::Gun& gun, const hands::HandState& rh) {
     UObject g = gun.Object();
     UObject main = 0;
@@ -1349,11 +1385,20 @@ void HoldGun(game::Gun& gun, const hands::HandState& rh) {
     // back, then returns (about 20 ms up, 100 ms back). A pistol in one
     // hand flips hard; a rifle less with two hands and least on the shoulder,
     // where it pivots from the butt and mostly pushes straight back.
+    // Its strength is chosen once a shot, by the gun and how it is held then.
     double kick = 0;
-    if (W.kick_t0 >= 0 && g_set.recoil_kick > 0) {
+    if (W.kick_t0 >= 0) {
+        if (W.kick_level_for != W.kick_t0) {
+            W.kick_level_for = W.kick_t0;
+            const double apart = lh2.valid ? Len(lh2.grip.location - rh.grip.location) : -1.0;
+            const bool both = W.is_pistol ? PistolInBothHands(rh, lh2) : two;
+            W.kick_level = W.is_pistol ? (both ? g_set.kick_pistol_two : g_set.kick_pistol_one)
+                                       : (both ? g_set.kick_rifle_two : g_set.kick_rifle_one);
+            LogKickLevel(W.is_pistol, both, W.kick_level, apart);
+        }
         double t = g_clock - W.kick_t0;
         if (t > 0.4) W.kick_t0 = -1;
-        else kick = g_set.recoil_kick * (1.0 - std::exp(-t / 0.012)) * std::exp(-t / 0.07) * 1.6;
+        else if (W.kick_level > 0) kick = W.kick_level * (1.0 - std::exp(-t / 0.012)) * std::exp(-t / 0.07) * 1.6;
     }
     if (kick > 0) {
         double up, back, side;
