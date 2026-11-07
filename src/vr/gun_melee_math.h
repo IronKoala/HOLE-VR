@@ -65,6 +65,15 @@ inline FVector TrackingPoint(const FVector& p_world, const FVector& ctrl_loc_wor
 
 inline double Length(const FVector& v) { return std::sqrt(v.X * v.X + v.Y * v.Y + v.Z * v.Z); }
 
+// Where the hand is taking the gun's grip point: the drawn grip less what the
+// wall check pushed it this frame (it holds the gun out of whatever it
+// reaches, a target included). A push that is not believable is ignored.
+inline FVector HandGrip(const FVector& drawn_grip, const FVector& wall_push) {
+    const double len = std::sqrt(wall_push.X * wall_push.X + wall_push.Y * wall_push.Y + wall_push.Z * wall_push.Z);
+    if (!std::isfinite(len) || len >= 60.0) return drawn_grip;
+    return drawn_grip - wall_push;
+}
+
 // Real speed of a point in m/s from two tracking-space positions (cm) dt
 // seconds apart. 0 when dt is not a believable frame time.
 inline double Speed(const FVector& before_cm, const FVector& now_cm, double dt) {

@@ -797,6 +797,7 @@ struct WeaponState {
     bool two_hand = false;        // support hand on the handguard
     FVector support_local;        // support hand point in the gun frame, from the grip
     FVector grip_world;           // gun-frame origin (the firing hand's grip point)
+    FVector wall_push;            // how far the wall check moved the gun this frame (grip_world includes it)
     bool handle_moved = false;    // charging handle moved off its rest
     double bore_height = 6.0;     // bore above the grip point, cm (gun frame Z)
     bool have_handle_grab = false;
@@ -1775,6 +1776,7 @@ void HoldGun(game::Gun& gun, const hands::HandState& rh) {
     FVector push = WallPushback(g, hand, grip_w, two);
     loc = loc + push;
     W.grip_world = grip_w + push;
+    W.wall_push = push;
     W.have_support_point = two;
     if (two) W.support_point = W.grip_world + hand.Rotate(W.support_id >= 0 ? W.support_draw : W.support_local);
     SetActorTransform(g, loc, rot);
@@ -7552,7 +7554,7 @@ void MeleeStrikes(UObject player, const hands::HandState hs[2], const input::Sna
     f.frame = g_controls_frame;
     f.xr_time = s.time;
     auto add = [&](UObject gun, bool pistol, const FQuat& frame, const FVector& grip, double muzzle, double bore,
-                   bool have_stock, const FVector& stock, int hand, int second, bool kicking) {
+                   bool have_stock, const FVector& stock, int hand, int second, bool kicking, const FVector& push) {
         if (!gun || f.count >= 2 || hand < 0 || hand > 1 || !hs[hand].valid || !s.hand[hand].grip_valid) return;
         gun_melee::HeldGun& g = f.guns[f.count++];
         g.gun = gun;
@@ -7568,20 +7570,24 @@ void MeleeStrikes(UObject player, const hands::HandState hs[2], const input::Sna
         g.hand_tracking = s.hand[hand].grip;
         g.second_hand = second;
         g.kicking = kicking;
+        g.wall_push = push;
     };
     const bool gun_in_hand = W.gun && W.in_hand && W.have_pose && !W.right_let_go && !W.edit_frozen;
     if (gun_in_hand)
         add(W.gun, W.is_pistol, W.frame_rot, W.grip_world, W.muzzle_dist, W.bore_height, W.have_stock, W.stock_local,
-            GunHand(), W.two_hand ? OtherHand() : -1, W.kick_t0 >= 0 && g_clock - W.kick_t0 < 0.3);
+            GunHand(), W.two_hand ? OtherHand() : -1, W.kick_t0 >= 0 && g_clock - W.kick_t0 < 0.3, W.wall_push);
     if (g_rc.carried && g_rc.rifle && g_rc.rg.ok && !(gun_in_hand && W.gun == g_rc.rifle)) {
         const bool own_stock = g_rc.rifle == W.gun && W.have_stock;
         add(g_rc.rifle, false, g_rc.frame_world, g_rc.grip_world, g_rc.rg.muzzle_dist, g_rc.rg.bore_height, own_stock,
-            own_stock ? W.stock_local : FVector{}, OtherHand(), -1, false);
+            own_stock ? W.stock_local : FVector{}, OtherHand(), -1, false, FVector{});
     }
     if (!f.count) return;
     for (UObject o : {W.gun, W.held_mag, W.pouch_mag, g_rc.rifle, g_rc.pistol})
         if (o) f.ignore.push_back(o);
     if (UObject holder = static_cast<UObject>(world_menu::PanelHolder())) f.ignore.push_back(holder);
+    // What hangs on the player (the walls' own list): never a wall for a swing.
+    for (UObject a : body::hand_walls::IgnoredActors())
+        if (a && std::find(f.ignore.begin(), f.ignore.end(), a) == f.ignore.end()) f.ignore.push_back(a);
     gun_melee::Update(f);
 }
 

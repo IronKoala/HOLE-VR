@@ -35,6 +35,8 @@ struct HeldGun {
     XrPosef hand_tracking{{0, 0, 0, 1}, {0, 0, 0}};  // and in tracking space (metres)
     int second_hand = -1;         // another hand on it (for the hit's buzz), -1 none
     bool kicking = false;         // a shot's kick is moving it: not a swing
+    FVector wall_push;            // how far the wall check moved it this frame (grip includes it): the
+                                  // swing is the hand's own path, without it
 };
 
 struct Frame {

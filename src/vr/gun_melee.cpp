@@ -452,6 +452,20 @@ void Apply(UObject player, const HeldGun& g, const StrikePoint& pt, double speed
     (void)clock;
 }
 
+// Something an enemy carries or wears (its weapon, a mask): part of the
+// enemy, not a wall between you and it.
+bool OnAnEnemy(UObject actor) {
+    if (!Live(actor)) return false;
+    for (const char* fn : {"GetAttachParentActor", "GetOwner"}) {
+        ue::Call c(actor, fn);
+        const UObject parent = c.Valid() && c.Invoke() ? c.Result<UObject>() : 0;
+        if (!parent) continue;
+        for (const Npc& n : g_npcs)
+            if (n.actor == parent) return true;
+    }
+    return false;
+}
+
 bool ShouldHit(UObject actor, UObject player) {
     if (!Live(actor) || actor == player) return false;
     return ClassHas(g_hittable_class, ue::GetClass(actor), &HasHitEvent);
@@ -486,9 +500,14 @@ void UpdateGun(int slot, const Frame& f, const HeldGun& g) {
     const FQuat cq = XrToUeQuat(g.hand_tracking.orientation.x, g.hand_tracking.orientation.y,
                                 g.hand_tracking.orientation.z, g.hand_tracking.orientation.w);
     const double scale = stereo::TrackingScale();
+    // The hand's own path: the wall check holds the drawn gun out of
+    // whatever it reaches (a mannequin, an enemy), which would stop the swing
+    // a frame early and read as slow. Walls still stop a hit (below).
+    const FVector grip = HandGrip(g.grip, g.wall_push);
+    const FVector push = g.grip - grip;
     FVector now_w[kMaxPoints], now_t[kMaxPoints];
     for (int i = 0; i < tr.n; ++i) {
-        now_w[i] = g.grip + g.frame.Rotate(tr.pts[i].local);
+        now_w[i] = grip + g.frame.Rotate(tr.pts[i].local);
         now_t[i] = TrackingPoint(now_w[i], g.hand_world.location, g.hand_world.rotation, ct, cq, scale);
     }
     const double dt = tr.have ? static_cast<double>(f.xr_time - tr.xr_time) * 1e-9 : 0.0;
@@ -503,6 +522,7 @@ void UpdateGun(int slot, const Frame& f, const HeldGun& g) {
     if (fastest_i >= 0 && fastest >= t.min_speed) {
         ++g_counts.fast;
         bool hit_any = false;
+        std::string wall;   // the first thing in the way that cannot be hit, for the log
         const std::vector<UObject>& ignore = f.ignore;
         for (int i = 0; i < tr.n && !hit_any; ++i) {
             const double v = Speed(tr.prev_t[i], now_t[i], dt);
@@ -517,8 +537,15 @@ void UpdateGun(int slot, const Frame& f, const HeldGun& g) {
             // bodies answer to it. A wall in the way stops the swing.
             // An enemy's capsule (no body part) is not a hit by itself: its body
             // shapes below decide.
-            const bool world_hit = Sweeper()->Run(f.player, a, b, tr.pts[i].radius, ignore, &c) &&
-                                   ShouldHit(c.actor, f.player);
+            const bool touched = Sweeper()->Run(f.player, a, b, tr.pts[i].radius, ignore, &c);
+            const bool world_hit = touched && ShouldHit(c.actor, f.player);
+            // Something else first (a wall, a door): an enemy only counts on this
+            // side of it.
+            double wall_at = 1e9;
+            if (touched && !world_hit && c.actor != f.player && !OnAnEnemy(c.actor)) {
+                wall_at = Length(c.point - a);
+                if (wall.empty()) wall = c.actor ? ue::GetName(c.actor) : std::string("the level");
+            }
             if (world_hit) c.npc = ClassHas(g_npc_class, ue::GetClass(c.actor), &IsNpcBase);
             if (world_hit && !(c.npc && !c.bone.comparison_index)) {
                 c.found_by = "the game's hit channel";
@@ -534,7 +561,8 @@ void UpdateGun(int slot, const Frame& f, const HeldGun& g) {
                     ue::GetProp(n.actor, "BodyMesh", meshes[1]);
                     for (UObject m : meshes) {
                         if (!m || (m == meshes[1] && meshes[0] == meshes[1])) continue;
-                        if (BodySweep(m, a, b, tr.pts[i].radius, &c)) {
+                        if (BodySweep(m, a, b, tr.pts[i].radius, &c) &&
+                            Length(c.point - a) <= wall_at + tr.pts[i].radius) {
                             c.actor = n.actor;
                             c.npc = true;
                             c.found_by = m == meshes[0] ? "the enemy's body (Mesh)" : "the enemy's body (BodyMesh)";
@@ -553,8 +581,9 @@ void UpdateGun(int slot, const Frame& f, const HeldGun& g) {
         }
         if (!hit_any && g_fast_lines < 12) {
             ++g_fast_lines;
-            log::Info("gun melee: %s %s swung at %.1f m/s, touched nothing it can hit%s",
+            log::Info("gun melee: %s %s swung at %.1f m/s, touched nothing it can hit%s%s%s (wall push %.1f cm)%s",
                       g.pistol ? "pistol" : "long gun", tr.pts[fastest_i].name, fastest,
+                      wall.empty() ? "" : " (stopped by ", wall.c_str(), wall.empty() ? "" : ")", Length(push),
                       g_fast_lines == 12 ? " (swings without a hit stop being logged here)" : "");
         }
     }

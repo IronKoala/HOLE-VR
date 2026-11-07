@@ -27,6 +27,11 @@ A rifle carried in the off hand (one-handed, by its foregrip) can hit too.
   targets, and enemies whose bodies answer to it; a wall in the way stops it),
   then on each nearby enemy's own body shapes, so a hit lands on a real body
   part (head, arm, chest...).
+- **The swing is the hand's own path.** The wall check holds the drawn gun out
+  of whatever it reaches (a wall, a mannequin, an enemy); the speed and the
+  contact use where your hand is taking the gun, so being held at a target
+  does not slow the hit. A wall (anything that cannot be hit) between the gun
+  and an enemy still stops it; what an enemy carries or wears does not.
 - A shot's kick moving the gun is never a swing. One swing through a body is
   one hit (`gun_melee_cooldown_s`, 0.45 s per target).
 
@@ -55,8 +60,9 @@ Log lines start `gun melee:`:
 - `... can hit with: ...` once per gun picked up (the strike points).
 - `... hit enemy|target NAME (CLASS, part BONE, surface N) at X m/s ...` for
   every hit, with the damage and stun worked out, then `NAME HP a -> b`.
-- `... swung at X m/s, touched nothing it can hit` for the first 12 fast swings
-  that missed (shows the speeds being reached).
+- `... swung at X m/s, touched nothing it can hit (stopped by NAME) (wall push
+  N cm)` for the first 12 fast swings that missed: the speed reached, what was
+  in the way, and how far the wall check was holding the gun back.
 - `N fast swing frames, M hits so far` once a minute while swinging.
 
 Code: `src/vr/gun_melee.cpp` (engine side), `src/vr/gun_melee_math.h`

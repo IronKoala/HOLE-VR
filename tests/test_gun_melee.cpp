@@ -61,6 +61,19 @@ int main() {
     // Aiming steadily: 1 cm per frame is 0.7 m/s, well under a hit.
     Check(Speed({0, 0, 0}, {1, 0, 0}, 0.0139) < 2.0, "steady aiming is not a hit");
 
+    // Held at a target by the wall check: the hand's own path still reads as
+    // the swing. Last frame the muzzle was 2 cm short of a mannequin; this
+    // frame the hand took it 5.5 cm on (4 m/s) but the drawn gun was held 1 cm
+    // in front of the surface, 3.5 cm back.
+    {
+        const FVector before{98, 0, 0}, drawn{99, 0, 0}, push{-4.5, 0, 0};
+        Check(Speed(before, drawn, 0.0139) < 1.0, "the drawn gun alone would read as a touch");
+        Check(Near(Speed(before, HandGrip(drawn, push), 0.0139), 5.5 / 0.0139 / 100.0),
+              "the hand's path reads as the real swing");
+        Check(Near(HandGrip(drawn, FVector{0, 0, 80}), drawn) && Near(HandGrip(drawn, FVector{NAN, 0, 0}), drawn),
+              "an unbelievable push is ignored");
+    }
+
     // Swing scale.
     Check(SwingScale(1.9, 2.0, 4.5) == 0.0, "below the hit speed: nothing");
     Check(Near(SwingScale(2.0, 2.0, 4.5), 0.4), "at the hit speed: 40%");
