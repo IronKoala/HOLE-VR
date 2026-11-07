@@ -32,8 +32,9 @@ const Block kBlocks[] = {
      "; HOLE VR settings. Lines starting with ; are comments.\n"
      "\n"
      "; Write a list of every class, function and property in the game to the\n"
-     "; dump folder on startup. Needed while the mod is being developed.\n"
-     "dump_on_start=1\n"},
+     "; dump folder on startup. Only needed while the mod is being developed\n"
+     "; (Ctrl+F9 in game writes one at any time).\n"
+     "dump_on_start=0\n"},
     {"engine_wait_seconds",
      "\n"
      "; Seconds to wait for the engine to finish starting before giving up.\n"
@@ -75,6 +76,13 @@ const Block kBlocks[] = {
      "; The player's extra scene capture renders the level a second time\n"
      "; (the game's Capture2D option). Stopping it saves a lot of GPU time.\n"
      "vr_disable_player_scene_capture=1\n"},
+    {"vr_kill_shot_camera_when_shown",
+     "\n"
+     "; The kill shot room's camera photographs your body for the death and\n"
+     "; results screens, and the game sets it to take a picture every frame.\n"
+     "; 1 = only while one of those screens is up (the same pictures, less GPU\n"
+     "; work while you play). 0 = as the game runs it.\n"
+     "vr_kill_shot_camera_when_shown=0\n"},
     {"vr_anti_aliasing",
      "\n"
      "; --- Anti-aliasing and console variables ---\n"
@@ -872,7 +880,20 @@ const Block kBlocks[] = {
      "; mod's own, so the game's Present thread doesn't wait on it. 0 = never,\n"
      "; 1 = always, 2 = decided each run by the GPU cost test (on only if the\n"
      "; headset missed fewer frames with it).\n"
-     "xr_end_async=2\n"},
+     "xr_end_async=1\n"},
+    {"gpu_cost_test",
+     "\n"
+     "; Frame times (diagnostic): 45 s into the first run level, switch render\n"
+     "; features off and on for a minute or two and log what each costs the\n"
+     "; graphics card. 1 = every feature (the picture changes while it runs),\n"
+     "; 2 = only ones that leave the picture as it is, 0 = off.\n"
+     "gpu_cost_test=0\n"},
+    {"dump_in_game",
+     "\n"
+     "; Diagnostic: once a level is loaded, write the game's class list to the\n"
+     "; dump folder (includes the weapon and player classes the start-up dump\n"
+     "; misses). Only needed while the mod is being developed.\n"
+     "dump_in_game=0\n"},
     {"vr_lumen_gi_quality",
      "\n"
      "; Lumen indirect lighting quality in VR. Levels ask for 2; 1 looks nearly the\n"
