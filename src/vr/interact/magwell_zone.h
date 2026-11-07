@@ -47,17 +47,37 @@ struct MagwellZone {
 MagwellZone MeasureMagwell(const std::vector<FVector>& mag_corners, const FVector& seat, const FVector& in,
                            const std::vector<PartBox>& parts);
 
-// How far below its seat the magazine's origin may be for it to line up:
-// its top within `slack` of the opening. `fallback` when not measured.
-double SnapBelow(const MagwellZone& z, double slack, double fallback);
+// How far below its seat the magazine's origin is when it lines up: its top
+// `out_cm` under the magwell opening (owner 2026-11-07: "make it stick out of
+// the mag well by an inch"). `fallback` when not measured.
+double LineUpBelow(const MagwellZone& z, double out_cm, double fallback);
 
-// Where the hand pushing the magazine finishes it by itself (the seat
-// animation), cm below the seat: `finish`, but never more than half of the
-// travel inside the gun.
-double SeatFinish(const MagwellZone& z, double finish);
+// Where the hand pushing the magazine in hands over to the seat animation,
+// cm below the seat: `last` (the final click), never more than half of the
+// travel inside the gun. Before 2026-11-07 it was 6 cm (half of a pistol
+// magazine's travel), and the pistol magazine went in by itself half way up
+// ("it snaps in way to early").
+double SeatLast(const MagwellZone& z, double last);
 
 // The reload's progress for a magazine whose origin is `below` cm under its
-// seat: 0 with its top at the opening (or lower), 1 seated.
-double InsertProgress(const MagwellZone& z, double below, double fallback_insert);
+// seat: 0 where it lines up (`line_up` cm below), 1 where it seats itself
+// (`last` cm below), so the hand's reload animation has played out by the
+// time the magazine is fully in (owner 2026-11-07).
+double InsertProgress(double below, double line_up, double last);
+
+// The held magazine's top against the magwell. The line-up test used the
+// magazine's origin, which on the AR's magazines is 17 cm under its top: a
+// magazine tilted 30-60 deg or 7 cm to the side still lined up with its top
+// far from the magwell.
+struct TopProbe {
+    double below = 0;  // its top below where its top sits seated, along the magwell axis, cm
+    double side = 0;   // its top's distance from the magwell axis, cm
+    double tilt = 0;   // its own axis against the magwell's, deg
+};
+// seat, seat_rot: where its origin sits seated and how it is turned. out:
+// out of the magwell (down), any length. top: MagwellZone::top. at, rot:
+// where it is held now.
+TopProbe ProbeTop(const FVector& seat, const FQuat& seat_rot, const FVector& out, double top, const FVector& at,
+                  const FQuat& rot);
 
 }  // namespace holevr::vr::interact

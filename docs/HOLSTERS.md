@@ -170,6 +170,21 @@ magazines, as before).
   plus `-left` / `-right` (e.g. `grips/BP_HG_C.grip-left.ini`), so the
   right-hand grips are never overwritten. `grip_record::SideKey` / `UsualKey`,
   tested in `tests/test_grip.cpp`.
+- **The left hand reaching for the holstered pistol** (owner 2026-11-07: "the
+  current hand pose for when the left hand is near is just a re-use of the
+  right hands pose and it causes the left arm to contort"). The pistol sits
+  in its holster turned for the right hand, so the right hand's grip mirrored
+  onto it twisted the left arm. The left hand's hand snap now has its own pose,
+  `grips/BP_HG_C.holster-left.ini` (`hands::kPointHolster` on the reach,
+  set by controls for the left hand only). It is never borrowed from the right
+  hand: until it is posed, the left hand stays on the controller near the
+  holster (the lid still opens). Shown exactly as posed (no
+  `holster_pose::Fit`, which is for the right hand's gun grip). To pose it: put
+  the left hand on the pistol in its holster the way you would grab it, hold
+  left Y for 1 s (the hand freezes, the 3D holster stays in view), pose it with
+  the right controller, tap Y to save. Drawing it still uses the held grip
+  (`BP_HG_C.grip-left`). Log: `body: BP_HG_C.holster-left not posed yet`,
+  `body: grip editor: posing the left hand's reach for the holstered pistol`.
 - Log: `controls: the left hand is the gun hand now (it draws the pistol)`,
   `holster: pistol drawn by the left hand`, `controls: left hand took the pouch
   magazine`, `controls: mag release (left hand)`, `body: BP_HG_C.grip-left not
