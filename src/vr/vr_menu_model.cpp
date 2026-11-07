@@ -43,7 +43,7 @@ const std::vector<Row>& Rows() {
           {"120 deg/s", {{"smooth_turn_speed", "120"}}},
           {"180 deg/s", {{"smooth_turn_speed", "180"}}},
           {"240 deg/s", {{"smooth_turn_speed", "240"}}}},
-         1, "How fast you turn while you hold the turn stick over.", "Turn style", kSmooth},
+         1, "How fast you turn while you push the turn stick to the side.", "Turn style", kSmooth},
         {"Turn speed",
          K::kChoice,
          {{"15 deg a flick", {{"snap_turn_degrees", "15"}}},
