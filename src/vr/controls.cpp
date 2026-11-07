@@ -3094,11 +3094,17 @@ void SupportGrip(const hands::HandState& lh, const input::HandInput& lin, double
     input::Haptic(InputOf(OtherHand()), 0.35f, 0.03f);
 }
 
-// Right stick click: fire selector (safe / semi / auto, as the gun allows).
-void FireSelector(game::Gun& gun, const input::HandInput& rin) {
-    // Rifles only: a Glock has no selector, and a stray click on the turn
-    // stick must never put the pistol on safe.
-    if (W.is_pistol || !rin.stick_click.pressed) return;
+// Fire selector (safe / semi / auto, as the gun allows): left X with the
+// rifle in the right hand. Owner 2026-11-07: it shared the right stick click
+// with the kick, so a rifle could not kick. With the rifle in the left hand
+// (left X is its magazine release) it stays on the right stick click.
+bool SelectorOnStick() { return GunHand() == input::kLeft; }
+void FireSelector(game::Gun& gun, const input::Snapshot& s) {
+    // Rifles only: a Glock has no selector.
+    if (W.is_pistol) return;
+    const bool pressed = SelectorOnStick() ? s.hand[input::kRight].stick_click.pressed
+                                           : s.hand[input::kLeft].primary.pressed;
+    if (!pressed) return;
     ue::Call c(gun.Object(), "Gun_SwitchFireMode");
     c.Invoke();
     uint8_t mode = 0;
@@ -3404,7 +3410,8 @@ void PhysicalCrouchAndJump(UObject player) {
 //   Left stick            move; click: sprint on/off (ends when you stop)
 //   Left Y                tap: switch weapon (slide release with the gun in the left hand); hold 1 s: grip editor
 //   Left X                magazine release with the gun in the left hand
-//   Right stick           left/right turn, up jump, down crouch / stand; click: kick (fire selector on a rifle)
+//   Right stick           left/right turn, up jump, down crouch / stand; click: kick
+//   Left X                rifle fire selector with the rifle in the right hand
 //   Gun hand's trigger    fire
 //   Other trigger         weapon light with that hand right next to the gun, else interact (any empty hand)
 //   Right A / B           magazine release / slide release with the gun in the right hand;
@@ -4230,9 +4237,9 @@ void GameActions(UObject player, const input::Snapshot& s) {
         log::Info("controls: objective markers (right B, hand empty)");
     }
 
-    // Right stick click: kick (the game's melee). On a rifle it is the fire
-    // selector instead (FireSelector).
-    if (r.stick_click.pressed && !GunIsRifle(player) && g_clock >= GA.melee_ready_at) {
+    // Right stick click: kick (the game's melee), with any gun. Only a rifle
+    // held in the left hand keeps its fire selector there (FireSelector).
+    if (r.stick_click.pressed && !(GunIsRifle(player) && SelectorOnStick()) && g_clock >= GA.melee_ready_at) {
         BeginKick(player);
         ue::Call c(player, "PlayerInput_MeleeAttack");
         c.Set("Press Released", false);
@@ -6866,8 +6873,7 @@ void OnTick(UObject player, float dt) {
         input::HandInput osup = ofree;
         if (toggle_drop[O]) osup.grip_button.pressed = false;  // that squeeze let go of the magazine
         SupportGrip(lh, osup, dt);
-        // The fire selector stays on the right stick's click (the left one sprints).
-        FireSelector(gun, s.hand[input::kRight]);
+        FireSelector(gun, s);
         RifleCarry(player, rh, lh, s.hand[O], s.hand[G], dt, true);
     }
     {
