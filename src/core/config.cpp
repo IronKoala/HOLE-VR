@@ -836,6 +836,26 @@ const Block kBlocks[] = {
      "; empty can lies on the floor this long (s).\n"
      "drinks_hide_game_can_s=6\n"
      "drinks_empty_can_s=30\n"},
+    {"gun_melee",
+     "\n"
+     "; --- Hitting with your guns (pistol whip, rifle butt) ---\n"
+     "; 1 = a gun in your hand hits what you really swing it into: the pistol's\n"
+     "; muzzle, slide or grip base, a long gun's butt, muzzle or handguard. No\n"
+     "; button and no gesture: it has to touch the target while moving this fast\n"
+     "; (metres a second; slower is just a touch), and is a full hit from the\n"
+     "; second speed up.\n"
+     "gun_melee=1\n"
+     "gun_melee_min_speed=2.0\n"
+     "gun_melee_full_speed=4.5\n"
+     "; Damage of a full hit: this share of the enemy's own max HP (0.15 = 15%),\n"
+     "; then the game's own body-part multiplier (the one its bullets use).\n"
+     "gun_melee_pistol_damage=0.15\n"
+     "gun_melee_long_gun_damage=0.25\n"
+     "; Stun of a full hit, as a share of your kick's stun.\n"
+     "gun_melee_pistol_stun=0.7\n"
+     "gun_melee_long_gun_stun=1.2\n"
+     "; The same gun hits the same target at most this often (seconds).\n"
+     "gun_melee_cooldown_s=0.45\n"},
     {"paired_capture_enabled",
      "\n"
      "; White squares (diagnostic): when the square watch sees dots in one eye, save\n"

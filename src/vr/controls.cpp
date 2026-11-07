@@ -34,6 +34,7 @@
 #include "vr/workbench.h"
 #include "vr/workbench_carry.h"
 #include "vr/drinks.h"
+#include "vr/gun_melee.h"
 #include "vr/input.h"
 #include "vr/interact/grip_points.h"
 #include "vr/interact/holster.h"
@@ -6575,6 +6576,49 @@ void OnLateTick(UObject player, float) {
     DrawHolsterModel(player);
 }
 
+// Gun melee (vr/gun_melee): the gun in the gun hand, and the rifle the other
+// hand carries by itself, hit what they are swung into. No button or gesture
+// starts it; only a real swing that touches something.
+void MeleeStrikes(UObject player, const hands::HandState hs[2], const input::Snapshot& s) {
+    gun_melee::Frame f;
+    f.player = player;
+    f.clock = g_clock;
+    f.frame = g_controls_frame;
+    f.xr_time = s.time;
+    auto add = [&](UObject gun, bool pistol, const FQuat& frame, const FVector& grip, double muzzle, double bore,
+                   bool have_stock, const FVector& stock, int hand, int second, bool kicking) {
+        if (!gun || f.count >= 2 || hand < 0 || hand > 1 || !hs[hand].valid || !s.hand[hand].grip_valid) return;
+        gun_melee::HeldGun& g = f.guns[f.count++];
+        g.gun = gun;
+        g.pistol = pistol;
+        g.frame = frame;
+        g.grip = grip;
+        g.muzzle_dist = muzzle;
+        g.bore_height = bore;
+        g.have_stock = have_stock;
+        g.stock = stock;
+        g.hand = hand;
+        g.hand_world = hs[hand].grip;
+        g.hand_tracking = s.hand[hand].grip;
+        g.second_hand = second;
+        g.kicking = kicking;
+    };
+    const bool gun_in_hand = W.gun && W.in_hand && W.have_pose && !W.right_let_go && !W.edit_frozen;
+    if (gun_in_hand)
+        add(W.gun, W.is_pistol, W.frame_rot, W.grip_world, W.muzzle_dist, W.bore_height, W.have_stock, W.stock_local,
+            GunHand(), W.two_hand ? OtherHand() : -1, W.kick_t0 >= 0 && g_clock - W.kick_t0 < 0.3);
+    if (g_rc.carried && g_rc.rifle && g_rc.rg.ok && !(gun_in_hand && W.gun == g_rc.rifle)) {
+        const bool own_stock = g_rc.rifle == W.gun && W.have_stock;
+        add(g_rc.rifle, false, g_rc.frame_world, g_rc.grip_world, g_rc.rg.muzzle_dist, g_rc.rg.bore_height, own_stock,
+            own_stock ? W.stock_local : FVector{}, OtherHand(), -1, false);
+    }
+    if (!f.count) return;
+    for (UObject o : {W.gun, W.held_mag, W.pouch_mag, g_rc.rifle, g_rc.pistol})
+        if (o) f.ignore.push_back(o);
+    if (UObject holder = static_cast<UObject>(world_menu::PanelHolder())) f.ignore.push_back(holder);
+    gun_melee::Update(f);
+}
+
 void OnTick(UObject player, float dt) {
     g_clock += dt;
     ++g_controls_frame;
@@ -6869,6 +6913,7 @@ void OnTick(UObject player, float dt) {
         // The fire selector stays on the right stick's click (the left one sprints).
         FireSelector(gun, s.hand[input::kRight]);
         RifleCarry(player, rh, lh, s.hand[O], s.hand[G], dt, true);
+        MeleeStrikes(player, hs, s);
     }
     {
         perf::Scope t(g_perf_holster_visual);
@@ -6935,6 +6980,7 @@ void RequestHolsterMove() {
 void Init() {
     LoadSettings();
     LoadMagSeats();
+    gun_melee::Init();
     holster_audio::Init(config::Dir());
     config::AddChangeListener(&ReloadSettings);
     game::AddTickListener(&OnTick);
