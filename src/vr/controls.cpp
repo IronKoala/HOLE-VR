@@ -3274,12 +3274,36 @@ struct {
     double next_refresh = 0;
     double ready_at = 0;
     std::vector<PressButton> buttons;
+    // Away from home the class is looked for once per level (see below).
+    UObject level_player = 0;
+    bool at_home = true;
+    bool searched_here = false;
 } g_press;
+
+// True when the player's world is the home level (Area000_Home).
+bool PlayerAtHome(UObject player) {
+    UObject o = player;
+    for (int i = 0; o && i < 8; ++i, o = ue::GetOuter(o))
+        if (ue::GetName(ue::GetClass(o)) == "World") return ue::GetName(o).find("Area000_Home") != std::string::npos;
+    return true;  // world not found: behave as before (keep looking)
+}
 
 void RefreshPressButtons(UObject player) {
     if (g_clock < g_press.next_refresh) return;
     g_press.next_refresh = g_clock + 2.0;
-    const UObject cls = g_press.cls.Get();
+    // Each lookup of a class that is not loaded is a pass over every game
+    // object on the game thread: 11-19 ms, one stutter every 10 s in the
+    // Office in the owner's 2026-11-07 run. The timer is a home prop, so away
+    // from home the class is looked for once when the level starts, and only
+    // kept checked after that if that level has it.
+    if (player != g_press.level_player) {
+        g_press.level_player = player;
+        g_press.at_home = PlayerAtHome(player);
+        g_press.searched_here = false;
+    }
+    const bool look = g_press.at_home || !g_press.searched_here || g_press.last_cls;
+    g_press.searched_here = true;
+    const UObject cls = look ? g_press.cls.Get() : 0;
     if (cls != g_press.last_cls) {
         g_press.last_cls = cls;
         if (cls) log::Info("controls: shooting range timer class found; its button can be pressed by hand");
