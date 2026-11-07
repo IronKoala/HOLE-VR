@@ -171,7 +171,13 @@ Angles Solve(const Chain& c, const FVector& target, const Limits& lim, double* e
 
 Angles Curl(const Chain& c, double amount, const Limits& lim) {
     Angles a;
-    for (int j = 0; j < 3; ++j) a.flex[j] = amount * lim.flex_max[j] * kD * (c.thumb ? 0.6 : 0.85);
+    // Controller scaling and contact drag can request more than a full curl.
+    // Generated poses must still respect the solver's configured joint stops.
+    if (!std::isfinite(amount)) amount = 0.0;
+    amount = std::max(0.0, amount);
+    for (int j = 0; j < 3; ++j)
+        a.flex[j] = std::clamp(amount * lim.flex_max[j] * kD * (c.thumb ? 0.6 : 0.85),
+                               lim.flex_min[j] * kD, lim.flex_max[j] * kD);
     return a;
 }
 

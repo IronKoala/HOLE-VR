@@ -12,8 +12,9 @@
 namespace holevr::perf {
 namespace {
 std::mutex g_mutex;
-// The default features currently register 51 distinct counters.
-constexpr int kMaxCounters = 64;
+// The default features registered 52 distinct counters on 2026-11-06 (55
+// with the holster parts, 57 with the lookup counters); leave room.
+constexpr int kMaxCounters = 96;
 Counter* g_counters[kMaxCounters];
 int g_count = 0;
 ReportFn g_lines[8];

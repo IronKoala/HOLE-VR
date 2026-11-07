@@ -1,6 +1,7 @@
 // Native tests: clang++ -std=c++20 -Isrc tests/test_hand_ownership.cpp -o test_hand_ownership
 #include <cstdio>
-#include "vr/hand_ownership.h"
+#include <initializer_list>
+#include "vr/hands.h"
 
 using namespace holevr::vr::hands;
 static int failures = 0;
@@ -38,6 +39,65 @@ struct Frame {
 };
 
 int main() {
+    // Calibration next to a seated pistol must ignore the approach pose,
+    // while genuine holds (including another owner's stale visual pose)
+    // still block setup. Candidate reservations are not actual item holds.
+    {
+        HandGrab approach;
+        approach.kind = GrabKind::kGunGrip;
+        approach.holster_preview = true;
+        for (const auto owner : {GripOwner::kNone, GripOwner::kWorkbench, GripOwner::kDrink}) {
+            const HandInteraction access{owner, true};
+            CHECK(!HasHeldObject(approach, access, false, false));
+            CHECK(HasHeldObject(approach, access, true, false));
+            CHECK(HasHeldObject(approach, access, false, true));
+        }
+        CHECK(HasHeldObject(approach, {GripOwner::kControls, true}, false, false));
+        approach.holster_preview = false;
+        for (const auto kind : {GrabKind::kGunGrip, GrabKind::kSlideGrab, GrabKind::kMagHeld,
+                               GrabKind::kMagInsert, GrabKind::kSupportGrip, GrabKind::kHolster}) {
+            approach.kind = kind;
+            CHECK(HasHeldObject(approach, {GripOwner::kNone, true}, false, false));
+        }
+        CHECK(!HasHeldObject({}, {GripOwner::kNone, true}, false, false));
+    }
+    // A visual approach can overlap a can/attachment. Reserving the input
+    // still chooses one real feature; the preview cannot block it or become
+    // a held gun for the grip editor/workbench. Raw pose data stays intact.
+    {
+        HandGrab approach;
+        approach.kind = GrabKind::kGunGrip;
+        approach.object = 123;
+        approach.holster_preview = true;
+        approach.pose_blend = 0.75;
+        CHECK(HeldGrabKind(approach) == GrabKind::kNone);
+        CHECK(HeldGrabKind(approach) != GrabKind::kGunGrip);
+        Frame both;
+        both.near_attachment = both.near_drink = HeldGrabKind(approach) == GrabKind::kNone;
+        auto access = both.Run(true, true);
+        CHECK(both.attachment && !both.drink && !both.weapon);
+        CHECK(access.owner == GripOwner::kWorkbench);
+        CHECK(!access.AllowsControls());
+        Frame can;
+        can.near_drink = HeldGrabKind(approach) == GrabKind::kNone;
+        access = can.Run(true, true);
+        CHECK(can.drink && !can.weapon && access.owner == GripOwner::kDrink);
+        // A true controls hold wins even if a visual snapshot still previews.
+        Frame actual;
+        actual.weapon = true;
+        actual.near_attachment = actual.near_drink = true;
+        access = actual.Run(true, true);
+        CHECK(actual.weapon && !actual.attachment && !actual.drink);
+        CHECK(HasHeldObject(approach, access, false, false));
+        CHECK(approach.kind == GrabKind::kGunGrip && approach.object == 123 && approach.pose_blend == 0.75);
+        for (const auto kind : {GrabKind::kNone, GrabKind::kGunGrip, GrabKind::kSlideGrab,
+                               GrabKind::kMagHeld, GrabKind::kMagInsert, GrabKind::kHolster,
+                               GrabKind::kSupportGrip}) {
+            HandGrab held;
+            held.kind = kind;
+            CHECK(HeldGrabKind(held) == kind); // retain every non-preview contract
+        }
+    }
     struct Case { const char* name; GripFacts facts; GripOwner expected; };
     const Case cases[] = {
         {"empty", {}, GripOwner::kNone},

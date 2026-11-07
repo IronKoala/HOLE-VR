@@ -1,6 +1,7 @@
 #include "vr/vr_options.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <map>
@@ -40,6 +41,8 @@ struct Lookups {
     UObject ktl = 0;   // KismetTextLibrary (Conv_StringToText)
     UObject scroll_class = 0, text_class = 0, rich_text_class = 0, panel_class = 0, user_widget_class = 0;
     UObject hbox_class = 0, sizebox_class = 0;  // for the arrows beside each setting (optional)
+    UObject slate_lib = 0;  // SlateBlueprintLibrary: where a row is drawn, for its description (optional)
+    int font = -1, font_size = 0;  // TextBlock.Font, copied from a row onto the description
 } L;
 
 // A widget we made, with its object index so a freed one is never touched.
@@ -57,21 +60,41 @@ bool Alive(const Made& m) { return m.obj && m.index >= 0 && ue::objects::Get(m.i
 // choice and stop at the ends; clicking the middle still steps forward and
 // wraps. The setup rows (Calibrate body ...) are one button.
 constexpr float kArrowWidth = 64.f;
+// Owner 2026-11-06: "when one is selected/cursor is hover over it, i want a
+// brief description of what the option does just off to the right". The
+// page is  [the rows (scrolling)] [description]: one text in a column right
+// of the rows, moved down level with the row last pointed at (or clicked).
+// Laid out in the menu's 1920x1080 units, before the arm zoom.
+constexpr float kAboutWidth = 520.f, kAboutGap = 28.f;
+const wchar_t* const kAboutHint = L"Point at a setting to see what it does.";
+constexpr uint8_t kVisible = 0, kCollapsed = 1;  // ESlateVisibility
 const wchar_t* const kLeftArrow = L"<";
 const wchar_t* const kRightArrow = L">";
 
 struct RowWidget {
     Made w;              // the middle button: "Setting: choice"
     Made left, right;    // the arrow buttons (setting rows only)
+    Made holder;         // what is in the list: the arrows' box, or the button alone
     int row = 0;         // index into vr_menu::Rows()
     int choice = 0;
+    int shown = -1;      // 1 shown, 0 hidden (does nothing with the other choices), -1 not set yet
     std::vector<UObject> texts, left_texts, right_texts;  // their TextBlocks
 };
 
 struct Tab {
     Made option;
     Made switcher;
-    Made page;        // our ScrollBox in the switcher
+    Made page;        // ours in the switcher: the rows and the description beside them
+    Made list;        // the ScrollBox of rows (the page itself without a description)
+    Made about_box;   // the description's column (SizeBox)
+    Made about;       // the description (TextBlock)
+    int about_row = -1;        // the row to describe (last pointed at or clicked)
+    int about_shown = -1;      // the row described now
+    int about_place = 0;       // frames left to place it level with its row every frame
+    int about_tick = 0;
+    int about_changes = 0;     // descriptions shown since Options opened (the first few are logged)
+    double about_y = -1;       // where it was placed (render translation, layout units)
+    bool about_font = false;   // the rows' font copied onto it
     Made vr_button;
     std::vector<UObject> vr_button_texts;
     std::vector<RowWidget> rows;
@@ -89,6 +112,8 @@ struct Tab {
 } T;
 
 UObject g_click_fn = 0;  // the game buttons' "clicked" event
+UObject g_focus_fn = 0;  // the row buttons' "focused" event (gamepad / keyboard selection)
+bool g_hover_hooked = false;
 
 // ---- text ----
 // FText values made once per string and kept forever, so they can be handed
@@ -305,15 +330,210 @@ void RelabelAll() {
         for (UObject t : T.vr_button_texts) SetText(t, L"VR");
 }
 
+// Hides the rows that do nothing with the other rows' current choices
+// (vr_menu::Row::only_with), shows the rest. Only rows that change are set.
+void ApplyShown(const char* why) {
+    const auto& rows = vr_menu::Rows();
+    std::string hidden, shown;
+    for (auto& r : T.rows) {
+        if (!Alive(r.holder)) continue;
+        const int show = vr_menu::Shown(rows[static_cast<size_t>(r.row)], &Current) ? 1 : 0;
+        if (show == r.shown) continue;
+        ue::Call v(r.holder.obj, "SetVisibility");
+        v.Set("InVisibility", show ? kVisible : kCollapsed);
+        if (!v.Invoke()) continue;
+        const bool first = r.shown < 0;
+        r.shown = show;
+        if (!show) hidden += std::string(hidden.empty() ? "" : ", ") + rows[static_cast<size_t>(r.row)].label;
+        else if (!first) shown += std::string(shown.empty() ? "" : ", ") + rows[static_cast<size_t>(r.row)].label;
+    }
+    if (!hidden.empty() || !shown.empty())
+        log::Info("vr options: %s: %s%s%s%s", why, hidden.empty() ? "" : "hidden (they do nothing now): ",
+                  hidden.c_str(), !hidden.empty() && !shown.empty() ? "; " : "",
+                  shown.empty() ? "" : ("shown again: " + shown).c_str());
+}
+
+// ---- description beside the rows ----
+struct Geo {
+    double top = 0, h = 0, local_h = 0;
+};
+
+// Where the engine last drew a widget (window pixels) and, if asked, its
+// height in its own layout units: the widget's cached geometry turned into
+// numbers by SlateBlueprintLibrary, as world_menu's WidgetRect does.
+bool GeoOf(UObject w, Geo* out, bool want_local) {
+    if (!L.slate_lib || !w) return false;
+    ue::Call g(w, "GetCachedGeometry");
+    if (!g.Invoke()) return false;
+    int32_t size = 0;
+    const uint8_t* geo = g.Raw("ReturnValue", &size);
+    if (!geo || size <= 0) return false;
+    auto with_geometry = [&](ue::Call& c) {
+        int32_t want = 0;
+        uint8_t* dst = c.Raw("Geometry", &want);
+        if (!dst || want != size) return false;
+        std::memcpy(dst, geo, static_cast<size_t>(size));
+        return true;
+    };
+    struct V2 {
+        double x, y;
+    };
+    ue::Call at(L.slate_lib, "LocalToAbsolute");
+    ue::Call extent(L.slate_lib, "GetAbsoluteSize");
+    if (!with_geometry(at) || !with_geometry(extent)) return false;
+    at.Set("LocalCoordinate", V2{0, 0});
+    if (!at.Invoke() || !extent.Invoke()) return false;
+    const V2 a = at.Result<V2>(), e = extent.Result<V2>();
+    if (!std::isfinite(a.y) || !std::isfinite(e.y) || e.y < 0) return false;
+    out->top = a.y;
+    out->h = e.y;
+    if (want_local) {
+        ue::Call local(L.slate_lib, "GetLocalSize");
+        if (!with_geometry(local) || !local.Invoke()) return false;
+        const V2 l = local.Result<V2>();
+        if (!std::isfinite(l.y) || l.y < 0) return false;
+        out->local_h = l.y;
+    }
+    return true;
+}
+
+// The rows' own font (the game's, before the arm makes menu text bigger)
+// onto the description, so it looks like the rest of the menu.
+void CopyRowFont() {
+    if (T.about_font || !Alive(T.about) || L.font < 0) return;
+    for (const auto& r : T.rows) {
+        if (r.texts.empty()) continue;
+        std::vector<uint8_t> font(static_cast<size_t>(L.font_size));
+        if (!mem::SafeCopy(font.data(), reinterpret_cast<const void*>(r.texts[0] + L.font), font.size())) return;
+        ue::Call c(T.about.obj, "SetFont");
+        int32_t want = 0;
+        uint8_t* dst = c.Raw("InFontInfo", &want);
+        if (!dst || want != L.font_size) return;
+        std::memcpy(dst, font.data(), font.size());
+        T.about_font = c.Invoke();
+        return;
+    }
+}
+
+// Moves the description level with its row: the top of the text at the top
+// of the row, kept inside the column (a row near the bottom gets its text
+// pulled up; one scrolled out of sight, the nearest end).
+void PlaceAbout() {
+    if (!Alive(T.about) || !Alive(T.about_box) || T.about_shown < 0) return;
+    const RowWidget* rw = nullptr;
+    for (const auto& r : T.rows)
+        if (r.row == T.about_shown) rw = &r;
+    if (!rw || !Alive(rw->holder)) return;
+    Geo box, row;
+    if (!GeoOf(T.about_box.obj, &box, true) || !GeoOf(rw->holder.obj, &row, false)) return;
+    if (box.h < 1 || box.local_h < 1) return;  // not drawn yet (another tab is showing)
+    struct V2 {
+        double x, y;
+    };
+    ue::Call d(T.about.obj, "GetDesiredSize");
+    const double text_h = d.Invoke() ? d.Result<V2>().y : 0.0;
+    double y = (row.top - box.top) * (box.local_h / box.h);
+    y = std::clamp(y, 0.0, std::max(0.0, box.local_h - (std::isfinite(text_h) ? text_h : 0.0)));
+    if (T.about_y >= 0 && std::fabs(y - T.about_y) < 0.5) return;
+    ue::Call c(T.about.obj, "SetRenderTranslation");
+    int32_t size = 0;
+    uint8_t* p = c.Raw("Translation", &size);
+    if (!p || size != static_cast<int32_t>(sizeof(V2))) return;
+    const V2 v{0.0, y};
+    std::memcpy(p, &v, sizeof(v));
+    if (c.Invoke()) T.about_y = y;
+}
+
+// From Tick: a new row to describe gets its words now and is placed over
+// the next frames (the engine lays the new words out first); after that it
+// is placed again 6 times a second, following the list as it scrolls.
+void UpdateAbout() {
+    if (!Alive(T.about)) return;
+    const auto& rows = vr_menu::Rows();
+    if (T.about_row >= 0 && T.about_row != T.about_shown && T.about_row < static_cast<int>(rows.size())) {
+        CopyRowFont();
+        const auto& row = rows[static_cast<size_t>(T.about_row)];
+        if (SetText(T.about.obj, Widen(row.about))) {
+            T.about_shown = T.about_row;
+            T.about_place = 3;
+            if (++T.about_changes <= 6)
+                log::Info("vr options: describing %s (pointed at or clicked)%s", row.label,
+                          T.about_changes == 6 ? "; not logged again until Options opens again" : "");
+        } else {
+            T.about_row = T.about_shown;  // try again only when another row is pointed at
+        }
+    }
+    if (T.about_shown < 0) return;
+    if (T.about_place > 0) {
+        --T.about_place;
+        PlaceAbout();
+    } else if (++T.about_tick % 12 == 0) {
+        PlaceAbout();
+    }
+}
+
+// The row a widget of ours belongs to (its button or an arrow), or -1.
+int RowOf(UObject w) {
+    for (const auto& r : T.rows)
+        if ((Alive(r.w) && r.w.obj == w) || (Alive(r.left) && r.left.obj == w) || (Alive(r.right) && r.right.obj == w))
+            return r.row;
+    return -1;
+}
+
+// Runs right after a row button's hover, unhover or focus event (the game's
+// buttons run the same ones; only ours are acted on). The laser pointer
+// hovers through the engine's widget interaction, like a mouse. Unhover is
+// skipped, so the last row pointed at stays described.
+void AfterHover(UObject self, UObject fn, void*) {
+    if (!Alive(T.about)) return;
+    const int row = RowOf(self);
+    if (row < 0) return;
+    if (fn != g_focus_fn) {
+        UObject button = 0;
+        if (ue::GetProp(self, "Button", button) && button) {
+            ue::Call h(button, "IsHovered");
+            if (h.Valid() && h.Invoke() && !h.Result<bool>()) return;  // the pointer left it
+        }
+    }
+    T.about_row = row;
+}
+
+// The row buttons' hover / unhover events and their focus event: Blueprint
+// events of the game's button class, followed like its click.
+void HookHover(UObject row_class) {
+    if (g_hover_hooked) return;
+    g_hover_hooked = true;
+    std::string names;
+    int n = 0;
+    for (UObject c = row_class; c; c = rf::GetSuper(c)) {
+        std::string cn = ue::GetName(c);
+        if (cn.size() < 2 || cn.compare(cn.size() - 2, 2, "_C") != 0) break;
+        for (UObject f : rf::GetFunctions(c)) {
+            const std::string fname = ue::GetName(f);
+            const bool hover = fname.find("OnButtonHoverEvent") != std::string::npos;
+            const bool focus = fname == "OnFocused_Event";
+            if (!hover && !focus) continue;
+            if (!ue::process_event::On(f, nullptr, &AfterHover)) continue;
+            if (focus) g_focus_fn = f;
+            names += fname + " ";
+            ++n;
+        }
+    }
+    if (n)
+        log::Info("vr options: descriptions follow %d row button event(s): %s", n, names.c_str());
+    else
+        log::Warn("vr options: the row buttons have no hover or focus event; descriptions show for clicked rows only");
+}
+
 // step: +1 right arrow, -1 left arrow (both stop at the ends), 0 the middle
 // button (next choice, wrapping round).
 void ClickRow(RowWidget& r, int step) {
     const auto& row = vr_menu::Rows()[static_cast<size_t>(r.row)];
+    T.about_row = r.row;
     if (row.kind == vr_menu::RowKind::kMeasureArms) {
         body::RequestMeasure();
-        controls::RequestHeightMeasure();
-        log::Info("vr options: Calibrate body clicked; once the menu closes, stand straight with your arms out to "
-                  "the sides (height after 2 s, arms after 5 s)");
+        log::Info("vr options: guided body calibration requested; close the menu with both hands free, then follow "
+                  "height, forward, out, bend and forward-check instructions; hold both triggers 2s, release between steps; X keeps arms; B/Y cancels");
         input::Haptic(input::kLeft, 0.4f, 0.05f);
         return;
     }
@@ -353,6 +573,7 @@ void ClickRow(RowWidget& r, int step) {
     log::Info("vr options: %s -> %s (%s, %s)%s", row.label, c.text, what.c_str(),
               step > 0 ? "right arrow" : step < 0 ? "left arrow" : "row clicked",
               saved ? "" : "; NOT saved in hole-vr.ini, used for this run only");
+    ApplyShown(row.label);
 }
 
 // Runs right after any game button's clicked event; only ours are acted on.
@@ -401,6 +622,22 @@ struct Margin {
     float l, t, r, b;
 };
 
+// Calls a setter whose one parameter is a bool (whatever the engine named
+// the parameter).
+bool SetFirstBool(UObject obj, const char* fn_name, bool value) {
+    ue::Call c(obj, fn_name);
+    if (!c.Valid()) return false;
+    for (const auto& q : rf::GetProperties(c.Function())) {
+        if (!(q.flags & rf::CPF_Parm) || (q.flags & rf::CPF_ReturnParm)) continue;
+        int32_t size = 0;
+        uint8_t* p = c.Raw(q.name.c_str(), &size);
+        if (!p || size != 1) return false;
+        *p = value ? 1 : 0;
+        return c.Invoke();
+    }
+    return false;
+}
+
 // [<] [Setting: choice] [>] in a horizontal box; false (nothing added) if
 // any part could not be made, and the row is the middle button alone.
 bool AddArrows(RowWidget& r, UObject label, UObject outer, UObject owner_widget, UObject row_class, UObject owner,
@@ -437,10 +674,44 @@ bool AddArrows(RowWidget& r, UObject label, UObject outer, UObject owner_widget,
     return true;
 }
 
+// Children in a panel widget, or -1.
+int ChildCount(UObject panel) {
+    if (!panel) return -1;
+    ue::Call c(panel, "GetChildrenCount");
+    return c.Valid() && c.Invoke() ? c.Result<int32_t>() : -1;
+}
+
+UObject ParentOf(UObject widget) {
+    if (!widget) return 0;
+    ue::Call c(widget, "GetParent");
+    return c.Invoke() ? c.Result<UObject>() : 0;
+}
+
+// True when our VR tab button is still in the tab row and our page still in
+// the switcher of this same Options widget.
+bool StillBuilt(UObject option) {
+    if (!Alive(T.option) || T.option.obj != option || !Alive(T.vr_button) || !Alive(T.page) || !Alive(T.switcher))
+        return false;
+    return ParentOf(T.vr_button.obj) && ParentOf(T.page.obj) == T.switcher.obj;
+}
+
 void Build(UObject option) {
     mem::ScopedRegionCache rc;
     if (!L.done) {
         log::Warn("vr options: engine lookups missing; no VR tab");
+        return;
+    }
+    // The game keeps its Options widget and shows the same one again each
+    // time (the pause menu does the same: one UIM_Pause_C for the whole
+    // session). Adding the tab on every opening put a second, third ... VR
+    // tab and page into it: the "VR menu duplicating itself" (owner
+    // 2026-11-06). The tab we already added is kept and only relabelled.
+    if (StillBuilt(option)) {
+        T.relabel_frames = 30;
+        T.about_changes = 0;
+        T.about_place = 3;
+        log::Info("vr options: Options opened again; its VR tab is already there (not added again; tab row has %d "
+                  "buttons)", ChildCount(ParentOf(T.vr_button.obj)));
         return;
     }
     T = Tab{};
@@ -479,6 +750,7 @@ void Build(UObject option) {
         log::Info("vr options: following clicks through %s.%s%s", ue::GetName(ue::GetOuter(row_fn)).c_str(),
                   ue::GetName(row_fn).c_str(), tab_fn != row_fn ? " (and the tab buttons' own)" : "");
     }
+    HookHover(row_class);
     static bool s_study = false;
     if (!s_study) {
         s_study = true;
@@ -495,6 +767,7 @@ void Build(UObject option) {
     ue::process_event::HookVtableOf(vr);
     std::vector<std::string> names;
     SetBlueprintTexts(vr, L"VR", &names);
+    const int tabs_before = ChildCount(tab_row);
     UObject vr_slot = AddChild(tab_row, vr);
     int copied = CopySlotLayout(SlotOf(tab_button), vr_slot);
     T.vr_button = Track(vr);
@@ -502,26 +775,57 @@ void Build(UObject option) {
     for (UObject t : T.vr_button_texts) SetText(t, L"VR");
     std::string text_names;
     for (auto& n : names) text_names += n + " ";
-    log::Info("vr options: VR tab button added to %s (%s; %d layout values copied; %zu text(s); label variables: %s)",
+    log::Info("vr options: VR tab button added to %s (%s; %d layout values copied; %zu text(s); label variables: %s; "
+              "the row had %d buttons before)",
               ue::GetName(tab_row).c_str(), ue::GetName(tab_class).c_str(), copied, T.vr_button_texts.size(),
-              text_names.empty() ? "none" : text_names.c_str());
+              text_names.empty() ? "none" : text_names.c_str(), tabs_before);
 
-    // The page: a scroll box of rows, one per setting.
+    // The page: a scroll box of rows, one per setting, with the description
+    // column to its right (without a HorizontalBox / SizeBox class: the rows
+    // alone, as before).
     UObject tree = 0;
     ue::GetProp(option, "WidgetTree", tree);
-    ue::Call so(L.gps, "SpawnObject");
-    so.Set("ObjectClass", L.scroll_class).Set("Outer", tree ? tree : option);
-    UObject page = so.Invoke() ? so.Result<UObject>() : 0;
-    if (!page) {
+    UObject outer = tree ? tree : option;
+    UObject list = SpawnWidget(L.scroll_class, outer);
+    if (!list) {
         log::Warn("vr options: could not make the VR page (ScrollBox)");
         return;
+    }
+    UObject page = list;
+    if (L.hbox_class && L.sizebox_class) {
+        UObject hb = SpawnWidget(L.hbox_class, outer);
+        UObject box = SpawnWidget(L.sizebox_class, outer);
+        UObject about = SpawnWidget(L.text_class, outer);
+        UObject list_slot = hb && box && about ? AddChild(hb, list) : 0;
+        if (list_slot) {
+            struct ChildSize {
+                float value;
+                uint8_t rule, pad[3];
+            } fill{1.f, 1, {0, 0, 0}};
+            SetStruct(list_slot, "SetSize", "InSize", fill);
+            ue::Call w(box, "SetWidthOverride");
+            w.Set("InWidthOverride", kAboutWidth);
+            w.Invoke();
+            if (UObject box_slot = AddChild(hb, box)) SetStruct(box_slot, "SetPadding", "InPadding", Margin{kAboutGap, 6.f, 0.f, 0.f});
+            AddChild(box, about);
+            const bool wraps = SetFirstBool(about, "SetAutoWrapText", true);
+            SetText(about, kAboutHint);
+            page = hb;
+            T.about_box = Track(box);
+            T.about = Track(about);
+            log::Info("vr options: description column added right of the rows (%.0f wide%s)", kAboutWidth,
+                      wraps ? "" : "; SetAutoWrapText missing, long descriptions may run on");
+        } else {
+            log::Warn("vr options: could not make the description column; the VR page has the rows only");
+        }
     }
     UObject page_slot = AddChild(switcher, page);
     T.switcher = Track(switcher);
     T.page = Track(page);
+    T.list = Track(list);
     T.row_class = row_class;
     T.owner = owner;
-    T.outer = tree ? tree : option;
+    T.outer = outer;
     T.building = page_slot != 0;
     T.rows.reserve(vr_menu::Rows().size());
     if (!page_slot) log::Warn("vr options: the VR page could not be added to the Options switcher");
@@ -542,7 +846,8 @@ void BuildRow(size_t i) {
     UObject holder = w;
     if (rows[i].kind == vr_menu::RowKind::kChoice && AddArrows(r, w, T.outer, option, T.row_class, T.owner, &holder))
         ++T.with_arrows;
-    if (UObject slot = AddChild(T.page.obj, holder)) SetStruct(slot, "SetPadding", "InPadding", Margin{0.f, 3.f, 0.f, 3.f});
+    if (UObject slot = AddChild(T.list.obj, holder)) SetStruct(slot, "SetPadding", "InPadding", Margin{0.f, 3.f, 0.f, 3.f});
+    r.holder = Track(holder);
     r.texts = FindTexts(r.w.obj);
     if (Alive(r.left)) r.left_texts = FindTexts(r.left.obj);
     if (Alive(r.right)) r.right_texts = FindTexts(r.right.obj);
@@ -553,7 +858,7 @@ void BuildRow(size_t i) {
 // From Tick while Options is open: rows until 3 ms of this frame are spent
 // (at least one), then the next frame.
 void BuildSomeRows() {
-    if (!T.building || !Alive(T.page) || !Alive(T.option)) return;
+    if (!T.building || !Alive(T.page) || !Alive(T.list) || !Alive(T.option)) return;
     mem::ScopedRegionCache rc;
     const double t0 = perf::NowMs();
     const auto& rows = vr_menu::Rows();
@@ -567,6 +872,8 @@ void BuildSomeRows() {
     if (T.next_row < rows.size()) return;
     T.building = false;
     RelabelAll();
+    ApplyShown("with the current choices");
+    CopyRowFont();
     T.relabel_frames = 30;
     size_t texts = 0;
     for (auto& r : T.rows) texts += r.texts.size();
@@ -590,6 +897,14 @@ void InitGame() {
     L.user_widget_class = ue::FindObject("Class /Script/UMG.UserWidget");
     L.hbox_class = ue::FindObject("Class /Script/UMG.HorizontalBox");
     L.sizebox_class = ue::FindObject("Class /Script/UMG.SizeBox");
+    L.slate_lib = ue::FindObject("SlateBlueprintLibrary /Script/UMG.Default__SlateBlueprintLibrary");
+    if (L.text_class) {
+        rf::PropertyInfo font = rf::FindProperty(L.text_class, "Font");
+        if (font.valid() && font.element_size > 0 && font.element_size <= 0x200) {
+            L.font = font.offset;
+            L.font_size = font.element_size;
+        }
+    }
     L.done = L.wbl && L.gps && L.ktl && L.scroll_class && L.text_class && L.panel_class && L.user_widget_class;
     if (L.done)
         log::Info("vr options: ready (a VR tab is added to Options)");
@@ -614,6 +929,7 @@ void Tick() {
         --T.relabel_frames;
         RelabelAll();
     }
+    UpdateAbout();
 }
 
 }  // namespace holevr::vr::vr_options

@@ -57,4 +57,11 @@ void DragTip(const Chain& c, const Limits& lim, const skel::Xf& hand, double ben
 // The posed fingertip in the world.
 FVector TipWorld(const Chain& c, const Angles& a, const skel::Xf& hand);
 
+// Ease toward a contact-solved pose only when the result does not penetrate
+// the current plane more deeply than that solved pose. Apply after drag.
+// Immediate separation takes priority over smoothing when the hand moves
+// into a surface; this is a kinematic constraint, not a force simulation.
+Angles BlendOnPlane(const Chain& c, const Angles& current, const Angles& solved, double t,
+                   const skel::Xf& hand, const FVector& point, const FVector& normal, double radius);
+
 }  // namespace holevr::vr::fingers

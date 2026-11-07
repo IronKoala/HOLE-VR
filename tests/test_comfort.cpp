@@ -122,6 +122,77 @@ static void TestPhysicalBody() {
     EXPECT(mc == 1);
 }
 
+static void TestPhysicalModeTransitions() {
+    constexpr double dt=1.0/72;
+    auto settle=[](PhysicalBody& body,double height) {
+        int events=0;
+        for(int i=0;i<150;++i) events+=body.Update(height,dt)!=BodyEvent::kNone;
+        return events;
+    };
+    PhysicalBody body;
+    body.SetStanding(1.65);
+    body.Configure(true,35,true);
+    EXPECT(settle(body,1.65)==0);
+    // The last physical sample before seated mode is low. While seated,
+    // controls disables posture actions and stops feeding the detector.
+    EXPECT(settle(body,1.10)==1);
+    body.Configure(false,35,false);
+    PhysicalBody without_reset=body;
+    without_reset.Configure(true,35,true);
+    EXPECT(without_reset.Update(1.70,dt)==BodyEvent::kJump); // reproduced old transition bug
+
+    // Changing mode clears old velocity/hold history but keeps a verified
+    // standing reference. Standing up during the disabled interval is no hop.
+    body.Reset();
+    body.Configure(true,35,true);
+    EXPECT(std::fabs(body.Standing()-1.65)<1e-9);
+    EXPECT(settle(body,1.70)==0);
+    int crouches=0,stands=0,jumps=0;
+    double head=1.70;
+    for(int i=0;i<110;++i) {
+        head+=((i<55?1.20:1.65)-head)*.12;
+        const auto event=body.Update(head,dt);
+        crouches+=event==BodyEvent::kCrouch;
+        stands+=event==BodyEvent::kStand;
+        jumps+=event==BodyEvent::kJump;
+    }
+    EXPECT(crouches==1 && stands==1 && jumps==0);
+    for(int i=0;i<15;++i) {
+        head+=.025;
+        jumps+=body.Update(head,dt)==BodyEvent::kJump;
+    }
+    EXPECT(jumps==1); // genuine motion after transition still works
+
+    // Quarantining the old seated-as-standing value must remove the measured
+    // flag too. Reset alone deliberately preserves measured standing height.
+    PhysicalBody legacy;
+    legacy.SetStanding(1.1648);
+    legacy.Configure(true,35,false);
+    EXPECT(settle(legacy,1.1648)==0);
+    legacy=PhysicalBody{}; // the reference-cleared path used by controls
+    legacy.Configure(true,35,false);
+    EXPECT(settle(legacy,1.73)==0);
+    EXPECT(std::fabs(legacy.Standing()-1.73)<1e-9);
+    EXPECT(settle(legacy,1.36)==1); // ordinary37cm crouch is detected again
+
+    // A new verified reference also starts a fresh observation window. No
+    // comparison is made between the old seated sample and the new baseline.
+    legacy=PhysicalBody{};
+    legacy.SetStanding(1.80);
+    legacy.Configure(true,35,true);
+    EXPECT(settle(legacy,1.80)==0);
+    EXPECT(std::fabs(legacy.Standing()-1.80)<1e-9);
+
+    // With no floor, the configured physical actions are disabled. Arbitrary
+    // LOCAL-space heights cannot generate posture actions; stick input is a
+    // separate controls path and does not pass through PhysicalBody.
+    PhysicalBody local;
+    local.Configure(false,35,false);
+    EXPECT(settle(local,0)==0);
+    EXPECT(settle(local,1.80)==0);
+    EXPECT(settle(local,-.40)==0);
+}
+
 static FQuat Yaw(double deg) { return ToQuat(FRotator{0, deg, 0}); }
 
 static void TestAimSmoother() {
@@ -266,6 +337,7 @@ int main() {
     TestLevels();
     TestSmoother();
     TestPhysicalBody();
+    TestPhysicalModeTransitions();
     TestAimSmoother();
     TestToggleGrip();
     TestCameraHeight();

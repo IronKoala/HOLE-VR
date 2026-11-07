@@ -9,6 +9,7 @@
 #include "vr/math.h"
 #include "vr/openxr.h"
 #include "vr/view_lead_math.h"
+#include <cstdint>
 
 namespace holevr::vr::stereo {
 
@@ -20,6 +21,10 @@ bool Install();
 
 // Re-zero the headset position/yaw against the game camera.
 void Recenter();
+// Changes when the tracking origin is explicitly re-established.
+std::uint64_t OriginGeneration();
+// World centimetres per real centimetre; 1 at the normal 100 units/metre.
+double TrackingScale();
 
 // Maps a pose in OpenXR tracking space (hands, controllers) into the game
 // world with exactly the transform the eyes used on the latest frame
@@ -66,6 +71,9 @@ void SetViewRaiseCm(double cm);
 // Your measured standing eye height (tracking space, metres above the
 // floor): the height the fixed-height modes and real crouch count from,
 // instead of wherever the head was at the last recentre. Thread-safe.
+// Used only in floor-based tracking space. Zero clears the trusted reference
+// and rebases only the vertical origin at the next fresh finite head sample;
+// horizontal origin and facing remain unchanged. Other invalid values are ignored.
 void SetStandingEyeHeight(double floor_to_eye_m);
 
 }  // namespace holevr::vr::stereo

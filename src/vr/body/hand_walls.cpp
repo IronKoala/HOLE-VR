@@ -1,78 +1,56 @@
 #include "vr/body/hand_walls.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <string>
-#include <vector>
 
 #include "core/config.h"
 #include "core/log.h"
 #include "core/memory.h"
 #include "core/perf.h"
 #include "ue/call.h"
-#include "vr/body/ik_math.h"
 #include "vr/world_menu.h"
 
 namespace holevr::vr::body::hand_walls {
 namespace {
-
-using ik::Length;
-
+using namespace ik;
 struct Settings {
-    bool on = true;
-    double radius = 4.0;    // cm: about half a fist
-    double probe = 14.0;    // cm: how far past the fist the fingertip probe reaches (0 = off)
+    bool on = true, complex = false, legacy_probe = false;
+    double probe = 14.0;
+    hand_motion::Settings motion;
 } S;
-constexpr double kProbeRadius = 2.0;  // cm: about a finger's width
-
-struct TArrayRaw {
-    const UObject* data;
-    int32_t num, max;
-};
-
-// An object we hold on to between frames, with its slot in the object
-// array, so a freed one is noticed before it reaches the engine.
-struct Kept {
-    UObject obj = 0;
-    int32_t index = -1;
-};
+constexpr double kProbeRadius = 2.0;
+struct TArrayRaw { const UObject* data; int32_t num, max; };
+struct Kept { UObject obj = 0; int32_t index = -1; };
 bool Alive(const Kept& k) {
     return k.obj && k.index >= 0 && mem::ReadOr<int32_t>(k.obj + ue::off::kObjIndex, -1) == k.index &&
            ue::objects::Get(k.index) == k.obj;
 }
-
+Kept Keep(UObject object) { return {object, mem::ReadOr<int32_t>(object + ue::off::kObjIndex, -1)}; }
 struct Side {
-    bool touching = false;
-    double touch_time = 0.0;  // how long this touch has lasted, s
-    double deepest = 0.0;     // furthest the real hand went past the surface in this touch, cm
-    std::string what;         // what the hand touched
-    // A clear sweep is reused while the eyes and the hand stay put.
-    bool last_clear = false;
-    FVector last_from, last_to, last_fwd;
-    // The fingertip probe found a surface ahead of the fingers.
-    bool ahead = false;
-    // The surface the hand last touched (fingers rest on it), kept while
-    // the hand stays near it.
-    bool have_plane = false;
+    hand_motion::State motion;
+    hand_motion::Result result;
+    bool ahead = false, have_plane = false;
     FVector plane_point, plane_normal;
-    FVector drawn;  // where the hand is drawn this frame
+    double plane_ms = 0;
+    Kept plane_actor;
 };
 Side g_side[2];
-
-perf::Counter g_perf{"body hands stop at walls"};
+hand_motion::PalmShape g_palm[2];
+perf::Counter g_perf{"body hand proxy collision"};
 UObject g_ksl = 0, g_gps = 0;
-int g_lookups = 0;
-int32_t g_radius_size = -1;  // SphereTraceSingle's Radius: float (4) or double (8)
-std::vector<Kept> g_attached;  // actors hanging on the player (holstered gun, mags)
+Kept g_player;
+double g_next_lookup_ms = 0;
+std::vector<Kept> g_attached;
+std::vector<UObject> g_ignore;
 double g_attached_age = 1e9;
-bool g_announced = false;  // the on/off state last logged
-int g_ahead_logged = 0;    // fingertip probe hits logged this run
-int g_logged = 0;          // touches logged one by one this run
-int g_touches = 0;         // touches since the last summary
-double g_summary_age = 0;  // s since the last summary
+bool g_announced = false;
+double g_log_age = 0;
+unsigned g_log_queries = 0, g_log_blocked = 0, g_log_recovery = 0;
+unsigned g_log_budget = 0, g_log_rotation_blocked = 0, g_log_max_queries = 0;
+double g_log_error = 0;
 
-// Actors on the player (holstered gun, pouch mags, anything the game hung on
-// the character) never stop the hand. Refreshed twice a second.
 void RefreshAttached(UObject player, double dt) {
     g_attached_age += dt;
     if (g_attached_age < 0.5) return;
@@ -80,232 +58,291 @@ void RefreshAttached(UObject player, double dt) {
     g_attached.clear();
     ue::Call c(player, "GetAttachedActors");
     if (!c.Valid()) return;
-    // Set only the flags this engine version has (a missing name would warn
-    // twice a second).
     int32_t flag = 0;
     if (c.Raw("bResetArray", &flag) && flag == 1) c.Set("bResetArray", true);
-    if (c.Raw("bRecursivelyIncludeAttachedActors", &flag) && flag == 1)
-        c.Set("bRecursivelyIncludeAttachedActors", true);
+    if (c.Raw("bRecursivelyIncludeAttachedActors", &flag) && flag == 1) c.Set("bRecursivelyIncludeAttachedActors", true);
     if (!c.Invoke()) return;
     int32_t size = 0;
     const uint8_t* raw = c.Raw("OutActors", &size);
-    struct Arr {
-        uintptr_t data;
-        int32_t num, max;
-    } arr{};
+    struct Arr { uintptr_t data; int32_t num, max; } arr{};
     if (!raw || size < static_cast<int32_t>(sizeof(Arr))) return;
     std::memcpy(&arr, raw, sizeof(Arr));
-    for (int i = 0; i < arr.num && i < 32; ++i) {
+    if (arr.num < 0 || arr.num > arr.max || arr.num > 4096) return;
+    for (int i = 0; i < arr.num && i < 64; ++i) {
         UObject a = mem::ReadOr<uintptr_t>(arr.data + i * sizeof(uintptr_t), 0);
-        if (a) g_attached.push_back({a, mem::ReadOr<int32_t>(a + ue::off::kObjIndex, -1)});
+        if (a) g_attached.push_back(Keep(a));
     }
 }
 
-// Sweeps the hand's ball from `from` to `to`. True with the ball's centre
-// where it first touches something; false when the way is clear (or the
-// sweep starts inside something: the eyes are in a wall, so there is no
-// sensible place to stop the hand).
-bool Sweep(UObject player, const FVector& from, const FVector& to, double radius, const std::vector<UObject>& ignore,
-           FVector* at, FVector* surface, FVector* normal, std::string* what) {
-    ue::Call t(g_ksl, "SphereTraceSingle");
-    if (!t.Valid()) return false;
-    if (g_radius_size < 0) {
-        int32_t sz = 0;
-        t.Raw("Radius", &sz);
-        g_radius_size = sz;
-        if (sz != 4 && sz != 8) log::Warn("hand walls: sphere trace radius is %d bytes; hands won't stop at walls", sz);
-    }
-    if (g_radius_size == 4)
-        t.Set("Radius", static_cast<float>(radius));
-    else if (g_radius_size == 8)
-        t.Set("Radius", radius);
-    else
-        return false;
-    TArrayRaw arr{ignore.data(), static_cast<int32_t>(ignore.size()), static_cast<int32_t>(ignore.size())};
-    t.Set("WorldContextObject", player).Set("Start", from).Set("End", to).Set("TraceChannel", uint8_t{0})
-        .Set("bTraceComplex", false).Set("ActorsToIgnore", arr).Set("bIgnoreSelf", true);
-    if (!t.Invoke() || !t.Result<bool>()) return false;
-    int32_t hit_size = 0;
-    uint8_t* hit = t.Raw("OutHit", &hit_size);
-    if (!hit) return false;
-    ue::Call b(g_gps, "BreakHitResult");
-    int32_t in_size = 0;
-    uint8_t* in = b.Raw("Hit", &in_size);
-    if (!in || in_size != hit_size) return false;
-    std::memcpy(in, hit, static_cast<size_t>(hit_size));
-    if (!b.Invoke() || !b.Get<bool>("bBlockingHit") || b.Get<bool>("bInitialOverlap")) return false;
-    *at = b.Get<FVector>("Location");
-    *surface = b.Get<FVector>("ImpactPoint");
-    *normal = b.Get<FVector>("ImpactNormal");
-    UObject actor = b.Get<UObject>("HitActor");
-    *what = actor ? ue::GetName(actor) : "something";
-    return true;
+bool Has(const ue::Call& call, const char* parameter, size_t expected) {
+    int32_t size = 0;
+    return call.Raw(parameter, &size) && size == static_cast<int32_t>(expected);
 }
 
-bool Near(const FVector& a, const FVector& b) { return Length(a - b) < 0.3; }
+// Reuse reflected parameter buffers for this body's frame. Validate all
+// fields before any query: Call::Set/Get intentionally tolerate mismatches,
+// but a missing boolean return must never masquerade as clear space here.
+// No hardcoded FHitResult offsets or engine-allocated output arrays are used.
+struct TraceAdapter {
+    ue::Call trace{g_ksl, "SphereTraceSingle"};
+    ue::Call box{g_ksl, "BoxTraceSingle"};
+    ue::Call unpack{g_gps, "BreakHitResult"};
+    int32_t radius_size = 0, hit_size = 0;
+    bool usable = false, box_usable = false;
 
-// The fingers reach well past the fist the hand's ball is centred on. A
-// thin ball swept from the fist along the fingers finds a wall or table
-// ahead of them, so the fingers and palm react when the fingertips get
-// there, not only once the fist does (a real hand, and the owner's
-// reference, SentientArt/TheBasement, collide with the whole hand). It only
-// remembers the surface; the hand isn't moved for it.
-void Probe(UObject player, int side, const FVector& fist, const FVector& fwd, const std::vector<UObject>& ignore) {
-    Side& s = g_side[side];
-    FVector at, surface, normal;
-    std::string what;
-    const bool hit = S.probe > 0.0 && Sweep(player, fist, fist + fwd * S.probe, kProbeRadius, ignore, &at, &surface,
-                                            &normal, &what) &&
-                     ik::Length(normal) > 0.5;
-    if (hit) {
-        s.have_plane = true;
-        s.plane_point = surface;
-        s.plane_normal = normal * (1.0 / ik::Length(normal));
-        if (!s.ahead && g_ahead_logged < 8) {
-            ++g_ahead_logged;
-            log::Info("hand walls: %s fingertips found %s %.1f cm past the fist", side == 0 ? "left" : "right",
-                      what.c_str(), ik::Length(at - fist));
-        }
+    explicit TraceAdapter(UObject player) {
+        if (!trace.Valid() || !unpack.Valid()) return;
+        trace.Raw("Radius", &radius_size);
+        int32_t input_size = 0;
+        if ((radius_size != 4 && radius_size != 8) ||
+            !trace.Raw("OutHit", &hit_size) || hit_size <= 0 ||
+            !unpack.Raw("Hit", &input_size) || input_size != hit_size ||
+            !Has(trace, "WorldContextObject", sizeof(UObject)) ||
+            !Has(trace, "Start", sizeof(FVector)) || !Has(trace, "End", sizeof(FVector)) ||
+            !Has(trace, "TraceChannel", sizeof(uint8_t)) ||
+            !Has(trace, "bTraceComplex", sizeof(bool)) ||
+            !Has(trace, "ActorsToIgnore", sizeof(TArrayRaw)) ||
+            !Has(trace, "bIgnoreSelf", sizeof(bool)) || !Has(trace, "ReturnValue", sizeof(bool)) ||
+            !Has(unpack, "bBlockingHit", sizeof(bool)) || !Has(unpack, "bInitialOverlap", sizeof(bool)) ||
+            !Has(unpack, "Location", sizeof(FVector)) || !Has(unpack, "ImpactPoint", sizeof(FVector)) ||
+            !Has(unpack, "ImpactNormal", sizeof(FVector)) || !Has(unpack, "Normal", sizeof(FVector)) ||
+            !Has(unpack, "HitActor", sizeof(UObject))) return;
+        TArrayRaw ignore{g_ignore.data(), static_cast<int32_t>(g_ignore.size()), static_cast<int32_t>(g_ignore.size())};
+        trace.Set("WorldContextObject", player).Set("TraceChannel", uint8_t{0}).Set("bTraceComplex", S.complex)
+            .Set("ActorsToIgnore", ignore).Set("bIgnoreSelf", true);
+        usable = true;
+        int32_t box_hit_size = 0;
+        box_usable = box.Valid() && box.Raw("OutHit", &box_hit_size) && box_hit_size == hit_size &&
+            Has(box, "WorldContextObject", sizeof(UObject)) && Has(box, "Start", sizeof(FVector)) &&
+            Has(box, "End", sizeof(FVector)) && Has(box, "HalfSize", sizeof(FVector)) &&
+            Has(box, "Orientation", sizeof(FRotator)) && Has(box, "TraceChannel", sizeof(uint8_t)) &&
+            Has(box, "bTraceComplex", sizeof(bool)) && Has(box, "ActorsToIgnore", sizeof(TArrayRaw)) &&
+            Has(box, "bIgnoreSelf", sizeof(bool)) && Has(box, "ReturnValue", sizeof(bool));
+        if (box_usable)
+            box.Set("WorldContextObject", player).Set("TraceChannel", uint8_t{0}).Set("bTraceComplex", S.complex)
+                .Set("ActorsToIgnore", ignore).Set("bIgnoreSelf", true);
+        static bool warned = false;
+        if (!box_usable && !warned) log::Warn("hand palm: BoxTraceSingle reflection unavailable; palm queries fail closed");
+        warned = !box_usable;
     }
-    s.ahead = hit;
+
+    hand_motion::Sweep Run(ue::Call& call, Kept* actor) {
+        hand_motion::Sweep hit;
+        if (actor) *actor = {};
+        call.Set("ReturnValue", false);
+        if (!call.Invoke()) return hit;
+        hit.available = true;
+        if (!call.Result<bool>()) return hit;
+        int32_t source_size = 0, target_size = 0;
+        const uint8_t* raw = call.Raw("OutHit", &source_size);
+        uint8_t* input = unpack.Raw("Hit", &target_size);
+        if (!raw || !input || source_size != hit_size || target_size != hit_size) return {};
+        std::memcpy(input, raw, static_cast<size_t>(hit_size));
+        if (!unpack.Invoke()) return {};
+        hit.hit = unpack.Get<bool>("bBlockingHit");
+        if (!hit.hit) return hit;
+        const Kept contact = Keep(unpack.Get<UObject>("HitActor"));
+        if (contact.obj && (!Alive(contact) ||
+            std::find(g_ignore.begin(), g_ignore.end(), contact.obj) != g_ignore.end())) return {};
+        hit.initial_overlap = unpack.Get<bool>("bInitialOverlap");
+        hit.centre = unpack.Get<FVector>("Location");
+        hit.point = unpack.Get<FVector>("ImpactPoint");
+        hit.normal = unpack.Get<FVector>(hit.initial_overlap ? "Normal" : "ImpactNormal");
+        if (actor) *actor = contact;
+        return hit;
+    }
+    hand_motion::Sweep Trace(const FVector& from, FVector to, double radius, Kept* actor = nullptr) {
+        if (!usable) return {};
+        if (Length(to - from) < 1e-5) to = from + FVector{0.001, 0, 0};
+        trace.Set("Start", from).Set("End", to);
+        if (radius_size == 4) trace.Set("Radius", static_cast<float>(radius));
+        else trace.Set("Radius", radius);
+        return Run(trace, actor);
+    }
+    hand_motion::Sweep Box(const FVector& from, FVector to, const FVector& half, const FQuat& rotation,
+                           Kept* actor = nullptr) {
+        if (!box_usable) return {};
+        if (Length(to - from) < 1e-5) to = from + FVector{0.001, 0, 0};
+        box.Set("Start", from).Set("End", to).Set("HalfSize", half).Set("Orientation", ToRotator(rotation));
+        return Run(box, actor);
+    }
+};
+void Remember(Side& side, const FVector& point, const FVector& normal, const Kept& actor) {
+    if (Length(normal) < 0.5) return;
+    side.have_plane = true;
+    side.plane_point = point;
+    side.plane_normal = Normalize(normal);
+    side.plane_actor = actor;
+    side.plane_ms = perf::NowMs();
+}
+double Setting(const char* name, double fallback, double lo, double hi) {
+    const double value = config::GetFloat(name, static_cast<float>(fallback));
+    return std::isfinite(value) ? std::clamp(value, lo, hi) : fallback;
+}
 }
 
-void EndTouch(int side) {
-    Side& s = g_side[side];
-    if (!s.touching) return;
-    s.touching = false;
-    if (g_logged >= 12) {
-        ++g_touches;
-    } else {
-        ++g_logged;
-        log::Info("hand walls: %s hand stopped at %s for %.1f s; the real hand went up to %.1f cm past the surface",
-                  side == 0 ? "left" : "right", s.what.c_str(), s.touch_time, s.deepest);
-    }
+void Reset(int side) {
+    if (side >= 0 && side < 2) { g_side[side] = {}; return; }
+    g_side[0] = g_side[1] = {};
+    g_ignore.clear();
+    g_attached.clear();
+    g_attached_age = 1e9;
+    g_player = {};
 }
-
-}  // namespace
 
 void LoadSettings() {
     S.on = config::GetBool("hand_wall_collision", true);
-    S.radius = std::clamp<double>(config::GetFloat("hand_wall_radius_cm", 4.f), 1.0, 10.0);
-    S.probe = std::clamp<double>(config::GetFloat("hand_wall_probe_cm", 14.f), 0.0, 30.0);
+    S.complex = config::GetBool("hand_world_trace_complex", false);
+    S.legacy_probe = !config::GetBool("hand_individual_finger_collision", true) ||
+                     !config::GetBool("hand_fingers_rest_on_walls", true);
+    auto& m = S.motion;
+    m.radius_cm = Setting("hand_wall_radius_cm", 4.0, 1.0, 10.0);
+    S.probe = Setting("hand_wall_probe_cm", 14.0, 0.0, 30.0);
+    m.frequency_hz = Setting("hand_follow_hz", 10.0, 3.0, 18.0);
+    m.damping_ratio = Setting("hand_follow_damping", 1.0, 0.7, 2.0);
+    m.max_force_n = Setting("hand_follow_max_force_n", 65.0, 5.0, 150.0);
+    m.max_speed_cm_s = Setting("hand_follow_max_speed_cm_s", 700.0, 100.0, 1200.0);
+    m.friction_per_s = Setting("hand_surface_friction", 5.0, 0.0, 30.0);
+    m.recovery_distance_cm = Setting("hand_recovery_distance_cm", 40.0, 15.0, 100.0);
+    Reset();
 }
 
-void Apply(UObject player, const hands::Pose& head, hands::HandState hs[2], const hands::HandGrab grab[2],
-           double dt) {
-    static bool registered = [] {
-        perf::Register(&g_perf);
-        return true;
-    }();
+void Apply(UObject player, const hands::Pose& head, hands::HandState hs[2], const hands::HandGrab grab[2], double dt) {
+    static bool registered = [] { perf::Register(&g_perf); return true; }();
     (void)registered;
     if (g_announced != S.on) {
         g_announced = S.on;
-        if (S.on)
-            log::Info("hand walls: on (a %.1f cm ball from the eyes to each empty hand stops at what it touches; "
-                      "the fingertips feel %.0f cm past the fist)",
-                      S.radius, S.probe);
-        else
-            log::Info("hand walls: off (hands pass through walls)");
+        log::Info("hand proxy: %s (calibrated palm box, %.1f cm sphere fallback, checked rotation, %.0f N virtual force cap)",
+                  S.on ? "on" : "off", S.motion.radius_cm, S.motion.max_force_n);
     }
-    if (!S.on || !player) {
-        EndTouch(0);
-        EndTouch(1);
-        g_side[0].have_plane = g_side[1].have_plane = false;
-        g_side[0].ahead = g_side[1].ahead = false;
-        return;
+    if (!player || !ue::IsLive(player)) { Reset(); return; }
+    if (g_player.obj != player || !Alive(g_player)) {
+        Reset();
+        g_player = Keep(player);
+        g_ksl = g_gps = 0;
+        g_next_lookup_ms = 0;
     }
+    const double elapsed = std::isfinite(dt) ? std::clamp(dt, 0.0, 0.25) : 0.0;
+    RefreshAttached(player, elapsed);
+    g_ignore.clear();
+    g_ignore.push_back(player);
+    for (const Kept& kept : g_attached) if (Alive(kept)) g_ignore.push_back(kept.obj);
+    for (int i = 0; i < 2; ++i) if (grab[i].object) g_ignore.push_back(grab[i].object);
+    if (UObject holder = world_menu::PanelHolder()) g_ignore.push_back(holder);
+    if (!S.on) { g_side[0] = g_side[1] = {}; return; }
     perf::Scope timer(g_perf);
-    if ((!g_ksl || !g_gps) && g_lookups < 3) {
-        ++g_lookups;
+    if ((!g_ksl || !g_gps) && perf::NowMs() >= g_next_lookup_ms) {
+        g_next_lookup_ms = perf::NowMs() + 5000.0;
         if (!g_ksl) g_ksl = ue::FindObject("KismetSystemLibrary /Script/Engine.Default__KismetSystemLibrary");
         if (!g_gps) g_gps = ue::FindObject("GameplayStatics /Script/Engine.Default__GameplayStatics");
-        if (!g_ksl || !g_gps) log::Warn("hand walls: trace library not found; hands won't stop at walls");
+        if (!g_ksl || !g_gps) log::Warn("hand proxy: reflected trace functions unavailable");
     }
-    if (!g_ksl || !g_gps) return;
-
-    RefreshAttached(player, dt);
-    std::vector<UObject> ignore;
-    for (const Kept& k : g_attached)
-        if (Alive(k)) ignore.push_back(k.obj);
-    for (int i = 0; i < 2; ++i)
-        if (grab[i].object) ignore.push_back(grab[i].object);
-    // The forearm menu and wrist HUD panels sit between the eyes and the
-    // left hand whenever you look at your wrist.
-    if (UObject holder = world_menu::PanelHolder()) ignore.push_back(holder);
-
+    // An unavailable backend follows Step's unavailable-query policy too:
+    // preserve an acquired position, or mark this local body hand invalid.
+    TraceAdapter backend(player);
     for (int side = 0; side < 2; ++side) {
         Side& s = g_side[side];
         hands::HandState& h = hs[side];
-        if (!h.valid || grab[side].kind != hands::GrabKind::kNone) {
-            EndTouch(side);
-            s.last_clear = false;
-            s.have_plane = false;
-            s.ahead = false;
+        const auto ownership = hands::GetInteraction(static_cast<hands::Hand>(side));
+        if (!h.valid || grab[side].kind != hands::GrabKind::kNone ||
+            ownership.owner != hands::GripOwner::kNone || !ownership.actions_allowed ||
+            hands::EditorHand() >= 0) {
+            Reset(side);
             continue;
         }
-        const FVector from = head.location, to = h.grip.location;
-        const FVector fwd = ik::Normalize(h.grip.rotation.Rotate(FVector{1, 0, 0}));
-        s.drawn = to;
-        // Reused while the eyes, the hand and its pointing stay put (2 deg).
-        if (s.last_clear && Near(from, s.last_from) && Near(to, s.last_to) && ik::Dot(fwd, s.last_fwd) > 0.9994)
-            continue;
-        FVector at, surface, normal;
-        std::string what;
-        if (!Sweep(player, from, to, S.radius, ignore, &at, &surface, &normal, &what)) {
-            EndTouch(side);
-            s.last_clear = true;
-            s.last_from = from;
-            s.last_to = to;
-            s.last_fwd = fwd;
-            Probe(player, side, to, fwd, ignore);
-            continue;
-        }
-        s.last_clear = false;
+        // Never keep the old plane just because the hand stayed near it.
+        s.have_plane = false;
         s.ahead = false;
-        const FVector shift = at - to;
-        const double depth = Length(shift);
-        if (!s.touching) {
-            s.touching = true;
-            s.touch_time = 0;
-            s.deepest = 0;
-        }
-        s.touch_time += dt;
-        s.deepest = std::max(s.deepest, depth);
-        s.what = what;
-        if (ik::Length(normal) > 0.5) {
-            s.have_plane = true;
-            s.plane_point = surface;
-            s.plane_normal = normal * (1.0 / ik::Length(normal));
-        }
-        s.drawn = at;
-        h.grip.location = at;
-        h.aim.location = h.aim.location + shift;
-        h.wrist.location = h.wrist.location + shift;
-    }
+        Kept contact_actor;
+        const FVector raw_position = h.grip.location;
+        const FQuat raw_rotation = Normalized(h.grip.rotation);
+        hand_motion::Input input;
+        input.target = raw_position;
+        input.rotation = raw_rotation;
+        input.anchor = head.location;
+        input.dt = dt;
+        input.palm = g_palm[side];
+        s.result = hand_motion::Step(s.motion, S.motion, input,
+            [&](const FVector& from, const FVector& to, double radius) {
+                Kept actor;
+                auto hit = backend.Trace(from, to, radius, &actor);
+                if (hit.hit && !hit.initial_overlap) contact_actor = actor;
+                return hit;
+            }, [&](const FVector& from, const FVector& to, const FVector& half, const FQuat& rotation) {
+                Kept actor;
+                auto hit = backend.Box(from, to, half, rotation, &actor);
+                if (hit.hit && !hit.initial_overlap) contact_actor = actor;
+                return hit;
+            });
+        // No verified physical placement (for example an overlapping reset
+        // anchor) must not silently fall through to the raw tracked pose.
+        // This is only the body copy; controls retain their actual tracking.
+        if (!s.result.valid) { h.valid = false; continue; }
+        if (s.result.touching) Remember(s, s.result.point, s.result.normal, contact_actor);
 
-    g_summary_age += dt;
-    if (g_summary_age >= 60.0) {
-        if (g_touches > 0)
-            log::Info("hand walls: %d more times a hand stopped at something in the last minute", g_touches);
-        g_touches = 0;
-        g_summary_age = 0;
+        const FQuat turn = Normalized(s.result.rotation * raw_rotation.Inverse());
+        h.aim.location = s.result.position + turn.Rotate(h.aim.location - raw_position);
+        h.wrist.location = s.result.position + turn.Rotate(h.wrist.location - raw_position);
+        h.aim.rotation = Normalized(turn * h.aim.rotation);
+        h.wrist.rotation = Normalized(turn * h.wrist.rotation);
+        h.palm_normal = turn.Rotate(h.palm_normal);
+        h.grip.location = s.result.position;
+        h.grip.rotation = s.result.rotation;
+
+        // Legacy palm-flattening hint only; individual finger geometry is
+        // handled by finger_world later in the body frame.
+        if (!s.have_plane && S.legacy_probe && S.probe > 0.0) {
+            Kept actor;
+            const FVector forward = h.grip.rotation.Rotate(FVector{1,0,0});
+            auto hit = backend.Trace(h.grip.location, h.grip.location + forward * S.probe, kProbeRadius, &actor);
+            ++s.result.queries;
+            if (hit.available && hit.hit && !hit.initial_overlap && Length(hit.normal) > 0.5) {
+                s.ahead = true;
+                Remember(s, hit.point, hit.normal, actor);
+            }
+        }
+        g_log_queries += s.result.queries;
+        g_log_blocked += s.result.touching ? 1 : 0;
+        g_log_recovery += s.result.recovering ? 1 : 0;
+        g_log_budget += s.result.budget_limited ? 1 : 0;
+        g_log_rotation_blocked += s.result.rotation_blocked ? 1 : 0;
+        g_log_max_queries = std::max(g_log_max_queries, static_cast<unsigned>(s.result.queries));
+        g_log_error = std::max(g_log_error, s.result.error_cm);
+    }
+    g_log_age += elapsed;
+    if (g_log_age >= 10.0) {
+        log::Info("hand proxy: %u sweeps (max %u/hand), %u blocked, %u recovery, %u rotation blocked, "
+                  "%u budget-limited frames, max tracking separation %.1f cm",
+                  g_log_queries, g_log_max_queries, g_log_blocked, g_log_recovery, g_log_rotation_blocked,
+                  g_log_budget, g_log_error);
+        g_log_age = 0; g_log_queries = g_log_blocked = g_log_recovery = 0; g_log_error = 0;
+        g_log_budget = g_log_rotation_blocked = g_log_max_queries = 0;
     }
 }
 
-double Radius() { return S.radius; }
-
+const std::vector<UObject>& IgnoredActors() { return g_ignore; }
+void SetPalmShape(int side, const hand_motion::PalmShape& shape) {
+    if (side < 0 || side > 1) return;
+    const auto& before = g_palm[side];
+    if (before.valid != shape.valid || Length(before.centre - shape.centre) > 0.5 ||
+        Length(before.half - shape.half) > 0.25 ||
+        AngleBetween(before.rotation.Rotate({0,0,1}), shape.rotation.Rotate({0,0,1})) > 5.0*kDegToRad)
+        Reset(side);
+    g_palm[side] = shape;
+}
+bool Enabled() { return S.on; }
+hand_motion::Result Motion(int side) { return side >= 0 && side < 2 ? g_side[side].result : hand_motion::Result{}; }
+double Radius() { return S.motion.radius_cm; }
 bool Touching(int side) {
-    if (side < 0 || side > 1 || !S.on) return false;
-    return g_side[side].touching || g_side[side].ahead;
+    return side >= 0 && side < 2 && S.on && (g_side[side].result.touching || g_side[side].ahead);
 }
-
 bool Contact(int side, FVector* point, FVector* normal) {
-    if (side < 0 || side > 1 || !S.on) return false;
+    if (side < 0 || side > 1 || !S.on || !point || !normal) return false;
     Side& s = g_side[side];
-    if (!s.have_plane) return false;
-    // Forget it once the hand has moved away from that spot, or is past the
-    // surface's plane (round an edge or corner, where the plane isn't).
-    if (ik::Length(s.drawn - s.plane_point) > 20.0 || ik::Dot(s.drawn - s.plane_point, s.plane_normal) < 0.0) {
+    if (!s.have_plane || perf::NowMs() - s.plane_ms > 100.0 ||
+        (s.plane_actor.obj && !Alive(s.plane_actor)) ||
+        Length(s.result.position - s.plane_point) > 20.0 ||
+        Dot(s.result.position - s.plane_point, s.plane_normal) < 0.0) {
         s.have_plane = false;
         return false;
     }
@@ -313,5 +350,4 @@ bool Contact(int side, FVector* point, FVector* normal) {
     *normal = s.plane_normal;
     return true;
 }
-
-}  // namespace holevr::vr::body::hand_walls
+} // namespace holevr::vr::body::hand_walls

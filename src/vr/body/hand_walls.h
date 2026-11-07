@@ -2,39 +2,52 @@
 // Empty hands stop at walls (owner's feature list, 2026-11-03, item 12:
 // "physics hands that stop at walls").
 //
-// The VR body's hand is drawn where the controller is, unless something is
-// in the way: a fist-sized ball is swept from the eyes to the hand, and where
-// it first touches a wall, floor, door, table or person, the drawn hand stops
-// against that surface. The controller itself is left alone, so grabbing,
-// holsters, doors and menus still use the real hand. A hand that holds
-// something follows that object instead (the gun keeps itself out of walls on
-// its own: controls WallPushback).
+// The empty hand follows tracking through a bounded damped virtual spring.
+// A rig-calibrated oriented palm box resolves contact and slides tangentially;
+// a grip-centred sphere is used only without valid rig geometry. Rotation and
+// palm seating have checked clearance. Tracking loss/teleport reacquisition
+// sweeps from the head before placement. The actual controller is untouched.
+// Held objects, interaction reservations and the grip editor bypass this
+// proxy so their authoritative poses keep control. No Chaos body or prop
+// impulse is created by this kinematic collision-constrained spring model.
 //
-// The fingers reach past that ball, so a thin ball is also swept from the
-// fist along the fingers: a surface ahead of the fingertips is remembered
-// for them (and the palm) before the fist gets there.
+// A fresh forward sphere trace supplies the optional legacy finger path.
+// Individual finger geometry is queried separately after arm posing.
 //
 // Settings: hand_wall_collision (1 = on), hand_wall_radius_cm (ball radius),
 // hand_wall_probe_cm (fingertip probe length past the fist, 0 = off).
 #include "ue/objects.h"
 #include "vr/hands.h"
+#include "vr/body/hand_motion.h"
+#include <vector>
 
 namespace holevr::vr::body::hand_walls {
 
 using ue::UObject;
 
 void LoadSettings();
+bool Enabled();
+// Invalidate physical history and contact planes on lifecycle changes. A
+// negative side resets both hands and the frame-local ignored actor list.
+void Reset(int side = -1);
 
-// hs: this frame's hands as the body is about to draw them. An empty hand
-// that would be inside something is moved back to the surface (grip, aim and
-// wrist points move together; rotations are kept).
+// Populated by Apply, reused by individual finger traces later in the same
+// body frame. Contains player, validated attached actors, held objects and UI.
+const std::vector<UObject>& IgnoredActors();
+hand_motion::Result Motion(int side);
+// Rebuilt by body from FreeHand and rig landmarks before Apply. Extents include
+// the full palm volume; the palm-facing surface is centre + rotated Z * half.Z.
+void SetPalmShape(int side, const hand_motion::PalmShape& shape);
+
+// hs: this frame's local body hand copies. The proxy's translation/rotation
+// are applied consistently to grip, aim, wrist and palm direction.
 void Apply(UObject player, const hands::Pose& head, hands::HandState hs[2], const hands::HandGrab grab[2],
            double dt);
 
 // The surface an empty hand (0 left, 1 right) last stopped against: a point
-// on it and its normal (out of the surface, toward the hand). Kept while the
-// hand stays within 20 cm of that point and on its open side, so fingers
-// can rest on a wall the ball itself isn't touching. False otherwise.
+// on it and its normal (out of the surface, toward the hand). Requires a
+// fresh current-frame trace, expires after 100 ms if Apply stops, and checks
+// actor lifetime and a finite local neighborhood. False otherwise.
 bool Contact(int side, FVector* point, FVector* normal);
 
 // Radius of the hand's ball, cm: the real fist centre is this far off a

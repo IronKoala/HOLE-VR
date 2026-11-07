@@ -53,6 +53,14 @@ the hand finally came within range of the box.
      between (the Visibility trace) rules a thing out;
   4. where you look (the game's own target).
 
+  The ray for 2 and 3 is the controller's aim pose turned
+  `touch_interact_point_pitch_deg` (-30) down and `touch_interact_point_yaw_deg`
+  (5, mirrored for the left hand) out: the aim pose points about 30 degrees
+  above where a hand naturally points, the same offset the held pistol uses
+  (`kBasePitch`/`kBaseYaw` in `vr/controls.cpp`). Owner 2026-11-06: "the angle
+  isnt in line with my hand, i think its pointing more towards the sky"; the
+  log agreed (the raw aim was level at a box on the floor 1.4 m away).
+
   A press buzzes only when it used something, and only a press that used
   something holds up the next one (0.5 s).
 
@@ -125,7 +133,8 @@ the hand finally came within range of the box.
 `touch_interact_extra_containers` and `touch_interact_skip` (class-name
 pieces, comma separated); `touch_interact_study` (1);
 `touch_interact_trigger_near_cm` (8); `touch_interact_point_cone_deg` (8);
-`touch_interact_point_min_cm` (6); `touch_interact_loot_log` (1).
+`touch_interact_point_min_cm` (6); `touch_interact_loot_log` (1);
+`touch_interact_point_pitch_deg` (-30); `touch_interact_point_yaw_deg` (5).
 
 ## What the game does (bytecode, dump/script)
 

@@ -47,9 +47,18 @@ Anchors Sample(UObject player) {
         a.mesh_at = x.translation;
         a.mesh_rot = x.rotation;
     }
-    // The gun in the right hand, for the shake line in the log.
-    const hands::HandGrab grab = hands::GetGrab(hands::kRight);
-    if (grab.kind == hands::GrabKind::kGunGrip && grab.object) {
+    // The gun in the hand that holds it by its grip (either hand can), for
+    // the shake line in the log.
+    int gun_side = input::kRight;
+    hands::HandGrab grab = hands::GetGrab(hands::kRight);
+    if (hands::HeldGrabKind(grab) != hands::GrabKind::kGunGrip) {
+        const hands::HandGrab left = hands::GetGrab(hands::kLeft);
+        if (hands::HeldGrabKind(left) == hands::GrabKind::kGunGrip) {
+            grab = left;
+            gun_side = input::kLeft;
+        }
+    }
+    if (hands::HeldGrabKind(grab) == hands::GrabKind::kGunGrip && grab.object) {
         ue::Call c(grab.object, "GetTransform");
         if (c.Invoke()) {
             const skel::Xf x = c.Result<skel::Xf>();
@@ -58,7 +67,7 @@ Anchors Sample(UObject player) {
             a.held_rot = x.rotation;
             // The controller pose this tick's hands came from.
             const input::Snapshot s = input::LastConsumed();
-            const input::HandInput& h = s.hand[input::kRight];
+            const input::HandInput& h = s.hand[gun_side];
             if (s.valid && h.grip_valid) {
                 a.grip = true;
                 a.grip_m = XrToUePosition(h.grip.position.x, h.grip.position.y, h.grip.position.z, 1.0);

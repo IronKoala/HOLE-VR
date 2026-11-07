@@ -42,6 +42,20 @@ Use the engine's own `FullBodyIK` / `IKRig` (PBIK) solvers on the player mesh,
 driven by head and hand targets, with leg animation from locomotion. Body
 calibration (height, arm length) feeds the solver.
 
+### Stairs and foot placement: headset validation pending
+
+First implementation added: recognize multiple consistent treads, confirm each
+foot's landing with centre/heel/toe traces, retain native gait timing, and plant
+supporting feet on their individual steps. Stair probing has a per-frame budget.
+Isolated ledges, ramps, and the shooting-range table cannot qualify as stairs.
+Unsupported or unavailable geometry retains ordinary floor handling/animation.
+
+Pending headset checks: ascent, descent, stopping and turning on actual stairs;
+pelvis/knee coherence, weight transfer and tread clearance; no table climbing;
+and Seated, Character (fixed-height), and Your own (real-height) modes. Use the
+new body-stairs counters and body-leg timing to investigate missed contacts or
+excessive query cost. Single steps and irregular geometry remain fallback cases.
+
 ## Comfort and settings (inspired by TheFreeMike's F.E.A.R. VR)
 
 - Movement direction: head or controller (fall back to head if the hand loses tracking).

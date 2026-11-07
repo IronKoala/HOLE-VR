@@ -5,8 +5,8 @@
 // hand, a magazine or the slide in the left), the OTHER controller edits it:
 //   - hold Y (left controller) for 1 s: start / save and stop editing;
 //   - squeeze grip with the editing hand on a finger joint: that joint
-//     turns with the controller, in all three axes (pitch, yaw, roll); the
-//     rest of the finger follows. On the palm: move and turn the whole hand
+//     turns with the controller as far as a real joint can (joint_limits.h:
+//     middle and tip joints only curl); the rest of the finger follows. On the palm: move and turn the whole hand
 //     on the object. On the object ball (a held magazine): move and turn the
 //     object in the hand;
 //   - tap Y: save; click the left stick: undo back to the saved grip.

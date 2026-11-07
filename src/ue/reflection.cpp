@@ -1,7 +1,14 @@
 #include "ue/reflection.h"
 
+#include <chrono>
+#include <cstring>
+#include <map>
+#include <mutex>
+#include <utility>
+
 #include "core/log.h"
 #include "core/memory.h"
+#include "core/perf.h"
 
 namespace holevr::ue::reflection {
 namespace {
@@ -138,9 +145,22 @@ bool Ready() { return g_ready; }
 UObject GetSuper(UObject s) { return g_ready && s ? mem::ReadOr<uintptr_t>(s + o_super) : 0; }
 int32_t GetPropertiesSize(UObject s) { return g_ready && s ? mem::ReadOr<int32_t>(s + o_props_size) : 0; }
 
+// Reading every variable of a class decodes each name through guarded reads
+// (about 1 ms for a weapon Blueprint and its parents). Counted so the perf
+// report shows any code that does it every frame instead of once
+// (2026-11-06: three uncached pistol lookups cost 9 ms of every frame).
+static perf::Counter g_perf_props{"lookups: all of a class's variables read"};
+
 std::vector<PropertyInfo> GetProperties(UObject s) {
     std::vector<PropertyInfo> out;
     if (!g_ready || !s) return out;
+    static const bool registered = [] {
+        g_perf_props.per_second_total = true;
+        perf::Register(&g_perf_props);
+        return true;
+    }();
+    (void)registered;
+    perf::Scope timed(g_perf_props);
     uintptr_t f = mem::ReadOr<uintptr_t>(s + o_child_props);
     for (int n = 0; f && n < 4096; ++n) {
         PropertyInfo p;
@@ -202,12 +222,62 @@ int32_t FindPropertyOffset(UObject s, const std::string& name) {
     return -1;
 }
 
-PropertyInfo FindProperty(UObject s, const std::string& name) {
+namespace {
+PropertyInfo FindPropertyUncached(UObject s, const std::string& name) {
     for (int n = 0; s && n < 128; ++n, s = GetSuper(s)) {
         for (auto& p : GetProperties(s))
             if (p.name == name) return p;
     }
     return {};
+}
+
+// FindProperty walks the whole class chain and decodes every property's
+// names through guarded reads: about 3 ms for a weapon Blueprint, and the
+// holster code asked for the pistol's IsOffset three times a frame (owner
+// 2026-11-06: tick 3 took 8 ms of every 14 ms frame). A class's properties
+// never change once it is loaded, so the answer is kept, checked against
+// the struct's own index and name each time so a freed class whose memory
+// now holds another object is looked up again. A miss is kept for 2 s only:
+// a class still linking may gain the property.
+struct CachedProperty {
+    int32_t index = -1;
+    FName name{};
+    bool found = false;
+    std::chrono::steady_clock::time_point miss_until{};
+    PropertyInfo info;
+};
+std::mutex g_find_mutex;
+std::map<std::pair<UObject, std::string>, CachedProperty> g_find_cache;
+
+bool SameStruct(UObject s, const CachedProperty& c) {
+    if (mem::ReadOr<int32_t>(s + off::kObjIndex, -2) != c.index) return false;
+    const FName now = mem::ReadOr<FName>(s + off::kObjName);
+    return std::memcmp(&now, &c.name, sizeof(FName)) == 0;
+}
+}  // namespace
+
+PropertyInfo FindProperty(UObject s, const std::string& name) {
+    if (!s || !g_ready) return {};
+    const auto now = std::chrono::steady_clock::now();
+    auto key = std::make_pair(s, name);
+    {
+        std::lock_guard<std::mutex> lock(g_find_mutex);
+        auto it = g_find_cache.find(key);
+        if (it != g_find_cache.end() && SameStruct(s, it->second) &&
+            (it->second.found || now < it->second.miss_until))
+            return it->second.info;
+    }
+    PropertyInfo info = FindPropertyUncached(s, name);
+    CachedProperty c;
+    c.index = mem::ReadOr<int32_t>(s + off::kObjIndex, -2);
+    c.name = mem::ReadOr<FName>(s + off::kObjName);
+    c.found = info.valid();
+    c.miss_until = now + std::chrono::seconds(2);
+    c.info = info;
+    std::lock_guard<std::mutex> lock(g_find_mutex);
+    if (g_find_cache.size() >= 8192) g_find_cache.clear();
+    g_find_cache[std::move(key)] = std::move(c);
+    return info;
 }
 
 }  // namespace holevr::ue::reflection

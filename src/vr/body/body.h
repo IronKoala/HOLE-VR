@@ -11,14 +11,15 @@
 //     hand to the gun grip / slide / magazine while something is held;
 //   - fingers: hand poses from vr/body/hand_pose (grip, trigger, slide,
 //     magazine) and the controller's finger sensors;
-//   - legs: two-bone IK keeps the animated feet planted while the pelvis
-//     moves;
+//   - legs: reference-frame solving preserves moving strides; grounded idle
+//     feet plant/step on verified floor. Kick/airborne animation owns the legs;
 //   - the head is shrunk to nothing so it never blocks your view.
 // Clothing/hair meshes that followed BodyMesh are pointed at the copy.
 //
 // F9 toggles it (falls back to the game's own body). Settings: body_* in
 // hole-vr.ini.
 #include "vr/hands.h"
+#include "vr/watch_math.h"
 
 namespace holevr::vr::body {
 
@@ -67,7 +68,7 @@ bool PinchPoint(int side, FVector* thumb_in_grip, FVector* index_in_grip);
 
 // What the visible hand can touch things with, in the world, as drawn on the
 // body's last frame: after empty hands stop at walls, fingers give way on
-// surfaces and the palm settles flat (vr/body/hand_walls, finger_rest). For
+// surfaces and the palm settles flat (hand_walls, finger_world, finger_contact). For
 // pressing buttons with the hand the player sees, not the controller.
 struct HandContacts {
     FVector tip[5];            // fingertips: thumb, index, middle, ring, pinky
@@ -80,10 +81,34 @@ struct HandContacts {
 // newer than 0.1 s. side: 0 left, 1 right.
 bool GetHandContacts(int side, HandContacts* out);
 
-// Measures the arms like holding the left stick click 2 s does: a 5 s
-// countdown (buzzes) once the game runs again, then stand straight with both
-// arms straight out to the sides. For the VR tab in Options.
+// Game-thread accessory mount: the current solved forearm/wrist and their
+// reference frames. False after an incomplete body tick or stale tracking.
+bool GetForearm(int side, watch::Forearm* out);
+
+// Guided height -> arms forward -> arms out -> bend once -> forward verification.
+// Only quality-checked measurements replace the previous fit. Hands must be free.
 void RequestMeasure();
+bool CalibrationActive();
+void CancelCalibration();
+// Queue height-only completion (left X), including during the height step.
+// Finish after height is measured; preserve the existing arm fit. Limited
+// reach must never be interpreted as shorter anatomical arm segments.
+void SkipCalibrationArms();
+// Calibration owns both index triggers. Holding both starts the actual 2s
+// measurement; either release cancels it. Both must be up before rearming.
+// interrupted preserves a coalesced release/repress between body samples.
+void SetCalibrationTriggers(bool left_down, bool right_down, bool valid, bool interrupted = false);
+// Thread-safe text for the headset overlay. No engine access on the render thread.
+enum class CalibrationPose { None, Height, SeatedHeight, Forward, Out, BendUp, Bent };
+struct CalibrationHud {
+    bool visible = false;
+    CalibrationPose pose = CalibrationPose::None;
+    char title[64] = {};
+    char line[3][96] = {};
+    char footer[96] = {};
+    int progress = 0;  // 0..100, current representative pose window
+};
+CalibrationHud GetCalibrationHud();
 
 // Registers the game tick listener. Call after controls::Init() so hand
 // poses for this frame are already published.

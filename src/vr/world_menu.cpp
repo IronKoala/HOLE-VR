@@ -1,4 +1,5 @@
 #include "vr/world_menu.h"
+#include "vr/watch.h"
 
 #include <windows.h>
 #include <d3d12.h>
@@ -3663,6 +3664,7 @@ void OnGameFrame() {
         UpdateStack();
     }
     g_menu_up = !G.panels.empty();
+    watch::MenuTick();
     UpdateBrightness(now);
     static UObject s_death = 0;
     {
@@ -3674,6 +3676,7 @@ void OnGameFrame() {
             s_death = death;
         }
     }
+    if (s_death) watch::ResultsOpened();
     // Blur the world past arm's length while a menu is on the arm. Not on the
     // death screen: its kill shot is a picture the game takes of your body a
     // few metres away, and the blur turned it into a smear (2026-11-03 panel

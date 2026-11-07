@@ -33,36 +33,100 @@ whatever the laser is on). A step writes the ini key(s) into `hole-vr.ini` in pl
 
 | Row | Choices | ini key(s) |
 |---|---|---|
-| Moving | Smooth, Teleport | `locomotion` |
-| Turning | Smooth, Snap | `turn_mode` |
-| Snap turn | 15, 30, 45, 60, 90 deg | `snap_turn_degrees` |
-| Turn speed | 60, 90, 120, 180, 240 deg/s | `smooth_turn_speed` |
+| Moving | Walk, Teleport | `locomotion` (smooth, teleport) |
+| Turn style | Smooth, Snap, Off | `turn_mode` (1 smooth, 0 snap, 2 off: no stick turning) |
+| Turn speed (Smooth) | 60, 90, 120, 180, 240 deg/s (default 90) | `smooth_turn_speed` |
+| Turn speed (Snap) | 15, 30, 45, 60, 90 deg a flick (default 30) | `snap_turn_degrees` |
 | Move stick | Left, Right | `move_stick` |
-| Move toward | Where you look, Stick hand | `move_direction` |
+| Move toward (Walk only) | Where you look, Stick hand | `move_direction` |
 | Vignette moving | Off, Light, Medium, Strong | `comfort_vignette_move` (0, 0.35, 0.6, 0.85) |
-| Vignette turning | Off, Light, Medium, Strong | `comfort_vignette_turn` |
-| Head in a wall | Fades, No fade | `head_wall_fade` |
-| Wall fade starts | 5, 10, 15, 20, 25 cm away | `head_wall_fade_start_cm` (15) |
+| Vignette turning (Smooth only) | Off, Light, Medium, Strong | `comfort_vignette_turn` |
+| Wall fade | Off, 5, 10, 15, 20, 25 cm away | `head_wall_fade` + `head_wall_fade_start_cm` (on, 15) |
 | Height | Character, Your own, Seated | `fixed_height` + `height_mode` |
-| Real crouch | On, Off | `physical_crouch` |
-| Hop to jump | Off, On | `physical_jump` |
+| Real crouch (not Seated) | On, Off | `physical_crouch` |
+| Hop to jump (not Seated) | Off, On | `physical_jump` |
 | World size | 80% to 120% | `world_scale` (0.8 to 1.2) |
-| Room walking | On, Off | `room_scale_follow` |
+| Roomscale | On, Off | `room_scale_follow` |
 | Grip | Hold, Toggle | `grip_toggle` |
-| Aiming eye | Right, Left | `dominant_eye_right` |
 | Aim smoothing | Off, Light, Medium, Strong | `aim_smoothing` (0, 0.33, 0.66, 1) |
 | Rifle stock | On, Off | `rifle_virtual_stock` |
 | Gun stops at walls | On, Off | `gun_wall_collision` |
 | Hands stop at walls | On, Off | `hand_wall_collision` |
-| Gun kick | Off, Light, Normal, Strong | `gun_recoil_kick` |
+| Gun kick | Off, Light, Normal, Strong, Stronger, Heavy, Heavier, Brutal, Extreme | `gun_recoil_kick` (0, 0.5, 1, 1.5, 2.4, 3.3, 4.2, 5.1, 6: Extreme is 4x Strong) |
 | Monitor shows | Right eye, Left eye, Both eyes | `monitor_view` (right, left, both) |
-| Calibrate body | (action) | after the menu closes: height at 2 to 4 s (`standing_height_cm`), arms at 5 s (`body-measure.ini`) |
+| Calibrate body | (action) | height → arms forward → arms out → bent elbows → forward check; hold both triggers for 2s to record; left X keeps the current arms |
 | Edit hand grips | (action) | opens the grip editor once the menu closes; while it is open the row reads "open, click to close" and closes it |
 | Move holsters | (action) | 5 s after the menu closes (a buzz each second), each holster moves to where the hand holding its item is |
+
+**Descriptions** (owner 2026-11-06: "when one is selected/cursor is hover
+over it, i want a brief description of what the option does just off to the
+right"). The page is a horizontal box: the scroll box of rows (filling the
+width) and, right of it, a 520-unit column (`SizeBox`) holding one wrapping
+`TextBlock`. Pointing the laser at a row or its arrows, clicking it, or
+selecting it with a gamepad shows that row's description (`Row::about` in
+`vr_menu_model.cpp`), moved down level with the row (a render translation,
+so nothing else is laid out again) and kept inside the column; it follows
+the list when it scrolls. Moving off the rows keeps the last description.
+Hover comes from the game button class's own hover/unhover and focus events
+(`AfterHover`), which the laser's widget interaction sets off like a mouse.
+The text gets the rows' font, and the forearm menu outlines and enlarges it
+with the rest of the page. Log: `vr options: description column added right
+of the rows`, `descriptions follow N row button event(s)`, and `describing
+<row>` for the first six each time Options opens.
+
+**Hidden rows** (owner 2026-11-06: "are any of them redundant/moot?"). A
+row that does nothing with another row's current choice is collapsed
+(`Row::only_with`): Vignette turning unless Turn style is Smooth (a
+snap is instant, so there is nothing to darken); Move toward with Teleport
+(the arc follows the stick hand); Real crouch and Hop to jump when Seated
+(they are off then). There are two Turn speed rows, deg/s shown only with
+Smooth and deg a flick only with Snap, so one Turn speed row is on the page
+at a time and none with Off. Changing the deciding row shows or hides them
+at once. Log: `vr options: Turn style: hidden (they do nothing now): Turn
+speed, Vignette turning`.
+
+**Removed and merged** (2026-11-06): "Aiming eye" is off the tab: since
+6DoF aiming it only chose which eye the rifle's shoulder lock lines the
+sights up with. `dominant_eye_right` still works in the ini (right unless
+set) for a later left-handed mode. "Head in a wall" and "Wall fade starts"
+are one row, Wall fade: Off or the distance the fade starts at. Owner's
+answer the same day: "Smooth turn, snap turn, teleport all merge into row":
+Moving, Turning, Snap turn and Turn speed are one row, Movement, stepping
+Teleport, Snap turn 15-90 deg, Smooth turn 60-240 deg/s. Then (owner,
+same day): "Rename room walking to roomscale, and to add an option to turn
+off joystick turning altogether": `turn_mode=2` turns the stick's sideways
+push off (you turn with your body), offered as "Teleport, no turning" and
+"Walk, no turning". A choice's keys that the ini has count for it when they
+match and against it when they don't, so "no turning" (two keys) beats a
+turn choice whose step or speed happens to match the ini.
+
+**Split again** (owner 2026-11-07: "the turning row is far to dense, we
+need 1 row for turn style and 1 for turn speed, also double check that all
+turn styles should be functioning"): Moving (Walk, Teleport), Turn style
+(Smooth, Snap, Off) and Turn speed, whose choices follow the style. Any
+turn style works with either way of moving. The stick-to-degrees math for
+each style is `vr/turn_math.h` (`turn::Step`), checked by
+`tests/test_turn.cpp`: smooth turns the set speed per second at full stick
+and nothing inside the dead zone, snap turns one step per flick (again only
+once the stick comes back under 0.4), and Off never turns. `controls.cpp`
+reads `turn_mode` with the same `turn::StyleFromMode` (unknown values are
+Smooth, as the tab shows them). Same day, "give me 5 more kick strength
+options with the fifth being 4x as strong as 'strong'": Gun kick adds
+Stronger, Heavy, Heavier, Brutal and Extreme in even steps from Strong
+(1.5) to Extreme (6). The kick's peak is about the setting, so Extreme flips
+a one-handed pistol up about 40 degrees and back about 12 cm a shot,
+mostly settled again within 0.2 s (the same timing as every level).
 
 Move holsters is here because the right stick click (which used to be held
 for it) is now the kick. The grip editor (left Y hold) and the arm measure
 (left stick click hold) still open on their buttons too.
+
+Right-stick kick automatically chooses the right leg when you aim right of
+the body; left/centre uses the left leg. Aim and side lock when the kick starts.
+The existing rifle fire-selector use of the button is unchanged. The VR body
+and native kick trace share the chosen side/direction, with the game's extra
+upward trace offset removed. If the bilateral adapter or body is unavailable,
+the native kick remains the fallback. No arm recalibration is required.
 
 The tab button and an empty page are added when Options opens; the rows
 are then made a few per frame (up to 3 ms of each frame, at least one row)
@@ -88,7 +152,7 @@ levels. Each frame picks one part of it.
   Strong the clear circle is about 33 deg wide each side of centre.
 - Head in a wall: a ball is swept from the body's middle at head height to
   the eyes. Its radius is where the fade begins (`head_wall_fade_start_cm`,
-  15 cm, the "Wall fade starts" row). Where it stops, the eyes are that
+  15 cm, the "Wall fade" row). Where it stops, the eyes are that
   close to a surface; the closer they are to it, measured along the
   surface's normal (comfort_math `WallFade`), the darker, until black
   `head_wall_fade_full_cm` (2 cm) before the surface. Until 2026-11-04 the
@@ -108,17 +172,27 @@ levels. Each frame picks one part of it.
 ## Height, real crouch and hop to jump (controls.cpp `PhysicalCrouchAndJump`)
 
 - **Character** (default): your eyes are at the character's eye height
-  whatever your real height.
+  whether you physically sit or stand. Calibration keeps this height and does
+  not guess your physical posture or overwrite saved height references.
 - **Your own**: your real head height. When the game's camera drops for a
   crouch, the mod gives that drop back (`stereo::SetViewRaiseCm`) so your eyes
-  stay where your real head is.
+  stay where your real head is. Calibrate standing upright to record the
+  standing floor-to-eye reference.
 - **Seated**: like Character, and real crouch and hop to jump are off.
+  Calibration records a separate seated reference while you sit comfortably;
+  it leaves the standing reference and character height unchanged.
 - **Real crouch**: dropping your head 35 cm (`physical_crouch_cm`) below your
   standing height makes the character crouch (the game's own Crouch). Standing
-  back up past 25 cm stands it up. Your standing height is learned in the
-  first 1.5 s and is the highest still head height under 2.3 m.
+  back up past 25 cm stands it up. A valid saved standing measurement sets the
+  baseline; otherwise it learns the highest still head height under 2.3 m,
+  starting after 1.5 s.
 - **Hop to jump** (off by default): the head rising faster than 1.1 m/s while
   above standing height presses jump. Then 1 s before it can fire again.
+
+In Character and Seated modes, the drawn pelvis follows the game's stance.
+Shoulder fitting adjusts the spine within bounds instead of forcing a squat;
+the game's actual crouches still apply. Switching height mode does not require
+repeating a successful arm calibration.
 
 ### Stick crouch check and the camera hold (controls.cpp)
 
@@ -179,12 +253,47 @@ right hand. Putting the gun in the left hand is a later change.
 
 ## Body calibration
 
-Calibrate body on the VR tab. After the menu closes, stand straight with your
-arms straight out to the sides. At 2 s both controllers buzz and your eye
-height is measured for 2 s (the highest point), then saved as
-`standing_height_cm` (a strong buzz). At 5 s the body measures your arms as
-before (left stick click 2 s still works too). Real crouch uses the standing
-height from the start of every run instead of learning it.
+Put down held items and select **Calibrate body** on the VR tab, then close the
+menu. Follow the five steps at a comfortable pace:
+
+1. **Height:** relax and look ahead. Stand for **Your own**, sit for **Seated**,
+   or use the usual posture for **Character**. Character keeps existing height
+   references because the tracking floor alone does not identify physical posture.
+2. **Forward:** extend arms comfortably forward, palms inward and wrists in line.
+   Choose a comfortable height; do not lock the elbows.
+3. **Out:** open the straight arms comfortably to the sides, palms down and
+   wrists in line. This opening motion helps estimate the shoulders.
+4. **Bend:** let the hands rise by bending the elbows. Keep elbows near their
+   current places and wrists in line; palms can turn naturally.
+5. **Forward check:** return to the earlier comfortable forward pose, palms inward.
+
+When comfortable, **hold both index triggers for two seconds**. Recording happens
+during that hold and tolerates natural movement. Vibration builds from 0% toward
+90%, then reaches 100% when the step is accepted. Release both triggers between
+steps. Releasing either early resets only the current recording and stops the
+vibration. A no longer confirms. The bar shows recording progress. There is no overhead reach, exact required arm
+height, prescribed bend angle or repeated raise/lower cycle. The program learns
+from the confirmed poses instead of deciding readiness from guessed joint positions.
+
+**Left X skips arm setup and keeps the current arms.** Your own/Seated can still
+record the corresponding height reference; Character or unavailable floor tracking
+keeps existing references. No uncomfortable movement should be forced. B/Y cancels.
+Tracking loss pauses the current sample and retains completed steps; release both triggers, then hold them again when ready. Recentring or
+changing height mode during setup stops the attempt without saving partial data.
+
+The fit learns the shoulder directions supported by the recorded motion. Other
+directions remain estimates. Elbow motion independently estimates forearm length;
+upper-arm length can still depend on an uncertain shoulder. These confidence levels
+are saved separately, and an uncertain fit is not labeled a measured proportion.
+The final forward sample checks repeatability rather than proving exact anatomy.
+
+One learned wrist mapping applies across poses. Free-hand elbow posture remains
+independent of wrist turning. Profile v6 preserves separate standing/seated heights,
+shoulder confidence and forearm confidence. Updating one height keeps the other;
+skipping arms keeps the previous arm fit. Older profiles remain usable and are not
+rewritten by installation. Cancelled/failed setup keeps the saved file; a successful
+replacement backs it up first. V1/v2 heights remain unclassified, never assumed standing.
+See [BODY.md](BODY.md) for validation rules and remaining tracking limitations.
 
 ## Shot study (does the game shoot from the muzzle?)
 
@@ -334,7 +443,7 @@ The fingers follow the controller's curl less the flatness.
   the character standing; calling Crouch directly`, and `... by itself N s
   after` if something else changes it.
 - `teleport: arc uses ...`, `teleport: moved N cm`, `teleport: no room ...`.
-- `controls: height measured: your eyes are N cm above the floor`.
+- `body calibration:` stage, rejection and per-arm fit-quality records.
 - `vr options: Edit hand grips clicked ...` then `controls: opening/closing the
   grip editor (asked for from the VR tab)`.
 - `vr options: Move holsters clicked ...` then the holster countdown lines.

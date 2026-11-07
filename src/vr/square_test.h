@@ -24,4 +24,8 @@ namespace holevr::vr::square_test {
 // After game::Init: follows the player's tick.
 void Init();
 
+// Game thread: a suspect is switched off or about to be (the GPU cost test
+// waits for it).
+bool Busy();
+
 }  // namespace holevr::vr::square_test

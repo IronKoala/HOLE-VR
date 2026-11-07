@@ -1,5 +1,11 @@
 # Rifle in the left hand, pistol in the right
 
+Since 2026-11-06 either hand can hold either gun (docs/HOLSTERS.md, "Either
+hand"). Below, "right hand" means the gun hand and "left hand" the other hand;
+`interact::Decide` is unchanged and is fed the two roles. New with it: the
+other hand can hold the rifle by its own grip (`by_grip`) while the pistol is
+out, and the rifle comes out in that hand when the pistol is put away.
+
 Owner request (2026-11-03): "hold the foregrip of the rifle in one hand and
 pistol in the other". The rifle stays in the left hand by its handguard while
 the pistol is the gun that fires, like a soldier going from a rifle to a
@@ -145,6 +151,17 @@ player's own `InpActEvt_SwitchToPrimary_K2Node_InputActionEvent_7` /
 `InpActEvt_SwitchToSecondary_K2Node_InputActionEvent_6` (falls back to
 `PlayerInput_ScrollWeapon` if missing). The mod waits up to 2.5 s for the
 game to switch; until then the rifle stays where it is.
+
+Switching to the pistol, the weapon manager also calls the rifle's
+`SetOffsetTransform(false)` (BP_WeaponBase: `PartsOffset` / `BaseOffset` move
+to their put-away place), as it does for the spare pistol. Owner, 2026-11-06
+run: with the rifle in the left hand, drawing the pistol made the rifle "move
+out of place on its own", and it came back when both hands took it. While the
+mod places the rifle (left hand, flying back, resting in its holster) its
+parts are kept in the held place (`IsOffset` true, the place its frame was
+measured in); handed back to the game's own spot they go back. Log: `rifle
+carry: the game moved the rifle's parts to their put-away place ...; put them
+back in the held place (the grip point moved N cm) because ...`.
 
 The rifle's spot is learned from where the game hangs it (its root
 component's `AttachParent`, `AttachSocketName` and offset); before that it

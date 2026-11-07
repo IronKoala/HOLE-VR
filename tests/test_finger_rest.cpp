@@ -1,6 +1,7 @@
 // Native unit tests for fingers giving way against a surface (vr/body/finger_rest).
 //   g++ -std=c++20 -Isrc tests/test_finger_rest.cpp src/vr/body/finger_rest.cpp src/vr/body/finger_solve.cpp
 //       src/vr/body/skeleton.cpp src/vr/body/ik_math.cpp -o /tmp/test_finger_rest && /tmp/test_finger_rest
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 
@@ -69,6 +70,21 @@ int main() {
         EXPECT(std::fabs(p.bend - 0.4) < 1e-9 && p.depth == 0.0 && p.dir == 0 && !p.pushed);
     }
 
+    // Strong curl input and fingertip drag must not bypass joint stops.
+    // This also covers reverse drag beyond the backward end of the range.
+    for (bool thumb : {false, true}) {
+        fingers::Chain joint = c;
+        joint.thumb = thumb;
+        const auto limits = fingers::DefaultLimits(thumb);
+        for (double b : {-3.0, -1.3, 0.0, 1.2, 1.5, 3.0}) {
+            const auto a = fingers::Bend(joint, b, limits);
+            for (int j = 0; j < 3; ++j) {
+                EXPECT(a.flex[j] >= limits.flex_min[j] * kDegToRad - 1e-12);
+                EXPECT(a.flex[j] <= limits.flex_max[j] * kDegToRad + 1e-12);
+            }
+        }
+    }
+
     // Palm 2 cm from a wall: an open finger asked to curl (pad toward the
     // wall) curls until it touches the wall and rests there.
     const FVector wall{0, 3.3, 0}, out{0, -1, 0};
@@ -104,6 +120,33 @@ int main() {
         EXPECT(p.pushed && p.dir == +1);
         EXPECT(p.bend > 0.0);
         EXPECT(p.depth == 0.0);
+    }
+
+    // A non-grid starting bend must still reach the exact backward stop.
+    // Place the plane so the final fraction of a 0.05 step is required.
+    {
+        Xf joints[3];
+        FVector tip;
+        fingers::Fk(c, fingers::Bend(c, -1.0, lim), joints, &tip);
+        const double highest = std::max({joints[1].translation.Y, joints[2].translation.Y, tip.Y});
+        const FVector edge{0, highest + 0.5 + 1e-6, 0};
+        EXPECT(depth_at(-1.0, edge, out) == 0.0);
+        EXPECT(depth_at(-0.97, edge, out) > 0.0);
+        const auto p = fingers::PushFromPlane(c, lim, hand, 0.13, 0.13, 1.2, edge, out, 0.5);
+        EXPECT(p.pushed && p.dir == -1 && p.bend < -0.99 && p.depth == 0.0);
+    }
+
+    // The forward stop also need not be aligned to the sampling grid.
+    {
+        Xf joints[3];
+        FVector tip;
+        fingers::Fk(c, fingers::Bend(c, 0.83, lim), joints, &tip);
+        const double lowest = std::min({joints[1].translation.Y, joints[2].translation.Y, tip.Y});
+        const FVector edge{0, lowest - 0.5 - 1e-6, 0};
+        EXPECT(depth_at(0.83, edge, back_out) == 0.0);
+        EXPECT(depth_at(0.81, edge, back_out) > 0.0);
+        const auto p = fingers::PushFromPlane(c, lim, hand, 0.11, 0.11, 0.83, edge, back_out, 0.5);
+        EXPECT(p.pushed && p.dir == +1 && p.bend > 0.82 && p.depth == 0.0);
     }
 
     // A finger bent back to its limit with the wall on its nails: it can't
@@ -152,6 +195,40 @@ int main() {
                                                                moved.rotation.Rotate(out), 0.5);
             EXPECT(std::fabs(here.bend - there.bend) < 1e-6 && here.dir == there.dir);
         }
+    }
+
+    // Contact must survive the final render-pose easing. A newly pressed
+    // palm has a clear solved pose but ordinary blending puts it back in.
+    // Exercise common headset frame rates and transformed contact planes.
+    for (double hz : {72.0, 90.0, 120.0}) {
+        const auto p = fingers::PushFromPlane(c, lim, hand, 0.15, 0.15, 1.2, flat, out, 0.5);
+        const auto current = fingers::Bend(c, 0.15, lim);
+        const auto solved = fingers::Bend(c, p.bend, lim);
+        const double ease = 1.0 - std::exp(-1.0 / (hz * 0.04));
+        const auto legacy = fingers::Blend(current, solved, ease);
+        const double legacy_depth = fingers::PlaneDepth(c, legacy, hand, flat, out, 0.5);
+        EXPECT(legacy_depth > 0.5);
+        const auto safe = fingers::BlendOnPlane(c, current, solved, ease, hand, flat, out, 0.5);
+        EXPECT(fingers::PlaneDepth(c, safe, hand, flat, out, 0.5) <= 1e-6);
+        const Xf moved = X(FVector{20, -10, 60}, ToQuat(FRotator{20, 70, -30}));
+        const auto rotated = fingers::BlendOnPlane(c, current, solved, ease, moved,
+                            skel::Apply(moved, flat), moved.rotation.Rotate(out), 0.5);
+        for (int j = 0; j < 3; ++j) EXPECT(std::fabs(safe.flex[j] - rotated.flex[j]) < 1e-9);
+        std::printf("contact at %.0f Hz: old easing %.3f cm inside, corrected %.6f cm\n", hz,
+                    legacy_depth, fingers::PlaneDepth(c, safe, hand, flat, out, 0.5));
+
+        // An unreachable contact keeps the solver's best residual instead
+        // of worsening it for visual smoothness.
+        const auto hard = fingers::PushFromPlane(c, lim, hand, 0.0, 0.0, 1.2, front, front_out, 0.5);
+        const auto hard_pose = fingers::Bend(c, hard.bend, lim);
+        const auto partial = fingers::BlendOnPlane(c, fingers::Bend(c, 0.0, lim), hard_pose, ease,
+                                                   hand, front, front_out, 0.5);
+        EXPECT(fingers::PlaneDepth(c, partial, hand, front, front_out, 0.5) <= hard.depth + 1e-6);
+
+        // Clear movement still eases, including release away from the wall.
+        const FVector far{0, 50, 0};
+        const auto smooth = fingers::BlendOnPlane(c, current, solved, ease, hand, far, out, 0.5);
+        for (int j = 0; j < 3; ++j) EXPECT(std::fabs(smooth.flex[j] - legacy.flex[j]) < 1e-12);
     }
 
     // Drag: asked to move the fingertip toward the palm, the finger curls;

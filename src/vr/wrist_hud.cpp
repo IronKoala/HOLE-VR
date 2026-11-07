@@ -21,6 +21,7 @@
 #include "ue/call.h"
 #include "ue/objects.h"
 #include "ue/reflection.h"
+#include "vr/body/body.h"
 #include "vr/dxgi_hooks.h"
 #include "vr/input.h"
 #include "vr/openxr.h"
@@ -192,6 +193,8 @@ struct Canvas {
     HBITMAP bmp = nullptr;
     uint32_t* pixels = nullptr;  // BGRA, top-down
     HFONT big = nullptr, small_font = nullptr;
+    HFONT calibration_title = nullptr, calibration_text = nullptr;
+    HFONT calibration_compact = nullptr, calibration_detail = nullptr;
 } C;
 
 bool InitCanvas() {
@@ -212,6 +215,14 @@ bool InitCanvas() {
                         L"Segoe UI");
     C.small_font = CreateFontW(-44, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0,
                           L"Segoe UI");
+    C.calibration_title = CreateFontW(-26, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0,
+                                    ANTIALIASED_QUALITY, 0, L"Segoe UI");
+    C.calibration_text = CreateFontW(-22, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0,
+                                   ANTIALIASED_QUALITY, 0, L"Segoe UI");
+    C.calibration_compact = CreateFontW(-19, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0,
+                                       ANTIALIASED_QUALITY, 0, L"Segoe UI");
+    C.calibration_detail = CreateFontW(-18, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0,
+                                      ANTIALIASED_QUALITY, 0, L"Segoe UI");
     SetBkMode(C.dc, TRANSPARENT);
     return true;
 }
@@ -221,6 +232,8 @@ void Text(const std::wstring& s, HFONT font, COLORREF color, RECT r, UINT flags)
     SetTextColor(C.dc, color);
     DrawTextW(C.dc, s.c_str(), -1, &r, flags | DT_SINGLELINE | DT_NOPREFIX);
 }
+
+void FinishDrawing(std::vector<uint32_t>& out, float backing_alpha = 0.f);
 
 // Renders the status and converts it into premultiplied BGRA: GDI draws
 // coloured text on black, and each pixel's brightest channel becomes its
@@ -264,11 +277,16 @@ void Draw(const Status& st, std::vector<uint32_t>& out) {
         FillRect(C.dc, &bar, fg);
         DeleteObject(fg);
     }
+    FinishDrawing(out);
+}
+
+// Both displays use the existing canvas/upload path. Calibration gets a
+// dark backing so its instructions remain readable against any scenery.
+void FinishDrawing(std::vector<uint32_t>& out, float backing_alpha) {
     GdiFlush();
     out.resize(kTexW * kTexH);
-    // No box behind it: each pixel's brightest channel is its coverage, and a
-    // soft dark outline around the text and bar keeps it readable over
-    // anything.
+    // Normal wrist text has no box: a soft dark outline keeps it readable.
+    // The calibration panel additionally requests a translucent backing.
     std::vector<float> cov(kTexW * kTexH), tmp(kTexW * kTexH), halo(kTexW * kTexH);
     for (int i = 0; i < kTexW * kTexH; ++i) {
         uint32_t p = C.pixels[i];
@@ -290,11 +308,134 @@ void Draw(const Status& st, std::vector<uint32_t>& out) {
     for (int i = 0; i < kTexW * kTexH; ++i) {
         uint32_t p = C.pixels[i];
         float b = (p & 0xFF) / 255.f, g = ((p >> 8) & 0xFF) / 255.f, rr = ((p >> 16) & 0xFF) / 255.f;
-        float a = std::max(cov[i], 0.6f * halo[i]);
+        float a = std::max({cov[i], 0.6f * halo[i], backing_alpha});
         // Premultiplied: colour already carries its coverage; the outline is black.
         auto ch = [](float v) { return static_cast<uint32_t>(std::clamp(v, 0.f, 1.f) * 255.f + 0.5f); };
         out[i] = ch(b) | (ch(g) << 8) | (ch(rr) << 16) | (ch(a) << 24);
     }
+}
+
+std::wstring CalibrationText(const char* text) {
+    if (!text || !*text) return {};
+    const int count = MultiByteToWideChar(CP_UTF8, 0, text, -1, nullptr, 0);
+    if (count < 2) return {};
+    std::wstring wide(static_cast<size_t>(count), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, text, -1, wide.data(), count);
+    wide.resize(static_cast<size_t>(count - 1));
+    return wide;
+}
+
+void DrawCalibrationPose(body::CalibrationPose pose) {
+    using Pose = body::CalibrationPose;
+    if (pose == Pose::None) return;
+    const int saved = SaveDC(C.dc);
+    const auto segment = [](int x1, int y1, int x2, int y2) {
+        MoveToEx(C.dc, x1, y1, nullptr); LineTo(C.dc, x2, y2);
+    };
+    HPEN body_pen = CreatePen(PS_SOLID, 3, RGB(185, 205, 210));
+    HPEN arm_pen = CreatePen(PS_SOLID, 4, RGB(110, 230, 190));
+    HPEN guide_pen = CreatePen(PS_SOLID, 2, RGB(255, 195, 90));
+    SelectObject(C.dc, GetStockObject(NULL_BRUSH));
+    SelectObject(C.dc, body_pen);
+    const bool seated = pose == Pose::SeatedHeight;
+    const bool side = pose == Pose::Forward || seated;
+    const int x = side ? 44 : 69;
+    Ellipse(C.dc, x - 10, 72, x + 10, 93);
+    if (side) {  // Nose and the arrow both show which way "forward" points.
+        segment(54, 81, 61, 86); segment(61, 86, 54, 88);
+    }
+    segment(x, 93, x, 147);
+    if (seated) {
+        segment(x, 147, x + 35, 147); segment(x + 35, 147, x + 35, 175);
+        segment(x + 35, 175, x + 51, 175);
+        segment(x - 8, 120, x - 8, 153); segment(x - 8, 153, x + 30, 153);
+        segment(x - 8, 153, x - 8, 175); segment(x + 30, 153, x + 30, 175);
+    } else {
+        segment(x, 147, x - 15, 175); segment(x, 147, x + 15, 175);
+        segment(x - 20, 176, x + 20, 176);
+    }
+    SelectObject(C.dc, arm_pen);
+    switch (pose) {
+        case Pose::Height:
+            segment(69, 106, 50, 141); segment(69, 106, 88, 141);
+            SelectObject(C.dc, guide_pen);
+            segment(25, 72, 25, 175); segment(20, 72, 35, 72); segment(20, 175, 35, 175);
+            segment(25, 72, 21, 79); segment(25, 72, 29, 79);
+            break;
+        case Pose::SeatedHeight:
+            segment(44, 106, 59, 139); segment(59, 139, 76, 139);
+            SelectObject(C.dc, guide_pen);
+            segment(22, 82, 22, 175); segment(17, 82, 30, 82); segment(17, 175, 30, 175);
+            segment(22, 82, 18, 89); segment(22, 82, 26, 89);
+            break;
+        case Pose::Forward:
+            segment(44, 106, 116, 106); segment(44, 112, 111, 112);
+            SelectObject(C.dc, guide_pen);
+            segment(72, 79, 119, 79); segment(119, 79, 111, 73); segment(119, 79, 111, 85);
+            break;
+        case Pose::Out:
+            segment(69, 106, 20, 106); segment(69, 106, 118, 106);
+            break;
+        case Pose::BendUp:
+        case Pose::Bent:
+            segment(69, 106, 28, 106); segment(28, 106, 28, 70);
+            segment(69, 106, 110, 106); segment(110, 106, 110, 70);
+            if (pose == Pose::Bent) {
+                SelectObject(C.dc, guide_pen);
+                segment(34, 72, 48, 72); segment(48, 72, 43, 68); segment(48, 72, 43, 76);
+                segment(104, 72, 90, 72); segment(90, 72, 95, 68); segment(90, 72, 95, 76);
+            } else {
+                // One upward bend only. Inward palm arrows belong to the
+                // final bent pose, not to the movement from straight arms.
+                SelectObject(C.dc, guide_pen);
+                segment(17, 100, 17, 77); segment(17, 77, 13, 83); segment(17, 77, 21, 83);
+                segment(121, 100, 121, 77); segment(121, 77, 117, 83); segment(121, 77, 125, 83);
+            }
+            break;
+        case Pose::None: break;
+    }
+    Text(side ? L"SIDE VIEW" : L"FRONT VIEW", C.calibration_detail, RGB(160, 185, 190),
+         RECT{12, 178, 130, 200}, DT_CENTER | DT_VCENTER);
+    RestoreDC(C.dc, saved);
+    DeleteObject(body_pen); DeleteObject(arm_pen); DeleteObject(guide_pen);
+}
+
+void DrawCalibration(const body::CalibrationHud& hud, std::vector<uint32_t>& out) {
+    std::memset(C.pixels, 0, kTexW * kTexH * 4);
+    Text(CalibrationText(hud.title), C.calibration_title, RGB(110, 230, 190), RECT{20, 4, 492, 40},
+         DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+    const bool diagram = hud.pose != body::CalibrationPose::None;
+    DrawCalibrationPose(hud.pose);
+    SelectObject(C.dc, diagram || hud.footer[0] ? C.calibration_compact : C.calibration_text);
+    SetTextColor(C.dc, RGB(240, 240, 240));
+    for (int i = 0; i < 3; ++i) {
+        const int row_height = diagram || hud.footer[0] ? 52 : 60;
+        RECT row{diagram ? 142 : 20, 42 + row_height * i, 492, 42 + row_height * (i + 1)};
+        const std::wstring line = CalibrationText(hud.line[i]);
+        // Bypass Text(), which deliberately forces single-line wrist text.
+        // Each instruction can wrap to two lines; ellipsis bounds long text.
+        DrawTextW(C.dc, line.c_str(), -1, &row, DT_LEFT | DT_WORDBREAK | DT_END_ELLIPSIS | DT_NOPREFIX);
+    }
+    if (hud.footer[0])
+        Text(CalibrationText(hud.footer), C.calibration_detail, RGB(190, 210, 215), RECT{20, 202, 492, 226},
+             DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+    RECT back{20, 228, 492, 244};
+    HBRUSH bg = CreateSolidBrush(RGB(45, 55, 60));
+    FillRect(C.dc, &back, bg);
+    DeleteObject(bg);
+    RECT progress{20, 228, 20 + 472 * std::clamp(hud.progress, 0, 100) / 100, 244};
+    HBRUSH fg = CreateSolidBrush(RGB(90, 220, 170));
+    FillRect(C.dc, &progress, fg);
+    DeleteObject(fg);
+    FinishDrawing(out, 0.78f);
+}
+
+bool SameCalibration(const body::CalibrationHud& a, const body::CalibrationHud& b) {
+    if (a.progress != b.progress || a.pose != b.pose || std::strcmp(a.title, b.title) != 0 ||
+        std::strcmp(a.footer, b.footer) != 0) return false;
+    for (int i = 0; i < 3; ++i)
+        if (std::strcmp(a.line[i], b.line[i]) != 0) return false;
+    return true;
 }
 
 // ---------------------------------------------------------- the layer --
@@ -317,6 +458,10 @@ ID3D12Resource* g_upload = nullptr;
 bool g_failed = false;
 Status g_drawn;
 bool g_drawn_any = false;
+bool g_drawn_calibration = false;
+body::CalibrationHud g_calibration_bitmap, g_calibration_uploaded;
+bool g_calibration_bitmap_valid = false;
+std::vector<uint32_t> g_calibration_pixels;
 
 bool InitGpu() {
     if (g_cmd) return true;
@@ -557,6 +702,39 @@ bool LookingAtWrist(const XrPosef& wrist) {
     return cos_face > std::cos(S.show_angle_deg * 0.0174533f) && cos_gaze > std::cos(50.f * 0.0174533f);
 }
 
+bool CalibrationPose(XrSession session, XrSpace space, XrTime display_time, XrPosef* pose) {
+    auto locate = Proc<PFN_xrLocateViews>("xrLocateViews");
+    if (!locate || !pose || display_time <= 0) return false;
+    XrViewLocateInfo info{XR_TYPE_VIEW_LOCATE_INFO};
+    info.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+    info.displayTime = display_time;
+    info.space = space;
+    XrViewState state{XR_TYPE_VIEW_STATE};
+    XrView eyes[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+    uint32_t count = 0;
+    // The normal view cache can retain an older pose after tracking fails.
+    // Locate this frame explicitly so an instruction panel never follows it.
+    constexpr XrViewStateFlags required = XR_VIEW_STATE_ORIENTATION_VALID_BIT | XR_VIEW_STATE_POSITION_VALID_BIT;
+    if (XR_FAILED(locate(session, &info, &state, 2, &count, eyes)) || count != 2 ||
+        (state.viewStateFlags & required) != required) return false;
+    for (const XrView& eye : eyes) {
+        const auto& p = eye.pose.position;
+        const auto& q = eye.pose.orientation;
+        const float norm = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
+        if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z) ||
+            !std::isfinite(norm) || norm < 0.5f || norm > 1.5f) return false;
+    }
+    XrQuaternionf q = eyes[0].pose.orientation;
+    const float inv_norm = 1.f / std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
+    q = {q.x * inv_norm, q.y * inv_norm, q.z * inv_norm, q.w * inv_norm};
+    const V3 centre = Mul(Add({eyes[0].pose.position.x, eyes[0].pose.position.y, eyes[0].pose.position.z},
+                              {eyes[1].pose.position.x, eyes[1].pose.position.y, eyes[1].pose.position.z}), 0.5f);
+    const V3 at = Add(centre, Rotate(q, {0, -0.13f, -0.85f}));
+    pose->orientation = q;
+    pose->position = {at.x, at.y, at.z};
+    return true;
+}
+
 // ------------------------------------------------------- heartbeat --
 
 void Heartbeat(const Status& st) {
@@ -581,8 +759,46 @@ struct WristListener : xr::Listener {
     bool shown = false;
     DWORD hide_after = 0;
 
-    void AddLayers(XrSession session, XrSpace space, XrTime,
+    void AddLayers(XrSession session, XrSpace space, XrTime display_time,
                    std::vector<const XrCompositionLayerBaseHeader*>& layers) override {
+        body::CalibrationHud calibration = body::GetCalibrationHud();
+        calibration.title[sizeof(calibration.title) - 1] = '\0';
+        for (auto& line : calibration.line) line[sizeof(line) - 1] = '\0';
+        calibration.footer[sizeof(calibration.footer) - 1] = '\0';
+        calibration.progress = std::clamp(calibration.progress, 0, 100) / 10 * 10;
+        if (!calibration.visible && g_drawn_calibration) {
+            // The shared texture contains instructions, even if the health
+            // and ammo did not change. Force the normal wrist bitmap back.
+            g_drawn_any = false;
+            g_drawn_calibration = false;
+            L.has_image = false;
+        }
+        if (ui_panel::MenuOpen()) return;
+        if (calibration.visible) {
+            XrPosef pose;
+            if (!CalibrationPose(session, space, display_time, &pose) || !InitGpu()) return;
+            if (!L.swapchain && !CreateSwapchain(session)) return;
+            if (!g_calibration_bitmap_valid || !SameCalibration(calibration, g_calibration_bitmap)) {
+                DrawCalibration(calibration, g_calibration_pixels);
+                g_calibration_bitmap = calibration;
+                g_calibration_bitmap_valid = true;
+            }
+            if (!g_drawn_calibration || !SameCalibration(calibration, g_calibration_uploaded)) {
+                if (!Upload(g_calibration_pixels)) return;
+                g_calibration_uploaded = calibration;
+                g_drawn_calibration = true;
+                L.has_image = true;
+            }
+            L.quad.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+            L.quad.space = space;
+            L.quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+            L.quad.subImage.swapchain = L.swapchain;
+            L.quad.subImage.imageRect = {{0, 0}, {kTexW, kTexH}};
+            L.quad.pose = pose;
+            L.quad.size = {0.62f, 0.31f};
+            layers.push_back(reinterpret_cast<const XrCompositionLayerBaseHeader*>(&L.quad));
+            return;
+        }
         if (!S.enabled) return;
         Status st;
         {
@@ -639,6 +855,9 @@ struct WristListener : xr::Listener {
             if (auto destroy = Proc<PFN_xrDestroySwapchain>("xrDestroySwapchain")) destroy(L.swapchain);
         L = Layer{};
         g_drawn_any = false;
+        g_drawn_calibration = false;
+        g_calibration_bitmap_valid = false;
+        g_calibration_pixels.clear();
     }
 } g_listener;
 

@@ -39,6 +39,11 @@ bool IsReadable(uintptr_t p, size_t len);
 // from this thread's cache. Any other crash is left alone.
 bool SafeCopy(void* dst, const void* src, size_t len);
 
+// Game thread, at the start of every game frame: readability answers from
+// the last frame are dropped (every thread's), and this frame's are kept until
+// the next call. Also counts the checks for the 10 s perf report.
+void NewFrame();
+
 // How many faults SafeCopy has caught since start.
 unsigned CaughtFaults();
 
