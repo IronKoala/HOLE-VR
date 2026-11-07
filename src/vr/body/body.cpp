@@ -3911,6 +3911,10 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
     posture_input.straight_wrist = S.gun_wrist_straight && recorded && rig.ok &&
         grab.kind == hands::GrabKind::kGunGrip && g.key.rfind("BP_HG", 0) == 0;
     posture_input.joint_limits = S.arm_joint_limits;
+    // Owner 2026-11-07, rifle aimed: the trigger elbow sat out at shoulder
+    // height. A hand on a gun keeps the elbow hanging.
+    posture_input.gun_hold = recorded &&
+        (grab.kind == hands::GrabKind::kGunGrip || grab.kind == hands::GrabKind::kSupportGrip);
     posture_input.shoulder_twist_share = S.shoulder_twist_share;
     posture_input.radial_axis_hand = rig.across_h;
     posture_input.dt = dt;

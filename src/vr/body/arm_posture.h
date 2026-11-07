@@ -32,9 +32,15 @@ struct Input {
     // Forearm: about 85 deg of turn each way from thumb-up; the shoulder
     // takes shoulder_twist_share of that turn and everything past it. Wrist:
     // 70 deg back, 80 deg toward the palm, 20 deg toward the thumb, 35 deg
-    // toward the little finger. Forearm and wrist ranges need the hand frame
-    // and fade with the other hand terms at full extension.
+    // toward the little finger, for free hands and gun grips alike. Forearm
+    // and wrist ranges need the hand frame and fade with the other hand terms
+    // at full extension. Where the arm cannot reach below a height limit,
+    // the limit starts a little above the lowest reachable elbow.
     bool joint_limits = true;
+    // The hand holds a gun (its grip or a support hold; needs joint_limits):
+    // the elbow hangs about 45 deg down when the hand is at shoulder height,
+    // rising with the hand, and stays behind the hand rather than ahead of it.
+    bool gun_hold = false;
     double shoulder_twist_share = .15;
     // Thumb side across the knuckles, hand space (index minus little-finger
     // knuckle). Optional: without it both wrist side bends use 25 deg.

@@ -295,9 +295,14 @@ limit; "the human shoulder has a small amount of twist"). With
 | Joint | Range kept | What gives way past it |
 |---|---|---|
 | Shoulder (elbow height) | elbow at most 10% of the upper arm above the shoulder, plus 1.3 cm for each cm the hand is raised beyond a third of the upper arm, or reaches back over the shoulder | nothing: steep cost, also releases a plane carried through a straight arm |
+| Shoulder (elbow height, hand on a gun) | elbow hangs: 45% of the upper arm below the shoulder with the hand at shoulder height, rising half a cm per cm of hand height (between 57% below and 10% above), plus the same raised-hand allowance; and the elbow stays behind the hand | as above |
 | Shoulder (turn) | takes `body_shoulder_twist_share` (0.15) of the forearm's turn from thumb-up | |
 | Forearm turn | -10 (palm toward the biceps) to 180 (palm away) deg; 90 = thumb up | the shoulder turns the arm (elbow swings up and out past palm-down) |
-| Wrist, empty hands | 70 back, 80 toward the palm, 20 toward the thumb, 35 toward the little finger | the elbow moves so the forearm comes from a reachable side |
+| Wrist, every hand (free hands and gun grips) | 70 back, 80 toward the palm, 20 toward the thumb, 35 toward the little finger, as an ellipse around the straight wrist | the elbow moves so the forearm comes from a reachable side |
+
+Where no elbow can reach the height limit (a nearly straight arm, or a hand
+high up), the limit starts 6% of the upper arm above the lowest elbow the
+arm can reach, so the other ranges still choose among the low elbows.
 
 The forearm's turn is read from the wrist's side-to-side axis and the bend
 plane, so a bent wrist doesn't read as a turn. The 2026-11-07 run had the
@@ -306,6 +311,19 @@ support elbow 19 cm above: the pistol's straight-wrist preference applied to
 the rifle grip too (now pistol grips only, key `BP_HG*`), and wrist relief
 on a folded arm chose the top of the elbow circle. Ranges are limits, not a
 pose: a hand in line with the resting forearm leaves the resting elbow alone.
+
+The 09:21 run on the first ranges (872c72a) kept every elbow at or below
+shoulder height unless the hand was raised, but with the rifle at the cheek
+the trigger hand sat only 13-16 cm ahead of the measured shoulder, so the arm
+was folded almost shut. About a quarter of those samples put the trigger
+elbow out at shoulder height, ahead of the hand. The wrist measure then used
+atan2 side angles, which flip once a bend passes 90 deg, so a forearm
+arriving from the back of the hand read as a small bend and made that pose
+look cheap. The wrist bend is now measured as the whole angle between the
+forearm and the hand, and a gun hold keeps the elbow hanging. Replaying that
+run's 78 rifle trigger samples through the solver: no elbow out at shoulder
+height (13 before). With the hand that close the wrist still bends past its
+range when the rifle is at the cheek; the gun hides most of it.
 
 The forearm skin's twist runs from `body_forearm_twist_at_elbow` (0) of the
 hand's turn at the elbow end to `body_forearm_twist_at_middle` (0.5) at the
