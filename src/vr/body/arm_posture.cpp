@@ -130,31 +130,45 @@ Result Solve(const Input& in, State* state) {
     };
     auto pole_at = [&](double angle) { return zero*std::cos(angle)+tangent*std::sin(angle); };
 
+    // The elbow circle for this hand, from one exact two-bone solve: its
+    // centre (along the shoulder-to-wrist axis) and radius.
+    const auto zero_triangle = SolveTwoBone(in.shoulder,in.wrist,in.upper_cm,in.forearm_cm,zero,in.max_stretch_cm);
+    const FVector along = axis*Dot(zero_triangle.mid-in.shoulder,axis);
+    const double bend_radius = Length(zero_triangle.mid-in.shoulder-along);
+    // A support hand held well out in front (under a rifle's handguard):
+    // every elbow on the circle is in front of the chest, where an elbow
+    // turned in under the gun cannot touch the body. The midline guard and
+    // the medial preference fade there, so the forearm can keep its human
+    // turn range rather than twisting the palm up past it (2026-11-07 run:
+    // support forearms 10-30 deg past their range, with the elbow held at
+    // the guard's edge). A gun's grip hand keeps the guard: a pistol's elbow
+    // must not cross the chest to straighten the wrist.
+    const double front_forward = Dot(along,forward)-bend_radius*Length(Reject(forward,axis));
+    const double front_relief = in.support_hold && in.joint_limits && std::isfinite(front_forward)
+        ? Ramp(front_forward/in.upper_cm,.35,.60) : 0.0;
+    const double guard_relaxed = std::max(relaxed,front_relief);
     // With the arm pointing out sideways, the elbow is already well away
     // from the torso and outward projected onto its plane approaches zero.
     // Relax that plane bound before the singularity; otherwise crossing a
     // T-pose flips the sign of a tiny projection and snaps the straight arm.
-    const double plane_relaxed = std::max(relaxed,Ramp(Dot(axis,outward),.55,.85));
+    const double plane_relaxed = std::max(guard_relaxed,Ramp(Dot(axis,outward),.55,.85));
     double threshold = -.80*plane_relaxed;
     bool clearance_limited = false;
     if (in.torso_center_valid && out_length > .05) {
-        const auto triangle = SolveTwoBone(in.shoulder,in.wrist,in.upper_cm,in.forearm_cm,zero,in.max_stretch_cm);
-        const FVector along = axis*Dot(triangle.mid-in.shoulder,axis);
-        const double bend_radius = Length(triangle.mid-in.shoulder-along);
         // Guard the actual elbow against the midline for ordinary forward
         // reaches. Relax for crossed/overhead hands, where medial elbows can
         // be necessary. If exact geometry cannot satisfy this, choose the
         // furthest-out feasible plane and report it; never move the wrist.
-        const double minimum = std::min(3.0,in.upper_cm*.10)*(1-relaxed)-reach*.15*relaxed;
+        const double minimum = std::min(3.0,in.upper_cm*.10)*(1-guard_relaxed)-reach*.15*guard_relaxed;
         const double centre = Dot(in.shoulder+along-in.torso_center,outward);
         if (bend_radius*out_length > 1e-5) {
             const double required = (minimum-centre)/(bend_radius*out_length);
-            clearance_limited = required > 1 && relaxed < .05;
+            clearance_limited = required > 1 && guard_relaxed < .05;
             // A crossed arm can require an elbow on the opposite side of
             // the shoulder. Fade this actual-position guard with that reach
             // instead of pinning an impossible elbow to a vanishing outward
             // projection; torso proximity remains part of the soft cost.
-            const double guard = std::clamp(required,-.8,1.0)*(1-relaxed)+threshold*relaxed;
+            const double guard = std::clamp(required,-.8,1.0)*(1-guard_relaxed)+threshold*guard_relaxed;
             threshold = std::max(threshold,guard);
         } else clearance_limited = centre < minimum;
     }
@@ -166,10 +180,7 @@ Result Solve(const Input& in, State* state) {
     // turn range still counts (a rifle's support arm, nearly straight).
     double cap = elbow_cap;
     {
-        const auto triangle = SolveTwoBone(in.shoulder,in.wrist,in.upper_cm,in.forearm_cm,zero,in.max_stretch_cm);
-        const FVector along = axis*Dot(triangle.mid-in.shoulder,axis);
-        const double radius = Length(triangle.mid-in.shoulder-along);
-        const double lowest = Dot(along,up)-radius*Length(Reject(up,axis));
+        const double lowest = Dot(along,up)-bend_radius*Length(Reject(up,axis));
         if (std::isfinite(lowest)) cap = std::max(cap,lowest+.06*in.upper_cm);
     }
     // Optional authored-pose preferences fade at the straight-arm
@@ -263,7 +274,7 @@ Result Solve(const Input& in, State* state) {
         // hand as permission for arbitrary extra elbow crossing. Raised
         // reaches ease this soft preference without pinning a fixed point.
         // Reaching out to the side releases the tuck cost, not the wrist target.
-        const double torso_cost = 12*Square(elbow_medial)*(1-.25*overhead)
+        const double torso_cost = 12*Square(elbow_medial)*(1-.25*overhead)*(1-front_relief)
                                   +2*Square(elbow_flare)*tuck_weight
                                   +2*Square(std::max(0.0,-elbow_forward-.15));
         double limit_cost = 0, hand_limit_cost = 0;

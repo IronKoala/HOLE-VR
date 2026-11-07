@@ -401,6 +401,48 @@ static void LoggedRifleAimElbowHangs() {
                 -Up(in,r),-lowest,r.elbow_cap_cm);
 }
 
+// Degrees a forearm turn lies past its range (-10 deg supination .. 180 deg).
+static double TurnPast(const Result& r) {
+    const double rho=r.forearm_rotation*180/kPi;
+    if(!std::isfinite(rho)) return 0;
+    return rho<-10 && rho>-180 ? std::min(-10-rho,rho+180) : std::max(0.0,rho-180);
+}
+
+// The same run's support hand far out under the handguard. The midline guard
+// held its elbow at the guard's edge and twisted the forearm 16-23 deg past
+// its turn range; in front of the chest the elbow may turn in under the gun.
+static void LoggedSupportForearmTurn() {
+    const FVector le1{.99902,.04067,.01728},le2{.04220,-.99406,-.10030},le3{.01310,.10093,-.99481};
+    const Logged support[]={
+        {0,6,38.62,20.82,{10.41,14.58,19.86},{55.20,11.83,.62},{.6017,.3073,-.2968,-.6749},le1,le2,le3},
+        {0,6,38.62,20.82,{10.41,14.58,19.86},{54.36,10.85,-.71},{.6640,.2503,-.3535,-.6095},le1,le2,le3}};
+    for(const Logged& l:support) {
+        Input in=FromLog(l); in.support_hold=true;
+        Input guarded=in; guarded.support_hold=false;
+        const auto r=Settled(in), old=Settled(guarded);
+        Geometry(in,r);
+        EXPECT(TurnPast(old)>12);
+        EXPECT(TurnPast(r)<TurnPast(old)-8);
+        EXPECT(TurnPast(r)<10);
+        // Still an elbow out in front of the chest, below the shoulder, and
+        // not across to the other side of the head.
+        EXPECT(Dot(r.solved.mid-in.shoulder,in.forward)>.8*in.upper_cm);
+        EXPECT(r.elbow_over_cm<1e-9);
+        EXPECT(Dot(r.solved.mid-in.torso_center,in.outward)>-5);
+        std::printf("logged rifle support: forearm turn %.0f deg past its range (guarded %.0f), elbow %.1f cm "
+                    "from the head's midline (guarded %.1f)\n",TurnPast(r),TurnPast(old),
+                    Dot(r.solved.mid-in.torso_center,in.outward),Dot(old.solved.mid-in.torso_center,in.outward));
+    }
+    {   // A hand near the body keeps the midline guard: an elbow beside the
+        // chest is not in front of it.
+        Input in=FromLog(support[0]); in.support_hold=true;
+        in.wrist={20,8,-20};
+        Input guarded=in; guarded.support_hold=false;
+        const auto r=Settled(in), old=Settled(guarded);
+        EXPECT(Near(Dot(r.solved.mid-old.solved.mid,in.outward),0,1e-6) && Near(Up(in,r),Up(in,old),1e-6));
+    }
+}
+
 static void RaisedHandsStillRaiseElbows() {
     for(int side=0;side<2;++side) {
         // Hand on top of the head and behind the head (reaching over the
@@ -591,7 +633,7 @@ int main() {
     FreeWristDoesNotMeasureElbow(); ExtensionKeepsTransportedPlane();
     TurningExtendedArmThenRetracting();
     RifleAimKeepsElbowsDown(); RaisedHandsStillRaiseElbows(); ExtensionLockWithLimits(); ForearmRotationMeasure();
-    JointLimitsMoveElbow(); LoggedRifleAimElbowHangs();
+    JointLimitsMoveElbow(); LoggedRifleAimElbowHangs(); LoggedSupportForearmTurn();
     std::printf("arm posture: %s (%d checks, %d failures)\n",failures?"FAIL":"PASS",checks,failures);
     return failures?1:0;
 }

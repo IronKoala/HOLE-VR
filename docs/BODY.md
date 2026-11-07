@@ -325,6 +325,30 @@ run's 78 rifle trigger samples through the solver: no elbow out at shoulder
 height (13 before). With the hand that close the wrist still bends past its
 range when the rifle is at the cheek; the gun hides most of it.
 
+Why the shouldered trigger wrist cannot be fixed by the elbow alone (same
+replay): the recorded rifle grip (`BP_AR_C.grip`) lays the hand along the
+barrel, as if the elbow were behind it at hand height. With the hand 13-16
+cm ahead of the shoulder the elbow circle lies across the forearm's line, so
+every elbow that is not inside the chest leaves the wrist 40-58 deg past its
+range (a hanging elbow bends it toward the little finger; out at shoulder
+height bends it back). Lifting the shoulder 6 cm only halves it. Tilting the
+hand on the grip about 35 deg wrist-down (knuckles fixed), the way rifle
+shooters hold the grip with a low elbow, keeps the wrist in range in 17 of
+19 aimed samples with the upper arm hanging straight down, and 11 of 78
+rifle trigger samples past 10 deg instead of 43: a grip-editor pose, so the
+owner's to make. The drawn rifle hand also sits 10-11 cm from the free hand's
+wrist (`body fit: ... controller offset`), the pistol hand 5-6 cm.
+
+Support hand under the handguard (`posture_input.support_hold`): when every
+elbow on the circle is at least 35-60% of the upper arm in front of the
+shoulder, the midline guard and the medial preference fade, so the elbow can
+turn in under the gun. Held at the guard's edge it had twisted the forearm
+10-30 deg past its turn range (25 of 37 support samples past 10 deg; 11
+after, all with the rifle held low near the body). The forearm and wrist
+then share what neither range can hold: in that run the hand on the
+handguard sat about 20 deg off any pose both ranges allow. Grip hands keep
+the guard; a pistol's elbow must not cross the chest to straighten the wrist.
+
 The forearm skin's twist runs from `body_forearm_twist_at_elbow` (0) of the
 hand's turn at the elbow end to `body_forearm_twist_at_middle` (0.5) at the
 mid-forearm twist joint and all of it at the wrist; the seam of that split
@@ -414,7 +438,11 @@ angle. With `body_fit_log`, `body arm sample` also records one signed snapshot
 per hand every five seconds: raw/target/lower-arm/skin roll, wrist bend, candidate
 count, constraint flag, lengths and simultaneous joint geometry. Shoulder is
 head-relative; elbow/wrist are shoulder-relative; all use the body-yaw frame
-and cm. The hand quaternion is also body-relative. `body legs:` reports bypass and terrain-recovery counts
+and cm. The hand quaternion is also body-relative. `real-wrist`/`real-hand-q` are where the
+controller alone puts the hand (the free hand's wrist, shoulder-relative), so a drawn hand
+on a gun can be compared with the real one, and `head-pitch/roll` (degrees, up and right
+ear down positive, body-relative) shows a head leaning into the sights, which carries the
+head-relative shoulder with it. `body legs:` reports bypass and terrain-recovery counts
 plus read-only ALS offsets. These describe solved bones, not GPU skinning.
 Performance counters include `body calibration`, `body legs and ground`, and
 `body arms and fingers`.

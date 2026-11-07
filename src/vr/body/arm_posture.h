@@ -41,6 +41,10 @@ struct Input {
     // the elbow hangs about 45 deg down when the hand is at shoulder height,
     // rising with the hand, and stays behind the hand rather than ahead of it.
     bool gun_hold = false;
+    // The hand is a support hand on a gun (needs joint_limits). Held well out
+    // in front of the chest, its elbow may turn in under the gun, past the
+    // midline guard, to keep the forearm's turn in range.
+    bool support_hold = false;
     double shoulder_twist_share = .15;
     // Thumb side across the knuckles, hand space (index minus little-finger
     // knuckle). Optional: without it both wrist side bends use 25 deg.
