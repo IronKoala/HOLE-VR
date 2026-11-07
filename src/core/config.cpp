@@ -32,8 +32,9 @@ const Block kBlocks[] = {
      "; HOLE VR settings. Lines starting with ; are comments.\n"
      "\n"
      "; Write a list of every class, function and property in the game to the\n"
-     "; dump folder on startup. Needed while the mod is being developed.\n"
-     "dump_on_start=1\n"},
+     "; dump folder on startup. Only needed while the mod is being developed\n"
+     "; (Ctrl+F9 in game writes one at any time).\n"
+     "dump_on_start=0\n"},
     {"engine_wait_seconds",
      "\n"
      "; Seconds to wait for the engine to finish starting before giving up.\n"
@@ -75,6 +76,13 @@ const Block kBlocks[] = {
      "; The player's extra scene capture renders the level a second time\n"
      "; (the game's Capture2D option). Stopping it saves a lot of GPU time.\n"
      "vr_disable_player_scene_capture=1\n"},
+    {"vr_kill_shot_camera_when_shown",
+     "\n"
+     "; The kill shot room's camera photographs your body for the death and\n"
+     "; results screens, and the game sets it to take a picture every frame.\n"
+     "; 1 = only while one of those screens is up (the same pictures, less GPU\n"
+     "; work while you play). 0 = as the game runs it.\n"
+     "vr_kill_shot_camera_when_shown=0\n"},
     {"vr_anti_aliasing",
      "\n"
      "; --- Anti-aliasing and console variables ---\n"
@@ -576,6 +584,36 @@ const Block kBlocks[] = {
      "; this far (cm) of the magwell's line (mag_line_up_side_cm with the gun in the\n"
      "; right hand).\n"
      "mag_line_up_side_left_gun_cm=5\n"},
+    {"shotgun_smart_reload",
+     "\n"
+     "; --- Shotgun: shells by hand (not tested in the headset yet) ---\n"
+     "; The magazine pouch is the shotgun's shell caddy. Smart reload: a grab gives\n"
+     "; 4 shells when the tube is missing 4 or more, 2 when it is missing 2 or 3, 1\n"
+     "; when it is missing 1. 0 = always shotgun_shells_per_grab (1 to 4).\n"
+     "shotgun_smart_reload=1\n"
+     "shotgun_shells_per_grab=4\n"
+     "; 1 = with the bolt locked open on an empty gun the caddy gives 1 shell, for\n"
+     "; the ejection port (B or a full rack then chambers it).\n"
+     "shotgun_empty_gun_single=1\n"
+     "; 1 = the tube takes no shells while the bolt is locked open (like a Benelli M4).\n"
+     "shotgun_tube_needs_closed_bolt=1\n"
+     "; Loading port: the lead shell's crimp catches this close to the tube's mouth\n"
+     "; (cm) and this close to pointing along the tube (degrees); the hand this far\n"
+     "; off the tube's line (cm) lets go.\n"
+     "shotgun_port_capture_cm=4\n"
+     "shotgun_port_capture_deg=35\n"
+     "shotgun_push_let_go_cm=5\n"
+     "; One push loads two: the first shell clicks in this far into the push (cm),\n"
+     "; the second this far. A shell the tube refuses stops this far in (cm).\n"
+     "shotgun_first_shell_cm=5.5\n"
+     "shotgun_second_shell_cm=12.5\n"
+     "shotgun_blocked_cm=1\n"
+     "; A shell this close (cm) to the ejection port drops in (empty gun, bolt open).\n"
+     "shotgun_ejection_port_cm=4\n"
+     "; Moves the shells in the hand (cm): forward, right, up.\n"
+     "shotgun_hold_forward_cm=0\n"
+     "shotgun_hold_right_cm=0\n"
+     "shotgun_hold_up_cm=0\n"},
     {"fixed_height",
      "\n"
      "; 1 = your in-game height is always the character's, seated or standing\n"
@@ -892,7 +930,20 @@ const Block kBlocks[] = {
      "; mod's own, so the game's Present thread doesn't wait on it. 0 = never,\n"
      "; 1 = always, 2 = decided each run by the GPU cost test (on only if the\n"
      "; headset missed fewer frames with it).\n"
-     "xr_end_async=2\n"},
+     "xr_end_async=1\n"},
+    {"gpu_cost_test",
+     "\n"
+     "; Frame times (diagnostic): 45 s into the first run level, switch render\n"
+     "; features off and on for a minute or two and log what each costs the\n"
+     "; graphics card. 1 = every feature (the picture changes while it runs),\n"
+     "; 2 = only ones that leave the picture as it is, 0 = off.\n"
+     "gpu_cost_test=0\n"},
+    {"dump_in_game",
+     "\n"
+     "; Diagnostic: once a level is loaded, write the game's class list to the\n"
+     "; dump folder (includes the weapon and player classes the start-up dump\n"
+     "; misses). Only needed while the mod is being developed.\n"
+     "dump_in_game=0\n"},
     {"vr_lumen_gi_quality",
      "\n"
      "; Lumen indirect lighting quality in VR. Levels ask for 2; 1 looks nearly the\n"

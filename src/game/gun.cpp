@@ -154,4 +154,52 @@ bool Gun::ClearSlideLock() { return ue::SetProp<bool>(self_, "IsBolt(Slide)Stopp
 
 bool Gun::ReleaseSlideCatch() { return CallSimple("Gun_ReleaseBolt"); }
 
+bool Gun::LoadOneShell(std::string* why) {
+    auto fail = [&](const char* w) {
+        if (why) *why = w;
+        return false;
+    };
+    if (!self_) return fail("no gun");
+    if (!ue::FindFunction(GetClass(self_), "ReloadShell_TakeNewShell") ||
+        !ue::FindFunction(GetClass(self_), "ReloadShell_InsertShell_End") ||
+        !ue::FindFunction(GetClass(self_), "GetShellNumInHand"))
+        return fail("the gun has no shell reload functions");
+    // OneReloadMaxShell must be what the dump says: a plain int.
+    const auto p = ue::reflection::FindProperty(GetClass(self_), "OneReloadMaxShell");
+    if (!p.valid() || p.type != "IntProperty" || p.element_size != 4 || p.array_dim != 1 || p.offset <= 0)
+        return fail("OneReloadMaxShell is missing or not an int");
+    int32_t old_max = 0;
+    if (!mem::Read(self_ + p.offset, old_max)) return fail("OneReloadMaxShell unreadable");
+    UObject tube = 0;
+    if (!ue::GetProp(self_, "MagazineObj", tube) || !tube) return fail("no tube magazine");
+    auto shells_in_hand = [&]() {
+        ue::Call n(self_, "GetShellNumInHand");
+        return n.Invoke() ? n.Get<int32_t>("ShellNum", -1) : -1;
+    };
+    if (shells_in_hand() != 0) CallSimple("DestroyShellsInHand");  // left over from an earlier call
+    if (!ue::SetProp<int32_t>(self_, "OneReloadMaxShell", 1)) return fail("OneReloadMaxShell not writable");
+    const bool took = CallSimple("ReloadShell_TakeNewShell");
+    ue::SetProp<int32_t>(self_, "OneReloadMaxShell", old_max);
+    const int made = shells_in_hand();
+    if (!took) return fail("ReloadShell_TakeNewShell failed");
+    if (made != 1) {
+        CallSimple("DestroyShellsInHand");
+        return fail(made == 0 ? "the game made no shell (tube full?)" : "the game did not make exactly one shell");
+    }
+    CallSimple("ReloadShell_InsertShell_Begin");
+    if (!CallSimple("ReloadShell_InsertShell_End")) {
+        CallSimple("DestroyShellsInHand");
+        return fail("ReloadShell_InsertShell_End failed");
+    }
+    return true;
+}
+
+bool Gun::PlayShellBlocked() { return CallSimple("ReloadMag_InsertMag_Block"); }
+
+UObject Gun::AmmoClass() const {
+    UObject c = 0;
+    if (self_) ue::GetProp(self_, "AmmoClass", c);
+    return c;
+}
+
 }  // namespace holevr::game

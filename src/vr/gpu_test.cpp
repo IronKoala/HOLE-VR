@@ -12,6 +12,7 @@
 #include "vr/cvars.h"
 #include "vr/gpu_timer.h"
 #include "vr/openxr.h"
+#include "vr/render_fixes.h"
 #include "vr/square_test.h"
 #include "vr/ui_panel.h"
 #include "vr/world_menu.h"
@@ -37,6 +38,7 @@ struct Suspect {
     std::vector<Switch> sw;  // empty: nothing switched (shows the noise), or `toggle`
     void (*toggle)(bool test) = nullptr;  // switched by the mod, not a console variable
     void (*decide)(const struct Suspect& s) = nullptr;  // after it is measured
+    bool (*available)() = nullptr;  // false: nothing to measure now, skipped
     double base_ms = 0.0, test_ms = 0.0, base_idle = 0.0, test_idle = 0.0;
     long base_n = 0, test_n = 0, base_idle_n = 0, test_idle_n = 0;
     long long base_sent = 0, test_sent = 0, base_missed = 0, test_missed = 0;  // headset frames
@@ -46,6 +48,10 @@ struct Suspect {
 };
 
 std::vector<Suspect> g_suspects;
+// 1: every suspect, some of which change the picture (shadows off, half
+// resolution). 2: only the ones that leave the picture in the headset as it
+// is, for runs where the owner plays normally.
+int g_mode = 1;
 enum class Phase { kWaiting, kRunning, kDone };
 Phase g_phase = Phase::kWaiting;
 double g_clock = 0.0, g_window_start = 0.0;
@@ -113,7 +119,26 @@ std::string Describe(const Suspect& s, bool originals) {
     return out;
 }
 
+void Summary();
+
+// Skips suspects with nothing to measure now. False when none is left (the
+// test is then over).
+bool SkipUnavailable() {
+    while (g_index < static_cast<int>(g_suspects.size())) {
+        Suspect& s = g_suspects[g_index];
+        if (!s.available || s.available()) return true;
+        log::Info("GPU cost test: %s: nothing to switch in this level, skipped", s.what);
+        s.saved = 0.0;
+        ++g_index;
+    }
+    g_phase = Phase::kDone;
+    Summary();
+    log::Info("GPU cost test: done, every setting is back as it was");
+    return false;
+}
+
 void BeginSuspect(UObject player) {
+    if (!SkipUnavailable()) return;
     Suspect& s = g_suspects[g_index];
     for (Switch& w : s.sw) w.original = ReadNow(w);
     s.base_ms = s.test_ms = s.base_idle = s.test_idle = 0.0;
@@ -174,12 +199,6 @@ void FinishSuspect(UObject player) {
     }
     if (s.decide) s.decide(s);
     ++g_index;
-    if (g_index >= static_cast<int>(g_suspects.size())) {
-        g_phase = Phase::kDone;
-        Summary();
-        log::Info("GPU cost test: done, every setting is back as it was");
-        return;
-    }
     BeginSuspect(player);
 }
 
@@ -216,8 +235,10 @@ void OnTick(UObject player, float dt) {
         // A restart after a level change goes on from the setting it was on
         // (each setting is put back before the next one starts).
         log::Info("GPU cost test: starting; %zu settings, each switched off and on %d times for %.1f s "
-                  "(about %.0f s in all; the picture changes while it runs; gpu_cost_test=0 turns it off)",
-                  g_suspects.size(), kCycles, kWindowS, g_suspects.size() * kCycles * 2 * kWindowS);
+                  "(about %.0f s in all; %s; gpu_cost_test=0 turns it off)",
+                  g_suspects.size(), kCycles, kWindowS, g_suspects.size() * kCycles * 2 * kWindowS,
+                  g_mode == 2 ? "only settings that leave the picture in the headset as it is"
+                              : "the picture changes while it runs");
         BeginSuspect(player);
         return;
     }
@@ -291,6 +312,20 @@ void ToggleAsyncEnd(bool on) { xr::SetAsyncEnd(on, "GPU cost test"); }
 // arm and redrawn every frame, as when you look at it.
 void ToggleHud(bool on) { world_menu::ForceHudShown(on); }
 
+// Base: the scene captures as the game runs them. Test: each one that takes
+// a picture every frame (an extra render of the level) paused. Nothing in
+// the headset changes unless a screen showing that picture is in view.
+void ToggleSceneCaptures(bool test) {
+    std::string names;
+    const int n = render_fixes::PauseSceneCaptures(test, &names);
+    static bool s_logged = false;
+    if (test && !s_logged) {
+        s_logged = true;
+        log::Info("GPU cost test: paused %d scene capture(s) drawing every frame: %s", n, names.c_str());
+    }
+}
+bool SceneCapturesLive() { return render_fixes::LiveSceneCaptures() > 0; }
+
 void DecideAsyncEnd(const Suspect& s) {
     const double base = s.base_n ? (s.base_ms + s.base_idle) / s.base_n : 0.0;
     const double test = s.test_n ? (s.test_ms + s.test_idle) / s.test_n : 0.0;
@@ -305,12 +340,31 @@ void DecideAsyncEnd(const Suspect& s) {
 }
 
 void Init() {
-    if (!config::GetBool("gpu_cost_test", true)) return;
+    g_mode = config::GetInt("gpu_cost_test", 0);
+    if (g_mode == 0 && config::GetBool("gpu_cost_test", false)) g_mode = 1;  // "true", "yes"
+    if (g_mode != 1 && g_mode != 2) return;
     Add("nothing (measurement noise)", nullptr, nullptr);
-    if (config::GetInt("xr_end_async", 2) == 2) {
+    if (config::GetInt("xr_end_async", 1) == 2) {
         Add("xrEndFrame on its own thread (headset hand-off)", nullptr, nullptr);
         g_suspects.back().toggle = &ToggleAsyncEnd;
         g_suspects.back().decide = &DecideAsyncEnd;
+    }
+    // Work the picture doesn't need (2026-11-07, the ~4 ms of the fixed part
+    // nothing else explained). Scene captures: the kill shot room's camera
+    // was seen taking a picture every frame; each such picture is a whole
+    // extra render of the level. Occlusion: without instanced stereo (the
+    // game's shaders aren't built for it) each eye runs its own occlusion
+    // queries; the engine's VR option lets the eyes take turns.
+    Add("scene captures that draw every frame paused", nullptr, nullptr);
+    g_suspects.back().toggle = &ToggleSceneCaptures;
+    g_suspects.back().available = &SceneCapturesLive;
+    Add("occlusion checks one eye a frame (vr.RoundRobinOcclusion)", "vr.RoundRobinOcclusion", "1");
+    if (g_mode == 2) {
+        game::AddTickListener(&OnTick);
+        log::Info("GPU cost test: ready (gpu_cost_test=2: only what leaves the picture as it is); runs once, %.0f s "
+                  "into the first run level (not the home base), if the GPU timer is on",
+                  config::GetFloat("gpu_cost_test_after_s", 45.f));
+        return;
     }
     // Measured on 2026-11-06 (08:49 run): Lumen GI off -0.63 ms, regular
     // shadows instead of virtual +7.9 ms, fog and screen-space AO were off

@@ -76,6 +76,11 @@ constexpr int kPointHolster = 1;
 constexpr int kPointOffhand = 10;
 constexpr int kPointOffhandChest = 11;
 inline bool OffhandPoint(int point) { return point == kPointOffhand || point == kPointOffhandChest; }
+// kMagHeld: shotgun shells in the hand (controls' smart reload), the point
+// is kPointShells + how many the hold was taken as (4 quad, 2 twin, 1
+// single); each hold has its own pose, "shells.quad" etc. (owner poses them).
+constexpr int kPointShells = 20;
+inline bool ShellsPoint(int point) { return point > kPointShells && point <= kPointShells + 4; }
 HandGrab GetGrab(Hand hand);
 // A rifle's charging handle is grabbed at the rear end of its mesh (from
 // 2026-11-04; before, at the handle's origin). shift = the grab point now

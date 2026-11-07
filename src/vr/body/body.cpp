@@ -1385,6 +1385,12 @@ int PickSlideHold(const hands::HandState& h, const hands::Pose& gun, UObject gun
 }
 
 std::string BaseRecordKey(int side, const hands::HandGrab& grab) {
+    // Shotgun shells in the hand: one pose per hold, whatever the ammo type
+    // (controls' smart reload: quad, twin, single).
+    if (grab.kind == hands::GrabKind::kMagHeld && hands::ShellsPoint(grab.point)) {
+        const int n = grab.point - hands::kPointShells;
+        return std::string("shells.") + (n >= 4 ? "quad" : n >= 2 ? "twin" : "single");
+    }
     std::string cls = grab.object ? ue::GetName(ue::GetClass(grab.object)) : "unknown";
     switch (grab.kind) {
         // A hand reaching for the holstered pistol with its own pose
@@ -3968,6 +3974,9 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
     // height. A hand on a gun keeps the elbow hanging.
     posture_input.gun_hold = recorded &&
         (grab.kind == hands::GrabKind::kGunGrip || grab.kind == hands::GrabKind::kSupportGrip);
+    // A support hand far out under the handguard may turn its elbow in under
+    // the gun (2026-11-07 run: support forearms twisted 10-30 deg too far).
+    posture_input.support_hold = recorded && grab.kind == hands::GrabKind::kSupportGrip;
     posture_input.shoulder_twist_share = S.shoulder_twist_share;
     posture_input.radial_axis_hand = rig.across_h;
     posture_input.dt = dt;
@@ -4081,12 +4090,25 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
             const FVector sh = inv.Rotate(shoulder - (head_valid ? tracked_head.location : shoulder));
             const FVector el = inv.Rotate(sol.mid - shoulder), wr = inv.Rotate(sol.end - shoulder);
             const FQuat hq = Normalized(inv * hand_rot);
+            // Where the controller puts the hand (the free hand's wrist and
+            // turn) and how the head is tilted: a drawn hand on a gun sits
+            // away from the real one, and a head leaning into the sights
+            // carries the head-relative shoulder with it.
+            const FVector real_wr = inv.Rotate(raw_wrist - shoulder);
+            const FQuat real_q = Normalized(inv * raw_rotation);
+            double head_pitch = 0, head_roll = 0;
+            if (head_valid) {
+                const FQuat head_q = Normalized(inv * tracked_head.rotation);
+                head_pitch = std::asin(std::clamp(head_q.Rotate(FVector{1, 0, 0}).Z, -1.0, 1.0)) * kRadToDeg;
+                head_roll = std::asin(std::clamp(-head_q.Rotate(FVector{0, 1, 0}).Z, -1.0, 1.0)) * kRadToDeg;
+            }
             log::Info("body arm sample %s: calibrated=%d head=%d grab=%d lengths=%.2f/%.2f reach=%.3f "
                       "roll raw/target/lower/skin/watch=%+.1f/%+.1f/%+.1f/%+.1f/%+.1f seam=%d support-palm=%d "
                       "bend=%+.1f/%+.1f swivel=%+.1f forearm-turn=%+.0f elbow-up/limit=%.1f/%.1f "
                       "constrained=%d candidates=%u clearance=%.1f "
                       "shoulder=(%.2f,%.2f,%.2f) elbow=(%.2f,%.2f,%.2f) wrist=(%.2f,%.2f,%.2f) "
-                      "hand-q=(%.4f,%.4f,%.4f,%.4f)",
+                      "hand-q=(%.4f,%.4f,%.4f,%.4f) real-wrist=(%.2f,%.2f,%.2f) real-hand-q=(%.4f,%.4f,%.4f,%.4f) "
+                      "head-pitch/roll=%+.0f/%+.0f",
                       side == kL ? "left" : "right", calibrated, head_valid, static_cast<int>(grab.kind), upper, lower, dist/reach,
                       twist.raw_radians*kRadToDeg, twist.target_radians*kRadToDeg,
                       twist.forearm_radians*kRadToDeg, twist.twist_radians*kRadToDeg, twist.watch_radians*kRadToDeg,
@@ -4094,7 +4116,8 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
                       posture.flex*kRadToDeg, posture.deviation*kRadToDeg, posture.swivel*kRadToDeg,
                       posture.forearm_rotation*kRadToDeg, posture.elbow_height_cm, posture.elbow_cap_cm,
                       posture.constrained, posture.candidates, posture.torso_clearance_cm,
-                      sh.X,sh.Y,sh.Z,el.X,el.Y,el.Z,wr.X,wr.Y,wr.Z,hq.X,hq.Y,hq.Z,hq.W);
+                      sh.X,sh.Y,sh.Z,el.X,el.Y,el.Z,wr.X,wr.Y,wr.Z,hq.X,hq.Y,hq.Z,hq.W,
+                      real_wr.X,real_wr.Y,real_wr.Z,real_q.X,real_q.Y,real_q.Z,real_q.W,head_pitch,head_roll);
         }
     }
 

@@ -36,7 +36,8 @@ magazines) come once the rifle is unlocked.
   wins over the ini values; delete it to go back). Only the items in your hands
   move, so holster the pistol first to move just the pouch. A short tap on the
   right stick click is still objective markers (it fires on release). Needs the
-  VR body on; rifles keep the click for the fire selector.
+  VR body on. The rifle fire selector is left X (on the click only with the
+  rifle in the left hand).
 - Grip editor: while it borrows a controller (`hands::EditorHand() >= 0`) or a
   menu is open, the holster never changes, so the gun stays in the hand.
 

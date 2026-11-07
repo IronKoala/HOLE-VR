@@ -99,6 +99,21 @@ void StereoRenderSetup(UObject ksl) {
     log::Info("cvars: the game renders with virtual shadow maps %s (%d pages, cache %d), shadow quality %d, "
               "global illumination method %d, reflection method %d",
               vsm == 1 ? "on" : vsm == 0 ? "off" : "unknown", pages, cache, quality, gi, refl);
+    // What decides how much is drawn twice, once per eye (2026-11-07 fixed
+    // cost study). Instanced stereo would draw both eyes in one pass, but it
+    // is a start-up setting that needs the game's shaders built for it.
+    int isr = -1, nanite = -1, occlusion = -1, hzb = -1, turns = -1, fog = -1, translucency = -1, dfao = -1;
+    ReadInt(ksl, "vr.InstancedStereo", &isr);
+    ReadInt(ksl, "r.Nanite", &nanite);
+    ReadInt(ksl, "r.AllowOcclusionQueries", &occlusion);
+    ReadInt(ksl, "r.HZBOcclusion", &hzb);
+    ReadInt(ksl, "vr.RoundRobinOcclusion", &turns);
+    ReadInt(ksl, "r.VolumetricFog", &fog);
+    ReadInt(ksl, "r.Lumen.TranslucencyVolume.Enable", &translucency);
+    ReadInt(ksl, "r.DistanceFieldAO", &dfao);
+    log::Info("cvars: per-eye work: instanced stereo %d, Nanite %d, occlusion queries %d (HZB %d, eyes taking turns "
+              "%d), volumetric fog %d, Lumen on see-through things %d, distance field AO %d",
+              isr, nanite, occlusion, hzb, turns, fog, translucency, dfao);
     if (vsm != 1 || pages <= 0) return;
     int target = config::GetInt("vr_shadow_pages", -1);
     if (target < 0) target = pages * 2;

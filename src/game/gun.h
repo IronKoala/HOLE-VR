@@ -70,6 +70,22 @@ public:
     // Calls a parameterless function on the gun by name (lab use).
     bool CallSimple(const char* function_name);
 
+    // ---- shotgun (tube-fed) shells, through the game's own shell reload ----
+    // BP_GunBase_C (script dump 2026-11-03): ReloadShell_TakeNewShell runs
+    // Gun_ShellCreate, which makes min(tube missing, OneReloadMaxShell)
+    // shells in the hand; ReloadShell_InsertShell_Begin plays the shell-in
+    // sound; ReloadShell_InsertShell_End runs Gun_ShellLoad, which loads EVERY
+    // shell in the hand into the tube (BPI_Magazine.LoadSingleAmmo), then
+    // turns the lifter. So OneReloadMaxShell is set to 1 for the call and put
+    // back: exactly one shell goes in. Nothing is loaded (false, `why` says
+    // why) if the gun lacks these functions or the property, has no tube, or
+    // the game made other than one shell.
+    bool LoadOneShell(std::string* why);
+    // The game's "tube full" sound (ReloadMag_InsertMag_Block).
+    bool PlayShellBlocked();
+    // The class of the shells this gun fires (AmmoClass), 0 if none.
+    UObject AmmoClass() const;
+
 private:
     UObject self_ = 0;
 };

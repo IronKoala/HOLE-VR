@@ -26,10 +26,17 @@ bool PauseBlurOn();
 // Console settings the pause blur needs, applied at once (context: any object
 // in the game world, for the console command).
 void ApplyPauseBlurCvars(uintptr_t context);
-// Game thread: lets the player's scene capture (stopped in VR) run while the
-// death screen is up, for its picture of who killed you. Returns how many
-// captures were switched.
+// Game thread: lets the scene captures stopped in VR (the player's, and the
+// kill shot room's with vr_kill_shot_camera_when_shown=1) run while the death
+// screen is up, for its pictures. Returns how many captures were switched.
 int AllowPlayerCapture(bool allow);
+// Scene captures the mod leaves running that draw the level into a picture
+// every frame (a whole extra render each frame), as of the last Apply.
+// names: their actors, for the log. Any thread.
+int LiveSceneCaptures(std::string* names = nullptr);
+// GPU cost test, game thread: stops those captures (pause) or starts the ones
+// it stopped again. Returns how many were switched.
+int PauseSceneCaptures(bool pause, std::string* names = nullptr);
 
 // The exposure one object's post-process settings ask for (a camera,
 // post-process component or volume). The game raises it in dark areas
