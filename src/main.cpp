@@ -10,6 +10,7 @@
 #include "core/log.h"
 #include "core/memory.h"
 #include "core/perf.h"
+#include "core/gpu_share.h"
 #include "core/process_metrics.h"
 #include "core/sampler.h"
 #include "game/game.h"
@@ -155,6 +156,7 @@ DWORD WINAPI InitThread(LPVOID) {
     if (!WaitFor("reflection offsets", ue::reflection::Init, timeout)) return 0;
     log::Info("Engine discovery complete");
     sampler::Start();  // samples the game, render and present threads (profile=0 turns it off)
+    gpu_share::Start();  // which programs use the graphics card, every 10 s (gpu_share=0 turns it off)
     // Before the slow start-up work: the title screen is up within seconds.
     vr::launch::Init();
 

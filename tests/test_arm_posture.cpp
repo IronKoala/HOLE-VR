@@ -26,6 +26,9 @@ static Input Neutral(int side,double ratio=.85) {
     in.reference=arm_pose::MeasureReference(At(in.shoulder),At(in.shoulder+in.outward*30),
         At(in.shoulder+in.outward*58),in.down);
     in.forearm_axis_hand=in.outward; in.palm_axis_hand={0,0,-1};
+    // Thumb side, as the game's rig builds it (index minus little finger).
+    in.radial_axis_hand=side==0 ? Cross(in.forearm_axis_hand,in.palm_axis_hand)
+                                : Cross(in.palm_axis_hand,in.forearm_axis_hand);
     in.hand_rotation=AlignFrames(in.forearm_axis_hand,in.palm_axis_hand,{1,0,0},in.outward*-1);
     in.torso_center_valid=true;
     return in;
@@ -212,8 +215,11 @@ static void FreeWristDoesNotMeasureElbow() {
     // fixed. None of those observations measures a new elbow location.
     // Previously even wrist_relief=false allowed a hand roll to move the
     // elbow28.3cm at80% reach because a separate roll cost remained active.
+    // Without joint limits (body_arm_joint_limits=0). With them, a turn the
+    // forearm or wrist cannot make moves the elbow: JointLimitsMoveElbow.
     for(int side=0;side<2;++side) for(double ratio:{.5,.8,.95,.999}) {
         Input in=Neutral(side,ratio);
+        in.joint_limits=false;
         EXPECT(!in.straight_wrist && !in.wrist_relief);
         const Input fixed=in;
         const auto base=Solve(in,nullptr);
@@ -286,12 +292,244 @@ static void TurningExtendedArmThenRetracting() {
     }
 }
 
+// Owner 2026-11-07: "the only time humans elbows go above our head is when
+// we reach straight up. right now the elbows loving going up when I'm
+// holding the AR and I'm aiming it to shoot." Positions from that run's arm
+// samples (07:46:14-29, body yaw frame, cm from the shoulder), with a
+// synthetic hand frame: no controller here measures the real palm axes.
+static Input Shouldered(int side,FVector wrist_local,double upper,double forearm) {
+    Input in=Neutral(side);
+    const double sign=side==0?-1:1;
+    in.upper_cm=upper; in.forearm_cm=forearm;
+    in.wrist=in.shoulder+FVector{wrist_local.X,sign*wrist_local.Y,wrist_local.Z};
+    in.reference=arm_pose::MeasureReference(At(in.shoulder),At(in.shoulder+in.outward*upper),
+        At(in.shoulder+in.outward*(upper+forearm)),in.down);
+    // Gun hand: knuckles forward, palm toward the gun (medial), thumb up.
+    in.hand_rotation=AlignFrames(in.forearm_axis_hand,in.palm_axis_hand,{1,0,0},in.outward*-1);
+    return in;
+}
+static double Up(const Input& in,const Result& r) { return Dot(r.solved.mid-in.shoulder,in.down*-1); }
+static Result Settled(Input in) { State state; Result r; for(int i=0;i<200;++i) r=Solve(in,&state); return r; }
+
+static void RifleAimKeepsElbowsDown() {
+    for(int side=0;side<2;++side) {
+        // Trigger hand at the face: 13 cm ahead of and 6 cm above the shoulder.
+        Input trigger=Shouldered(side,{13.3,-.3,6.4},33.11,29.44);
+        // Support hand on the handguard, low and across toward the midline.
+        Input support=Shouldered(side,{32.6,-17.9,-.8},38.62,20.82);
+        support.hand_rotation=AlignFrames(support.forearm_axis_hand,support.palm_axis_hand,
+            {1,0,0},Normalize(support.outward*-.5+FVector{0,0,1}));
+        for(Input in:{trigger,support}) for(int mode=0;mode<3;++mode) {
+            in.wrist_relief=mode>=1; in.straight_wrist=mode==2;
+            Input old=in; old.joint_limits=false;
+            const auto before=Settled(old), after=Settled(in);
+            Geometry(in,after);
+            EXPECT(after.elbow_over_cm<1.0);
+            EXPECT(Up(in,after)<=after.elbow_cap_cm+1.0);
+            EXPECT(Up(in,after)<.15*in.upper_cm+1.0);
+            // The trigger elbow stays outside the shoulder; the support
+            // hand reaches across, so only compare it with the old solver.
+            if(in.upper_cm<35) EXPECT(Dot(after.solved.mid-in.shoulder,in.outward)>=-1e-6);
+            else EXPECT(after.torso_clearance_cm>=std::min(3.0,before.torso_clearance_cm)-1e-5);
+            if(side==1) std::printf("rifle %s, %s: elbow %.1f cm above the shoulder (without limits %.1f), cap %.1f; out %.1f (without %.1f)\n",
+                in.upper_cm>35?"support":"trigger",mode==0?"free":mode==1?"wrist relief":"straight wrist",
+                Up(in,after),Up(old,before),after.elbow_cap_cm,Dot(after.solved.mid-in.shoulder,in.outward),
+                Dot(before.solved.mid-in.shoulder,in.outward));
+        }
+    }
+}
+
+static void RaisedHandsStillRaiseElbows() {
+    for(int side=0;side<2;++side) {
+        // Hand on top of the head and behind the head (reaching over the
+        // shoulder): elbows point up there, as a person's do.
+        for(FVector local:{FVector{0,-12,30},FVector{-10,-5,18},FVector{5,5,52}}) {
+            Input in=Shouldered(side,local,30,28);
+            in.hand_rotation=AlignFrames(in.forearm_axis_hand,in.palm_axis_hand,{0,0,1},in.forward*-1);
+            const auto r=Settled(in); Geometry(in,r);
+            EXPECT(r.elbow_cap_cm>10);
+            EXPECT(r.elbow_over_cm<1.0);
+            if(side==1) std::printf("raised hand (%.0f %.0f %.0f): elbow %.1f cm up, cap %.1f\n",
+                local.X,local.Y,local.Z,Up(in,r),r.elbow_cap_cm);
+        }
+    }
+}
+
+static void ExtensionLockWithLimits() {
+    // A straight arm aimed a little above the shoulder (a pistol at head
+    // height) has its elbow over the height limit on every plane: the
+    // carried plane must still hold through noise, not chase it.
+    for(double hz:{30.0,90.0}) for(int side=0;side<2;++side) {
+        Input in=Neutral(side,1); in.dt=1/hz;
+        const FVector raised=Normalize(FVector{1,0,.25});
+        in.wrist=in.shoulder+raised*58;
+        State state; Solve(in,&state);
+        for(int i=0;i<static_cast<int>(2*hz);++i) {
+            const FVector axis=Normalize(raised+FVector{0,.004*std::sin(i*.7),.004*std::cos(i*.9)});
+            const FVector expected=Arc(state.axis,axis).Rotate(state.pole);
+            in.wrist=in.shoulder+axis*(58*(.991+.007*std::sin(i*.6)));
+            const auto out=Solve(in,&state); Geometry(in,out);
+            EXPECT(state.extension_locked && Near(out.pole,expected,1e-6));
+        }
+    }
+    // A plane carried straight with the elbow pointing up is let go when the
+    // arm bends, at the usual rate, and the elbow comes back under its limit.
+    for(double hz:{30.0,90.0}) for(int side=0;side<2;++side) {
+        Input in=Neutral(side,1); in.dt=1/hz;
+        State state{true,{1,0,0},{0,0,1}};
+        Solve(in,&state);
+        Result out;
+        for(int n=1;n<=static_cast<int>(hz);++n) {
+            const FVector previous=state.pole,previous_axis=state.axis;
+            in.wrist=in.shoulder+FVector{58*(1-.35*std::min(1.0,n/(.3*hz))),0,0};
+            out=Solve(in,&state); Geometry(in,out);
+            EXPECT(AngleBetween(Arc(previous_axis,state.axis).Rotate(previous),out.pole)<=360*kDegToRad*in.dt+1e-6);
+        }
+        EXPECT(out.elbow_over_cm<.5 && Up(in,out)<0);
+    }
+}
+
+static void ForearmRotationMeasure() {
+    // Right arm hanging, forearm forward: palm up = supinated (0), palm
+    // toward the body = thumb up (90), palm down = pronated (180). Mirrored
+    // for the left arm.
+    for(int side=0;side<2;++side) {
+        const double s=side==0?-1:1;
+        const FVector upper{0,0,-30},forearm{28,0,0},pole{0,0,-1};
+        EXPECT(Near(arm_pose::ForearmRotation(upper,forearm,{0,0,1},pole,s),0,1e-9));
+        EXPECT(Near(arm_pose::ForearmRotation(upper,forearm,{0,-s,0},pole,s),kPi/2,1e-9));
+        EXPECT(Near(std::fabs(arm_pose::ForearmRotation(upper,forearm,{0,0,-1},pole,s)),kPi,1e-9));
+        EXPECT(Near(arm_pose::ForearmRotation(upper,forearm,{0,s,0},pole,s),-kPi/2,1e-9));
+        // A straight arm uses the pole: hanging straight, elbow pointing back.
+        EXPECT(Near(arm_pose::ForearmRotation({0,0,-30},{0,0,-28},{1,0,0},{-1,0,0},s),0,1e-9));
+        EXPECT(!std::isfinite(arm_pose::ForearmRotation(upper,forearm,{1,0,0},pole,s)));
+    }
+    // The raw IK roll and the anatomical turn agree: raw = s*(rho - rho_ref).
+    for(int side=0;side<2;++side) for(double ratio:{.6,.9}) for(double roll:{-120.0,-45.0,0.0,60.0,150.0}) {
+        Input in=Neutral(side,ratio);
+        const double s=side==0?-1:1;
+        const double rest=arm_pose::ReferenceForearmRotation(in.reference,in.palm_axis_hand,s);
+        EXPECT(std::isfinite(rest));
+        const auto solved=SolveTwoBone(in.shoulder,in.wrist,in.upper_cm,in.forearm_cm,in.down);
+        const auto frames=arm_pose::Orient(in.reference,in.shoulder,solved,in.down);
+        const FVector f=Normalize(solved.end-solved.mid);
+        const FQuat hand=Normalized(AxisAngle(f,roll*kDegToRad)*frames.forearm*in.reference.forearm_to_hand);
+        const double raw=arm_pose::WristTwist(in.reference,frames.forearm,hand);
+        const double rho=arm_pose::ForearmRotation(solved.mid-in.shoulder,solved.end-solved.mid,
+            hand.Rotate(in.palm_axis_hand),in.down,s);
+        EXPECT(Near(std::remainder(raw-roll*kDegToRad,2*kPi),0,1e-6));
+        EXPECT(Near(std::remainder(s*(rho-rest)-raw,2*kPi),0,1e-6));
+    }
+}
+
+static double TurnOutside(double rho) {
+    // Radians outside the forearm's own range [-10, 180] deg.
+    const double end=-10*kDegToRad;
+    return rho<end ? std::min(end-rho,rho+kPi) : 0;
+}
+
+// A hand in line with the forearm the solver chose without limits, thumb
+// up (palm toward the body's midline), then turned roll_degrees about the
+// forearm: positive turns toward palm-down for either arm.
+static Input NaturalHand(int side,double ratio,double roll_degrees,Result* free_base=nullptr) {
+    Input in=Neutral(side,ratio);
+    Input off=in; off.joint_limits=false;
+    const auto base=Settled(off);
+    if(free_base) *free_base=base;
+    const double s=side==0?-1:1;
+    const FVector upper=base.solved.mid-in.shoulder, f=Normalize(base.solved.end-base.solved.mid);
+    const FVector medial=Normalize(Cross(upper,f))*s;
+    const FQuat straight=AlignFrames(in.forearm_axis_hand,in.palm_axis_hand,f,medial);
+    in.hand_rotation=Normalized(AxisAngle(f,s*roll_degrees*kDegToRad)*straight);
+    return in;
+}
+
+static void JointLimitsMoveElbow() {
+    for(int side=0;side<2;++side) for(double ratio:{.55,.8}) {
+        Result free_base;
+        const auto natural=Settled(NaturalHand(side,ratio,0,&free_base));
+        // A natural hand changes nothing.
+        EXPECT(Length(natural.solved.mid-free_base.solved.mid)<1.0);
+        EXPECT(Near(natural.forearm_rotation,kPi/2,2*kDegToRad));
+        double most_inside=0;
+        for(int degrees=-180;degrees<=180;degrees+=15) {
+            const Input in=NaturalHand(side,ratio,degrees);
+            Input free=in; free.joint_limits=false;
+            const auto limited=Settled(in), unlimited=Settled(free);
+            Geometry(in,limited);
+            EXPECT(limited.elbow_over_cm<1.0);
+            EXPECT(std::isfinite(limited.forearm_rotation) && std::isfinite(unlimited.forearm_rotation));
+            if(!std::isfinite(limited.forearm_rotation) || !std::isfinite(unlimited.forearm_rotation)) continue;
+            const double outside=TurnOutside(unlimited.forearm_rotation);
+            const double moved=Length(limited.solved.mid-unlimited.solved.mid);
+            if(outside<1e-9) {
+                // In range the shoulder takes only a small share.
+                most_inside=std::max(most_inside,moved);
+                EXPECT(moved<.2*in.upper_cm);
+            } else {
+                // Never worse. Past the palm-down end the shoulder takes most
+                // of the rest (the elbow rises and swings out; the wrist's own
+                // range shares the work with a folded arm). Past the
+                // palm-up end it would have to tuck across the chest, which
+                // the torso guard keeps out, or swing round the long way.
+                EXPECT(TurnOutside(limited.forearm_rotation)<=outside+1e-6);
+                // Unless raising the elbow further would pass its height limit
+                // (the hand here is no higher than the shoulder).
+                if(unlimited.forearm_rotation<-kPi/2 && limited.elbow_height_cm<limited.elbow_cap_cm-2) {
+                    EXPECT(TurnOutside(limited.forearm_rotation)<outside*.7+1e-6);
+                    if(TurnOutside(limited.forearm_rotation)>=outside*.7+1e-6)
+                        std::printf("  side %d reach %.2f turn %d: alone %.0f, limited %.0f, elbow %.1f cap %.1f\n",side,ratio,degrees,
+                            unlimited.forearm_rotation*kRadToDeg,limited.forearm_rotation*kRadToDeg,
+                            limited.elbow_height_cm,limited.elbow_cap_cm);
+                }
+            }
+            if(side==1 && ratio==.8) std::printf("turn %+4d: forearm %+4.0f deg (alone %+4.0f), elbow moved %.1f cm\n",
+                degrees,limited.forearm_rotation*kRadToDeg,unlimited.forearm_rotation*kRadToDeg,moved);
+        }
+        if(side==1) std::printf("hand turns within the forearm's range move the elbow at most %.1f cm (reach %.2f)\n",
+                                most_inside,ratio);
+    }
+    // Continuity under a full roll sweep with limits on.
+    for(double hz:{30.0,90.0}) for(int side=0;side<2;++side) {
+        Input in=NaturalHand(side,.75,0); in.dt=1/hz;
+        const FQuat start=in.hand_rotation;
+        State state; FVector previous; bool have=false;
+        const FVector axis=Normalize(in.wrist-in.shoulder);
+        for(int i=0;i<static_cast<int>(4*hz);++i) {
+            in.hand_rotation=Normalized(AxisAngle(axis,170*kDegToRad*std::sin(i/hz*1.7))*start);
+            const auto r=Solve(in,&state); Geometry(in,r);
+            if(have) EXPECT(AngleBetween(previous,r.pole)<=360*kDegToRad*in.dt+1e-6);
+            previous=r.pole; have=true;
+        }
+    }
+    // Wrist bent past its range: the elbow helps.
+    for(int side=0;side<2;++side) for(double degrees:{-110.0,-95.0,95.0,110.0}) {
+        Result free_base;
+        const Input natural=NaturalHand(side,.7,0,&free_base);
+        const FVector f=Normalize(free_base.solved.end-free_base.solved.mid);
+        const FVector palm=natural.hand_rotation.Rotate(natural.palm_axis_hand);
+        Input bent=natural;
+        bent.hand_rotation=Normalized(AxisAngle(Cross(f,palm),degrees*kDegToRad)*natural.hand_rotation);
+        Input free=bent; free.joint_limits=false;
+        const auto limited=Settled(bent), unlimited=Settled(free);
+        Geometry(bent,limited);
+        const auto over=[](const Result& r) {
+            return std::max(0.0,r.flex-70*kDegToRad)+std::max(0.0,-r.flex-80*kDegToRad); };
+        EXPECT(over(unlimited)>0);
+        EXPECT(over(limited)<over(unlimited)-1e-3);
+        if(side==1) std::printf("wrist bent %+.0f: past its range by %.0f deg (alone %.0f)\n",degrees,
+                                over(limited)*kRadToDeg,over(unlimited)*kRadToDeg);
+    }
+}
+
 int main() {
     PalmsFacingAndMirroring(); RejectInwardZeroWristCandidate(); CrossBodyOverheadAndHanging();
     FullReachRetractionAndRates(); YawAndMeasuredLengths(); ExtendedLateralSweep();
     TransportedPoleRateAcrossBody(); OptionsAndInvalidState();
     FreeWristDoesNotMeasureElbow(); ExtensionKeepsTransportedPlane();
     TurningExtendedArmThenRetracting();
+    RifleAimKeepsElbowsDown(); RaisedHandsStillRaiseElbows(); ExtensionLockWithLimits(); ForearmRotationMeasure();
+    JointLimitsMoveElbow();
     std::printf("arm posture: %s (%d checks, %d failures)\n",failures?"FAIL":"PASS",checks,failures);
     return failures?1:0;
 }

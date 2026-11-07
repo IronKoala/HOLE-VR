@@ -287,9 +287,38 @@ arm segments do not stretch. The reference skeleton supplies limb axes
 independently of the game's aiming animation, and the forearm-to-hand reference
 includes intermediate twist bones.
 
-Free-hand elbow posture follows a body-relative preference and continuity, not
-the controller's palm orientation. Turning a wrist must not pull the elbow
-around the arm. Explicit authored grips may opt into a wrist/roll preference.
+Arm joint ranges (owner 2026-11-07: "the only time humans elbows go above our
+head is when we reach straight up"; every arm joint needs a twist and bend
+limit; "the human shoulder has a small amount of twist"). With
+`body_arm_joint_limits=1` the solver adds, on top of the posture below:
+
+| Joint | Range kept | What gives way past it |
+|---|---|---|
+| Shoulder (elbow height) | elbow at most 10% of the upper arm above the shoulder, plus 1.3 cm for each cm the hand is raised beyond a third of the upper arm, or reaches back over the shoulder | nothing: steep cost, also releases a plane carried through a straight arm |
+| Shoulder (turn) | takes `body_shoulder_twist_share` (0.15) of the forearm's turn from thumb-up | |
+| Forearm turn | -10 (palm toward the biceps) to 180 (palm away) deg; 90 = thumb up | the shoulder turns the arm (elbow swings up and out past palm-down) |
+| Wrist, empty hands | 70 back, 80 toward the palm, 20 toward the thumb, 35 toward the little finger | the elbow moves so the forearm comes from a reachable side |
+
+The forearm's turn is read from the wrist's side-to-side axis and the bend
+plane, so a bent wrist doesn't read as a turn. The 2026-11-07 run had the
+shouldered rifle's trigger elbow up to 30 cm above the shoulder and the
+support elbow 19 cm above: the pistol's straight-wrist preference applied to
+the rifle grip too (now pistol grips only, key `BP_HG*`), and wrist relief
+on a folded arm chose the top of the elbow circle. Ranges are limits, not a
+pose: a hand in line with the resting forearm leaves the resting elbow alone.
+
+The forearm skin's twist runs from `body_forearm_twist_at_elbow` (0) of the
+hand's turn at the elbow end to `body_forearm_twist_at_middle` (0.5) at the
+mid-forearm twist joint and all of it at the wrist; the seam of that split
+sits opposite a thumb-up forearm (palm facing outward), measured from the
+skeleton's reference pose (logged: `body: <side> forearm in the skeleton's
+reference pose is turned ...`). The wrist display keeps
+`body_forearm_roll_share` of the turn, as before.
+
+Without joint ranges (`body_arm_joint_limits=0`), free-hand elbow posture
+follows a body-relative preference and continuity, not the controller's palm
+orientation: turning a wrist does not pull the elbow around the arm. Explicit
+authored grips may opt into a wrist/roll preference.
 For neutral forward reaches the solver uses an outward interval and guards the
 actual elbow against the torso midline. Cross-body and overhead reaches relax
 this constraint. The default bent-arm preference keeps elbows nearer the sides,
@@ -465,8 +494,11 @@ New keys (an old key keeps its old value in existing ini files, so changed
 defaults get new names): `body_turn_threshold_deg`, `body_turn_toward_hands`,
 `body_arm_scale_override`, `body_max_arm_stretch`,
 `body_max_arm_stretch_unmeasured`, `body_shoulder_below_eyes_cm`,
-`body_shoulder_behind_eyes_cm`, `body_forearm_roll_share`,
-`body_forearm_twist_bone_share`,
+`body_shoulder_behind_eyes_cm`, `body_forearm_roll_share` (now only the
+wrist display's share of the hand's turn), `body_arm_joint_limits`,
+`body_shoulder_twist_share`, `body_forearm_twist_at_elbow`,
+`body_forearm_twist_at_middle` (these two replace
+`body_forearm_twist_bone_share`, which is no longer read),
 `body_elbow_relieves_wrist`, `hand_grip_records`, `hand_joint_limits`, `hand_finger_radius_cm`,
 `body_fit_log`. Version 1 keys (scan, palm seat, contact, grip offsets) are
 ignored.

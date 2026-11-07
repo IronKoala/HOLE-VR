@@ -43,4 +43,8 @@ bool Enabled();
 // thread, run 2026-11-03 10:47).
 uintptr_t PanelHolder();
 
+// GPU cost test: show the wrist HUD on the arm and redraw it every frame, as
+// when you look at it (on), or leave it to the look as usual (off).
+void ForceHudShown(bool on);
+
 }  // namespace holevr::vr::world_menu

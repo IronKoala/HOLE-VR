@@ -465,8 +465,46 @@ static void CalibratedSkinLength() {
     EXPECT(Near(unchanged,{2.2,2.6,1.1}));
 }
 
+static void CenteredTwistSeam() {
+    // The seam sits opposite the center (owner 2026-11-07 skin twist: the
+    // seam goes where the palm faces outward, opposite a thumb-up forearm).
+    // A sweep through the old seam at +/-180 is continuous; shares still
+    // multiply the whole roll from the reference.
+    const double dt=1.0/90;
+    const double center=-90*kDegToRad;
+    TwistState state;
+    TwistResult out=FollowTwist(center,dt,0,.5,&state,center,.5);
+    EXPECT(out.valid && Near(out.twist_radians,center*.5) && Near(out.forearm_radians,0) &&
+           Near(out.watch_radians,center*.5));
+    double previous=out.twist_radians;
+    for(int n=0;n<=160;++n) {
+        // From the center to 160 deg past it: through raw -180/+180.
+        const double raw=std::remainder(center-n*kDegToRad,2*kPi);
+        out=FollowTwist(raw,dt,0,.5,&state,center,.5);
+        EXPECT(out.valid && !out.seam_guarded);
+        EXPECT(std::fabs(std::remainder(out.twist_radians-previous,2*kPi))<=kTwistBoneRate*dt+1e-9);
+        EXPECT(std::fabs(out.twist_radians)<=kPi+1e-9 && std::fabs(out.watch_radians)<=kPi+1e-9);
+        previous=out.twist_radians;
+    }
+    // Settled 160 deg past the center: half of (center - 160 deg), not the
+    // half of a principal angle on the other side.
+    for(int n=0;n<200;++n) out=FollowTwist(std::remainder(center-160*kDegToRad,2*kPi),dt,0,.5,&state,center,.5);
+    EXPECT(Near(std::remainder(out.twist_radians-(center-160*kDegToRad)*.5,2*kPi),0,1e-6));
+    EXPECT(Near(out.forearm_radians,0));
+    // The default center keeps the old behavior exactly.
+    TwistState a,b;
+    for(double raw:{-179.0,-120.0,30.0,179.0}) {
+        const auto old=FollowTwist(raw*kDegToRad,dt,.5,1,&a);
+        const auto centered=FollowTwist(raw*kDegToRad,dt,.5,1,&b,0,-1);
+        EXPECT(Near(old.forearm_radians,centered.forearm_radians) && Near(old.twist_radians,centered.twist_radians) &&
+               Near(centered.watch_radians,centered.forearm_radians));
+    }
+    EXPECT(!FollowTwist(0,dt,.5,1,&state,std::numeric_limits<double>::quiet_NaN()).valid && !state.valid);
+}
+
 int main() {
     CalibratedSkinLength();
+    CenteredTwistSeam();
     MirroredAndArbitraryBoneFrames();
     InterveningTwistParent();
     ReferenceRoundTripAndExtension();

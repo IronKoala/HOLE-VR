@@ -3,6 +3,8 @@
 // this is an anatomical preference with explicit bounds, not joint tracking.
 #include "vr/body/arm_pose.h"
 
+#include <limits>
+
 namespace holevr::vr::arm_posture {
 
 struct Input {
@@ -23,6 +25,20 @@ struct Input {
     // Explicit pose preferences for authored/recorded grips only. Ordinary
     // gameplay permits wrist bend and pronation; neither chooses the elbow.
     bool straight_wrist = false, wrist_relief = false;
+    // Human joint ranges (owner 2026-11-07: "the only time humans elbows go
+    // above our head is when we reach straight up"; every arm joint needs a
+    // twist and bend limit). Shoulder: the elbow stays at or below shoulder
+    // height unless the hand is raised or reaches back over the shoulder.
+    // Forearm: about 85 deg of turn each way from thumb-up; the shoulder
+    // takes shoulder_twist_share of that turn and everything past it. Wrist:
+    // 70 deg back, 80 deg toward the palm, 20 deg toward the thumb, 35 deg
+    // toward the little finger. Forearm and wrist ranges need the hand frame
+    // and fade with the other hand terms at full extension.
+    bool joint_limits = true;
+    double shoulder_twist_share = .15;
+    // Thumb side across the knuckles, hand space (index minus little-finger
+    // knuckle). Optional: without it both wrist side bends use 25 deg.
+    FVector radial_axis_hand;
     double dt = 0;
 };
 
@@ -44,6 +60,12 @@ struct Result {
     // principal IK-frame roll, not a measured anatomical rotation.
     double raw_roll = 0, flex = 0, deviation = 0, swivel = 0, cost = 0;
     double torso_clearance_cm = 0;
+    // Joint-range diagnostics. forearm_rotation: 0 = palm toward the biceps
+    // side of the bend (fully supinated), pi/2 = thumb up, pi = palm away
+    // (fully pronated); NaN when the palm cannot be measured. elbow_*_cm are
+    // heights above the shoulder along the body's up.
+    double forearm_rotation = std::numeric_limits<double>::quiet_NaN();
+    double elbow_height_cm = 0, elbow_cap_cm = 0, elbow_over_cm = 0;
     unsigned candidates = 0;
     bool constrained = false;
 };

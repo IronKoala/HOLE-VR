@@ -514,7 +514,7 @@ const Block kBlocks[] = {
      "\n"
      "; --- Reloading: where a magazine lines up with the magwell ---\n"
      "; Its top must come into a box under the gun's magwell opening, measured for\n"
-     "; each magazine in each gun: this deep (cm; 2.54 = an inch),\n"
+     "; each magazine in each gun: this deep (cm; 2.54 = an inch; rifles),\n"
      "mag_line_up_cm=2.54\n"
      "; its top at most this far off the magwell's line (cm),\n"
      "mag_line_up_side_cm=3.5\n"
@@ -522,6 +522,16 @@ const Block kBlocks[] = {
      "mag_line_up_tilt_deg=35\n"
      "; Pushed in to this close to seated (cm), it clicks in by itself.\n"
      "mag_seat_last_cm=1\n"},
+    {"mag_line_up_pistol_cm",
+     "\n"
+     "; --- Reloading the pistol ---\n"
+     "; A pistol magazine lines up from this deep under the magwell (cm; 3.81 = an\n"
+     "; inch and a half). mag_line_up_cm above is the rifle's.\n"
+     "mag_line_up_pistol_cm=3.81\n"
+     "; With the gun in the left hand the real controllers knock together under the\n"
+     "; grip: near the gun the magazine is drawn this far (cm) out of the right hand\n"
+     "; along its own length, so the controllers stay apart. 0 = off.\n"
+     "mag_reach_left_gun_cm=6\n"},
     {"mag_insert_anim_ar",
      "\n"
      "; --- Reloading the AR ---\n"
@@ -581,10 +591,9 @@ const Block kBlocks[] = {
      "; Fallback shoulder offsets before calibration. 0 = from standing height.\n"
      "body_shoulder_below_eyes_cm=0\n"
      "body_shoulder_behind_eyes_cm=0\n"
-     "; Forearm roll: share of the hand's twist taken by the forearm bone and by\n"
-     "; the forearm twist bone (less pinching at the wrist).\n"
+     "; Share of the hand's turn the wrist display (ammo and health) follows.\n"
+     "; The arm's own twist: body_forearm_twist_at_elbow / _at_middle below.\n"
      "body_forearm_roll_share=0.5\n"
-     "body_forearm_twist_bone_share=1.0\n"
      "; Optional wrist relief for recorded gun grips only. Free-hand elbow\n"
      "; placement follows the body and reach, independently of hand rotation.\n"
      "body_elbow_relieves_wrist=1\n"
@@ -601,6 +610,23 @@ const Block kBlocks[] = {
      "hand_editor_show_grab_points=1\n"
      "; Log a body fit line (reach, wrist bend, body turn) every 10 s.\n"
      "body_fit_log=1\n"},
+    {"body_arm_joint_limits",
+     "\n"
+     "; --- Arm joint ranges (added 2026-11-07) ---\n"
+     "; 1 = arms keep to human ranges: the elbow stays at or below shoulder\n"
+     "; height unless the hand is raised or reaching back over the shoulder;\n"
+     "; the forearm turns about 85 deg each way from thumb-up and the shoulder\n"
+     "; turns the arm past that; the wrist bends at most 70 deg back, 80 toward\n"
+     "; the palm, 20 toward the thumb and 35 toward the little finger (empty\n"
+     "; hands; gun grips use body_elbow_relieves_wrist). 0 = the old solver.\n"
+     "body_arm_joint_limits=1\n"
+     "; Share of the forearm's turn the shoulder takes as well (0-0.9).\n"
+     "body_shoulder_twist_share=0.15\n"
+     "; How much of the hand's turn shows in the forearm skin at the elbow end\n"
+     "; and at its middle (the wrist end always has all of it). A real forearm\n"
+     "; turns from nothing at the elbow to all of it at the wrist.\n"
+     "body_forearm_twist_at_elbow=0\n"
+     "body_forearm_twist_at_middle=0.5\n"},
     {"comfort_vignette_move",
      "\n"
      "; --- Comfort and the VR tab (2026-11-03) ---\n"
@@ -796,6 +822,14 @@ const Block kBlocks[] = {
      "square_watch=0\n"
      "square_watch_every=4\n"
      "square_test=0\n"},
+    {"vr_gpu_memory_sharing",
+     "\n"
+     "; White/yellow squares in one eye: the engine reuses video memory between\n"
+     "; drawing steps and runs some steps alongside the frame (async compute).\n"
+     "; With both off in VR the squares were gone (2026-11-07). 1 = the game's own\n"
+     "; (saves video memory / GPU time but may bring the squares back).\n"
+     "vr_gpu_memory_sharing=0\n"
+     "vr_async_compute=0\n"},
     {"xr_end_async",
      "\n"
      "; Frame times: hand each frame to the headset (xrEndFrame) on a thread of the\n"
@@ -808,6 +842,15 @@ const Block kBlocks[] = {
      "; Lumen indirect lighting quality in VR. Levels ask for 2; 1 looks nearly the\n"
      "; same and saves about 0.7 ms of GPU time a frame. 0 = the game's own.\n"
      "vr_lumen_gi_quality=1\n"},
+    {"vr_shadow_quality",
+     "\n"
+     "; Frame times in VR (72 Hz needs the GPU under about 12 ms a frame):\n"
+     "; shadow quality low / medium / high / epic / game (the game's own, Epic).\n"
+     "; High saves about 0.7 ms a frame against Epic.\n"
+     "vr_shadow_quality=high\n"
+     "; Lumen indirect lighting probes: half (half as many, saves about 0.9 ms a\n"
+     "; frame) / full / game.\n"
+     "vr_lumen_probes=half\n"},
     {"process_metrics",
      "\n"
      "; Every 30 s log the game process's memory, handles, CPU and disk use (game\n"

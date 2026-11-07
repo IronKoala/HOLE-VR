@@ -1,6 +1,7 @@
 #include "vr/body/arm_pose.h"
 
 #include <algorithm>
+#include <limits>
 
 namespace holevr::vr::arm_pose {
 namespace {
@@ -125,6 +126,44 @@ WristPole WristAlignedPole(const Reference& r, const FVector& shoulder,
     return out;
 }
 
+double ForearmRotation(const FVector& upper, const FVector& forearm, const FVector& palm,
+                       const FVector& bend_pole, double side_sign) {
+    constexpr double nan = std::numeric_limits<double>::quiet_NaN();
+    if (!Finite(upper) || !Finite(forearm) || !Finite(palm) || !Finite(bend_pole) ||
+        !std::isfinite(side_sign) || Length(forearm) < 1e-6) return nan;
+    const FVector f = Normalize(forearm);
+    // Bend-plane normal as Orient builds it: cross(upper, forearm); with a
+    // straight arm the elbow's pole supplies the plane (pole x axis).
+    FVector normal = Cross(upper, forearm);
+    if (Length(normal) <= 1e-3 * Length(upper) * Length(forearm)) {
+        const FVector axis = upper + forearm;
+        normal = Cross(Reject(bend_pole, Normalize(axis, f)), Normalize(axis, f));
+    }
+    normal = Reject(normal, f);
+    if (Length(normal) < 1e-9) return nan;
+    normal = Normalize(normal);
+    const FVector anterior = Cross(normal, f);          // inside of the bend
+    const FVector medial = normal * (side_sign < 0 ? -1.0 : 1.0);
+    const FVector p = Reject(palm, f);
+    if (Length(p) < .2 * Length(palm) || Length(p) < 1e-9) return nan;
+    return std::atan2(Dot(p, medial), Dot(p, anterior));
+}
+
+double ReferenceForearmRotation(const Reference& r, const FVector& palm_axis_hand, double side_sign) {
+    constexpr double nan = std::numeric_limits<double>::quiet_NaN();
+    if (!r.valid || !Finite(palm_axis_hand) || Length(palm_axis_hand) < 1e-6 ||
+        !ValidRotation(r.forearm_to_hand) || !Finite(r.forearm_axis) || !Finite(r.forearm_normal) ||
+        Length(r.forearm_axis) < .1 || Length(r.forearm_normal) < .1) return nan;
+    // Forearm bone space: its axis, the reference bend normal and the palm.
+    const FVector f = Normalize(r.forearm_axis);
+    const FVector normal = Reject(r.forearm_normal, f);
+    if (Length(normal) < .1) return nan;
+    const FVector n = Normalize(normal);
+    const FVector p = Reject(Normalized(r.forearm_to_hand).Rotate(palm_axis_hand), f);
+    if (Length(p) < .2 * Length(palm_axis_hand)) return nan;
+    return std::atan2(Dot(p, n * (side_sign < 0 ? -1.0 : 1.0)), Dot(p, Cross(n, f)));
+}
+
 SupportTwistResult FollowSupportTwist(const Reference& r, const FQuat& forearm_world,
     const FQuat& hand_world, const FVector& palm_axis_hand, double dt, double share,
     SupportTwistState* state, double initial_forearm_radians) {
@@ -184,27 +223,37 @@ SupportTwistResult FollowSupportTwist(const Reference& r, const FQuat& forearm_w
     return out;
 }
 
-TwistResult FollowTwist(double target,double dt,double forearm_share,double twist_share,TwistState* state) {
+TwistResult FollowTwist(double target,double dt,double forearm_share,double twist_share,TwistState* state,
+                        double center,double watch_share) {
     constexpr double seam_enter=170*kDegToRad, seam_leave=155*kDegToRad, seam_window=.18;
     TwistResult out;
-    if (!std::isfinite(target) || !std::isfinite(forearm_share) || !std::isfinite(twist_share)) {
+    if (!std::isfinite(target) || !std::isfinite(forearm_share) || !std::isfinite(twist_share) ||
+        !std::isfinite(center)) {
         if(state) *state={};
         return out;
     }
     out.valid=true;
     out.raw_radians=std::remainder(target,2*kPi);
-    out.target_radians=std::clamp(out.raw_radians,-kTwistTargetLimit,kTwistTargetLimit);
+    center=std::remainder(center,2*kPi);
+    // Roll measured from the center; the seam (and the voting) lives at +/-pi
+    // of this, the shares still multiply the whole roll from the reference.
+    const double centered=std::remainder(out.raw_radians-center,2*kPi);
+    out.target_radians=center+std::clamp(centered,-kTwistTargetLimit,kTwistTargetLimit);
     forearm_share=std::clamp(forearm_share,0.0,1.0);
     twist_share=std::clamp(twist_share,0.0,1.0);
+    watch_share=std::isfinite(watch_share)&&watch_share>=0 ? std::min(watch_share,1.0) : forearm_share;
     const auto bounded=[](double v) { return std::isfinite(v)&&std::fabs(v)<=kPi+1e-9; };
     const bool usable=state && state->valid && bounded(state->forearm_radians) && bounded(state->twist_radians) &&
+        bounded(state->watch_radians) &&
         state->seam_sign>=-1 && state->seam_sign<=1 && std::isfinite(state->seam_seconds) &&
         state->seam_seconds>=0 && state->seam_seconds<seam_window && std::isfinite(state->seam_vote) &&
         std::fabs(state->seam_vote)<=state->seam_seconds+1e-9 &&
         std::isfinite(dt) && dt>0 && dt<=.15;
+    const auto wrap=[](double v) { return std::remainder(v,2*kPi); };
     if (!usable) {
-        out.forearm_radians=out.target_radians*forearm_share;
-        out.twist_radians=out.target_radians*twist_share;
+        out.forearm_radians=wrap(out.target_radians*forearm_share);
+        out.twist_radians=wrap(out.target_radians*twist_share);
+        out.watch_radians=wrap(out.target_radians*watch_share);
         if(state) {
             // The authored-support follower owns its own continuity. A long
             // frame may reset this global principal-angle filter without
@@ -212,14 +261,15 @@ TwistResult FollowTwist(double target,double dt,double forearm_share,double twis
             const auto support=state->support;
             *state={}; state->valid=true; state->support=support;
             state->forearm_radians=out.forearm_radians; state->twist_radians=out.twist_radians;
-            if(std::fabs(out.raw_radians)>=seam_enter) state->seam_sign=out.raw_radians<0?-1:1;
+            state->watch_radians=out.watch_radians;
+            if(std::fabs(centered)>=seam_enter) state->seam_sign=centered<0?-1:1;
         }
         return out;
     }
-    const int sign=out.raw_radians<0?-1:1;
-    if(std::fabs(out.raw_radians)<seam_leave) {
+    const int sign=centered<0?-1:1;
+    if(std::fabs(centered)<seam_leave) {
         state->seam_sign=0; state->seam_seconds=state->seam_vote=0;
-    } else if(state->seam_sign || std::fabs(out.raw_radians)>=seam_enter) {
+    } else if(state->seam_sign || std::fabs(centered)>=seam_enter) {
         if(!state->seam_sign) state->seam_sign=sign;
         // Fixed-duration voting (rather than a timer reset at every sign
         // change) also converges under tracking noise exactly at the seam.
@@ -232,7 +282,7 @@ TwistResult FollowTwist(double target,double dt,double forearm_share,double twis
             state->seam_seconds=state->seam_vote=0;
         }
         out.seam_guarded=state->seam_sign!=sign;
-        out.target_radians=state->seam_sign*std::min(std::fabs(out.raw_radians),kTwistTargetLimit);
+        out.target_radians=center+state->seam_sign*std::min(std::fabs(centered),kTwistTargetLimit);
     }
     const auto follow=[&](double previous,double desired) {
         const double delta=std::remainder(desired-previous,2*kPi);
@@ -241,6 +291,7 @@ TwistResult FollowTwist(double target,double dt,double forearm_share,double twis
     };
     out.forearm_radians=state->forearm_radians=follow(state->forearm_radians,out.target_radians*forearm_share);
     out.twist_radians=state->twist_radians=follow(state->twist_radians,out.target_radians*twist_share);
+    out.watch_radians=state->watch_radians=follow(state->watch_radians,out.target_radians*watch_share);
     return out;
 }
 
