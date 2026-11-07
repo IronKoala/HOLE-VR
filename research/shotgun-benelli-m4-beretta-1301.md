@@ -34,14 +34,18 @@ well, and a proposed VR spec.
   pops back out.
 - **VR controls (owner decisions 2026-11-03 applied):** right trigger fires,
   right **B** is the bolt release (same as the pistol's slide release).
-  Shells are loaded by hand into the port under the gun, four per grab from
-  the pouch. Emergency loads go through the ejection port on the right. The
-  charging handle works like the pistol slide, with a partial pull to check
-  the chamber.
+  Shells are loaded by hand into the port under the gun. Emergency loads go
+  through the ejection port on the right. The charging handle works like the
+  pistol slide, with a partial pull to check the chamber.
+- **Smart reload (owner, 2026-11-07).** The shell caddy hands you as many
+  shells as the tube needs: 4 when it is missing 4 or more, 2 when it is
+  missing 2 or 3, and 1 when it is missing 1. Four are held in the
+  competition "quad" grip and two in the "twin" grip, and they go into the
+  tube **two per push**, the way 3-gun shooters load. See 2.5 and 4.6-4.7.
 - **Owner's choices:** racking works like a pump and always loads the next
   shell (unlike the real guns). The tube is locked while the bolt is open.
-  You get four shells per grab. There is no safety. Riding the handle does
-  not stop the bolt. See section 7.
+  Smart reload replaces the old "four per grab". There is no safety. Riding
+  the handle does not stop the bolt. See section 7.
 
 ## 1. What HOLE's shotgun is made of
 
@@ -246,6 +250,47 @@ pulling the trigger.
 | Racking a loaded gun | Ejects, does not feed | Ejects, does not feed |
 | Tube | 4-7 (+ extensions) | 4-7, 10 on Competition |
 
+### 2.5 How competition shooters load: twin ("load two") and quad
+
+The owner asked to start the reload from how 3-gun competitors load. They
+load shells in **pairs**, two per push, from belt caddies:
+
+- **Caddies.** Belt-mounted carriers hold shells in pairs stacked one above
+  the other. Quad caddies hold blocks of four (two pairs), usually worn on
+  the belt at about 45°, all shells facing the same way. Right-handed
+  shooters wear them with the brass towards the left side of the body
+  (Athlon, Gun Carrier).
+- **Twin grip ("load two").** Two shells stacked two-high. The top shell is
+  held by its brass and the lower one by the hull near the crimp. The thumb
+  sits on top of the brass of the top shell and the fingers curl round both
+  to keep them lined up (Outdoor Life). This is the owner's second photo.
+- **Quad grip.** Four shells as two stacked pairs, wrapped by the fingers
+  with the thumb on the brass of the top shell of the first pair, "since
+  those will go in first". Athlon says to think of it as two dual loads. This is
+  the owner's first photo. Guns.com describes the same block split in the
+  hand: two shells between the fingers and two in the palm and thumb.
+- **The gun.** The loading port is turned to face up or towards the loading
+  hand. For weak-hand loading the gun is rolled clockwise and pinned under
+  the strong arm or over the strong shoulder, with the strong hand still on
+  it. Strong-hand loaders hold the gun by the fore-end instead (Guns.com, Gun
+  Carrier).
+- **The push.** Crimp end first, shells as parallel to the tube as possible.
+  One firm, fast forward sweep across the port with slight downward pressure
+  drives the whole pair into the tube: the first shell goes in and the second
+  follows it in the same stroke. The side of the thumb pushes the last brass
+  in, and the hand carries on past the port like a throw. "Do not follow your
+  thumb into the tube" or it gets pinched (Athlon, Gun Carrier, Outdoor Life).
+- **Second pair.** The fingers keep the second pair curled while the first
+  goes in. Then the thumb moves to its brass and the same sweep loads it
+  (Athlon, Guns.com).
+- **Mistakes.** A tentative push leaves the second shell half in the tube.
+  Letting the pair spread apart or tilt makes the load fail. Dropped shells are
+  normal while learning ("yard sales"). Competition guns have widened,
+  chamfered loading ports to make this easier.
+- **Pace.** A practiced shooter dismounts, loads 10 shells, remounts and
+  fires an aimed shot in under 10 seconds, about 8 with practice (Outdoor
+  Life).
+
 ## 3. VR games that load shells well
 
 | Game | What it does well | Source |
@@ -316,38 +361,82 @@ button as the pistol's slide release.
 Not used on the shotgun. Because racking always feeds, the M4's drop lever
 (or the 1301's carrier stop) has no job to do, so it is left out.
 
-### 4.6 Shells in the hand
+### 4.6 Smart reload: shells in the hand
 
-- **Where from.** A shell pouch on the body, default left hip in front of the
-  magazine pouch, movable with the holsters system like the other holsters.
-  It is always visible and can be grabbed any time.
-- **How many.** One grab gives **four** shells (owner decision,
-  `shotgun_shells_per_grab=4`), or what is left in reserve if fewer. They are
-  held in a fan between the fingers. After each one goes in, the next moves
-  into the pushing position.
+- **Where from.** A shell caddy on the belt, default left hip in front of the
+  magazine pouch, angled about 45° like a competition quad caddy, and movable
+  with the holsters system. It is always visible and can be grabbed any time.
+- **How many (owner, 2026-11-07).** When the empty hand closes on the caddy,
+  the mod checks how many shells the tube is missing (capacity minus shells
+  in the tube; the chamber doesn't count):
+
+  | Tube missing | You get | Held as |
+  |---|---|---|
+  | 4 or more | 4 | quad grip (owner's photo 1) |
+  | 2 or 3 | 2 | twin grip (owner's photo 2) |
+  | 1 | 1 | single shell |
+  | 0 | nothing | short buzz, the tube is full |
+
+  On a 2-shell tube a full reload is one twin. On a 9-shell tube it is
+  quad, quad, then a single.
+- **Empty gun, bolt locked open (my addition).** The tube is locked until the
+  bolt closes (decision 2), so a quad would be useless here. The caddy gives
+  **1** shell for the port load. After B closes the bolt on it, the next
+  grabs follow the table. Say if you'd rather always get the table's number.
+- **Reserve.** Never more than you have left. If the reserve is short, you
+  get the largest of 4, 2 or 1 that it covers (3 left gives a twin, then a
+  single).
+- **The count is taken at the grab.** The caddy only gives shells to an empty
+  hand. Opening the hand at the caddy puts held shells back.
 - **Letting go away from the gun** drops the shells. They return to reserve
   after 2 seconds, so nothing is lost (`shotgun_dropped_shells_return=1`).
-- Hand poses (single shell, fan, thumb push, port drop) are set by the owner
-  in the in-headset editor, like the magazine poses.
+- **Hold layouts.** The shells sit in the hand as in the photos: brass
+  towards the thumb, crimps out past the little-finger side, with the pair
+  that goes in first under the thumb. The owner sets the finger poses for
+  quad, twin, single, thumb push and port drop in the in-headset editor, like
+  the magazine poses. Where the shells sit in the hand is data the owner can
+  nudge too.
+- Settings: `shotgun_smart_reload=1` (0 = always 4),
+  `shotgun_empty_gun_single=1`.
 
 ### 4.7 Loading the tube
 
 - **Loading port.** The opening under the receiver, in front of the trigger
   guard, learned at pickup from `GunParts_ShellCarrier` and the tube's attach
   point.
-- **Capture.** The shell's nose comes within 3 cm of the port mouth, base
-  towards the stock, and the shell axis within 35° of the tube. From then on
-  the hand only moves the shell along the tube axis (it is released if the
-  hand strays 5 cm off the axis).
-- **Commit.** Push forward 5.5 cm (a 70 mm shell's rim past the stop). It
-  clicks in with `Reload_Shell`, a haptic tick in the pushing hand, and one
-  shell into the game's tube (`ReloadShell_InsertShell_Begin/End`). The lifter
-  tips up while a shell is in the port and drops back afterwards.
-- **Not pushed far enough.** Let go before the commit and the shell pops back
-  out and drops (real shell-stop behaviour). Pull back while still holding and
-  it comes out with the hand.
-- **Full tube.** The shell stops after 1 cm with `Reload_Blocking` and a
-  firmer buzz: the "tube full" cue.
+- **Two per push.** The pair under the thumb (or the single shell) is the
+  one that loads. A quad is two pairs and a twin is one pair. A single loads
+  on its own.
+- **Capture.** The leading shell's nose comes within 3 cm of the port mouth,
+  base towards the stock, and the shells within 35° of the tube axis. From
+  then on the hand only moves the pair along the tube axis (it is released if
+  the hand strays 5 cm off the axis).
+- **One sweep loads the pair.** Push forward and the leading shell clicks in
+  at 5.5 cm (a 70 mm shell's rim past the stop). The second shell drops into
+  the port behind it and clicks in at 12.5 cm in the same stroke. Each shell
+  plays `Reload_Shell`, gives a haptic tick in the pushing hand, and puts one
+  shell into the game's tube (`ReloadShell_InsertShell_Begin/End`), so a pair
+  is two quick ticks. The hand can carry on past the port like the
+  competition "throw". The shells stay in the tube and the thumb never gets
+  pinched.
+- **Second pair.** After the first pair of a quad goes in, the second pair
+  moves under the thumb on its own, ready for the next sweep. A quad is two
+  sweeps.
+- **Stopping halfway.** If the sweep stops after the first shell, the second
+  shell stays in the hand at the front, ready for its own push. This is
+  kinder than a real gun, where it would be left half in the tube. If you let
+  go before the first shell clicks, that shell pops back out and drops (real
+  shell-stop behaviour). Pull back while still holding and the shells come
+  out with the hand.
+- **Full tube.** A shell that doesn't fit stops after 1 cm with
+  `Reload_Blocking` and a firmer buzz: the "tube full" cue. If only one slot
+  is left during a pair, the first shell goes in and the second blocks and
+  stays in the hand. Smart reload makes this rare.
+- **Gun angle.** Roll the gun so the port faces the loading hand, as
+  competitors do. Capture works in the gun's own frame, so any roll works.
+  The default is weak-hand loading (left hand loads, right hand keeps the
+  gun). Strong-hand loading needs the gun held by the fore-end in the left
+  hand, which the mod doesn't support yet.
 - **Bolt locked open.** By default (`shotgun_tube_needs_closed_bolt=1`) the
   lifter is locked and the tube refuses shells, as on the M4. You port-load
   first. Set it to 0 to allow tube loading with the bolt open.
@@ -404,7 +493,7 @@ Max Payne 2 VR and F.E.A.R. VR):
 | Right stick click | Kick (unchanged) |
 | Left grip on handguard | Support hold, virtual stock |
 | Left grip on charging handle | Rack, chamber check |
-| Left grip at shell pouch | Take shells |
+| Left grip at shell caddy | Smart reload: take 4, 2 or 1 shells |
 | Left trigger, index in loading port | Carrier latch: take one shell out |
 | Left trigger near the gun elsewhere | Weapon light (unchanged) |
 
@@ -422,10 +511,12 @@ riding the handle stopping the bolt short.
 
 The same approach as the pistol magazine:
 
-- **Taking shells:** `ReloadShell_TakeNewShell` (game creates
-  `OneReloadMaxShell` shells in `ShellObj_Temp`). If that is fewer than four,
-  call `Gun_ShellCreate(4)` or take again until the hand holds four. The mod
-  attaches those actors
+- **Taking shells (smart reload):** read `GetCurrentAmmoInfo`
+  (`AmmoInMagazine`, `MagazineCapacity`) to get the missing count, pick 4, 2
+  or 1, then `Gun_ShellCreate(N)`. `ReloadShell_TakeNewShell` alone creates
+  `OneReloadMaxShell` shells, so it is the fallback if a direct
+  `Gun_ShellCreate` call misbehaves. The mod lays the shells out in the quad,
+  twin or single hold and attaches those actors
   to the VR hand every frame and checks they still exist each tick (the
   `LiveObject` lesson from the pouch magazines).
 - **Each shell in:** `ReloadShell_InsertShell_Begin` + `_End` (`Gun_ShellLoad`),
@@ -460,16 +551,22 @@ The same approach as the pistol magazine:
 3. Weapon lab trace of one flat-screen shell reload from empty and one
    top-off. Record the order of `Reload_Start`, `OpenShellCarrier`, `TakeNewShell`,
    `InsertShell_*` and `BoltCatchRelease`, and whether `ChargeBolt` feeds.
-4. Only then build it. Nothing in this spec has been tested in the headset.
+4. For smart reload: where the game keeps the spare-shell count, whether
+   `Gun_ShellCreate(4)` works when `OneReloadMaxShell` is smaller, and what
+   `TakeNewShell` does with no spare shells.
+5. Only then build it. Nothing in this spec has been tested in the headset.
 
-## 7. Owner decisions (2026-11-03)
+## 7. Owner decisions (2026-11-03, smart reload 2026-11-07)
 
 1. **Feeding: pump-like.** A full rack always throws out the chambered shell
    and loads the next one from the tube, unlike the real M4 and 1301. No drop
    lever on A.
 2. **Tube locked while the bolt is open: yes.** From empty you port-load and
    press B, then fill the tube, as both manuals do it.
-3. **Shells per grab: four.**
+3. **Shells per grab: smart reload (2026-11-07).** 4 if the tube is missing
+   4 or more, 2 if it is missing 2-3, 1 if it is missing 1. Held in the quad
+   and twin grips from the owner's photos and loaded two per push. Replaces
+   the earlier "four per grab".
 4. **Manual safety: none.**
 5. **Riding the handle stops the bolt short: off.** The bolt always closes
    fully.
@@ -495,6 +592,14 @@ Real guns:
 - [Shooting Illustrated: Beretta 1301 Tactical review](https://www.shootingillustrated.com/articles/2017/9/8/review-beretta-1301-tactical-shotgun/)
 - [Gun Digest: Beretta 1301 Tactical review](https://gundigest.com/?p=219822)
 - [Wikipedia: Beretta 1301](https://en.wikipedia.org/wiki/Beretta_1301)
+
+Competition loading:
+- [Athlon Outdoors: shotgun quad loading](https://www.athlonoutdoors.com/article/shotgun-quad-loading/)
+- [Guns.com: speed reloads, shotgun quad loads 101](https://www.guns.com/news/speed-reloads-shotgun-quad-loads-101)
+- [Gun Carrier: competition shotgun loading techniques](https://guncarrier.com/competition-shotgun-loading-techniques/)
+- [Outdoor Life: how to "load two" shotgun shells](https://outdoorlife.com/articles/guns/2014/12/rec-shooting-how-load-two-shotgun-shells)
+- Owner's reference photos (2026-11-07): a quad grip with belt quad caddies,
+  and a competitor holding a twin
 
 VR games:
 - [Road to VR: The Best Shotguns in VR, part 1](https://roadtovr.com/inside-xr-design-best-shotguns-in-vr-what-makes-them-great-feedback/)
