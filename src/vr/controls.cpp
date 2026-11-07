@@ -44,6 +44,7 @@
 #include "vr/interact/magwell_zone.h"
 #include "vr/interact/offhand_snap.h"
 #include "vr/interact/rifle_carry.h"
+#include "vr/interact/shell_load.h"
 #include "vr/interact/slide.h"
 #include "vr/interact/touch.h"
 #include "vr/ui_panel.h"
@@ -223,6 +224,11 @@ struct Settings {
     bool mag_exact_seat = true;           // seat each magazine where the game itself puts it (AttachPoint_Mag)
 };
 Settings g_set;
+// Shotgun shells by hand (vr/interact/shell_load.h): smart reload, the hold,
+// the push into the tube. g_shell_nudge moves the hold in the hand (cm, grip
+// frame: forward, right, up).
+interact::shells::Settings g_shell_set;
+FVector g_shell_nudge;
 
 void LoadHolsterSpots();
 
@@ -311,6 +317,24 @@ void LoadSettings() {
     g_set.mag_line_up_side_left_gun =
         std::clamp(config::GetFloat("mag_line_up_side_left_gun_cm", 5.f), 1.f, 10.f);
     g_set.mag_exact_seat = config::GetBool("mag_exact_seat", true);
+    // Shotgun (2026-11-07, owner's smart reload): new keys, their own block.
+    {
+        interact::shells::Settings& sh = g_shell_set;
+        sh.smart = config::GetBool("shotgun_smart_reload", true);
+        sh.fixed = std::clamp(config::GetInt("shotgun_shells_per_grab", 4), 1, interact::shells::kMaxHeld);
+        sh.empty_gun_single = config::GetBool("shotgun_empty_gun_single", true);
+        sh.tube_needs_closed_bolt = config::GetBool("shotgun_tube_needs_closed_bolt", true);
+        sh.capture_cm = std::clamp(config::GetFloat("shotgun_port_capture_cm", 4.f), 1.f, 15.f);
+        sh.capture_deg = std::clamp(config::GetFloat("shotgun_port_capture_deg", 35.f), 5.f, 80.f);
+        sh.let_go_side_cm = std::clamp(config::GetFloat("shotgun_push_let_go_cm", 5.f), 1.f, 20.f);
+        sh.first_cm = std::clamp(config::GetFloat("shotgun_first_shell_cm", 5.5f), 1.f, 15.f);
+        sh.second_cm = std::clamp(config::GetFloat("shotgun_second_shell_cm", 12.5f), (float)sh.first_cm + 1.f, 30.f);
+        sh.block_cm = std::clamp(config::GetFloat("shotgun_blocked_cm", 1.f), 0.f, 5.f);
+        sh.port_cm = std::clamp(config::GetFloat("shotgun_ejection_port_cm", 4.f), 1.f, 15.f);
+        g_shell_nudge = FVector{std::clamp(config::GetFloat("shotgun_hold_forward_cm", 0.f), -10.f, 10.f),
+                                std::clamp(config::GetFloat("shotgun_hold_right_cm", 0.f), -10.f, 10.f),
+                                std::clamp(config::GetFloat("shotgun_hold_up_cm", 0.f), -10.f, 10.f)};
+    }
     LoadHolsterSpots();
 }
 
@@ -837,6 +861,22 @@ struct WeaponState {
         bool told_blocked = false;  // logged this squeeze's refused slide grab
     } sd;
     interact::SqueezeGate slide_squeeze;  // only a fresh squeeze grabs the slide
+    // Shotgun (BP_SG_*): shells by hand instead of magazines (ShellHandling,
+    // vr/interact/shell_load.h). The magazine pouch is its shell caddy.
+    bool is_shotgun = false;
+    UObject shell[interact::shells::kMaxHeld] = {};  // shells in the hand, by slot (0, 1: the pair under the thumb)
+    int shell_count = 0;          // shells in the hand
+    int shell_layout = 0;         // the hold they were taken as (4 quad, 2 twin, 1 single)
+    int shell_hand = input::kLeft;
+    interact::shells::Sweep sweep;
+    UObject caddy[interact::shells::kMaxHeld] = {};  // shown at the caddy, ready to take
+    int caddy_hidden[interact::shells::kMaxHeld] = {-1, -1, -1, -1};  // last SetActorHiddenInGame sent (-1: none)
+    double caddy_refill_at = 0;
+    int caddy_spawn_fails = 0;
+    bool have_ports = false;      // loading port and ejection port measured
+    FVector port_mouth;           // the tube's mouth at the loading port, gun frame from the grip
+    FVector eject_port;           // the ejection port, the same way
+    double shell_log_at = 0;
 } W;
 
 // ---- which hand holds the gun ----
@@ -855,7 +895,11 @@ int OtherHand() { return 1 - g_gun_hand; }
 const char* HandName(int h) { return h == input::kLeft ? "left" : "right"; }
 hands::Hand HandOf(int h) { return h == input::kLeft ? hands::kLeft : hands::kRight; }
 input::Hand InputOf(int h) { return h == input::kLeft ? input::kLeft : input::kRight; }
-bool HandHoldsMag(int h) { return W.held_mag && W.mag_hand == h; }
+// A magazine, or the shotgun's shells (either is "a magazine" to the other
+// hand jobs: no slide, support grip or light while holding them).
+bool HandHoldsMag(int h) {
+    return (W.held_mag && W.mag_hand == h) || (W.shell_count > 0 && W.shell_hand == h);
+}
 // The hand holds something of ours: the gun, its slide, a magazine, or the
 // rifle (by itself or on the handguard). Defined with the rifle carry.
 bool ControlsHoldsGrip(int hand);
@@ -2374,6 +2418,8 @@ FQuat PouchRotation(UObject g) {
 
 // hs / in: both hands (in: the grip as the magazine sees it, grip toggle
 // applied); rin: the gun hand's buttons.
+void ShellHandling(game::Gun& gun, UObject player, const hands::HandState hs[2], const input::HandInput in[2]);
+
 void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState hs[2], const input::HandInput in[2],
                       const input::HandInput& rin) {
     // The gun hand's A / X (primary): magazine release.
@@ -2440,7 +2486,7 @@ void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState hs[
     if (rin.secondary.pressed && !W.slide.Held() && W.in_hand) {
         game::GunState st = gun.State();
         // An empty magazine's follower holds the lever up: B can't drop it.
-        if (st.slide_locked && st.has_magazine && st.magazine == 0) {
+        if (st.slide_locked && st.has_magazine && st.magazine == 0 && !W.is_shotgun) {
             log::Info("controls: slide release blocked by the empty magazine");
         } else if (st.slide_locked) {
             log::Info("controls: slide release (B), before: %s", st.Describe().c_str());
@@ -2451,12 +2497,18 @@ void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState hs[
             input::Haptic(gun_in, 0.5f, 0.04f);
         }
     }
-    if (rin.primary.pressed && W.in_hand && gun.State().has_magazine) {
+    // The shotgun's tube is part of the gun: A does nothing on it (spec 4.5).
+    if (rin.primary.pressed && W.in_hand && !W.is_shotgun && gun.State().has_magazine) {
         log::Info("controls: mag release (%s hand), before: %s", HandName(GunHand()), gun.State().Describe().c_str());
         gun.DropMagazine();
         input::Haptic(gun_in, 0.4f, 0.04f);
     }
 
+    // The shotgun loads shells by hand instead (the pouch is its caddy).
+    if (W.is_shotgun) {
+        ShellHandling(gun, player, hs, in);
+        return;
+    }
     // A spare magazine always sits in its holster (the pouch), wherever it
     // was placed on the VR body. The late tick places it there each frame
     // (PlacePouchMag); here a free hand takes it out or puts it back.
@@ -2889,6 +2941,552 @@ bool ActorBoxInFrame(UObject actor, const FQuat& inv, const FVector& grip_w, FVe
         have = true;
     }
     return have;
+}
+
+// ---- shotgun shells by hand (vr/interact/shell_load.h) ----
+// Owner 2026-11-07: "smart reload". The magazine pouch is the shotgun's
+// shell caddy: it shows (and gives) as many shells as the tube needs, 4, 2 or
+// 1. They are held as a quad, twin or single and pushed into the loading
+// port under the receiver two per push. Each shell that clicks in goes into
+// the game's tube through the game's own shell reload (Gun::LoadOneShell), so
+// the counts, sounds and lifter are the game's. The shells drawn in the hand
+// and at the caddy are our own actors of the gun's AmmoClass (never loaded).
+// Nothing here has run in the headset yet: the shotgun is not unlocked.
+
+// The shell actor's own shape: which local axis runs from its rim to its
+// crimp, where its rim is. Measured from its mesh once per ammo class;
+// until then the game's capsule says +Z from the origin (BP_AmmoBase_C's
+// construction script puts its collision capsule there).
+struct ShellShape {
+    UObject cls = 0;
+    FVector axis{0, 0, 1};
+    FVector base;
+    double length = interact::shells::kLength;
+} g_shell_shape;
+
+bool IsAmmoActor(UObject a) {
+    if (!LiveObject(a)) return false;
+    UObject c = ue::GetClass(a);
+    for (int i = 0; c && i < 16; ++i, c = ue::reflection::GetSuper(c))
+        if (ue::GetName(c) == "BP_AmmoBase_C") return true;
+    return false;
+}
+
+void MeasureShellShape(UObject a) {
+    const UObject cls = ue::GetClass(a);
+    if (!cls || g_shell_shape.cls == cls) return;
+    g_shell_shape = ShellShape{};
+    g_shell_shape.cls = cls;
+    FVector lo, hi;
+    if (!ActorBoxInFrame(a, ActorRotation(a).Inverse(), ActorLocation(a), &lo, &hi)) {
+        log::Info("controls: shell %s: no mesh box; using its capsule's +Z axis", ue::GetName(cls).c_str());
+        return;
+    }
+    const double l[3] = {lo.X, lo.Y, lo.Z}, h[3] = {hi.X, hi.Y, hi.Z};
+    int k = 0;
+    for (int i = 1; i < 3; ++i)
+        if (h[i] - l[i] > h[k] - l[k]) k = i;
+    const double len = h[k] - l[k];
+    if (len < 4.0 || len > 12.0) {
+        log::Info("controls: shell %s: mesh box %.1f x %.1f x %.1f cm is not shell-shaped; using its capsule's +Z axis",
+                  ue::GetName(cls).c_str(), h[0] - l[0], h[1] - l[1], h[2] - l[2]);
+        return;
+    }
+    // The rim is the end nearer the actor's origin.
+    const bool nose_plus = std::fabs(h[k]) >= std::fabs(l[k]);
+    double ax[3] = {0, 0, 0};
+    ax[k] = nose_plus ? 1.0 : -1.0;
+    double b[3] = {(l[0] + h[0]) * 0.5, (l[1] + h[1]) * 0.5, (l[2] + h[2]) * 0.5};
+    b[k] = nose_plus ? l[k] : h[k];
+    g_shell_shape.axis = FVector{ax[0], ax[1], ax[2]};
+    g_shell_shape.base = FVector{b[0], b[1], b[2]};
+    g_shell_shape.length = len;
+    log::Info("controls: shell %s: %.1f cm long along its %s%c axis, rim at (%.1f %.1f %.1f) in the actor",
+              ue::GetName(cls).c_str(), len, nose_plus ? "+" : "-", "XYZ"[k], b[0], b[1], b[2]);
+}
+
+// Draws a shell with its rim at `base` (world) and its crimp pointing along
+// `nose` in `frame` (a hand's grip frame, or the gun frame).
+void PlaceShell(UObject a, const FVector& base, const FQuat& frame, const FVector& nose) {
+    const FQuat r = frame * FromTo(Norm(g_shell_shape.axis), Norm(nose));
+    SetActorTransform(a, base - r.Rotate(g_shell_shape.base), r);
+}
+
+UObject SpawnShell(UObject player, UObject cls, const FVector& at) {
+    UObject a = SpawnMagazine(player, cls, at, FQuat{});
+    if (!a) return 0;
+    // Drawn only: no collision with the player, the gun or the world.
+    ue::Call c(a, "SetActorEnableCollision");
+    c.Set("bNewActorEnableCollision", false);
+    c.Invoke();
+    MeasureShellShape(a);
+    return a;
+}
+
+// Gone at once: loaded, put back in the caddy, or the gun put away.
+void RemoveShell(UObject a) {
+    if (!IsAmmoActor(a)) return;
+    ue::Call c(a, "Ammo_Clear");
+    c.Invoke();
+    ue::Call k(a, "K2_DestroyActor");
+    k.Invoke();
+}
+
+// Dropped shells fall to the floor (the game's own Ammo_Drop) and are
+// removed after a few seconds.
+struct DroppedShell { UObject a = 0; double remove_at = 0; };
+DroppedShell g_dropped_shells[16];
+
+void DropShell(UObject a) {
+    if (!IsAmmoActor(a)) return;
+    ue::Call c(a, "SetActorEnableCollision");
+    c.Set("bNewActorEnableCollision", true);
+    c.Invoke();
+    ue::Call d(a, "Ammo_Drop");
+    d.Invoke();
+    DroppedShell* slot = &g_dropped_shells[0];
+    for (DroppedShell& s : g_dropped_shells) {
+        if (!s.a) { slot = &s; break; }
+        if (s.remove_at < slot->remove_at) slot = &s;
+    }
+    if (slot->a) RemoveShell(slot->a);
+    *slot = DroppedShell{a, g_clock + 6.0};
+}
+
+void TidyDroppedShells() {
+    for (DroppedShell& s : g_dropped_shells) {
+        if (!s.a || g_clock < s.remove_at) continue;
+        RemoveShell(s.a);
+        s = DroppedShell{};
+    }
+}
+
+int FirstShell() {
+    for (int i = 0; i < interact::shells::kMaxHeld; ++i)
+        if (W.shell[i]) return i;
+    return -1;
+}
+
+// After a push: the shells left move up under the thumb (owner's quad: the
+// second pair takes the first pair's place).
+void RepackShells() {
+    int n = 0;
+    for (int i = 0; i < interact::shells::kMaxHeld; ++i)
+        if (W.shell[i]) {
+            UObject a = W.shell[i];
+            W.shell[i] = 0;
+            W.shell[n++] = a;
+        }
+    W.shell_count = n;
+}
+
+void ForgetShell(int slot) {
+    W.shell[slot] = 0;
+    W.shell_count = 0;
+    for (UObject a : W.shell)
+        if (a) ++W.shell_count;
+}
+
+void ClearHeldShells(bool drop, const char* why) {
+    int n = 0;
+    for (UObject& a : W.shell) {
+        if (!a) continue;
+        if (drop) DropShell(a);
+        else RemoveShell(a);
+        a = 0;
+        ++n;
+    }
+    W.shell_count = 0;
+    W.sweep = interact::shells::Sweep{};
+    if (n) log::Info("controls: %d shell(s) %s (%s)", n, drop ? "dropped" : "put away", why);
+}
+
+void ClearCaddy() {
+    for (UObject& a : W.caddy) {
+        RemoveShell(a);
+        a = 0;
+    }
+}
+
+// The game destroyed one (level change): forget it.
+void ForgetDeadShells() {
+    for (UObject& a : W.shell)
+        if (a && !LiveObject(a)) a = 0;
+    for (UObject& a : W.caddy)
+        if (a && !LiveObject(a)) a = 0;
+    int n = 0;
+    for (UObject a : W.shell)
+        if (a) ++n;
+    if (n != W.shell_count) {
+        log::Info("controls: %d of the held shells were destroyed by the game", W.shell_count - n);
+        W.shell_count = n;
+        RepackShells();
+        W.sweep = interact::shells::Sweep{};
+    }
+}
+
+// The tube as the shell code sees it, from the game's counts.
+interact::shells::Tube ShellTube(const game::GunState& st) {
+    interact::shells::Tube t;
+    t.capacity = st.capacity;
+    t.in_tube = st.magazine > 0 ? st.magazine : 0;
+    t.chamber = st.chamber;
+    t.bolt_open = st.slide_locked;
+    return t;
+}
+
+// Where the shells go in, measured once the gun is in hand: the tube's
+// mouth at the loading port (the front of the lifter, GunParts_ShellCarrier,
+// at the tube's height) and the ejection port (the gun's own
+// EjectShellDirection, where spent hulls leave). Gun frame from the grip.
+void MeasureShellPorts(game::Gun& gun) {
+    W.have_ports = true;
+    const UObject g = gun.Object();
+    const FQuat inv = W.frame_rot.Inverse();
+    UObject lifter = 0, tube = 0, well = 0, eject = 0;
+    ue::GetProp(g, "GunParts_ShellCarrier", lifter);
+    ue::GetProp(g, "MagazineObj", tube);
+    ue::GetProp(g, "MagazinePoint", well);
+    ue::GetProp(g, "EjectShellDirection", eject);
+    FVector llo, lhi, tlo, thi;
+    const bool have_lifter = lifter && MeshBoxInFrame(lifter, inv, W.grip_world, &llo, &lhi);
+    const bool have_tube = tube && ActorBoxInFrame(tube, inv, W.grip_world, &tlo, &thi);
+    const FVector well_g = well ? inv.Rotate(ComponentToWorld(well).translation - W.grip_world) : FVector{};
+    FVector mouth = well_g;
+    const char* x_from = "the magazine point";
+    const char* yz_from = "the magazine point";
+    if (have_lifter) {
+        mouth.X = lhi.X;
+        x_from = "the lifter's front";
+        mouth.Y = (llo.Y + lhi.Y) * 0.5;
+        mouth.Z = llo.Z + 1.0;
+        yz_from = "the lifter's bottom";
+    } else if (have_tube) {
+        mouth.X = tlo.X;
+        x_from = "the tube's rear";
+    }
+    if (have_tube) {
+        mouth.Y = (tlo.Y + thi.Y) * 0.5;
+        mouth.Z = (tlo.Z + thi.Z) * 0.5;
+        yz_from = "the tube's middle";
+    }
+    W.port_mouth = mouth;
+    if (eject) {
+        W.eject_port = inv.Rotate(ComponentToWorld(eject).translation - W.grip_world);
+    } else {
+        // Not found: the right side of the receiver above the lifter.
+        W.eject_port = FVector{have_lifter ? (llo.X + lhi.X) * 0.5 : mouth.X - 6.0, 2.5, W.bore_height};
+    }
+    log::Info("controls: shotgun %s: loading port mouth (%.1f %.1f %.1f) cm from the grip (forward, right, up), "
+              "forward from %s, height from %s; ejection port (%.1f %.1f %.1f) from %s; lifter %s (%.1f..%.1f "
+              "forward, %.1f..%.1f up), tube %s (%.1f..%.1f forward, %.1f..%.1f up), bore %.1f up",
+              gun.ClassName().c_str(), mouth.X, mouth.Y, mouth.Z, x_from, yz_from, W.eject_port.X, W.eject_port.Y,
+              W.eject_port.Z, eject ? "EjectShellDirection" : "a guess (no EjectShellDirection)",
+              have_lifter ? "measured" : "not measured", have_lifter ? llo.X : 0.0, have_lifter ? lhi.X : 0.0,
+              have_lifter ? llo.Z : 0.0, have_lifter ? lhi.Z : 0.0, have_tube ? "measured" : "not measured",
+              have_tube ? tlo.X : 0.0, have_tube ? thi.X : 0.0, have_tube ? tlo.Z : 0.0, have_tube ? thi.Z : 0.0,
+              W.bore_height);
+    // What the game says about its shell reload (spec section 6, check 2).
+    int32_t one_max = -1, mag_type = -1;
+    uint8_t type_byte = 0;
+    ue::GetProp(g, "OneReloadMaxShell", one_max);
+    if (ue::GetProp(g, "MagazineType", type_byte)) mag_type = type_byte;
+    const game::GunState st = gun.State();
+    log::Info("controls: shotgun tube %d/%d, chamber %d, bolt %s; the game's OneReloadMaxShell %d, MagazineType %d, "
+              "bolt travel %.1f cm (catch at %.1f)",
+              st.magazine, st.capacity, st.chamber, st.slide_locked ? "locked open" : "closed", one_max, mag_type,
+              gun.SlideBackLength(), gun.SlideStopLength());
+}
+
+// The caddy (the magazine pouch spot): shows as many shells as a grab would
+// give now, crimps down, in the hold they would be taken as. Late tick.
+void PlaceCaddyShells(UObject player, game::Gun& gun) {
+    if (!W.is_shotgun || !g_hw.valid) return;
+    const UObject cls = gun.AmmoClass();
+    if (!cls) return;
+    for (UObject& a : W.caddy) {
+        // The workbench changed the ammo: new shells.
+        if (a && (!LiveObject(a) || ue::GetClass(a) != cls)) {
+            RemoveShell(a);
+            a = 0;
+        }
+    }
+    const int n = interact::shells::SmartCount(g_shell_set, ShellTube(gun.State()));
+    const FVector spot = g_hw.spot[kMagSpot];
+    if (g_clock >= W.caddy_refill_at) {
+        for (int i = 0; i < n; ++i) {
+            if (W.caddy[i]) continue;
+            W.caddy[i] = SpawnShell(player, cls, spot);
+            if (!W.caddy[i]) {
+                if (W.caddy_spawn_fails++ < 5)
+                    log::Warn("controls: could not spawn a %s for the shell caddy", ue::GetName(cls).c_str());
+                W.caddy_refill_at = g_clock + 1.0;
+                break;
+            }
+        }
+    }
+    // Crimps down, rims up, in the anchor's frame (tilting with the chest or
+    // thigh it rides on).
+    const FQuat an = g_hw.spot_anchor_rot[kMagSpot];
+    const FQuat frame = FromAxes(an.Rotate(FVector{0, 0, 1}), an.Rotate(FVector{0, 1, 0}), an.Rotate(FVector{-1, 0, 0}));
+    for (int i = 0; i < interact::shells::kMaxHeld; ++i) {
+        UObject a = W.caddy[i];
+        if (!a) {
+            W.caddy_hidden[i] = -1;
+            continue;
+        }
+        const bool shown = i < n;
+        if (W.caddy_hidden[i] != (shown ? 0 : 1)) {
+            W.caddy_hidden[i] = shown ? 0 : 1;
+            ue::Call h(a, "SetActorHiddenInGame");
+            h.Set("bNewHidden", !shown);
+            h.Invoke();
+        }
+        if (shown)
+            PlaceShell(a, spot + frame.Rotate(interact::shells::HoldBase(n, i, FVector{})), frame,
+                       interact::shells::HoldNoseDir());
+    }
+}
+
+// A free hand closing on the caddy takes what it shows.
+bool TakeShells(game::Gun& gun, UObject player, int n, int hand) {
+    const UObject cls = gun.AmmoClass();
+    if (!cls) return false;
+    const FVector at = g_hw.spot[kMagSpot];
+    for (int i = 0; i < n; ++i) {
+        UObject a = W.caddy[i];
+        W.caddy[i] = 0;
+        W.caddy_hidden[i] = -1;
+        if (!a || !LiveObject(a) || ue::GetClass(a) != cls) {
+            RemoveShell(a);
+            a = SpawnShell(player, cls, at);
+        }
+        if (!a) {
+            for (UObject& s : W.shell) {
+                RemoveShell(s);
+                s = 0;
+            }
+            W.shell_count = 0;
+            return false;
+        }
+        ue::Call h(a, "SetActorHiddenInGame");
+        h.Set("bNewHidden", false);
+        h.Invoke();
+        W.shell[i] = a;
+    }
+    W.shell_count = n;
+    W.shell_layout = n;
+    W.shell_hand = hand;
+    W.sweep = interact::shells::Sweep{};
+    W.caddy_refill_at = g_clock + 0.3;
+    return true;
+}
+
+// One shell into the game's tube. False: the game refused (logged).
+bool LoadShellIntoGun(game::Gun& gun, const char* how) {
+    const game::GunState before = gun.State();
+    std::string why;
+    const bool ok = gun.LoadOneShell(&why);
+    const game::GunState after = gun.State();
+    if (!ok) {
+        log::Warn("controls: shell %s refused: %s (tube %d/%d)", how, why.c_str(), before.magazine, before.capacity);
+        return false;
+    }
+    if (after.magazine != before.magazine + 1)
+        log::Warn("controls: shell %s: the tube went from %d to %d (expected one more)", how, before.magazine,
+                  after.magazine);
+    else
+        log::Info("controls: shell %s: tube %d/%d, chamber %d", how, after.magazine, after.capacity, after.chamber);
+    return true;
+}
+
+// Grip editor: the hand poses around the first shell (the body moves it
+// with the hand); the others keep their places in the hold around it.
+void ShellsFollowLead() {
+    const int lead = FirstShell();
+    if (lead < 0 || W.shell_count < 2 || !LiveObject(W.shell[lead])) return;
+    const FQuat lead_rot = ActorRotation(W.shell[lead]);
+    const FQuat in_hand = FromTo(Norm(g_shell_shape.axis), interact::shells::HoldNoseDir());
+    const FQuat hr = lead_rot * in_hand.Inverse();
+    const FVector lead_base = ActorLocation(W.shell[lead]) + lead_rot.Rotate(g_shell_shape.base);
+    const FVector at = interact::shells::HoldBase(W.shell_layout, lead, g_shell_nudge);
+    for (int i = 0; i < interact::shells::kMaxHeld; ++i) {
+        if (!W.shell[i] || i == lead) continue;
+        const FVector d = interact::shells::HoldBase(W.shell_layout, i, g_shell_nudge) - at;
+        PlaceShell(W.shell[i], lead_base + hr.Rotate(d), hr, interact::shells::HoldNoseDir());
+    }
+}
+
+void ShellHandling(game::Gun& gun, UObject player, const hands::HandState hs[2], const input::HandInput in[2]) {
+    namespace sh = interact::shells;
+    ForgetDeadShells();
+    TidyDroppedShells();
+    if (!W.have_ports && W.have_pose && W.in_hand) MeasureShellPorts(gun);
+    const sh::Tube tube = ShellTube(gun.State());
+    const bool have_pouch = g_hw.valid;
+    const FVector pouch_loc = g_hw.spot[kMagSpot];
+    const double pouch_radius = g_spots[kMagSpot].radius;
+
+    // An empty hand closing on the caddy takes 4, 2 or 1 (smart reload).
+    if (W.shell_count == 0) {
+        auto may_take = [&](int h) {
+            return (g_set.either_hand || h == OtherHand()) && hs[h].valid && !ControlsHoldsGrip(h);
+        };
+        int take = -1;
+        double take_dist = 1e9;
+        for (int h : {input::kLeft, input::kRight}) {
+            const bool can = have_pouch && may_take(h);
+            const double d = hs[h].valid ? Len(hs[h].grip.location - pouch_loc) : 1e9;
+            if (W.mag_zone[h].Update(d, pouch_radius, can)) input::Haptic(InputOf(h), 0.15f, 0.015f);
+            if (can && in[h].grip_button.pressed && d <= pouch_radius && d < take_dist) {
+                take = h;
+                take_dist = d;
+            }
+        }
+        if (take < 0) return;
+        const int n = sh::SmartCount(g_shell_set, tube);
+        if (n <= 0) {
+            input::Haptic(InputOf(take), 0.6f, 0.06f);
+            log::Info("controls: shell caddy: nothing to take (tube %d/%d, chamber %d, bolt %s)", tube.in_tube,
+                      tube.capacity, tube.chamber, tube.bolt_open ? "locked open: press B first" : "closed");
+            return;
+        }
+        if (!TakeShells(gun, player, n, take)) {
+            log::Warn("controls: shell caddy: could not make %d shell(s) of %s", n,
+                      ue::GetName(gun.AmmoClass()).c_str());
+            return;
+        }
+        input::Haptic(InputOf(take), 0.4f, 0.04f);
+        log::Info("controls: %s hand took %d shell(s) as a %s from the caddy (%.1f cm from it): tube %d/%d, chamber "
+                  "%d, bolt %s%s",
+                  HandName(take), n, sh::HoldName(n), take_dist, tube.in_tube, tube.capacity, tube.chamber,
+                  tube.bolt_open ? "locked open" : "closed",
+                  tube.bolt_open && g_shell_set.empty_gun_single ? " (one for the ejection port)" : "");
+    }
+
+    const int hand_i = W.shell_hand;
+    const hands::HandState& hand = hs[hand_i];
+    const input::HandInput& hin = in[hand_i];
+    if (!hand.valid) {
+        if (hin.grip_button.released || !hin.grip_button.down)
+            ClearHeldShells(true, "let go while the controller had no tracking");
+        return;
+    }
+    // Let go: at the caddy they go back, anywhere else they fall.
+    if (hin.grip_button.released || !hin.grip_button.down) {
+        const double d = Len(hand.grip.location - pouch_loc);
+        if (have_pouch && d <= pouch_radius) {
+            input::Haptic(InputOf(hand_i), 0.4f, 0.04f);
+            ClearHeldShells(false, "put back in the caddy");
+        } else {
+            ClearHeldShells(true, W.sweep.captured ? "let go in the loading port before they clicked in" : "let go");
+        }
+        return;
+    }
+
+    const FQuat hr = hand.grip.rotation;
+    auto held_base = [&](int slot) {
+        return hand.grip.location + hr.Rotate(sh::HoldBase(W.shell_layout, slot, g_shell_nudge));
+    };
+    const FVector nose_w = hr.Rotate(sh::HoldNoseDir());
+    // Only into the gun in the other hand.
+    const bool at_gun = W.have_pose && W.in_hand && W.have_ports && hand_i != GunHand();
+    FVector mouth, axis;
+    if (at_gun) {
+        mouth = W.grip_world + W.frame_rot.Rotate(W.port_mouth);
+        axis = W.frame_rot.Rotate(FVector{1, 0, 0});
+        int lead = FirstShell();
+        // An empty gun with its bolt locked open takes one shell through the
+        // ejection port (B or a rack then chambers it).
+        if (!W.sweep.captured && lead >= 0 && sh::PortOpen(tube)) {
+            const FVector middle = held_base(lead) + nose_w * (sh::kLength * 0.5);
+            const FVector port = W.grip_world + W.frame_rot.Rotate(W.eject_port);
+            if (sh::AtEjectionPort(middle, port, g_shell_set)) {
+                if (LoadShellIntoGun(gun, "dropped in the ejection port")) {
+                    RemoveShell(W.shell[lead]);
+                    ForgetShell(lead);
+                    RepackShells();
+                    input::Haptic(InputOf(hand_i), 0.5f, 0.04f);
+                    log::Info("controls: the shell is on the lifter: B (or a full rack) chambers it");
+                } else {
+                    input::Haptic(InputOf(hand_i), 0.6f, 0.06f);
+                }
+            }
+        }
+        sh::StepIn si;
+        si.nose = held_base(0) + nose_w * sh::kLength - mouth;
+        si.nose_dir = nose_w;
+        si.axis = axis;
+        si.held = W.shell_count;
+        si.room = sh::TubeRoom(tube);
+        si.locked = sh::TubeLocked(g_shell_set, tube);
+        if (!W.sweep.captured && g_clock >= W.shell_log_at && Len(si.nose) < 25.0) {
+            W.shell_log_at = g_clock + 0.5;
+            const double along = DotV(si.nose, axis);
+            log::Info("controls: shells near the loading port: lead nose %.1f cm %s the mouth along the tube, %.1f cm "
+                      "off its line, %.0f deg off it (catches within %.1f cm and %.0f deg)",
+                      std::fabs(along), along < 0 ? "behind" : "past", Len(si.nose - axis * along),
+                      std::acos(std::clamp(DotV(nose_w, axis), -1.0, 1.0)) * 180.0 / 3.14159265358979,
+                      g_shell_set.capture_cm, g_shell_set.capture_deg);
+        }
+        switch (sh::Advance(W.sweep, g_shell_set, si)) {
+            case sh::Step::kCaptured:
+                input::Haptic(InputOf(hand_i), 0.2f, 0.02f);
+                log::Info("controls: shells in the loading port: pushing %d (%d in the hand), tube %d/%d%s",
+                          W.sweep.pair, W.shell_count, tube.in_tube, tube.capacity,
+                          si.locked ? ", but the bolt is locked open: the tube is locked (press B first)" : "");
+                break;
+            case sh::Step::kCommit: {
+                lead = FirstShell();
+                if (lead >= 0 && LoadShellIntoGun(gun, W.sweep.loaded == 1 ? "1 of the push in" : "2 of the push in")) {
+                    RemoveShell(W.shell[lead]);
+                    ForgetShell(lead);
+                    // The spring pushes back harder as the tube fills.
+                    const float k = tube.capacity > 0 ? static_cast<float>(tube.in_tube + 1) / tube.capacity : 0.5f;
+                    input::Haptic(InputOf(hand_i), 0.3f + 0.4f * k, 0.03f);
+                } else {
+                    gun.PlayShellBlocked();
+                    input::Haptic(InputOf(hand_i), 0.8f, 0.08f);
+                    W.sweep.captured = false;
+                }
+                if (!W.sweep.captured) {
+                    RepackShells();
+                    log::Info("controls: push done: %d shell(s) left in the hand", W.shell_count);
+                }
+                break;
+            }
+            case sh::Step::kBlocked:
+                gun.PlayShellBlocked();
+                input::Haptic(InputOf(hand_i), 0.8f, 0.08f);
+                log::Info("controls: shell blocked: %s", si.locked ? "the bolt is locked open (press B first)"
+                                                                     : "the tube is full");
+                break;
+            case sh::Step::kLetGo:
+                log::Info("controls: shells came out of the loading port (%d still in the hand)", W.shell_count);
+                RepackShells();
+                break;
+            default:
+                break;
+        }
+    } else if (W.sweep.captured) {
+        W.sweep = sh::Sweep{};
+        RepackShells();
+    }
+    if (W.shell_count == 0) return;
+
+    // Draw them: the one being pushed on the tube's line, the rest in the hand.
+    const int lead = FirstShell();
+    for (int i = 0; i < sh::kMaxHeld; ++i) {
+        UObject a = W.shell[i];
+        if (!a) continue;
+        DetachIfAttached(a);
+        if (at_gun && W.sweep.captured && i == lead) {
+            const FVector nose = mouth + axis * sh::ShownDepth(W.sweep, g_shell_set);
+            PlaceShell(a, nose - axis * g_shell_shape.length, W.frame_rot, FVector{1, 0, 0});
+        } else {
+            PlaceShell(a, held_base(i), hr, sh::HoldNoseDir());
+        }
+    }
 }
 
 // Measures the parts; `found` lists what was used, for the log.
@@ -4528,6 +5126,15 @@ void PublishGrabs(game::Gun& gun, const hands::HandState hs[2]) {
         g[gh].point = hands::kPointChargingHandle;
     }
     auto mag_grab = [&](int mh) {
+        if (W.shell_count > 0 && W.shell_hand == mh) {
+            // Shotgun shells: the first one left, with the hold's own pose.
+            const int lead = FirstShell();
+            g[mh].kind = hands::GrabKind::kMagHeld;
+            g[mh].object = lead >= 0 ? W.shell[lead] : 0;
+            g[mh].target = hs[mh].grip;
+            g[mh].point = hands::kPointShells + W.shell_layout;
+            return;
+        }
         g[mh].kind = hands::GrabKind::kMagHeld;
         g[mh].object = W.held_mag;
         g[mh].target = hs[mh].grip;
@@ -6695,6 +7302,7 @@ void OnLateTick(UObject player, float) {
         game::Gun gun(W.gun);
         if (W.uses_holster && !W.in_hand && !W.edit_frozen) PlaceGunInHolster(gun);
         PlacePouchMag(W.gun);
+        PlaceCaddyShells(player, gun);
         if (!W.edit_frozen) PlaceSparePistol();
         PlaceRifleInHolster();
     }
@@ -6808,17 +7416,23 @@ void OnTick(UObject player, float dt) {
             if (DestroyMagazine(m)) removed++;
         }
         if (removed) log::Info("controls: removed %d spare magazine(s) of the gun put away", removed);
+        // The shotgun's shells (in the hand and at the caddy) go with it.
+        ClearHeldShells(false, "the shotgun was put away");
+        ClearCaddy();
         W = WeaponState();
         W.gun = gun.Object();
         if (gun.Valid()) {
             W.is_pistol = gun.ClassName().find("HG") != std::string::npos;
             W.is_ar = gun.ClassName().find("BP_AR") != std::string::npos;
+            // HOLE's shotgun (BP_SG_C, "Tombo12"): loaded by hand, shell by shell.
+            W.is_shotgun = gun.ClassName().rfind("BP_SG", 0) == 0;
             W.uses_holster = W.is_pistol && g_set.holster_pistol && g_spots[kPistolSpot].enabled;
             W.holster.Configure(g_spots[kPistolSpot].radius,
                                 g_set.holster_toggle ? interact::DrawMode::kToggle : interact::DrawMode::kHold);
             W.holster.Reset(interact::HolsterState::kHolstered);
             W.in_hand = !W.uses_holster;
-            log::Info("controls: holding %s (%s)", gun.ClassName().c_str(), W.is_pistol ? "pistol" : "rifle");
+            log::Info("controls: holding %s (%s)", gun.ClassName().c_str(),
+                      W.is_pistol ? "pistol" : W.is_shotgun ? "shotgun: shells by hand from the caddy" : "rifle");
             auto weld = g_welds.find(gun.ClassName());
             if (weld != g_welds.end()) {
                 W.have_weld = true;
@@ -6947,6 +7561,7 @@ void OnTick(UObject player, float dt) {
             c.Invoke();
             W.trigger_sent = false;
         }
+        ShellsFollowLead();
     } else if (ui_panel::MenuOpen()) {
         // A game menu is up: the trigger is a laser-pointer click, so no
         // firing, grabbing or gun buttons. Let go of anything held.

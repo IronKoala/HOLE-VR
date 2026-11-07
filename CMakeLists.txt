@@ -62,6 +62,7 @@ add_library(hole_vr SHARED
     src/vr/interact/touch_math.cpp
     src/vr/interact/touch.cpp
     src/vr/interact/magwell_zone.cpp
+    src/vr/interact/shell_load.cpp
     src/vr/body/ik_math.cpp
     src/vr/body/arm_pose.cpp
     src/vr/body/arm_posture.cpp
@@ -232,7 +233,8 @@ if(HOLEVR_BUILD_TESTS)
     add_executable(test_offhand_snap tests/test_offhand_snap.cpp src/vr/interact/offhand_snap.cpp)
     add_executable(test_magwell_zone tests/test_magwell_zone.cpp src/vr/interact/magwell_zone.cpp
                    src/vr/body/ik_math.cpp)
-    foreach(case body grip watch watch_marshal holster_visual holster_audio vr_options menu_input hand_ownership comfort kick turn workbench_rules bench_vise bench_layout rifle_carry vise_weapons workbench_release attachment_transaction ammo_refresh workbench_bughunt magwell_zone gpu_share offhand_snap)
+    add_executable(test_shell_load tests/test_shell_load.cpp src/vr/interact/shell_load.cpp)
+    foreach(case body grip watch watch_marshal holster_visual holster_audio vr_options menu_input hand_ownership comfort kick turn workbench_rules bench_vise bench_layout rifle_carry vise_weapons workbench_release attachment_transaction ammo_refresh workbench_bughunt magwell_zone shell_load gpu_share offhand_snap)
         target_include_directories(test_${case} PRIVATE src)
         if(MSVC)
             target_compile_options(test_${case} PRIVATE /EHsc)

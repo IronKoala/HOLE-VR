@@ -541,6 +541,31 @@ The same approach as the pistol magazine:
   round. **Unknown:** how to give it back to the player's reserve. Check
   before promising unload-to-pouch.
 
+### 5.1 What the game's own script answered (2026-11-07)
+
+The script dump of `BP_GunBase_C` (run of 2026-11-03, `logs/run-1402/script/`)
+shows what each shell function really does:
+
+- `Gun_ShellCreate` takes **no count**. It makes
+  `min(tube capacity - shells in the tube, OneReloadMaxShell)` shells and
+  attaches them to the player's hand socket. The shotgun's hand offsets are
+  for two shells, so the flat-screen reload most likely takes two at a time.
+- `Gun_ShellLoad` loads **every** shell in the hand into the tube at once
+  (`LoadSingleAmmo` for each).
+- `ReloadShell_InsertShell_Begin` only plays the shell-in sound.
+  `ReloadShell_InsertShell_End` runs `Gun_ShellLoad`, moves the lifter and
+  tells the weapon manager.
+- `ReloadMag_InsertMag_Block` plays the "tube full" sound.
+- **There is no spare-shell count.** `Gun_ShellCreate` makes shells from
+  nothing (the inventory holds only items and discs), so shells never run
+  out and the "reserve" rule in 4.6 has nothing to do.
+- A dropped shell (`Ammo_Drop`) turns on its physics and falls.
+
+So the build loads one shell at a time: it sets `OneReloadMaxShell` to 1,
+calls `ReloadShell_TakeNewShell` and `InsertShell_Begin/End`, and puts the
+old value back. The shells drawn in the hand are the mod's own actors of the
+gun's ammo class.
+
 ## 6. Checks when the owner unlocks the shotgun
 
 1. Press Ctrl+F9 in a level with the shotgun to refresh the dump. This gets
@@ -551,10 +576,10 @@ The same approach as the pistol magazine:
 3. Weapon lab trace of one flat-screen shell reload from empty and one
    top-off. Record the order of `Reload_Start`, `OpenShellCarrier`, `TakeNewShell`,
    `InsertShell_*` and `BoltCatchRelease`, and whether `ChargeBolt` feeds.
-4. For smart reload: where the game keeps the spare-shell count, whether
-   `Gun_ShellCreate(4)` works when `OneReloadMaxShell` is smaller, and what
-   `TakeNewShell` does with no spare shells.
-5. Only then build it. Nothing in this spec has been tested in the headset.
+4. For smart reload: answered by the script dump (5.1).
+5. Built ahead of time on 2026-11-07 (docs/SHOTGUN.md). The first run's log
+   lines starting `controls: shotgun` and `controls: shell` give the numbers
+   from checks 2 and 3.
 
 ## 7. Owner decisions (2026-11-03, smart reload 2026-11-07)
 

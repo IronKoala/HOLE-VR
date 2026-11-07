@@ -1385,6 +1385,12 @@ int PickSlideHold(const hands::HandState& h, const hands::Pose& gun, UObject gun
 }
 
 std::string BaseRecordKey(int side, const hands::HandGrab& grab) {
+    // Shotgun shells in the hand: one pose per hold, whatever the ammo type
+    // (controls' smart reload: quad, twin, single).
+    if (grab.kind == hands::GrabKind::kMagHeld && hands::ShellsPoint(grab.point)) {
+        const int n = grab.point - hands::kPointShells;
+        return std::string("shells.") + (n >= 4 ? "quad" : n >= 2 ? "twin" : "single");
+    }
     std::string cls = grab.object ? ue::GetName(ue::GetClass(grab.object)) : "unknown";
     switch (grab.kind) {
         // A hand reaching for the holstered pistol with its own pose
