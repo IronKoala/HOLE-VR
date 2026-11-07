@@ -197,8 +197,8 @@ want my off-hand to snap into position (the same way it snaps into position
 when it gets near the holster) i want 2 poses one for when the gun is near the
 chest and one for the rest of the time."
 
-- When the off hand's controller comes within `offhand_snap_cm` (10) of the
-  gun hand's controller, with the pistol in the gun hand and the off hand
+- When the off hand's controller comes within `pistol_both_hands_cm` (13) of
+  the gun hand's controller, with the pistol in the gun hand and the off hand
   free, the off hand is drawn holding the pistol too. It lets go 4 cm further
   out. Like the holster's hand snap it is only how the hand is drawn: the
   controller and the gun are not moved, and any real grab (slide, magazine,
@@ -217,17 +217,19 @@ chest and one for the rest of the time."
   gun where you want (near the chest, or held out), hold left Y 1 s (the
   hands freeze), pose it with the other controller, tap Y to save. Do it
   once with the gun near the chest and once held out.
-- While it is on, the pistol counts as held in two hands
-  (`GunHeldInTwoHands()` in controls; the rifle: the handguard held), for
-  one-hand vs two-hand recoil. Each of the first 12 shots logs which.
+- While it is on, the pistol counts as held in two hands for its kick
+  (`PistolInBothHands` in controls, VR settings thread's
+  `gun_kick_pistol_two_hands`): the snap and the kick use the one distance,
+  so the kick matches what you see. `offhand_snap=0` turns the snap off and
+  the kick goes back to the plain distance check.
 - The slide pinch keeps working from the snap: the body keeps the empty
   hand's last pinch (carried by the controller) in use while a hand is
   snapped.
 - Log: `controls: left hand on the pistol (controllers 8.4 cm apart, snaps
-  within 10); gun 27 cm from the chest: chest pose`, `controls: left hand on
+  within 13); gun 27 cm from the chest: chest pose`, `controls: left hand on
   the pistol: held-out pose`, `controls: left hand off the pistol after 3.2 s`,
   `controls: left controller came within 12.5 cm of the gun hand's without
-  snapping` (raise `offhand_snap_cm` if that is a real two-hand hold), `body:
+  snapping` (raise `pistol_both_hands_cm` if that is a real two-hand hold), `body:
   BP_HG_C.offhand-chest-left not posed yet`, `body: grip editor: posing the
-  left hand's hold on the pistol with the gun near the chest`, `shot 3: ...;
-  held in two hands`.
+  left hand's hold on the pistol with the gun near the chest`, `controls: gun
+  kick 1.0 (pistol, both hands; hands 9 cm apart)`.

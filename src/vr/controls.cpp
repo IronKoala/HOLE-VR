@@ -189,11 +189,10 @@ struct Settings {
     // magazine; false: the right hand holds the gun, the left takes magazines.
     bool either_hand = true;
     // The off hand snaps onto the pistol (vr/interact/offhand_snap.h) when
-    // its controller comes this close to the gun hand's, cm; lets go 4 cm
-    // further out. The chest pose while the gun is within offhand_chest of
-    // the chest (5 cm hysteresis).
+    // its controller comes within pistol_both_hands_cm of the gun hand's;
+    // lets go 4 cm further out. The chest pose while the gun is within
+    // offhand_chest of the chest (5 cm hysteresis).
     bool offhand_snap = true;
-    double offhand_snap_cm = 10.0;
     double offhand_chest_cm = 35.0;
     double handle_grab_radius = 9.0;      // either hand grabs the AR charging handle this close to its rear end, cm
     // Magazines (owner 2026-11-06: the AR's 10 round magazine snapped "way to
@@ -293,7 +292,6 @@ void LoadSettings() {
     g_set.rifle_right_let_go = config::GetBool("rifle_right_let_go", true);
     g_set.either_hand = config::GetBool("either_hand_guns", true);
     g_set.offhand_snap = config::GetBool("offhand_snap", true);
-    g_set.offhand_snap_cm = std::clamp(config::GetFloat("offhand_snap_cm", 10.f), 2.f, 30.f);
     g_set.offhand_chest_cm = std::clamp(config::GetFloat("offhand_chest_cm", 35.f), 5.f, 100.f);
     g_set.handle_grab_radius = std::clamp(config::GetFloat("rifle_charging_handle_grab_cm", 9.f), 3.f, 15.f);
     // New keys (2026-11-07): ini files keep mag_snap_slack_cm and
@@ -1286,10 +1284,15 @@ FQuat OneHandFrame(const hands::HandState& h, int hand) {
            ToQuat(FRotator{kBasePitch + g_set.gun_pitch, side * (kBaseYaw + g_set.gun_yaw), side * g_set.gun_roll});
 }
 
+bool OffhandOnPistol();  // below, with the off hand's snap
+
 // The pistol counts as held in both hands while the other controller is
 // "basically touching" the gun hand's (owner 2026-11-07) and that hand holds
-// nothing: grip centres closer than pistol_both_hands_cm.
+// nothing: grip centres closer than pistol_both_hands_cm. With offhand_snap
+// on, exactly while the off hand is drawn on the pistol (the same distance,
+// letting go 4 cm further out), so the kick matches what you see.
 bool PistolInBothHands(const hands::HandState& gun_hand, const hands::HandState& other) {
+    if (g_set.offhand_snap) return OffhandOnPistol();
     if (!gun_hand.valid || !other.valid || HandHoldsMag(OtherHand())) return false;
     const hands::Hand oh = HandOf(OtherHand());
     if (hands::GetInteraction(oh).owner != hands::GripOwner::kNone) return false;
@@ -4344,13 +4347,9 @@ int g_holster_reach_hand = input::kRight;   // the hand the holster's hand snap 
 interact::OffhandSnap g_offhand;
 hands::HandGrab g_offhand_reach;
 
-// The gun is held in two hands: a pistol with the off hand snapped onto it
-// (offhand_snap), a rifle with the other hand on its handguard (owner
-// 2026-11-07: one-handed guns kick harder than two-handed ones).
-bool GunHeldInTwoHands() {
-    if (!W.gun || !W.in_hand) return false;
-    return W.is_pistol ? g_offhand.TwoHands() : W.two_hand;
-}
+// The off hand is drawn on the pistol: it is held in both hands
+// (PistolInBothHands, for its kick).
+bool OffhandOnPistol() { return g_offhand.TwoHands(); }
 UObject g_holster_owner = 0;
 void UpdateHolsterVisual(UObject player, const hands::HandState hs[2]);
 void DrawHolsterModel(UObject player);
@@ -4963,8 +4962,8 @@ void LogShot(UObject player, game::Gun& gun) {
     UObject mag = 0, round = 0;
     ue::GetProp(gun.Object(), "MagazineObj", mag);
     ue::GetProp(gun.Object(), "AmmoObj_InChamber", round);
-    log::Info("shot %d: magazine %s, chambered round %s; held in %s", n, mag ? ue::GetName(mag).c_str() : "none",
-              round ? ue::GetName(round).c_str() : "none", GunHeldInTwoHands() ? "two hands" : "one hand");
+    log::Info("shot %d: magazine %s, chambered round %s", n, mag ? ue::GetName(mag).c_str() : "none",
+              round ? ue::GetName(round).c_str() : "none");
     ShotStudy(player, gun, n, muzzle ? mloc : W.grip_world + gfwd * W.muzzle_dist, gfwd, ctrl);
 }
 
@@ -6478,15 +6477,16 @@ void UpdateOffhandSnap(game::Gun& gun, const hands::HandState hs[2]) {
     in.hands_apart = gh.valid && oh.valid ? Len(oh.grip.location - gh.grip.location) : 1e9;
     in.gun_to_chest =
         g_hw.valid ? Len(W.grip_world - g_hw.anchor[static_cast<int>(interact::HolsterAnchor::kChest)].location) : 1e9;
-    in.snap_cm = g_set.offhand_snap_cm;
-    in.release_cm = g_set.offhand_snap_cm + 4.0;
+    // One distance for the snap and for the pistol's two-hand kick.
+    in.snap_cm = g_set.pistol_both_hands_cm;
+    in.release_cm = g_set.pistol_both_hands_cm + 4.0;
     in.chest_cm = g_set.offhand_chest_cm;
     in.chest_release_cm = g_set.offhand_chest_cm + 5.0;
     in.dt = g_dt;
     const bool was_near = g_offhand.Near(), was_chest = g_offhand.Chest();
     g_offhand.Update(in);
     // The log says how close the controllers came, so the distance can be
-    // set from a run (offhand_snap_cm).
+    // set from a run (pistol_both_hands_cm).
     static double since = 0, closest = 1e9, told_closest_at = -1e9;
     if (g_offhand.Near() != was_near) {
         if (g_offhand.Near()) {
@@ -6512,7 +6512,7 @@ void UpdateOffhandSnap(game::Gun& gun, const hands::HandState hs[2]) {
         if (!g_offhand.Near() && g_clock - told_closest_at > 10.0) {
             told_closest_at = g_clock;
             log::Info("controls: %s controller came within %.1f cm of the gun hand's without snapping (snaps within "
-                      "%.0f, offhand_snap_cm)",
+                      "%.0f, pistol_both_hands_cm)",
                       HandName(O), closest, in.snap_cm);
         }
         closest = 1e9;
