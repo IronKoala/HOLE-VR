@@ -78,6 +78,16 @@ double InsertProgress(double below, double line_up, double last) {
     return std::clamp((line_up - below) / span, 0.0, 1.0);
 }
 
+const char* LetGoWhy(const MagwellZone& z, double depth, double line_up, double side, double tilt, double max_side,
+                     double max_tilt, double hold_side) {
+    if (depth > line_up + 3.0) return "pulled back out";
+    const bool in_well = z.ok && depth < z.insert;
+    if (in_well) return side > hold_side ? "the hand went too far off the magwell's line" : nullptr;
+    if (side > max_side + 1.5) return "too far off the axis";
+    if (tilt > max_tilt + 10.0) return "leaning too far";
+    return nullptr;
+}
+
 TopProbe ProbeTop(const FVector& seat, const FQuat& seat_rot, const FVector& out, double top, const FVector& at,
                   const FQuat& rot) {
     TopProbe t;
