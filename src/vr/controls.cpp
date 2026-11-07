@@ -48,6 +48,7 @@
 #include "vr/ui_panel.h"
 #include "vr/openxr.h"
 #include "vr/stereo.h"
+#include "vr/turn_math.h"
 #include "vr/view_lead_math.h"
 #include "vr/world_menu.h"
 
@@ -196,8 +197,10 @@ void LoadHolsterSpots();
 
 void LoadSettings() {
     g_set.enabled = config::GetBool("vr_controls", true);
-    g_set.smooth_turn = config::GetInt("turn_mode", 1) == 1;
-    g_set.no_stick_turn = config::GetInt("turn_mode", 1) == 2;
+    // Same reading as the VR tab's Turn style row: unknown values are Smooth.
+    turn::Style style = turn::StyleFromMode(config::GetInt("turn_mode", 1));
+    g_set.smooth_turn = style == turn::Style::kSmooth;
+    g_set.no_stick_turn = style == turn::Style::kOff;
     g_set.snap_degrees = config::GetFloat("snap_turn_degrees", 30.f);
     g_set.smooth_speed = config::GetFloat("smooth_turn_speed", 90.f);
     g_set.move_with_hand = config::GetInt("move_direction", 0) == 1;
@@ -534,19 +537,13 @@ double Locomotion(UObject player, const input::Snapshot& s, double dt) {
         c.Invoke();
     }
 
-    double turn = 0;
-    if (g_set.no_stick_turn) {
-        g_snap_armed = true;  // the stick's sideways push does nothing
-    } else if (g_set.smooth_turn) {
-        if (std::fabs(right.stick_x) > g_set.deadzone) turn = right.stick_x * g_set.smooth_speed * dt;
-    } else {
-        if (g_snap_armed && std::fabs(right.stick_x) > 0.7) {
-            turn = right.stick_x > 0 ? g_set.snap_degrees : -g_set.snap_degrees;
-            g_snap_armed = false;
-        } else if (std::fabs(right.stick_x) < 0.4) {
-            g_snap_armed = true;
-        }
-    }
+    // Turn style (VR tab): smooth, snap, or off (turn_mode 1/0/2).
+    turn::Settings ts;
+    ts.style = g_set.no_stick_turn ? turn::Style::kOff : g_set.smooth_turn ? turn::Style::kSmooth : turn::Style::kSnap;
+    ts.snap_degrees = g_set.snap_degrees;
+    ts.smooth_speed = g_set.smooth_speed;
+    ts.deadzone = g_set.deadzone;
+    double turn = turn::Step(ts, right.stick_x, dt, &g_snap_armed);
     // Comfort vignette: how fast the character really moves (walls stop the
     // stick, falls count) and how fast the stick turns you. Snap turns are
     // instant, so they have nothing to darken.
