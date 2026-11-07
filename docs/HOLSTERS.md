@@ -189,3 +189,45 @@ magazines, as before).
   `holster: pistol drawn by the left hand`, `controls: left hand took the pouch
   magazine`, `controls: mag release (left hand)`, `body: BP_HG_C.grip-left not
   posed yet: using BP_HG_C.grip, mirrored`.
+
+## The off hand on the pistol (owner 2026-11-07)
+
+"when my off hand controller is basically touching my main hand controller i
+want my off-hand to snap into position (the same way it snaps into position
+when it gets near the holster) i want 2 poses one for when the gun is near the
+chest and one for the rest of the time."
+
+- When the off hand's controller comes within `offhand_snap_cm` (10) of the
+  gun hand's controller, with the pistol in the gun hand and the off hand
+  free, the off hand is drawn holding the pistol too. It lets go 4 cm further
+  out. Like the holster's hand snap it is only how the hand is drawn: the
+  controller and the gun are not moved, and any real grab (slide, magazine,
+  light, a menu, the grip editor) takes the hand at once. Pistol only: the
+  rifle has its real handguard grab. `vr/interact/offhand_snap.h` (tested in
+  `tests/test_offhand_snap.cpp`), `controls::UpdateOffhandSnap`, published by
+  `PublishGrabs` as a `kSupportGrip` preview at `hands::kPointOffhand` /
+  `kPointOffhandChest`, framed on the gun's grip point.
+- Two poses per hand: the gun within `offhand_chest_cm` (35) of the chest
+  anchor takes `grips/BP_HG_C.offhand-chest-left.ini`, beyond it +5 cm the
+  held-out pose `grips/BP_HG_C.offhand-left.ini` (`-right` when the gun is in
+  the left hand). Until a pose is set the hand uses that hand's other pose,
+  then the other hand's, mirrored (`grip_record::OffhandFallbacks`); with
+  none set it stays on its controller. Shown as posed, not fitted.
+- To pose: bring the off hand's controller against the gun hand's with the
+  gun where you want (near the chest, or held out), hold left Y 1 s (the
+  hands freeze), pose it with the other controller, tap Y to save. Do it
+  once with the gun near the chest and once held out.
+- While it is on, the pistol counts as held in two hands
+  (`GunHeldInTwoHands()` in controls; the rifle: the handguard held), for
+  one-hand vs two-hand recoil. Each of the first 12 shots logs which.
+- The slide pinch keeps working from the snap: the body keeps the empty
+  hand's last pinch (carried by the controller) in use while a hand is
+  snapped.
+- Log: `controls: left hand on the pistol (controllers 8.4 cm apart, snaps
+  within 10); gun 27 cm from the chest: chest pose`, `controls: left hand on
+  the pistol: held-out pose`, `controls: left hand off the pistol after 3.2 s`,
+  `controls: left controller came within 12.5 cm of the gun hand's without
+  snapping` (raise `offhand_snap_cm` if that is a real two-hand hold), `body:
+  BP_HG_C.offhand-chest-left not posed yet`, `body: grip editor: posing the
+  left hand's hold on the pistol with the gun near the chest`, `shot 3: ...;
+  held in two hands`.

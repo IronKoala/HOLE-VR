@@ -366,8 +366,40 @@ static void TestSideKeys() {
     EXPECT(SideKey("BP_HG_C.holster", false, false) == "BP_HG_C.holster-left");
     EXPECT(UsualKey("BP_HG_C.holster-left") == "BP_HG_C.holster");
     for (bool right : {false, true})
-        for (const char* base : {"BP_HG_C.grip", "BP_AR_C.support-light", "BP_HG_C.slide-front-flat", "M.mag"})
+        for (const char* base : {"BP_HG_C.grip", "BP_AR_C.support-light", "BP_HG_C.slide-front-flat", "M.mag",
+                                 "BP_HG_C.offhand", "BP_HG_C.offhand-chest"})
             EXPECT(UsualKey(SideKey(base, right, false)) == base);
+    // The off hand snapped onto the pistol (owner 2026-11-07): two poses per
+    // hand; until posed, this hand's other pose, then the other hand's.
+    using grip_record::OffhandKey;
+    using grip_record::OffhandFallbacks;
+    EXPECT(OffhandKey("BP_HG_C.offhand"));
+    EXPECT(OffhandKey("BP_HG_C.offhand-chest"));
+    EXPECT(!OffhandKey("BP_HG_C.grip"));
+    EXPECT(!OffhandKey("BP_AR_C.support-light"));
+    EXPECT(!OffhandKey(".offhand"));
+    EXPECT(UsualKey("BP_HG_C.offhand-chest-left") == "BP_HG_C.offhand-chest");
+    {
+        const auto f = OffhandFallbacks("BP_HG_C.offhand-chest-left");
+        EXPECT(f.size() == 3);
+        if (f.size() == 3) {
+            EXPECT(f[0].key == "BP_HG_C.offhand-left" && !f[0].other_hand);
+            EXPECT(f[1].key == "BP_HG_C.offhand-chest-right" && f[1].other_hand);
+            EXPECT(f[2].key == "BP_HG_C.offhand-right" && f[2].other_hand);
+        }
+    }
+    {
+        const auto f = OffhandFallbacks("BP_HG_C.offhand-right");
+        EXPECT(f.size() == 3);
+        if (f.size() == 3) {
+            EXPECT(f[0].key == "BP_HG_C.offhand-chest-right" && !f[0].other_hand);
+            EXPECT(f[1].key == "BP_HG_C.offhand-left" && f[1].other_hand);
+            EXPECT(f[2].key == "BP_HG_C.offhand-chest-left" && f[2].other_hand);
+        }
+    }
+    EXPECT(OffhandFallbacks("BP_HG_C.offhand").empty());
+    EXPECT(OffhandFallbacks("BP_HG_C.grip-left").empty());
+    EXPECT(OffhandFallbacks("BP_HG_C.holster-left").empty());
 }
 
 int main() {

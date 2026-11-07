@@ -492,6 +492,20 @@ const Block kBlocks[] = {
      "; (B or Y); the other hand racks, reloads, holds the handguard and works the light.\n"
      "; 0 = the right hand always holds the gun and the left hand takes the magazines.\n"
      "either_hand_guns=1\n"},
+    {"offhand_snap",
+     "\n"
+     "; --- The off hand on the pistol ---\n"
+     "; 1 = when the off hand's controller nearly touches the gun hand's controller, the\n"
+     "; off hand is drawn holding the pistol too (the way a hand snaps onto the pistol\n"
+     "; in its holster). It has two poses, set in the grip editor: one with the gun\n"
+     "; near the chest, one for the rest of the time. The pistol then counts as held\n"
+     "; in two hands.\n"
+     "; offhand_snap_cm: how close the two controllers come for it (it lets go 4 cm\n"
+     "; further out). offhand_chest_cm: the gun this close to the chest takes the chest\n"
+     "; pose.\n"
+     "offhand_snap=1\n"
+     "offhand_snap_cm=10\n"
+     "offhand_chest_cm=35\n"},
     {"rifle_charging_handle_grab_cm",
      "\n"
      "; --- The rifle's charging handle ---\n"
