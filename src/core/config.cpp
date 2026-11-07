@@ -796,6 +796,14 @@ const Block kBlocks[] = {
      "square_watch=0\n"
      "square_watch_every=4\n"
      "square_test=0\n"},
+    {"vr_gpu_memory_sharing",
+     "\n"
+     "; White/yellow squares in one eye: the engine reuses video memory between\n"
+     "; drawing steps and runs some steps alongside the frame (async compute).\n"
+     "; With both off in VR the squares were gone (2026-11-07). 1 = the game's own\n"
+     "; (saves video memory / GPU time but may bring the squares back).\n"
+     "vr_gpu_memory_sharing=0\n"
+     "vr_async_compute=0\n"},
     {"xr_end_async",
      "\n"
      "; Frame times: hand each frame to the headset (xrEndFrame) on a thread of the\n"
