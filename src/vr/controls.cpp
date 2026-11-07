@@ -361,6 +361,35 @@ void LoadMagSeats() {
     fclose(f);
 }
 
+// Cheek weld (owner 2026-11-07): shoulder the rifle, hold B, line the
+// sights up with your eye by moving the rifle, let go of B. Where your eye
+// sat against the rifle is kept per gun in cheek-weld.ini and the shoulder
+// snap puts the rifle back exactly there.
+std::map<std::string, FVector> g_welds;
+std::wstring WeldFile() { return config::Dir() + L"\\cheek-weld.ini"; }
+void LoadWelds() {
+    FILE* f = _wfopen(WeldFile().c_str(), L"r");
+    if (!f) return;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        char name[128] = {};
+        double x, y, z;
+        if (line[0] == ';' || std::sscanf(line, "%127[^=]=%lf %lf %lf", name, &x, &y, &z) != 4) continue;
+        if (std::fabs(x) > 80 || std::fabs(y) > 30 || std::fabs(z) > 40) continue;
+        g_welds[name] = FVector{x, y, z};
+        log::Info("controls: cheek weld for %s from cheek-weld.ini (eye %.1f %.1f %.1f from the grip)", name, x, y, z);
+    }
+    fclose(f);
+}
+void SaveWelds() {
+    FILE* f = _wfopen(WeldFile().c_str(), L"w");
+    if (!f) return;
+    std::fputs("; Where your aiming eye sits against each rifle (gun frame from the grip: forward, right, up; cm),\n"
+               "; set in game: shouldered, hold B, line up the sights, let go. Delete a line to go back.\n", f);
+    for (const auto& [name, v] : g_welds) std::fprintf(f, "%s=%.2f %.2f %.2f\n", name.c_str(), v.X, v.Y, v.Z);
+    fclose(f);
+}
+
 void SaveMagSeats() {
     FILE* f = _wfopen(MagSeatFile().c_str(), L"w");
     if (!f) return;
@@ -769,6 +798,10 @@ struct WeaponState {
     FQuat edit_gun_rot;
     bool have_stock = false;
     bool shouldered = false;
+    bool have_weld = false;       // cheek weld set by the owner for this gun
+    FVector weld_local;           // the aiming eye in the gun frame, from the grip
+    double weld_hold = 0;         // gun hand's B held, s
+    bool weld_free = false;       // B held: the rifle is off the shoulder snap
     double shouldered_at = -1;    // g_clock when the blend reached full
     double shoulder_blend = 0;    // 0 hands only .. 1 pivoting from the shoulder
     FVector gun_set_loc;          // where HoldGun put the gun this frame
@@ -1360,7 +1393,40 @@ void HoldGun(game::Gun& gun, const hands::HandState& rh) {
     // small wobbles no longer move the back of the gun. Pull it well away
     // to let go.
     FVector pocket;
-    if (!W.is_pistol && W.have_stock && g_set.virtual_stock && ShoulderPocket(&pocket)) {
+    FVector weld_eye;
+    if (W.weld_free) {
+        // Setting the cheek weld: the hands alone place the rifle.
+        W.shouldered = false;
+        W.shoulder_blend = 0;
+    } else if (!W.is_pistol && W.have_weld && g_set.virtual_stock && AimingEye(&weld_eye)) {
+        // Saved cheek weld: snaps when the rifle's eye point comes near your
+        // eye, and holds it exactly there, aiming toward the support hand.
+        double d = Len(grip_w + hand.Rotate(W.weld_local) - weld_eye);
+        if (!W.shouldered && d < g_set.stock_snap) {
+            W.shouldered = true;
+            input::Haptic(InputOf(GunHand()), 0.2f, 0.03f);
+            log::Info("controls: rifle shouldered on your cheek weld (%.1f cm from it)", d);
+        } else if (W.shouldered && d > g_set.stock_release) {
+            W.shouldered = false;
+            log::Info("controls: rifle off the shoulder");
+        }
+        W.shoulder_blend += (W.shouldered ? 1.0 : -1.0) * g_dt / 0.12;
+        W.shoulder_blend = std::fmax(0.0, std::fmin(1.0, W.shoulder_blend));
+        if (W.shoulder_blend > 0) {
+            const FVector anchor = W.weld_local;
+            FVector front_local = two ? W.support_local : hand.Inverse().Rotate(rh.grip.location - grip_w);
+            FVector front_w = two ? lh2.grip.location : rh.grip.location;
+            FVector gun_dir = Norm(hand.Rotate(front_local - anchor));
+            FVector want = front_w - weld_eye;
+            if (Len(want) > 5.0) {
+                FQuat hs = FromTo(gun_dir, Norm(want)) * hand;
+                FVector gs = weld_eye - hs.Rotate(anchor);
+                hand = Nlerp(hand, hs, W.shoulder_blend);
+                grip_w = grip_w + (gs - grip_w) * W.shoulder_blend;
+            }
+        }
+        ShoulderCapture(hand, grip_w);
+    } else if (!W.is_pistol && W.have_stock && g_set.virtual_stock && ShoulderPocket(&pocket)) {
         double d = Len(grip_w + hand.Rotate(W.stock_local) - pocket);
         if (!W.shouldered && d < g_set.stock_snap) {
             W.shouldered = true;
@@ -3099,6 +3165,58 @@ void SupportGrip(const hands::HandState& lh, const input::HandInput& lin, double
 // with the kick, so a rifle could not kick. With the rifle in the left hand
 // (left X is its magazine release) it stays on the right stick click.
 bool SelectorOnStick() { return GunHand() == input::kLeft; }
+
+bool AimingEye(FVector* out);
+// The gun hand's B (Y in the left hand), held with a rifle: past 0.4 s (a
+// tap is still the bolt release) the rifle comes off the shoulder snap and
+// follows the hands, so the sights can be lined up by eye. Let go after at
+// least 2 s and the eye's place against the rifle is saved.
+void CheekWeldButton(game::Gun& gun, const input::HandInput& gin) {
+    // Right hand only: the left hand's Y held 1 s opens the grip editor.
+    if (W.is_pistol || !W.in_hand || !W.have_pose || GunHand() != input::kRight) {
+        W.weld_hold = 0;
+        W.weld_free = false;
+        return;
+    }
+    if (gin.secondary.down && !W.slide.Held()) {
+        const double before = W.weld_hold;
+        W.weld_hold += g_dt;
+        if (before < 0.4 && W.weld_hold >= 0.4) {
+            W.weld_free = true;
+            input::Haptic(InputOf(GunHand()), 0.3f, 0.03f);
+            log::Info("controls: cheek weld: B held, the rifle follows your hands; line up the sights and let go");
+        }
+        if (before < 2.0 && W.weld_hold >= 2.0) input::Haptic(InputOf(GunHand()), 0.5f, 0.05f);  // long enough
+        return;
+    }
+    if (W.weld_free && W.weld_hold >= 2.0) {
+        FVector eye;
+        if (AimingEye(&eye)) {
+            const FVector e = W.frame_rot.Inverse().Rotate(eye - W.grip_world);
+            const bool sane = e.X > -60 && e.X < 20 && std::fabs(e.Y) < 20 && e.Z > -5 && e.Z < 35;
+            if (sane) {
+                W.have_weld = true;
+                W.weld_local = e;
+                W.shouldered = true;
+                W.shoulder_blend = 1.0;
+                g_welds[gun.ClassName()] = e;
+                SaveWelds();
+                input::Haptic(InputOf(GunHand()), 0.9f, 0.12f);
+                log::Info("controls: cheek weld saved for %s: eye %.1f cm behind the grip, %.1f right, %.1f up "
+                          "(sight point %.1f %.1f %.1f: eye %.1f cm behind it, %.1f right, %.1f up)",
+                          gun.ClassName().c_str(), -e.X, e.Y, e.Z, W.ads_local.X, W.ads_local.Y, W.ads_local.Z,
+                          W.ads_local.X - e.X, e.Y - W.ads_local.Y, e.Z - W.ads_local.Z);
+            } else {
+                log::Info("controls: cheek weld not saved: the eye was not behind the rifle (%.1f %.1f %.1f)", e.X, e.Y,
+                          e.Z);
+            }
+        }
+    } else if (W.weld_free) {
+        log::Info("controls: cheek weld cancelled (B let go after %.1f s; hold it 2 s)", W.weld_hold);
+    }
+    W.weld_hold = 0;
+    W.weld_free = false;
+}
 void FireSelector(game::Gun& gun, const input::Snapshot& s) {
     // Rifles only: a Glock has no selector.
     if (W.is_pistol) return;
@@ -3412,6 +3530,8 @@ void PhysicalCrouchAndJump(UObject player) {
 //   Left X                magazine release with the gun in the left hand
 //   Right stick           left/right turn, up jump, down crouch / stand; click: kick
 //   Left X                rifle fire selector with the rifle in the right hand
+//   Right B held          rifle in the right hand: cheek weld (rifle follows the hands while held;
+//                         let go after 2 s to save where the eye sits; a tap is still the bolt release)
 //   Gun hand's trigger    fire
 //   Other trigger         weapon light with that hand right next to the gun, else interact (any empty hand)
 //   Right A / B           magazine release / slide release with the gun in the right hand;
@@ -6699,6 +6819,11 @@ void OnTick(UObject player, float dt) {
             W.holster.Reset(interact::HolsterState::kHolstered);
             W.in_hand = !W.uses_holster;
             log::Info("controls: holding %s (%s)", gun.ClassName().c_str(), W.is_pistol ? "pistol" : "rifle");
+            auto weld = g_welds.find(gun.ClassName());
+            if (weld != g_welds.end()) {
+                W.have_weld = true;
+                W.weld_local = weld->second;
+            }
             auto seat = g_mag_seats.find(gun.ClassName());
             if (seat != g_mag_seats.end()) {
                 W.seat_offset = seat->second.offset;
@@ -6874,6 +6999,7 @@ void OnTick(UObject player, float dt) {
         if (toggle_drop[O]) osup.grip_button.pressed = false;  // that squeeze let go of the magazine
         SupportGrip(lh, osup, dt);
         FireSelector(gun, s);
+        CheekWeldButton(gun, s.hand[GunHand()]);
         RifleCarry(player, rh, lh, s.hand[O], s.hand[G], dt, true);
     }
     {
@@ -6941,6 +7067,7 @@ void RequestHolsterMove() {
 void Init() {
     LoadSettings();
     LoadMagSeats();
+    LoadWelds();
     holster_audio::Init(config::Dir());
     config::AddChangeListener(&ReloadSettings);
     game::AddTickListener(&OnTick);
