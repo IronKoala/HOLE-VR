@@ -26,6 +26,7 @@
 #include "ue/process_event.h"
 #include "ue/reflection.h"
 #include "vr/body/body.h"
+#include "vr/body/hand_walls.h"
 #include "vr/comfort.h"
 #include "vr/comfort_math.h"
 #include "vr/teleport.h"
@@ -52,6 +53,8 @@
 #include "vr/stereo.h"
 #include "vr/turn_math.h"
 #include "vr/view_lead_math.h"
+#include "vr/gun_walls_math.h"
+#include "vr/wall_shapes.h"
 #include "vr/world_menu.h"
 
 namespace holevr::vr::controls {
@@ -143,6 +146,8 @@ struct Settings {
     double finger_pinch_past_rear = 0.64;
     int slide_hold_log = 30;            // slide holds per run that log their frame-by-frame pull
     bool wall_collision = true;    // keep the gun out of walls
+    bool whole_gun = true;         // all of the gun and the hands on it, not just the muzzle line (2026-11-07)
+    wall_shapes::Mode wall_shape_mode = wall_shapes::Mode::kNearest;  // what the gun stops at (wall_shape)
     // In-hand recoil kick strength by gun and grip (VR tab; owner 2026-11-07:
     // rifle one hand Heavy, two hands Strong; pistol one hand Stronger, two
     // hands Normal). 1 = Normal, 0 = off. Every other gun (shotgun, sniper
@@ -247,6 +252,9 @@ void LoadSettings() {
     g_set.gun_yaw = config::GetFloat("gun_yaw_offset", 0.f);
     g_set.gun_roll = config::GetFloat("gun_roll_offset", 0.f);
     g_set.wall_collision = config::GetBool("gun_wall_collision", true);
+    g_set.whole_gun = config::GetBool("gun_wall_whole_gun", true);
+    g_set.wall_shape_mode = wall_shapes::ModeSetting();
+    wall_shapes::LoadSettings();
     g_set.recoil_kick = config::GetFloat("gun_recoil_kick", 1.f);
     g_set.kick_pistol_one = config::GetFloat("gun_kick_pistol_one_hand", 2.4f);
     g_set.kick_pistol_two = config::GetFloat("gun_kick_pistol_two_hands", 1.f);
@@ -1092,6 +1100,10 @@ struct WallPushLog {
     double jump_max = 0;        // largest change from one frame to the next, cm
     long long eyes_inside = 0;  // frames the eyes were inside something (no push)
     std::string worst_what;     // what the largest push was against
+    long long near_frames = 0;  // frames something was near the gun (its outline points were looked at)
+    long long looks = 0;        // lines from the eyes to outline points
+    long long by_part[static_cast<int>(gun_walls::Part::kCount)] = {};  // pushed frames by the deepest part
+    int points = 0;             // outline points (last frame)
 };
 std::mutex g_push_log_mutex;
 WallPushLog g_push_log;
@@ -1104,54 +1116,215 @@ std::string WallPushReport(double) {
         g_push_log = {};
     }
     if (w.pushed == 0 && w.eyes_inside == 0) return {};
-    char b[400];
+    char b[700];
     std::snprintf(b, sizeof(b),
                   "gun wall push: the held gun was pushed out of something in %lld of %lld frames (most %.1f cm, "
                   "against %s); the push changed by over 3 cm in a frame %lld times (worst %.1f cm); eyes inside "
-                  "something (no push) %lld frames",
+                  "something (no push) %lld frames; part furthest in: gun %lld, gun hand %lld, magazine %lld, "
+                  "support hand %lld; something near the gun in %lld frames, %d outline points, %.1f looks a frame "
+                  "then",
                   w.pushed, w.frames, w.push_max, w.worst_what.empty() ? "nothing" : w.worst_what.c_str(), w.jumps,
-                  w.jump_max, w.eyes_inside);
+                  w.jump_max, w.eyes_inside, w.by_part[0], w.by_part[1], w.by_part[2], w.by_part[3], w.near_frames, w.points,
+                  w.near_frames ? static_cast<double>(w.looks) / static_cast<double>(w.near_frames) : 0.0);
     return b;
 }
 
-// One line from the eyes to `to` against the world. True with the first
-// surface's point and normal (and what it belongs to); false when the way
-// is clear. *eyes_inside: the line started inside something.
-bool EyeLine(UObject ksl, UObject gps, UObject player, const FVector& from, const FVector& to,
-             const std::vector<UObject>& ignore, FVector* at, FVector* normal, UObject* what, bool* eyes_inside) {
-    TArrayRaw arr{ignore.data(), static_cast<int32_t>(ignore.size()), static_cast<int32_t>(ignore.size())};
-    ue::Call t(ksl, "LineTraceSingle");
-    t.Set("WorldContextObject", player).Set("Start", from).Set("End", to)
-        .Set("TraceChannel", uint8_t{0}).Set("bTraceComplex", false).Set("ActorsToIgnore", arr)
-        .Set("bIgnoreSelf", true);
-    if (!t.Invoke() || !t.Result<bool>()) return false;
-    int32_t hit_size = 0;
-    uint8_t* hit = t.Raw("OutHit", &hit_size);
-    if (!hit) return false;
-    ue::Call b(gps, "BreakHitResult");
-    int32_t in_size = 0;
-    uint8_t* in = b.Raw("Hit", &in_size);
-    if (!in || in_size != hit_size) return false;
-    std::memcpy(in, hit, static_cast<size_t>(hit_size));
-    if (!b.Invoke() || !b.Get<bool>("bBlockingHit")) return false;
-    if (b.Get<bool>("bInitialOverlap")) {
-        *eyes_inside = true;
+// Lines and the near test from the eyes against the world, for one frame:
+// the reflected calls are laid out once and reused for every line (building
+// a call costs more than the trace). Shapes (wall_shape setting): what you
+// see (complex), the game's hit boxes (simple), or both with the nearest hit
+// winning.
+struct GunWallTraces {
+    ue::Call line, sphere, unpack;
+    int32_t hit_size = 0, radius_size = 0;
+    bool ok = false, sphere_ok = false;
+    wall_shapes::Mode shapes;
+
+    GunWallTraces(UObject ksl, UObject gps, UObject player, const std::vector<UObject>& ignore,
+                  wall_shapes::Mode mode)
+        : line(ksl, "LineTraceSingle"), sphere(ksl, "SphereTraceSingle"), unpack(gps, "BreakHitResult"),
+          shapes(mode) {
+        int32_t in_size = 0;
+        if (!line.Valid() || !unpack.Valid() || !line.Raw("OutHit", &hit_size) || hit_size <= 0 ||
+            !unpack.Raw("Hit", &in_size) || in_size != hit_size)
+            return;
+        TArrayRaw arr{ignore.data(), static_cast<int32_t>(ignore.size()), static_cast<int32_t>(ignore.size())};
+        line.Set("WorldContextObject", player).Set("TraceChannel", uint8_t{0}).Set("bTraceComplex", false)
+            .Set("ActorsToIgnore", arr).Set("bIgnoreSelf", true);
+        ok = true;
+        int32_t sphere_hit = 0;
+        sphere_ok = sphere.Valid() && sphere.Raw("OutHit", &sphere_hit) && sphere_hit == hit_size &&
+                    sphere.Raw("Radius", &radius_size) && (radius_size == 4 || radius_size == 8);
+        if (sphere_ok)
+            sphere.Set("WorldContextObject", player).Set("TraceChannel", uint8_t{0}).Set("bTraceComplex", false)
+                .Set("ActorsToIgnore", arr).Set("bIgnoreSelf", true);
+    }
+
+    // Unpacks the call's hit. False: no usable hit.
+    bool Unpack(ue::Call& call) {
+        int32_t size = 0, in_size = 0;
+        const uint8_t* raw = call.Raw("OutHit", &size);
+        uint8_t* in = unpack.Raw("Hit", &in_size);
+        if (!raw || !in || size != hit_size || in_size != hit_size) return false;
+        std::memcpy(in, raw, static_cast<size_t>(hit_size));
+        return unpack.Invoke() && unpack.Get<bool>("bBlockingHit");
+    }
+
+    gun_walls::Hit Line(const FVector& from, const FVector& to) {
+        gun_walls::Hit best;
+        if (!ok) return best;
+        line.Set("Start", from).Set("End", to);
+        for (int pass = 0; pass < wall_shapes::Passes(shapes); ++pass) {
+            line.Set("bTraceComplex", wall_shapes::Complex(shapes, pass)).Set("ReturnValue", false);
+            if (!line.Invoke() || !line.Result<bool>() || !Unpack(line)) continue;
+            if (unpack.Get<bool>("bInitialOverlap")) {
+                gun_walls::Hit h;
+                h.eyes_inside = true;
+                return h;
+            }
+            const FVector at = unpack.Get<FVector>("ImpactPoint");
+            if (best.hit && Len(at - from) >= Len(best.impact - from)) continue;
+            best.hit = true;
+            best.impact = at;
+            best.normal = unpack.Get<FVector>("ImpactNormal");
+            best.what = unpack.Get<UObject>("HitActor");
+        }
+        return best;
+    }
+
+    // Anything at all in the capsule from the eyes to the sphere round the
+    // gun (every line from the eyes to the gun lies inside it). True when
+    // something is there, or when it can't be told.
+    bool Close(const FVector& eyes, const FVector& centre, double radius) {
+        if (!sphere_ok) return true;
+        FVector to = centre;
+        if (Len(to - eyes) < 1e-3) to = eyes + FVector{0.01, 0, 0};
+        sphere.Set("Start", eyes).Set("End", to).Set("ReturnValue", false);
+        if (radius_size == 4) sphere.Set("Radius", static_cast<float>(radius));
+        else sphere.Set("Radius", radius);
+        for (int pass = 0; pass < wall_shapes::Passes(shapes); ++pass) {
+            sphere.Set("bTraceComplex", wall_shapes::Complex(shapes, pass)).Set("ReturnValue", false);
+            if (!sphere.Invoke() || sphere.Result<bool>()) return true;
+        }
         return false;
     }
-    *at = b.Get<FVector>("ImpactPoint");
-    *normal = b.Get<FVector>("ImpactNormal");
-    *what = b.Get<UObject>("HitActor");
+};
+
+// The gun's parts as boxes in the gun frame (from the grip point), measured
+// from its meshes, the magazine in it and what is fitted to it (light,
+// sight, suppressor). Measured when it is taken and every 4 s while held
+// (attachments change at the bench; the magazine comes and goes).
+struct GunShape {
+    UObject gun = 0;
+    double measured_at = -1e9;  // g_clock
+    std::vector<gun_walls::PartBox> boxes;
+    int gun_boxes = 0, mag_boxes = 0, fitted_boxes = 0;
+    bool logged = false;
+} g_gun_shape;
+perf::Counter g_perf_gun_walls{"gun wall collision"};
+
+std::vector<UObject> AttachedActors(UObject actor) {
+    std::vector<UObject> out;
+    ue::Call c(actor, "GetAttachedActors");
+    if (!c.Valid()) return out;
+    int32_t flag = 0;
+    if (c.Raw("bResetArray", &flag) && flag == 1) c.Set("bResetArray", true);
+    if (c.Raw("bRecursivelyIncludeAttachedActors", &flag) && flag == 1) c.Set("bRecursivelyIncludeAttachedActors", true);
+    if (!c.Invoke()) return out;
+    int32_t size = 0;
+    const uint8_t* raw = c.Raw("OutActors", &size);
+    struct Arr { uintptr_t data; int32_t num, max; } arr{};
+    if (!raw || size < static_cast<int32_t>(sizeof(Arr))) return out;
+    std::memcpy(&arr, raw, sizeof(Arr));
+    if (arr.num < 0 || arr.num > arr.max || arr.num > 4096) return out;
+    for (int i = 0; i < arr.num && i < 32; ++i) {
+        UObject a = mem::ReadOr<uintptr_t>(arr.data + i * sizeof(uintptr_t), 0);
+        if (a && ue::IsLive(a)) out.push_back(a);
+    }
+    return out;
+}
+
+void MeasureGunShape(UObject g, const FVector& actor_loc, const FQuat& actor_rot, const FVector& grip_actor) {
+    if (!W.have_frame) return;
+    GunShape& s = g_gun_shape;
+    if (s.gun != g) s = {};
+    s.gun = g;
+    s.measured_at = g_clock;
+    s.boxes.clear();
+    s.gun_boxes = s.mag_boxes = s.fitted_boxes = 0;
+    const FQuat inv = (actor_rot * W.gun_frame).Inverse();
+    const FVector grip_w = actor_loc + actor_rot.Rotate(grip_actor);
+    auto add = [&](UObject actor, gun_walls::Part part, double max_size, int* count) {
+        for (UObject c : MeshComponents(actor)) {
+            FVector lo, hi;
+            if (!MeshBoxInFrame(c, inv, grip_w, &lo, &hi)) continue;
+            // Helper meshes (a light's beam cone) and anything not on the gun.
+            if (hi.X - lo.X > max_size || hi.Y - lo.Y > max_size || hi.Z - lo.Z > max_size) continue;
+            if (std::max({std::fabs(lo.X), std::fabs(hi.X), std::fabs(lo.Y), std::fabs(hi.Y), std::fabs(lo.Z),
+                          std::fabs(hi.Z)}) > 120.0)
+                continue;
+            s.boxes.push_back({gun_walls::Box{lo, hi}, part});
+            ++*count;
+        }
+    };
+    add(g, gun_walls::Part::kGun, 120.0, &s.gun_boxes);
+    UObject mag = 0;
+    ue::GetProp(g, "MagazineObj", mag);
+    const bool mag_in = mag && mag != W.held_mag && mag != W.pouch_mag && ue::IsLive(mag);
+    if (mag_in) add(mag, gun_walls::Part::kMagazine, 40.0, &s.mag_boxes);
+    for (UObject a : AttachedActors(g))
+        if (a != mag && a != W.held_mag && a != W.pouch_mag) add(a, gun_walls::Part::kGun, 30.0, &s.fitted_boxes);
+    if (!s.gun_boxes) {
+        // No measurable parts: at least the bore from the back of the gun to
+        // the muzzle (what the old muzzle line covered, and more).
+        s.boxes.push_back({gun_walls::Box{FVector{W.is_pistol ? -6.0 : -25.0, -1.5, W.bore_height - 2.0},
+                                          FVector{W.muzzle_dist, 1.5, W.bore_height + 1.5}},
+                           gun_walls::Part::kGun});
+    }
+    if (!s.logged) {
+        s.logged = true;
+        double lo_x = 1e9, hi_x = -1e9, lo_z = 1e9, hi_z = -1e9;
+        for (const auto& pb : s.boxes) {
+            lo_x = std::min(lo_x, pb.box.lo.X), hi_x = std::max(hi_x, pb.box.hi.X);
+            lo_z = std::min(lo_z, pb.box.lo.Z), hi_z = std::max(hi_z, pb.box.hi.Z);
+        }
+        log::Info("gun walls: %s is checked against walls as %d part boxes (%d of the gun, %d of its magazine, "
+                  "%d fitted to it%s), from %.1f to %.1f cm along the barrel and %.1f to %.1f cm up from the grip "
+                  "point, plus the hands on it",
+                  ue::GetName(ue::GetClass(g)).c_str(), static_cast<int>(s.boxes.size()), s.gun_boxes, s.mag_boxes,
+                  s.fitted_boxes, s.gun_boxes ? "" : "; no parts measured, the bore only", lo_x, hi_x, lo_z, hi_z);
+    }
+}
+
+// A hand on the gun as a box in the gun frame, round the visible hand (its
+// palm and back) as the body drew it last frame; false when the body has no
+// recent drawing of it.
+bool HandBoxOnGun(int side, gun_walls::Box* out) {
+    body::HandContacts hc;
+    if (!W.have_pose || !body::GetHandContacts(side, &hc)) return false;
+    const FQuat inv = W.frame_rot.Inverse();
+    // The middle of the fist: half a hand's thickness in from the palm.
+    const FVector mid = inv.Rotate(hc.palm - hc.palm_out * 1.5 - W.grip_world);
+    if (!std::isfinite(mid.X) || !std::isfinite(mid.Y) || !std::isfinite(mid.Z) || Len(mid) > 40.0) return false;
+    *out = gun_walls::Box{mid + FVector{-4.0, -4.5, -4.5}, mid + FVector{4.0, 4.5, 4.5}};
     return true;
 }
 
-// Keeps the held gun out of walls, like Half-Life: Alyx: the line from the
-// eyes to the muzzle finds what is in the way, and the whole gun moves out of
-// it along that surface (view_lead::WallPushOut; the hand on the gun follows
-// it), so against a wall it slides along it instead of coming back toward the
-// face. Twice, for a corner between two surfaces. Returns the offset to add
-// to the gun's location.
-FVector WallPushback(UObject gun, const FQuat& frame, const FVector& grip) {
+// The player's rifle and pistol (RifleCarry's), held or put away.
+void PlayerGuns(UObject* rifle, UObject* pistol);
+
+// Keeps the held gun out of walls, like Half-Life: Alyx: the gun's outline
+// (its parts, magazine and fitted parts, and the hands on it) is looked at
+// from the eyes; any outline point behind a surface puts the gun in it, and
+// the whole gun moves out along that surface (gun_walls::Solve; the hands on
+// the gun follow it), so against a wall it slides along it instead of
+// coming back toward the face. Twice, for a corner between two surfaces.
+// Owner 2026-11-07: hands and guns sank into the hub's walls: only the line
+// to the muzzle was checked before (gun_wall_whole_gun=0 brings that back).
+// Returns the offset to add to the gun's location.
+FVector WallPushback(UObject gun, const FQuat& frame, const FVector& grip, bool two) {
     if (!g_set.wall_collision) return FVector{};
+    perf::Scope timer(g_perf_gun_walls);
     // Looked up once: FindObject is a full object scan, too slow per frame.
     static UObject ksl = 0, gps = 0;
     static int lookups = 0;
@@ -1164,30 +1337,75 @@ FVector WallPushback(UObject gun, const FQuat& frame, const FVector& grip) {
     hands::Pose head;
     UObject player = game::Player();
     if (!ksl || !gps || !player || !hands::Head(&head)) return FVector{};
-    const FVector muzzle = grip + frame.Rotate(FVector{W.muzzle_dist, 0, 0});
-    // Not the gun or what the hands hold, and not the forearm menu or wrist
-    // HUD (they sit in front of the eyes whenever the left wrist is up).
+    // Not the gun or what the hands hold, not the forearm menu or wrist HUD
+    // (they sit in front of the eyes whenever the left wrist is up), and not
+    // the player or what hangs on it (body::hand_walls' list).
     std::vector<UObject> ignore{gun};
     if (W.held_mag) ignore.push_back(W.held_mag);
     if (W.pouch_mag) ignore.push_back(W.pouch_mag);
+    UObject in_mag = 0;
+    ue::GetProp(gun, "MagazineObj", in_mag);
+    if (in_mag) ignore.push_back(in_mag);
     const hands::HandGrab other = hands::GetGrab(HandOf(OtherHand()));
     if (other.object && other.object != gun) ignore.push_back(other.object);
     if (UObject holder = static_cast<UObject>(world_menu::PanelHolder())) ignore.push_back(holder);
-    constexpr double kClearanceCm = 1.0, kMaxPushCm = 40.0;
-    FVector push;
-    bool eyes_inside = false;
-    UObject what = 0;
-    for (int pass = 0; pass < 2; ++pass) {
-        FVector at, normal;
-        UObject hit_what = 0;
-        if (!EyeLine(ksl, gps, player, head.location, muzzle + push, ignore, &at, &normal, &hit_what, &eyes_inside))
-            break;
-        const FVector more = view_lead::WallPushOut(muzzle + push, at, normal, kClearanceCm, kMaxPushCm);
-        if (Len(more) < 0.01) break;
-        push = push + more;
-        if (!what) what = hit_what;
+    // The other gun in its holster (on the chest, behind the shoulder): the
+    // lines to the hand on a gun held low can pass it.
+    UObject rifle = 0, pistol = 0;
+    PlayerGuns(&rifle, &pistol);
+    for (UObject other_gun : {rifle, pistol})
+        if (other_gun && other_gun != gun) ignore.push_back(other_gun);
+    for (UObject a : body::hand_walls::IgnoredActors())
+        if (std::find(ignore.begin(), ignore.end(), a) == ignore.end()) ignore.push_back(a);
+
+    // The outline, gun frame.
+    std::vector<gun_walls::PartBox> boxes;
+    if (g_set.whole_gun && g_gun_shape.gun == gun) {
+        boxes = g_gun_shape.boxes;
+        gun_walls::Box hand_box;
+        if (!HandBoxOnGun(GunHand(), &hand_box)) {
+            // Where a fist sits on a grip: its web just under the slide.
+            const FVector mid{-1.0, 0.0, W.bore_height - 7.0};
+            hand_box = gun_walls::Box{mid + FVector{-4.0, -4.5, -4.5}, mid + FVector{4.0, 4.5, 4.5}};
+        }
+        boxes.push_back({hand_box, gun_walls::Part::kFiringHand});
+        gun_walls::Box support_box;
+        if (two && HandBoxOnGun(OtherHand(), &support_box))
+            boxes.push_back({support_box, gun_walls::Part::kSupportHand});
+        else if (two)
+            boxes.push_back({gun_walls::SupportHandBox(W.support_id >= 0 ? W.support_draw : W.support_local),
+                             gun_walls::Part::kSupportHand});
     }
-    if (Len(push) > kMaxPushCm) push = push * (kMaxPushCm / Len(push));
+    std::vector<gun_walls::Point> outline;
+    if (!boxes.empty()) outline = gun_walls::Outline(boxes, 1.0, 20.0, 48);
+    else outline.push_back({FVector{W.muzzle_dist, 0, 0}, gun_walls::Part::kGun});  // the muzzle only (before)
+    std::vector<FVector> points;
+    std::vector<gun_walls::Part> parts;
+    for (const gun_walls::Point& p : outline) {
+        points.push_back(grip + frame.Rotate(p.at));
+        parts.push_back(p.part);
+    }
+    // A rifle's points in groups along it (about 30 cm each): a wall by one
+    // end only has that end's points looked at.
+    const std::vector<int> groups = gun_walls::GroupsAlongBarrel(outline, 30.0, 3);
+    constexpr double kClearanceCm = 1.0, kMaxPushCm = 40.0;
+    GunWallTraces traces(ksl, gps, player, ignore, g_set.wall_shape_mode);
+    gun_walls::Result r;
+    if (traces.ok)
+        r = gun_walls::Solve(
+            head.location, points, parts, [&](const FVector& a, const FVector& b) { return traces.Line(a, b); },
+            kClearanceCm, kMaxPushCm, 2, groups,
+            [&](const FVector& a, const FVector& c, double radius) { return traces.Close(a, c, radius); });
+    const bool close = r.groups_close > 0;
+    FVector push = r.push;
+    // Where the game's hit box is against what you see, on the line to the
+    // part furthest in (the "wall shapes" log line).
+    if (r.deepest >= 0 && static_cast<size_t>(r.deepest) < points.size()) {
+        const FVector to = points[r.deepest];
+        const FVector dir = to - head.location;
+        const double len = Len(dir);
+        if (len > 1.0) wall_shapes::Compare(player, head.location, to + dir * (3.0 / len), ignore, wall_shapes::kGun);
+    }
     // For the log.
     static FVector s_last;
     static double s_last_clock = -1;
@@ -1200,15 +1418,20 @@ FVector WallPushback(UObject gun, const FQuat& frame, const FVector& grip) {
     {
         std::lock_guard<std::mutex> lock(g_push_log_mutex);
         ++g_push_log.frames;
-        if (eyes_inside) ++g_push_log.eyes_inside;
-        if (size > 0) ++g_push_log.pushed;
+        g_push_log.points = static_cast<int>(points.size());
+        if (close) ++g_push_log.near_frames, g_push_log.looks += r.queries;
+        if (r.eyes_inside) ++g_push_log.eyes_inside;
+        if (size > 0) {
+            ++g_push_log.pushed;
+            ++g_push_log.by_part[static_cast<int>(r.deepest_part)];
+        }
         if (step > 3.0) ++g_push_log.jumps;
         if (step > g_push_log.jump_max) g_push_log.jump_max = step;
         most = size > g_push_log.push_max;
         if (most) g_push_log.push_max = size;
     }
     if (most) {
-        const std::string name = what ? ue::GetName(what) : std::string("something");
+        const std::string name = r.what ? ue::GetName(r.what) : std::string("something");
         std::lock_guard<std::mutex> lock(g_push_log_mutex);
         if (g_push_log.push_max == size) g_push_log.worst_what = name;
     }
@@ -1409,6 +1632,9 @@ void HoldGun(game::Gun& gun, const hands::HandState& rh) {
     FVector rel = actor_rot.Inverse().Rotate(main_world.translation - actor_loc);
 
     if (!W.have_frame) LearnGunFrame(g, actor_loc, actor_rot, main_world.translation);
+    // The gun's parts for keeping it out of walls: when taken, then every 4 s.
+    if (W.have_frame && (g_gun_shape.gun != g || g_clock - g_gun_shape.measured_at > 4.0))
+        MeasureGunShape(g, actor_loc, actor_rot, rel);
     // The controller's pointing ray sits about 30 degrees above a pistol's
     // bore in a natural grip (second headset test: barrel at 10 o'clock
     // instead of 9 seen from the side), so pitch down by that first.
@@ -1545,7 +1771,7 @@ void HoldGun(game::Gun& gun, const hands::HandState& rh) {
     }
     FQuat rot = W.have_frame ? hand * W.gun_frame.Inverse() : hand;
     FVector loc = grip_w - rot.Rotate(rel);
-    FVector push = WallPushback(g, hand, grip_w);
+    FVector push = WallPushback(g, hand, grip_w, two);
     loc = loc + push;
     W.grip_world = grip_w + push;
     W.have_support_point = two;
@@ -5038,6 +5264,11 @@ struct RifleCarryState {
     ActionEvent to_secondary{"InpActEvt_SwitchToSecondary_K2Node_InputActionEvent_6"};
     bool logged_guns = false;
 } g_rc;
+
+void PlayerGuns(UObject* rifle, UObject* pistol) {
+    *rifle = g_rc.rifle;
+    *pistol = g_rc.pistol;
+}
 
 bool GunIsRifle(UObject player) {
     game::Gun gun = game::Gun::Current(player);

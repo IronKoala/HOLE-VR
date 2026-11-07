@@ -114,11 +114,26 @@ const Block kBlocks[] = {
      "menu_button_pauses=1\n"},
     {"hand_world_trace_complex",
      "\n"
-     "; Diagnostic surface mode shared by empty-hand palm and finger checks.\n"
-     "; 0 = the game's simple collision, 1 = complex mesh collision.\n"
-     "; Compare only when visible surfaces lack contact; this does not create\n"
-     "; collision on meshes that disable it, and detailed queries may cost more.\n"
+     "; Older switch for the surfaces empty hands and fingers stop at; replaced by\n"
+     "; wall_shape below (1 here with wall_shape=game means visible).\n"
      "hand_world_trace_complex=0\n"},
+    {"wall_shape",
+     "\n"
+     "; --- What your hands and the held gun stop at ---\n"
+     "; nearest = whichever comes first: the shape you see (each wall's or\n"
+     ";   object's own triangles) or the game's simplified hit box, so hands,\n"
+     ";   fingers and guns go into neither, even where the game's hit boxes are\n"
+     ";   smaller than the wall you see or missing.\n"
+     "; visible = only the shapes you see. game = only the game's hit boxes\n"
+     ";   (the mod before 2026-11-07).\n"
+     "wall_shape=nearest\n"
+     "; 1 = the whole held gun stops at walls: its slide, grip, magazine, stock,\n"
+     "; fitted parts and the hands on it. 0 = only the line from your eyes to the\n"
+     "; muzzle (before 2026-11-07).\n"
+     "gun_wall_whole_gun=1\n"
+     "; 1 = the log says, per wall or object your hands and gun touch, how far the\n"
+     "; game's hit box is from the surface you see (\"wall shapes:\" lines).\n"
+     "wall_shape_report=1\n"},
     {"hand_individual_finger_collision",
      "\n"
      "; Empty fingers check each of their three segments against nearby objects.\n"

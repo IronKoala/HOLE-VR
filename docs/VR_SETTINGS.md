@@ -383,8 +383,8 @@ hand.
   the menu laser still use where the controller really is, so nothing gets
   harder to reach.
 - A hand holding something follows that object: the gun keeps itself out of
-  walls (`gun_wall_collision`, a trace from the eyes to the muzzle), and the
-  support hand and slide hand follow the gun.
+  walls (`gun_wall_collision`; the whole gun since 2026-11-07, see "The whole
+  gun stops at walls" below), and the support hand and slide hand follow it.
 - If the eyes themselves are inside something (leaning through a wall), the
   hands are not stopped, since there is no sensible surface to stop them at.
 - The forearm menu and wrist HUD panels are ignored too (they block the
@@ -457,6 +457,68 @@ the line across the knuckles pointing into the surface) keep their angle.
 The fingers follow the controller's curl less the flatness.
 `hand_press_flat_on_walls=1` (on); it needs the hand wall check.
 
+## The whole gun stops at walls; the shapes you see (src/vr/gun_walls_math.cpp, src/vr/wall_shapes.cpp)
+
+Owner 2026-11-07: "The hit boxes in the hub need to be refined so the current
+physics hands and guns collide correctly and not sink into the wall."
+
+Two causes, both fixed:
+
+- **Only the muzzle line was checked.** The held gun was kept out of walls by
+  one line from the eyes to the muzzle, so the sides of the slide, the grip
+  and magazine, a rifle's stock and handguard, and the hands holding the gun
+  (they are skipped by the empty-hand check) went into walls freely: a gun
+  laid along a wall, or a rifle turned until its stock met one, sank in. Now
+  the gun's parts are measured as boxes in the gun frame when it is taken and
+  every 4 s (its meshes, the magazine in it, and fitted parts: light, sight,
+  suppressor; a light's beam cone and anything far off are skipped), plus a
+  box round each hand on it, placed round the hand the body drew last frame
+  (palm and back). Their outline points (the furthest corners in 26
+  directions, and for a rifle the widest point each way every 20 cm along it;
+  about 20 points for a pistol, 35 for a rifle) are each looked at from the
+  eyes; a point behind a surface means that part is in it, and the whole gun
+  moves out along the surface's normal by the deepest point's depth + 1 cm.
+  A second pass handles corners. A rifle's points are split into up to three
+  groups along it; a group's points are only looked at when a ball round
+  them, swept from the eyes, finds anything at all (every line from the eyes
+  to those points lies inside that sweep, so it never misses one), so a wall
+  by the muzzle doesn't cost the stock's lines.
+  `gun_wall_whole_gun=0` brings back the muzzle line alone.
+- **The game's hit boxes.** Every wall check used Unreal's "simple"
+  collision: the boxes and hulls the game's meshes were given, which can be
+  smaller than the wall you see, or missing. Hands, fingers and the gun now
+  also check each mesh's own triangles ("complex" collision, the shape you
+  see) and stop at whichever comes first: `wall_shape=nearest` (default), so
+  they go into neither, and a mesh without collision triangles still stops
+  them at its hit box as before. Each hand and finger sweep and each gun line
+  is made twice for this. `wall_shape=visible` uses only the shapes you see,
+  `wall_shape=game` only the hit boxes (before 2026-11-07); the older
+  `hand_world_trace_complex=1` with `wall_shape=game` means visible.
+
+Log lines:
+
+- `wall shapes: hands and the held gun stop at whichever comes first, the
+  shape you see or the game's hit box` at start and on a settings change;
+  `hand proxy: on (... against whichever comes first ...)`.
+- `gun walls: BP_HG_C is checked against walls as N part boxes (N of the gun,
+  N of its magazine, N fitted to it), from X to X cm along the barrel and Z to
+  Z cm up from the grip point, plus the hands on it`, once per gun taken.
+- `gun wall push: ... in N of M frames (most X cm, against <thing>) ...; part
+  furthest in: gun N, gun hand N, magazine N, support hand N; something near
+  the gun in N frames, N outline points, N looks a frame then`, every 10 s
+  while it pushed. "gun hand" pushes are the ones the old check missed.
+- `wall shapes (where the hands and gun touched things; the game's hit box vs
+  the shape you see): | <mesh>: N looks (hands N, gun N); hit box X cm behind
+  the surface N times (worst X); hit box X cm in front of it N times; same
+  place N times; NO hit box on the line N times`, every 10 s while hands or
+  the gun touch something (`wall_shape_report=1`). Up to four looks a second
+  for the hands and four for the gun, each two line traces from the eyes
+  through the touched spot. "Behind" = things sank into that mesh with the
+  game's hit boxes; "NO hit box" = they went straight through it. When the
+  hit box belongs to something else (an invisible blocking volume) its name
+  follows in brackets.
+- The perf report has a `gun wall collision` timer.
+
 ## Log lines to check after a test
 
 - `vr options: ready (a VR tab is added to Options)` at start.
@@ -502,6 +564,11 @@ The fingers follow the controller's curl less the flatness.
 
 ## Tests
 
+- `tests/test_gun_walls.cpp`: the gun outline (muzzle, hand sides, magazine
+  bottom, no point in a pistol's empty space under the barrel, rifle slices),
+  the push out of a wall beside the gun (missed by the old muzzle line), into
+  a wall, a rifle stock into a wall behind, a corner, eyes inside, the 40 cm
+  cap, clear space, and the groups' near check (same push, fewer lines).
 - `tests/test_comfort.cpp`: vignette texture, levels, smoothing, real crouch
   and jump, aim smoothing, grip toggle.
 - `tests/test_finger_rest.cpp`: fingers against a plane (the bend path, a

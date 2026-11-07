@@ -31,6 +31,8 @@ add_library(hole_vr SHARED
     src/vr/stereo.cpp
     src/vr/view_lead.cpp
     src/vr/view_lead_math.cpp
+    src/vr/gun_walls_math.cpp
+    src/vr/wall_shapes.cpp
     src/vr/square_test.cpp
     src/vr/square_watch.cpp
     src/vr/square_watch_math.cpp
@@ -229,12 +231,13 @@ if(HOLEVR_BUILD_TESTS)
     add_executable(test_comfort tests/test_comfort.cpp src/vr/comfort_math.cpp)
     add_executable(test_kick tests/test_kick.cpp src/vr/kick.cpp)
     add_executable(test_turn tests/test_turn.cpp)
+    add_executable(test_gun_walls tests/test_gun_walls.cpp src/vr/gun_walls_math.cpp)
     add_executable(test_gpu_share tests/test_gpu_share.cpp)
     add_executable(test_offhand_snap tests/test_offhand_snap.cpp src/vr/interact/offhand_snap.cpp)
     add_executable(test_magwell_zone tests/test_magwell_zone.cpp src/vr/interact/magwell_zone.cpp
                    src/vr/body/ik_math.cpp)
     add_executable(test_shell_load tests/test_shell_load.cpp src/vr/interact/shell_load.cpp)
-    foreach(case body grip watch watch_marshal holster_visual holster_audio vr_options menu_input hand_ownership comfort kick turn workbench_rules bench_vise bench_layout rifle_carry vise_weapons workbench_release attachment_transaction ammo_refresh workbench_bughunt magwell_zone shell_load gpu_share offhand_snap)
+    foreach(case body grip watch watch_marshal holster_visual holster_audio vr_options menu_input hand_ownership comfort kick turn workbench_rules bench_vise bench_layout rifle_carry vise_weapons workbench_release attachment_transaction ammo_refresh workbench_bughunt magwell_zone shell_load gpu_share offhand_snap gun_walls)
         target_include_directories(test_${case} PRIVATE src)
         if(MSVC)
             target_compile_options(test_${case} PRIVATE /EHsc)
