@@ -514,7 +514,7 @@ const Block kBlocks[] = {
      "\n"
      "; --- Reloading: where a magazine lines up with the magwell ---\n"
      "; Its top must come into a box under the gun's magwell opening, measured for\n"
-     "; each magazine in each gun: this deep (cm; 2.54 = an inch),\n"
+     "; each magazine in each gun: this deep (cm; 2.54 = an inch; rifles),\n"
      "mag_line_up_cm=2.54\n"
      "; its top at most this far off the magwell's line (cm),\n"
      "mag_line_up_side_cm=3.5\n"
@@ -522,6 +522,16 @@ const Block kBlocks[] = {
      "mag_line_up_tilt_deg=35\n"
      "; Pushed in to this close to seated (cm), it clicks in by itself.\n"
      "mag_seat_last_cm=1\n"},
+    {"mag_line_up_pistol_cm",
+     "\n"
+     "; --- Reloading the pistol ---\n"
+     "; A pistol magazine lines up from this deep under the magwell (cm; 3.81 = an\n"
+     "; inch and a half). mag_line_up_cm above is the rifle's.\n"
+     "mag_line_up_pistol_cm=3.81\n"
+     "; With the gun in the left hand the real controllers knock together under the\n"
+     "; grip: near the gun the magazine is drawn this far (cm) out of the right hand\n"
+     "; along its own length, so the controllers stay apart. 0 = off.\n"
+     "mag_reach_left_gun_cm=6\n"},
     {"mag_insert_anim_ar",
      "\n"
      "; --- Reloading the AR ---\n"
