@@ -144,7 +144,10 @@ struct Settings {
     bool wall_collision = true;    // keep the gun out of walls
     // In-hand recoil kick strength by gun and grip (VR tab; owner 2026-11-07:
     // rifle one hand Heavy, two hands Strong; pistol one hand Stronger, two
-    // hands Normal). 1 = Normal, 0 = off.
+    // hands Normal). 1 = Normal, 0 = off. Every other gun (shotgun, sniper
+    // rifle) keeps the one Gun kick (owner, same day: "we still have two
+    // more guns to test").
+    double recoil_kick = 1.0;
     double kick_pistol_one = 2.4, kick_pistol_two = 1.0;
     double kick_rifle_one = 3.3, kick_rifle_two = 1.5;
     double pistol_both_hands_cm = 13.0;  // other controller this near the gun hand's: both hands
@@ -238,6 +241,7 @@ void LoadSettings() {
     g_set.gun_yaw = config::GetFloat("gun_yaw_offset", 0.f);
     g_set.gun_roll = config::GetFloat("gun_roll_offset", 0.f);
     g_set.wall_collision = config::GetBool("gun_wall_collision", true);
+    g_set.recoil_kick = config::GetFloat("gun_recoil_kick", 1.f);
     g_set.kick_pistol_one = config::GetFloat("gun_kick_pistol_one_hand", 2.4f);
     g_set.kick_pistol_two = config::GetFloat("gun_kick_pistol_two_hands", 1.f);
     g_set.kick_rifle_one = config::GetFloat("gun_kick_rifle_one_hand", 3.3f);
@@ -725,6 +729,7 @@ struct WeaponState {
     // of the upper receiver, a bolt catch on the left, a vertical magwell
     // and a handguard for the support hand.
     bool is_pistol = true;
+    bool is_ar = false;           // BP_AR_*: its own kick rows (the shotgun and sniper rifle use Gun kick)
     double muzzle_dist = 18.0;    // grip to muzzle along the bore, cm
     FVector slide_axis{-1, 0, 0}; // bolt/slide pull direction in its parent's space
     bool two_hand = false;        // support hand on the handguard
@@ -1303,15 +1308,15 @@ bool PistolInBothHands(const hands::HandState& gun_hand, const hands::HandState&
 // The first shots, and every change of gun or grip after, log the strength
 // they kicked with (and how far apart the hands were, to tune the pistol's
 // both-hands distance).
-void LogKickLevel(bool pistol, bool both, double level, double apart_cm) {
-    static int shots = 0, last = -1;
-    const int kind = (pistol ? 2 : 0) + (both ? 1 : 0);
+void LogKickLevel(const char* gun, bool both, double level, double apart_cm) {
+    static int shots = 0;
+    static std::string last;
+    const std::string kind = std::string(gun) + (both ? "2" : "1");
     if (++shots > 3 && kind == last) return;
     last = kind;
     char apart[48] = "the other hand not tracked";
     if (apart_cm >= 0) std::snprintf(apart, sizeof(apart), "hands %.0f cm apart", apart_cm);
-    log::Info("controls: gun kick %.1f (%s, %s; %s)", level, pistol ? "pistol" : "rifle",
-              both ? "both hands" : "one hand", apart);
+    log::Info("controls: gun kick %.1f (%s, %s; %s)", level, gun, both ? "both hands" : "one hand", apart);
 }
 
 void HoldGun(game::Gun& gun, const hands::HandState& rh) {
@@ -1407,8 +1412,10 @@ void HoldGun(game::Gun& gun, const hands::HandState& rh) {
             const double apart = lh2.valid ? Len(lh2.grip.location - rh.grip.location) : -1.0;
             const bool both = W.is_pistol ? PistolInBothHands(rh, lh2) : two;
             W.kick_level = W.is_pistol ? (both ? g_set.kick_pistol_two : g_set.kick_pistol_one)
-                                       : (both ? g_set.kick_rifle_two : g_set.kick_rifle_one);
-            LogKickLevel(W.is_pistol, both, W.kick_level, apart);
+                           : W.is_ar   ? (both ? g_set.kick_rifle_two : g_set.kick_rifle_one)
+                                       : g_set.recoil_kick;
+            LogKickLevel(W.is_pistol ? "pistol" : W.is_ar ? "rifle" : "other gun (Gun kick)", both, W.kick_level,
+                         apart);
         }
         double t = g_clock - W.kick_t0;
         if (t > 0.4) W.kick_t0 = -1;
@@ -6678,6 +6685,7 @@ void OnTick(UObject player, float dt) {
         W.gun = gun.Object();
         if (gun.Valid()) {
             W.is_pistol = gun.ClassName().find("HG") != std::string::npos;
+            W.is_ar = gun.ClassName().find("BP_AR") != std::string::npos;
             W.uses_holster = W.is_pistol && g_set.holster_pistol && g_spots[kPistolSpot].enabled;
             W.holster.Configure(g_spots[kPistolSpot].radius,
                                 g_set.holster_toggle ? interact::DrawMode::kToggle : interact::DrawMode::kHold);

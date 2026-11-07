@@ -146,6 +146,11 @@ const std::vector<Row>& Rows() {
         // is two handed, normal"). Same nine strengths each (earlier the same
         // day: five past Strong, the fifth 4x Strong). The pistol counts as
         // two-handed while the other hand touches the gun hand.
+        // Gun kick stays for every other gun (owner: "i never told you to
+        // remove them in the first place, we still have two more guns to
+        // test"): the shotgun and sniper rifle.
+        {"Gun kick", K::kChoice, KickChoices("gun_recoil_kick"), 2,
+         "How hard each shot kicks guns without their own rows below (shotgun, sniper rifle). Extreme is 4x Strong."},
         {"Pistol kick, one hand", K::kChoice, KickChoices("gun_kick_pistol_one_hand"), 4,
          "How hard each shot kicks the pistol in one hand. Extreme is 4x Strong."},
         {"Pistol kick, two hands", K::kChoice, KickChoices("gun_kick_pistol_two_hands"), 2,
