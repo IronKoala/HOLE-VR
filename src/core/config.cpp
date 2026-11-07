@@ -826,6 +826,15 @@ const Block kBlocks[] = {
      "; Lumen indirect lighting quality in VR. Levels ask for 2; 1 looks nearly the\n"
      "; same and saves about 0.7 ms of GPU time a frame. 0 = the game's own.\n"
      "vr_lumen_gi_quality=1\n"},
+    {"vr_shadow_quality",
+     "\n"
+     "; Frame times in VR (72 Hz needs the GPU under about 12 ms a frame):\n"
+     "; shadow quality low / medium / high / epic / game (the game's own, Epic).\n"
+     "; High saves about 0.7 ms a frame against Epic.\n"
+     "vr_shadow_quality=high\n"
+     "; Lumen indirect lighting probes: half (half as many, saves about 0.9 ms a\n"
+     "; frame) / full / game.\n"
+     "vr_lumen_probes=half\n"},
     {"process_metrics",
      "\n"
      "; Every 30 s log the game process's memory, handles, CPU and disk use (game\n"

@@ -14,22 +14,29 @@
 #include "vr/openxr.h"
 #include "vr/square_test.h"
 #include "vr/ui_panel.h"
+#include "vr/world_menu.h"
 
 namespace holevr::vr::gpu_test {
 namespace {
 using ue::UObject;
+
+// One console variable a suspect switches. `test` is the value under test;
+// one starting with '+' is added to the value the variable had ("+1").
+struct Switch {
+    const char* cvar;
+    const char* test;
+    bool is_float;
+    std::string original;  // read when the suspect starts
+};
 
 // One render feature to measure: switched to `test` and back, three times,
 // 1.5 s each way, while the GPU timer counts each frame. The first 0.4 s of
 // every window is left out (the engine reallocates some buffers on a switch).
 struct Suspect {
     const char* what;
-    const char* cvar;  // nullptr: nothing switched (shows the noise), or `toggle`
-    const char* test;
-    bool is_float;
+    std::vector<Switch> sw;  // empty: nothing switched (shows the noise), or `toggle`
     void (*toggle)(bool test) = nullptr;  // switched by the mod, not a console variable
     void (*decide)(const struct Suspect& s) = nullptr;  // after it is measured
-    std::string original;
     double base_ms = 0.0, test_ms = 0.0, base_idle = 0.0, test_idle = 0.0;
     long base_n = 0, test_n = 0, base_idle_n = 0, test_idle_n = 0;
     long long base_sent = 0, test_sent = 0, base_missed = 0, test_missed = 0;  // headset frames
@@ -53,22 +60,36 @@ double g_level_clock = 0.0;
 constexpr double kWindowS = 1.5, kSettleS = 0.4;
 constexpr int kCycles = 3;
 
-void Add(const char* what, const char* cvar, const char* test, bool is_float = false) {
+void Add(const char* what, std::vector<Switch> sw) {
     Suspect s;
     s.what = what;
-    s.cvar = cvar;
-    s.test = test;
-    s.is_float = is_float;
+    s.sw = std::move(sw);
     g_suspects.push_back(s);
 }
 
-std::string ReadNow(const Suspect& s) {
-    if (s.is_float) {
+void Add(const char* what, const char* cvar, const char* test, bool is_float = false) {
+    if (cvar) Add(what, std::vector<Switch>{{cvar, test, is_float, {}}});
+    else Add(what, std::vector<Switch>{});
+}
+
+bool Readable(const Switch& w) { return !w.original.empty() && w.original != "-12345"; }
+
+std::string ReadNow(const Switch& w) {
+    if (w.is_float) {
+        const float v = cvars::ReadFloatNow(w.cvar, -12345.f);
+        if (v == -12345.f) return "-12345";
         char b[32];
-        std::snprintf(b, sizeof(b), "%g", cvars::ReadFloatNow(s.cvar, -12345.f));
+        std::snprintf(b, sizeof(b), "%g", v);
         return b;
     }
-    return std::to_string(cvars::ReadIntNow(s.cvar, -12345));
+    return std::to_string(cvars::ReadIntNow(w.cvar, -12345));
+}
+
+std::string TestValue(const Switch& w) {
+    if (w.test[0] != '+') return w.test;
+    char b[32];
+    std::snprintf(b, sizeof(b), "%g", std::atof(w.original.c_str()) + std::atof(w.test + 1));
+    return b;
 }
 
 void Set(UObject player, const Suspect& s, bool test) {
@@ -76,13 +97,25 @@ void Set(UObject player, const Suspect& s, bool test) {
         s.toggle(test);
         return;
     }
-    if (!s.cvar || s.original.empty() || s.original == "-12345") return;
-    cvars::RunNow(std::string(s.cvar) + " " + (test ? s.test : s.original), player);
+    for (const Switch& w : s.sw)
+        if (Readable(w)) cvars::RunNow(std::string(w.cvar) + " " + (test ? TestValue(w) : w.original), player);
+}
+
+// "r.A 0, r.B 0" and "3, 5" for the log.
+std::string Describe(const Suspect& s, bool originals) {
+    if (s.toggle) return originals ? "-" : "the mod";
+    if (s.sw.empty()) return originals ? "-" : "nothing switched";
+    std::string out;
+    for (const Switch& w : s.sw) {
+        if (!out.empty()) out += ", ";
+        out += originals ? (Readable(w) ? w.original : std::string("?")) : std::string(w.cvar) + " " + TestValue(w);
+    }
+    return out;
 }
 
 void BeginSuspect(UObject player) {
     Suspect& s = g_suspects[g_index];
-    if (s.cvar) s.original = ReadNow(s);
+    for (Switch& w : s.sw) w.original = ReadNow(w);
     s.base_ms = s.test_ms = s.base_idle = s.test_idle = 0.0;
     s.base_n = s.test_n = s.base_idle_n = s.test_idle_n = 0;
     s.base_sent = s.test_sent = s.base_missed = s.test_missed = 0;
@@ -108,8 +141,10 @@ void Summary() {
     // GPU frame = fixed part + per-pixel part x (resolution share)^2, from
     // each resolution point against the full-resolution windows.
     for (const Suspect& s : g_suspects) {
-        if (!s.cvar || std::string(s.cvar) != "r.ScreenPercentage" || s.base_n == 0 || s.test_n == 0) continue;
-        const double f = std::atof(s.test) / 100.0;
+        if (s.sw.size() != 1 || std::string(s.sw[0].cvar) != "r.ScreenPercentage" || s.base_n == 0 ||
+            s.test_n == 0)
+            continue;
+        const double f = std::atof(s.sw[0].test) / 100.0;
         const double base = s.base_ms / s.base_n;
         const double pixel = s.saved / (1.0 - f * f);
         log::Info("GPU cost test: from the %s point, about %.1f ms of the %.1f ms GPU frame follows the number of "
@@ -127,15 +162,15 @@ void FinishSuspect(UObject player) {
     s.saved = base - test;
     const double bmiss = s.base_sent ? 100.0 * s.base_missed / (s.base_sent + s.base_missed) : 0.0;
     const double tmiss = s.test_sent ? 100.0 * s.test_missed / (s.test_sent + s.test_missed) : 0.0;
-    if (s.cvar && (s.original.empty() || s.original == "-12345")) {
-        log::Info("GPU cost test: %s: %s could not be read, skipped", s.what, s.cvar);
+    const bool none = !s.sw.empty() && std::none_of(s.sw.begin(), s.sw.end(), Readable);
+    if (none) {
+        log::Info("GPU cost test: %s: %s could not be read, skipped", s.what, s.sw[0].cvar);
         s.saved = 0.0;
     } else {
-        log::Info("GPU cost test: %s (%s %s, was %s): GPU %.2f -> %.2f ms a frame (%+.2f ms; each try%s), GPU idle "
+        log::Info("GPU cost test: %s (%s, was %s): GPU %.2f -> %.2f ms a frame (%+.2f ms; each try%s), GPU idle "
                   "%.2f -> %.2f ms; headset slots missed %.1f%% -> %.1f%%; %ld + %ld frames",
-                  s.what, s.cvar ? s.cvar : s.toggle ? "the mod" : "nothing switched", s.cvar ? s.test : "",
-                  s.cvar ? s.original.c_str() : "-", base, test, test - base, s.tries.c_str(), bidle, tidle, bmiss,
-                  tmiss, s.base_n, s.test_n);
+                  s.what, Describe(s, false).c_str(), Describe(s, true).c_str(), base, test, test - base,
+                  s.tries.c_str(), bidle, tidle, bmiss, tmiss, s.base_n, s.test_n);
     }
     if (s.decide) s.decide(s);
     ++g_index;
@@ -252,6 +287,10 @@ bool Running() { return g_phase == Phase::kRunning; }
 // (its work plus its idle) got shorter.
 void ToggleAsyncEnd(bool on) { xr::SetAsyncEnd(on, "GPU cost test"); }
 
+// Base: the HUD as it is (out of sight unless you look). Test: shown on the
+// arm and redrawn every frame, as when you look at it.
+void ToggleHud(bool on) { world_menu::ForceHudShown(on); }
+
 void DecideAsyncEnd(const Suspect& s) {
     const double base = s.base_n ? (s.base_ms + s.base_idle) / s.base_n : 0.0;
     const double test = s.test_n ? (s.test_ms + s.test_idle) / s.test_n : 0.0;
@@ -275,19 +314,31 @@ void Init() {
     }
     // Measured on 2026-11-06 (08:49 run): Lumen GI off -0.63 ms, regular
     // shadows instead of virtual +7.9 ms, fog and screen-space AO were off
-    // already; those are no longer switched.
-    Add("Lumen GI tracing at 3/4 resolution", "r.Lumen.ScreenProbeGather.TracingOctahedronResolution", "6");
-    Add("Lumen GI probes at half density", "r.Lumen.ScreenProbeGather.DownsampleFactor", "32");
-    Add("Lumen lighting of see-through things", "r.Lumen.TranslucencyVolume.Enable", "0");
-    Add("Lumen short-range AO", "r.Lumen.ScreenProbeGather.ShortRangeAO", "0");
-    Add("shadow quality high instead of epic", "sg.ShadowQuality", "2");
-    // 2026-11-07: 75% resolution saved only 2.3 of ~14 ms, so most of the
-    // frame does not follow the pixel count. A second resolution point splits
-    // the frame into its per-pixel and fixed parts (summary line), and all
-    // shadows off for a moment shows how much of the fixed part is shadows.
-    Add("all shadows off", "r.ShadowQuality", "0");
-    Add("75% resolution", "r.ScreenPercentage", "75", true);
+    // already. 2026-11-07 (Office): shadows High instead of Epic -0.67 ms and
+    // Lumen GI probes at half density -0.88 ms are VR defaults now (cvars);
+    // GI tracing at 3/4 -0.57 ms is about what the GI quality 1 cap does;
+    // Lumen on see-through things -0.12 and short-range AO -0.09 are small.
+    // Those are no longer switched.
+    //
+    // The same run split the 12.9 ms GPU frame into about 4.9 ms that
+    // follows the pixel count and 7.9 ms that does not, of which all shadows
+    // were 2.7 ms. These points split the rest of the fixed part.
     Add("50% resolution", "r.ScreenPercentage", "50", true);
+    Add("all shadows off", "r.ShadowQuality", "0");
+    Add("sun shadows one step coarser", "r.Shadow.Virtual.ResolutionLodBiasDirectional", "+1", true);
+    Add("lamp shadows one step coarser", "r.Shadow.Virtual.ResolutionLodBiasLocal", "+1", true);
+    Add("Lumen GI off entirely", "r.Lumen.DiffuseIndirect.Allow", "0");
+    Add("objects drawn half as far", "r.ViewDistanceScale", "0.5", true);
+    Add("post effects off (bloom, motion blur, depth of field, lens flares, auto exposure)",
+        {{"r.BloomQuality", "0", false, {}},
+         {"r.MotionBlurQuality", "0", false, {}},
+         {"r.DepthOfFieldQuality", "0", false, {}},
+         {"r.LensFlareQuality", "0", false, {}},
+         {"r.EyeAdaptationQuality", "0", false, {}}});
+    // Owner 2026-11-07: what do the menus cost? Out of sight the wrist HUD is
+    // redrawn 4 times a second; this is it shown and redrawn every frame.
+    Add("wrist HUD shown and redrawn every frame", nullptr, nullptr);
+    g_suspects.back().toggle = &ToggleHud;
     game::AddTickListener(&OnTick);
     log::Info("GPU cost test: ready; runs once, %.0f s into the first run level (not the home base), if the GPU "
               "timer is on",

@@ -118,14 +118,15 @@ DWORD WINAPI Loop(LPVOID) {
         }
         failures = 0;
         std::map<std::string, Share> by_luid;
+        ProgramUse game;  // the game's own use, every engine type on every card
         const auto* items = reinterpret_cast<const PDH_FMT_COUNTERVALUE_ITEM_W*>(buf.data());
         for (DWORD i = 0; i < count; ++i) {
-            if (items[i].FmtValue.CStatus != PDH_CSTATUS_VALID_DATA &&
-                items[i].FmtValue.CStatus != PDH_CSTATUS_NEW_DATA)
-                continue;
             Instance in;
             if (!ParseInstance(Narrow(items[i].szName), &in)) continue;
-            by_luid[in.luid].Add(in, items[i].FmtValue.doubleValue);
+            const bool valid = items[i].FmtValue.CStatus == PDH_CSTATUS_VALID_DATA ||
+                               items[i].FmtValue.CStatus == PDH_CSTATUS_NEW_DATA;
+            if (in.pid == own) game.Add(in, items[i].FmtValue.doubleValue, valid);
+            if (valid) by_luid[in.luid].Add(in, items[i].FmtValue.doubleValue);
         }
         // The card the game draws on: the one where the game uses the 3D
         // engine most (else the busiest one).
@@ -152,6 +153,10 @@ DWORD WINAPI Loop(LPVOID) {
                       Top(card->by_pid[ecomp], name_of, 3).c_str(), card->total[eenc],
                       Top(card->by_pid[eenc], name_of, 3).c_str(), card->total[ecopy],
                       Top(card->by_pid[ecopy], name_of, 3).c_str(), perf::NowMs() - t0);
+            // 2026-11-07: the game never showed on the 3D engine above, so
+            // its work is counted under another engine type; these say where.
+            log::Info("gpu share (last 10 s): the game itself: %s (%d counters) | other engines on the card: %s",
+                      FormatTop(game.by_type, 6).c_str(), game.instances, FormatTop(card->other_types, 4).c_str());
         }
         if (round % kReopenEvery == 0) {
             g_pdh.close(query);

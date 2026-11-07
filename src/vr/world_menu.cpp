@@ -3214,6 +3214,8 @@ bool LookingAtArm() {
     return facing > std::cos(S.hud_look_deg * kDegToRad) && gaze > std::cos(40.0 * kDegToRad);
 }
 
+bool g_force_hud = false;  // game thread; GPU cost test
+
 // Every frame: keeps the HUD on the arm, fades it in and out, and lets go of
 // it when the game takes it away or puts it back on the flat screen.
 void UpdateHud(double now) {
@@ -3232,7 +3234,7 @@ void UpdateHud(double now) {
     if (CallBool(HP.widget, "IsInViewport")) return UnhostHud("was put back on the flat screen by the game");
     bool want = false;
     if (G.panels.empty() && PlaceOnForearm()) {
-        if (LookingAtArm()) HP.look_until = now + 0.4;
+        if (LookingAtArm() || g_force_hud) HP.look_until = now + 0.4;
         want = now < HP.look_until;
         double s = Scale() * S.hud_size;
         SetWorldPose(HP.comp, G.centre, PanelRotation());
@@ -4345,6 +4347,15 @@ bool PauseMenuOnTop() { return g_menu_up.load() && g_top_is_pause.load(); }
 void RequestClosePause() { g_close_pause = true; }
 bool Active() { return g_active.load(); }
 bool Enabled() { return S.enabled; }
-uintptr_t PanelHolder() { return G.actor && Alive(G.actor, G.actor_index) ? G.actor : 0; }
+// Asked twice a frame (wall push, wall fade) for trace ignore lists, where a
+// holder on its way out does no harm: the slot and flags check alone, without
+// the engine's IsValid call (0.1-0.16 ms a frame on the game thread, 2026-11-07).
+uintptr_t PanelHolder() {
+    if (!G.actor || G.actor_index < 0 || ue::objects::Get(G.actor_index) != G.actor) return 0;
+    const uint32_t flags = mem::ReadOr<uint32_t>(G.actor + ue::off::kObjFlags, RF_BeginDestroyed);
+    return flags & (RF_BeginDestroyed | RF_FinishDestroyed) ? 0 : G.actor;
+}
+
+void ForceHudShown(bool on) { g_force_hud = on; }
 
 }  // namespace holevr::vr::world_menu

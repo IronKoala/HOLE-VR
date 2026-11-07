@@ -51,20 +51,18 @@ inline bool ParseInstance(const std::string& name, Instance* out) {
 struct Share {
     std::map<uint32_t, double> by_pid[5];  // index: Engine
     double total[5] = {0, 0, 0, 0, 0};
+    std::map<std::string, double> other_types;  // kOther engines by type name
     void Add(const Instance& in, double pct) {
         if (!(pct > 0.0)) return;
         const int e = static_cast<int>(in.engine);
         by_pid[e][in.pid] += pct;
         total[e] += pct;
+        if (in.engine == Engine::kOther) other_types[in.engtype] += pct;
     }
 };
 
-// "name 78%, name 11%, others 2%": the biggest users of one engine, names
-// looked up through `name_of`, the rest summed.
-template <typename NameOf>
-std::string Top(const std::map<uint32_t, double>& by_pid, NameOf name_of, size_t keep = 5) {
-    std::map<std::string, double> by_name;
-    for (const auto& kv : by_pid) by_name[name_of(kv.first)] += kv.second;
+// "name 78%, name 11%, others 2%": the biggest entries, the rest summed.
+inline std::string FormatTop(const std::map<std::string, double>& by_name, size_t keep = 5) {
     std::vector<std::pair<std::string, double>> v(by_name.begin(), by_name.end());
     std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
     std::string out;
@@ -84,5 +82,24 @@ std::string Top(const std::map<uint32_t, double>& by_pid, NameOf name_of, size_t
     }
     return out.empty() ? "nothing" : out;
 }
+
+// The biggest users of one engine, names looked up through `name_of`.
+template <typename NameOf>
+std::string Top(const std::map<uint32_t, double>& by_pid, NameOf name_of, size_t keep = 5) {
+    std::map<std::string, double> by_name;
+    for (const auto& kv : by_pid) by_name[name_of(kv.first)] += kv.second;
+    return FormatTop(by_name, keep);
+}
+
+// What one program used, by engine type as Windows names them ("3D",
+// "Compute_0", "Graphics_1", ...), on every card.
+struct ProgramUse {
+    std::map<std::string, double> by_type;
+    int instances = 0;  // counter instances seen for the program, any value
+    void Add(const Instance& in, double pct, bool valid) {
+        ++instances;
+        if (valid && pct > 0.0) by_type[in.engtype] += pct;
+    }
+};
 
 }  // namespace holevr::gpu_share

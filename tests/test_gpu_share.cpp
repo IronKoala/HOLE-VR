@@ -60,6 +60,25 @@ int main() {
     EXPECT(t2.find("others 30%") != std::string::npos);
     EXPECT(Top(Share{}.by_pid[0], name) == "nothing");
 
+    // Engines Windows names other than 3D/Compute/VideoEncode/Copy are kept by name.
+    Share g;
+    Instance gfx;
+    EXPECT(ParseInstance("pid_100_luid_a_b_phys_0_eng_7_engtype_Graphics_1", &gfx));
+    EXPECT(gfx.engine == Engine::kOther && gfx.engtype == "Graphics_1");
+    g.Add(gfx, 40.0);
+    EXPECT(g.other_types["Graphics_1"] > 39.9);
+    EXPECT(FormatTop(g.other_types) == "Graphics_1 40%");
+
+    // The game's own use, by engine type, counting every instance it has.
+    ProgramUse use;
+    use.Add(gfx, 40.0, true);
+    use.Add(game, 30.0, true);
+    use.Add(game, 50.0, false);  // invalid data: counted as an instance only
+    use.Add(game, 0.0, true);
+    EXPECT(use.instances == 4);
+    EXPECT(FormatTop(use.by_type) == "Graphics_1 40%, 3D 30%");
+    EXPECT(FormatTop(ProgramUse{}.by_type) == "nothing");
+
     if (failures) return 1;
     std::printf("test_gpu_share: all passed\n");
     return 0;
