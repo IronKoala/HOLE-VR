@@ -48,6 +48,7 @@
 #include "vr/ui_panel.h"
 #include "vr/openxr.h"
 #include "vr/stereo.h"
+#include "vr/turn_math.h"
 #include "vr/view_lead_math.h"
 #include "vr/world_menu.h"
 
@@ -183,11 +184,16 @@ struct Settings {
     bool either_hand = true;
     double handle_grab_radius = 9.0;      // either hand grabs the AR charging handle this close to its rear end, cm
     // Magazines (owner 2026-11-06: the AR's 10 round magazine snapped "way to
-    // early"; "make custom sized detection zones for all mags"): each
-    // magazine lines up when its top is this close below the magwell
+    // early"; "make custom sized detection zones for all mags"; 2026-11-07:
+    // "make it stick out of the mag well by an inch"): each magazine lines
+    // up when its own top is in a box an inch deep under the magwell
     // opening, measured per magazine and gun (vr/interact/magwell_zone.h).
-    double mag_snap_slack = 1.0;          // cm
-    double mag_seat_finish = 6.0;         // pushed this close to seated, it seats itself (at most half its travel), cm
+    double mag_line_up_out = 2.54;        // cm under the opening its top lines up from (rifles)
+    double mag_line_up_out_pistol = 3.81; // the same for pistols (owner 2026-11-07: half an inch more)
+    double mag_reach_left_gun = 6.0;      // cm the magazine is drawn out of the hand near a gun held in the left hand
+    double mag_line_up_side = 3.5;        // cm its top may be off the magwell's axis
+    double mag_line_up_tilt = 35.0;       // deg it may lean off the magwell's axis
+    double mag_seat_last = 1.0;           // pushed this close to seated, it seats itself (at most half its travel), cm
     bool mag_exact_seat = true;           // seat each magazine where the game itself puts it (AttachPoint_Mag)
 };
 Settings g_set;
@@ -196,8 +202,10 @@ void LoadHolsterSpots();
 
 void LoadSettings() {
     g_set.enabled = config::GetBool("vr_controls", true);
-    g_set.smooth_turn = config::GetInt("turn_mode", 1) == 1;
-    g_set.no_stick_turn = config::GetInt("turn_mode", 1) == 2;
+    // Same reading as the VR tab's Turn style row: unknown values are Smooth.
+    turn::Style style = turn::StyleFromMode(config::GetInt("turn_mode", 1));
+    g_set.smooth_turn = style == turn::Style::kSmooth;
+    g_set.no_stick_turn = style == turn::Style::kOff;
     g_set.snap_degrees = config::GetFloat("snap_turn_degrees", 30.f);
     g_set.smooth_speed = config::GetFloat("smooth_turn_speed", 90.f);
     g_set.move_with_hand = config::GetInt("move_direction", 0) == 1;
@@ -257,8 +265,14 @@ void LoadSettings() {
     g_set.rifle_right_let_go = config::GetBool("rifle_right_let_go", true);
     g_set.either_hand = config::GetBool("either_hand_guns", true);
     g_set.handle_grab_radius = std::clamp(config::GetFloat("rifle_charging_handle_grab_cm", 9.f), 3.f, 15.f);
-    g_set.mag_snap_slack = std::clamp(config::GetFloat("mag_snap_slack_cm", 1.f), 0.f, 15.f);
-    g_set.mag_seat_finish = std::clamp(config::GetFloat("mag_seat_finish_cm", 6.f), 0.f, 15.f);
+    // New keys (2026-11-07): ini files keep mag_snap_slack_cm and
+    // mag_seat_finish_cm as they were given, and those meant the old zone.
+    g_set.mag_line_up_out = std::clamp(config::GetFloat("mag_line_up_cm", 2.54f), 0.f, 10.f);
+    g_set.mag_line_up_out_pistol = std::clamp(config::GetFloat("mag_line_up_pistol_cm", 3.81f), 0.f, 10.f);
+    g_set.mag_reach_left_gun = std::clamp(config::GetFloat("mag_reach_left_gun_cm", 6.f), 0.f, 15.f);
+    g_set.mag_line_up_side = std::clamp(config::GetFloat("mag_line_up_side_cm", 3.5f), 1.f, 10.f);
+    g_set.mag_line_up_tilt = std::clamp(config::GetFloat("mag_line_up_tilt_deg", 35.f), 10.f, 80.f);
+    g_set.mag_seat_last = std::clamp(config::GetFloat("mag_seat_last_cm", 1.f), 0.f, 10.f);
     g_set.mag_exact_seat = config::GetBool("mag_exact_seat", true);
     LoadHolsterSpots();
 }
@@ -534,19 +548,13 @@ double Locomotion(UObject player, const input::Snapshot& s, double dt) {
         c.Invoke();
     }
 
-    double turn = 0;
-    if (g_set.no_stick_turn) {
-        g_snap_armed = true;  // the stick's sideways push does nothing
-    } else if (g_set.smooth_turn) {
-        if (std::fabs(right.stick_x) > g_set.deadzone) turn = right.stick_x * g_set.smooth_speed * dt;
-    } else {
-        if (g_snap_armed && std::fabs(right.stick_x) > 0.7) {
-            turn = right.stick_x > 0 ? g_set.snap_degrees : -g_set.snap_degrees;
-            g_snap_armed = false;
-        } else if (std::fabs(right.stick_x) < 0.4) {
-            g_snap_armed = true;
-        }
-    }
+    // Turn style (VR tab): smooth, snap, or off (turn_mode 1/0/2).
+    turn::Settings ts;
+    ts.style = g_set.no_stick_turn ? turn::Style::kOff : g_set.smooth_turn ? turn::Style::kSmooth : turn::Style::kSnap;
+    ts.snap_degrees = g_set.snap_degrees;
+    ts.smooth_speed = g_set.smooth_speed;
+    ts.deadzone = g_set.deadzone;
+    double turn = turn::Step(ts, right.stick_x, dt, &g_snap_armed);
     // Comfort vignette: how fast the character really moves (walls stop the
     // stick, falls count) and how fast the stick turns you. Snap turns are
     // instant, so they have nothing to darken.
@@ -665,7 +673,9 @@ struct WeaponState {
     double seat_from = 0, seat_t0 = 0;
     FVector mag_shown;            // where the held mag is drawn
     FQuat mag_shown_rot;          // and how it is turned
-    double mag_insert = 0;        // lined up: how far in, 0 top at the opening .. 1 seated (the hand's reload pose)
+    double mag_insert = 0;        // lined up: how far in, 0 lined up .. 1 where it seats itself (the hand's reload pose)
+    double mag_push_offset = 0;   // lined up: the hand's distance below the seat minus the magazine's (cm)
+    double mag_deepest = 1e9;     // lined up: the closest it came to seated (cm), for the log
     // This magazine's own window in this gun (vr/interact/magwell_zone.h),
     // measured once when it first comes near the magwell.
     UObject zone_mag = 0, zone_gun = 0;
@@ -1886,8 +1896,17 @@ FVector MagMeshLocation(UObject mag) {
 
 // Removes a magazine with its rounds: the game's own DestroyMag. Destroying
 // just the actor left its rounds lying on the floor (owner 2026-11-04).
-void DestroyMagazine(UObject mag) {
-    if (!LiveObject(mag)) return;
+bool DestroyMagazine(UObject mag) {
+    if (!LiveObject(mag)) return false;
+    // A pointer kept from an earlier level whose slot the new level gave to
+    // another object is not a magazine (2026-11-07, entering Area001_Office:
+    // "removed magazine Box1", a box component).
+    const UObject base = game::MagazineBaseClass();
+    if (base ? !ue::reflection::IsA(mag, base) : ue::GetName(ue::GetClass(mag)).find("Mag") == std::string::npos) {
+        log::Info("controls: %s (%s) is not a magazine any more: left alone", ue::GetName(mag).c_str(),
+                  ue::GetName(ue::GetClass(mag)).c_str());
+        return false;
+    }
     // Its rounds are actors attached to it: collect them first.
     std::vector<UObject> rounds;
     {
@@ -1918,6 +1937,7 @@ void DestroyMagazine(UObject mag) {
     }
     log::Info("controls: removed magazine %s and its %d rounds (%d were left after the game's DestroyMag)",
               name.c_str(), (int)rounds.size(), left);
+    return true;
 }
 
 // The pouch magazine's class is read from the gun's own magazine in each
@@ -1965,9 +1985,113 @@ void RefillPouch(game::Gun& gun, UObject player, const FVector& loc, const FQuat
 // Magwell rake: a Glock's runs up the grip, raked about 18 degrees; an
 // AR-15's magwell is square to the bore.
 double MagwellRake() { return W.is_pistol ? 18.0 : 0.0; }
+double MagLineUpOut() { return W.is_pistol ? g_set.mag_line_up_out_pistol : g_set.mag_line_up_out; }
 
 bool MeshBoxInFrame(UObject c, const FQuat& frame_inv, const FVector& grip_w, FVector* lo, FVector* hi);
 std::vector<UObject> MeshComponents(UObject actor);
+
+// A magazine's own long axis, in its own frame, measured from its mesh: rays
+// straight across its body (front to back and side to side) at 30% and 70%
+// of its height find the middle of the body at each height; the line
+// through the two middles is the way the magazine slides into the magwell.
+// Owner 2026-11-07: the pistol magazine slid in at a fixed 18 deg rake and
+// clipped; the line from its base to the magwell point (24 deg) "went the
+// wrong way". Once per magazine class (it is a property of the mesh).
+// in_guess_w / fwd_w: the magwell's in direction and the gun's forward as
+// guessed, in the world; seat_rot: the magazine's turn when seated.
+bool MagBodyAxis(UObject mag, const FQuat& seat_rot, const FVector& in_guess_w, const FVector& fwd_w, FVector* in_w) {
+    struct Result { bool ok = false; FVector axis; };
+    static std::map<std::string, Result> cache;
+    const std::string cls = ue::GetName(ue::GetClass(mag));
+    auto it = cache.find(cls);
+    if (it == cache.end()) {
+        Result res;
+        std::string why;
+        UObject mesh = 0;
+        ue::GetProp(mag, "MagazineMesh", mesh);
+        const FVector loc = ActorLocation(mag);
+        const FQuat rot = ActorRotation(mag), inv = rot.Inverse();
+        const FQuat seat_inv = seat_rot.Inverse();
+        const FVector up = Norm(seat_inv.Rotate(in_guess_w));
+        FVector fwd = seat_inv.Rotate(fwd_w);
+        fwd = Norm(fwd - up * DotV(fwd, up));
+        const FVector side = Cross(up, fwd);
+        FVector lo, hi;
+        if (!mesh) {
+            why = "it has no MagazineMesh";
+        } else if (!MeshBoxInFrame(mesh, inv, loc, &lo, &hi)) {
+            why = "its mesh has no size";
+        } else {
+            double h0 = 1e9, h1 = -1e9;
+            for (int k = 0; k < 8; ++k) {
+                const FVector c{k & 1 ? hi.X : lo.X, k & 2 ? hi.Y : lo.Y, k & 4 ? hi.Z : lo.Z};
+                h0 = std::fmin(h0, DotV(c, up));
+                h1 = std::fmax(h1, DotV(c, up));
+            }
+            // Traces need query collision on the mesh: on for the rays only.
+            uint8_t coll = 0;
+            { ue::Call ce(mesh, "GetCollisionEnabled"); if (ce.Invoke()) coll = ce.Result<uint8_t>(); }
+            if (coll == 0) { ue::Call e(mesh, "SetCollisionEnabled"); e.Set("NewType", uint8_t{1}); e.Invoke(); }
+            auto trace = [&](const FVector& a_l, const FVector& b_l, FVector* hit_l) {
+                ue::Call t(mesh, "K2_LineTraceComponent");
+                if (!t.Valid()) return false;
+                t.Set("TraceStart", loc + rot.Rotate(a_l)).Set("TraceEnd", loc + rot.Rotate(b_l)).Set("bTraceComplex", true);
+                if (!t.Invoke() || !t.Result<bool>()) return false;
+                *hit_l = inv.Rotate(t.Get<FVector>("HitLocation") - loc);
+                return true;
+            };
+            FVector mid[2];
+            bool ok = h1 - h0 > 4.0;
+            if (!ok) why = "its mesh is under 4 cm tall";
+            double width[2][2] = {};
+            for (int i = 0; i < 2 && ok; ++i) {
+                const FVector c = up * (h0 + (i == 0 ? 0.3 : 0.7) * (h1 - h0));
+                FVector m = c;
+                for (int a = 0; a < 2 && ok; ++a) {
+                    const FVector dir = a == 0 ? fwd : side;
+                    FVector p1, p2;
+                    if (!trace(c + dir * 10.0, c - dir * 10.0, &p1) || !trace(c - dir * 10.0, c + dir * 10.0, &p2)) {
+                        ok = false;
+                        why = "a ray across it missed its mesh (no complex collision?)";
+                        break;
+                    }
+                    const double a1 = DotV(p1 - c, dir), a2 = DotV(p2 - c, dir);
+                    width[i][a] = a1 - a2;
+                    if (width[i][a] < 0.5 || width[i][a] > 8.0) {
+                        ok = false;
+                        why = "its body measured " + std::to_string(width[i][a]) + " cm across";
+                        break;
+                    }
+                    m = m + dir * ((a1 + a2) * 0.5);
+                }
+                mid[i] = m;
+            }
+            if (coll == 0) { ue::Call e(mesh, "SetCollisionEnabled"); e.Set("NewType", uint8_t{0}); e.Invoke(); }
+            if (ok) {
+                res.axis = Norm(mid[1] - mid[0]);
+                const double off = std::acos(std::fmax(-1.0, std::fmin(1.0, DotV(res.axis, up)))) * 180.0 / 3.14159265358979;
+                // Its lean in the gun's own terms: forward (+) or back, and to the side.
+                const double lean_f = std::atan2(DotV(res.axis, fwd), DotV(res.axis, up)) * 180.0 / 3.14159265358979;
+                const double lean_s = std::atan2(DotV(res.axis, side), DotV(res.axis, up)) * 180.0 / 3.14159265358979;
+                if (off > 40.0) {
+                    why = "its body came out " + std::to_string(static_cast<int>(off)) + " deg off the guess";
+                } else {
+                    res.ok = true;
+                    log::Info("controls: magazine %s measured across its body: %.1f x %.1f cm low, %.1f x %.1f cm high; "
+                              "its own axis is %.1f deg from the guessed magwell line (%.1f deg forward, %.1f deg to "
+                              "the side of it)",
+                              cls.c_str(), width[0][0], width[0][1], width[1][0], width[1][1], off, lean_f, lean_s);
+                }
+            }
+        }
+        if (!res.ok)
+            log::Info("controls: magazine %s: its own axis could not be measured (%s)", cls.c_str(), why.c_str());
+        it = cache.emplace(cls, res).first;
+    }
+    if (!it->second.ok) return false;
+    *in_w = Norm(seat_rot.Rotate(it->second.axis));
+    return true;
+}
 
 // Where the game itself seats this magazine (BP_GunBase Gun_MagazineLoad):
 // attached to the gun's MagazinePoint, then moved by the inverse of its own
@@ -2032,12 +2156,14 @@ const interact::MagwellZone& MagwellZoneFor(UObject g, UObject mag, const FVecto
     if (W.zone.ok) {
         log::Info("controls: magwell zone for %s in %s: seated, its top is %.1f cm above its seat and its bottom %.1f "
                   "below; the magwell opening (bottom of %s) is %.1f cm %s the seat, so it goes %.1f cm into the gun. "
-                  "It lines up with its top within %.1f cm of the opening: its origin %.1f cm or less below the seat "
-                  "(was %.0f for every %s magazine); it seats itself from %.1f cm",
+                  "It lines up with its top up to %.1f cm under the opening, %.1f cm off the magwell's axis and "
+                  "%.0f deg off it (when it is straight, its origin %.1f cm below the seat); it seats itself from "
+                  "%.1f cm, and the reload plays from lining up to there",
                   mag_cls.c_str(), gun_cls.c_str(), W.zone.top, -W.zone.bottom, W.zone.part.c_str(),
                   std::fabs(W.zone.opening), W.zone.opening < 0 ? "below" : "above", W.zone.insert,
-                  g_set.mag_snap_slack, interact::SnapBelow(W.zone, g_set.mag_snap_slack, old_below), old_below,
-                  W.is_pistol ? "pistol" : "rifle", interact::SeatFinish(W.zone, g_set.mag_seat_finish));
+                  MagLineUpOut(), g_set.mag_line_up_side, g_set.mag_line_up_tilt,
+                  interact::LineUpBelow(W.zone, MagLineUpOut(), old_below),
+                  interact::SeatLast(W.zone, g_set.mag_seat_last));
     } else {
         std::string list;
         char buf[160];
@@ -2314,8 +2440,57 @@ void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState hs[
             // gun clipped it through the receiver (owner 2026-11-04).
             const FVector up = well_w.rotation.Rotate(FVector{0, 0, 1});
             if (DotV(up, out) < -0.9) out = Norm(up) * -1.0;
+        } else {
+            // A pistol magazine goes in along its own body's axis, measured
+            // from its mesh (MagBodyAxis). The fixed 18 deg rake clipped
+            // (owner 2026-11-07), and the line from its base to the magwell
+            // point (24 deg) "went the wrong way". Not measured: the magwell
+            // point's own up axis, as on the AR (which goes in right), else
+            // the rake.
+            const FVector rake_in = out * -1.0;
+            const FVector up = well_w.rotation.Rotate(FVector{0, 0, 1});
+            FVector in_w;
+            const char* how = "the fixed rake";
+            if (MagBodyAxis(W.held_mag, seat_rot, rake_in, W.frame_rot.Rotate(FVector{1, 0, 0}), &in_w)) {
+                how = "its body's own axis";
+            } else if (DotV(Norm(up), rake_in) > std::cos(35.0 * 3.14159265358979 / 180.0)) {
+                in_w = Norm(up);
+                how = "the magwell point's up axis";
+            } else {
+                in_w = rake_in;
+            }
+            static std::string told;
+            const std::string key = ue::GetName(ue::GetClass(W.held_mag)) + " in " + gun.ClassName();
+            if (told != key) {
+                told = key;
+                auto deg = [](const FVector& a, const FVector& b) {
+                    return std::acos(std::fmax(-1.0, std::fmin(1.0, DotV(Norm(a), Norm(b))))) * 180.0 / 3.14159265358979;
+                };
+                const FVector base_line = well_w.translation - seat;
+                const FVector f = W.frame_rot.Rotate(FVector{1, 0, 0}), r = W.frame_rot.Rotate(FVector{0, 1, 0});
+                log::Info("controls: %s goes in along %s: leaning %.1f deg forward and %.1f deg right in the gun; "
+                          "%.1f deg from the old %.0f deg rake, %.1f deg from the magwell point's up axis, %.1f deg "
+                          "from its base-to-magwell-point line (the last build's)",
+                          key.c_str(), how, std::atan2(DotV(in_w, f), DotV(in_w, Cross(f, r))) * 180.0 / 3.14159265358979,
+                          std::atan2(DotV(in_w, r), DotV(in_w, Cross(f, r))) * 180.0 / 3.14159265358979,
+                          deg(in_w, rake_in), MagwellRake(), deg(in_w, up), deg(in_w, base_line));
+            }
+            out = in_w * -1.0;
         }
-        FVector p = lh.grip.location - seat;
+        // Owner 2026-11-07: with the gun in the LEFT hand the real
+        // controllers knock together under the grip before the magazine is
+        // in. Near the magwell the magazine is drawn further out of the hand,
+        // along its own axis, so the controllers stay that far apart (the
+        // drawn hand stays on the magazine). Blends in from 35 to 20 cm.
+        FVector held = lh.grip.location;
+        if (GunHand() == input::kLeft && g_set.mag_reach_left_gun > 0.0) {
+            const double d = Len(lh.grip.location - seat);
+            const double k = std::fmin(1.0, std::fmax(0.0, (35.0 - d) / 15.0));
+            const FVector mag_in = Norm(show_rot.Rotate(seat_rot.Inverse().Rotate(out * -1.0)));
+            held = lh.grip.location + mag_in * (g_set.mag_reach_left_gun * k);
+            show_loc = held;
+        }
+        FVector p = held - seat;
         double along = DotV(p, out);
         double lateral = Len(p - out * along);
         // This magazine's own window (measured as it first comes near):
@@ -2326,13 +2501,13 @@ void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState hs[
         const interact::MagwellZone& zone = Len(p) < 40.0 || W.mag_engaged || W.mag_seating
                                                 ? MagwellZoneFor(gun.Object(), W.held_mag, seat, seat_rot, out)
                                                 : kNoZone;
-        const double max_below = interact::SnapBelow(zone, g_set.mag_snap_slack, old_below);
-        const double finish = interact::SeatFinish(zone, g_set.mag_seat_finish);
+        const double max_below = interact::LineUpBelow(zone, MagLineUpOut(), old_below);
+        const double finish = interact::SeatLast(zone, g_set.mag_seat_last);
 
         if (W.mag_seating) {
             double t = std::fmin(1.0, (g_clock - W.seat_t0) / 0.1);
             along = W.seat_from * (1.0 - t);
-            W.mag_insert = interact::InsertProgress(zone, along, old_below);
+            W.mag_insert = interact::InsertProgress(along, max_below, finish);
             show_loc = seat + out * along;
             show_rot = seat_rot;
             SetActorTransform(W.held_mag, show_loc, show_rot);
@@ -2391,31 +2566,59 @@ void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState hs[
                       W.is_pistol ? "pistol" : "rifle", ue::GetName(well).c_str(), rel.X, rel.Y, rel.Z, wup_g.X,
                       wup_g.Y, wup_g.Z, W.seat_learned ? "learned" : "not learned yet");
         }
+        // Measured: the magazine's own top must come into a box under the
+        // magwell opening, an inch deep (mag_line_up_cm), its top near the
+        // magwell's axis and the magazine not leaning far off it. Not
+        // measured: the old window on its origin (a rifle's magwell is
+        // wider and its magazine is held more freely: owner 2026-11-04 "i
+        // cannot reload the AR at all").
+        interact::TopProbe top;
+        if (zone.ok) top = interact::ProbeTop(seat, seat_rot, out, zone.top, held, show_rot);
+        const double probe_below = zone.ok ? top.below : along;
+        const double probe_side = zone.ok ? top.side : lateral;
+        const double probe_tilt = zone.ok ? top.tilt : aim_off_deg;
+        const double max_lat = zone.ok ? g_set.mag_line_up_side : W.is_pistol ? 5.5 : 7.5;
+        const double max_aim = zone.ok ? g_set.mag_line_up_tilt : W.is_pistol ? 40.0 : 60.0;
         if (!W.mag_engaged && g_clock >= W.magwell_log_at && Len(p) < 35.0) {
             W.magwell_log_at = g_clock + 0.5;
-            log::Info("controls: held magazine near the magwell: %.1f cm below it, %.1f cm off its axis, pointing %.0f deg "
-                      "off it (lines up within -4..%.1f below, %.1f off, %.0f deg)", along, lateral, aim_off_deg,
-                      max_below, W.is_pistol ? 5.5 : 7.5, W.is_pistol ? 40.0 : 60.0);
+            log::Info("controls: held magazine near the magwell: its %s %.1f cm below where it sits seated, %.1f cm off "
+                      "the axis, leaning %.0f deg off it (lines up within -4..%.1f below, %.1f off, %.0f deg)",
+                      zone.ok ? "top" : "origin", probe_below, probe_side, probe_tilt, max_below, max_lat, max_aim);
         }
-        // A rifle's magwell is wider and its magazine is held more freely
-        // (owner 2026-11-04: "i cannot reload the AR at all"): more slack.
-        const double max_lat = W.is_pistol ? 5.5 : 7.5, max_aim = W.is_pistol ? 40.0 : 60.0;
         if (!W.mag_engaged) {
-            if (along > -4.0 && along < max_below && lateral < max_lat && aim_off_deg < max_aim) {
+            if (probe_below > -4.0 && probe_below < max_below && probe_side < max_lat && probe_tilt < max_aim) {
                 W.mag_engaged = true;
+                // From here the hand's push moves it, from where its top was.
+                W.mag_push_offset = along - probe_below;
+                W.mag_deepest = 1e9;
                 input::Haptic(InputOf(mh), 0.25f, 0.02f);
-                log::Info("controls: magazine lined up with the magwell (%.1f cm below, %.1f off axis, %.0f deg; "
-                          "window %.1f cm%s)",
-                          along, lateral, aim_off_deg, max_below, zone.ok ? ", this magazine's own" : ", not measured");
+                if (zone.ok)
+                    log::Info("controls: magazine lined up with the magwell: its top %.1f cm under the opening, %.1f "
+                              "cm off the axis, leaning %.0f deg (lines up within %.1f cm under, %.1f off, %.0f deg; "
+                              "this magazine's own)",
+                              probe_below - zone.insert, probe_side, probe_tilt, max_below - zone.insert, max_lat,
+                              max_aim);
+                else
+                    log::Info("controls: magazine lined up with the magwell (%.1f cm below, %.1f off axis, %.0f deg; "
+                              "window %.1f cm, not measured)",
+                              along, lateral, aim_off_deg, max_below);
             }
-        } else if (lateral > max_lat + 1.5 || along > max_below + 3.0 || aim_off_deg > max_aim + 10.0) {
+        } else if (probe_side > max_lat + 1.5 || along - W.mag_push_offset > max_below + 3.0 ||
+                   probe_tilt > max_aim + 10.0) {
             W.mag_engaged = false;
+            log::Info("controls: magazine came off the magwell (%s): it got to %.1f cm from seated (it seats itself "
+                      "from %.1f); its top %.1f cm off the axis, leaning %.0f deg%s",
+                      probe_side > max_lat + 1.5 ? "too far off the axis"
+                      : probe_tilt > max_aim + 10.0 ? "leaning too far" : "pulled back out",
+                      W.mag_deepest, finish, probe_side, probe_tilt,
+                      GunHand() == input::kLeft ? " (gun in the left hand)" : "");
         }
         if (W.mag_engaged) {
-            double a = std::fmax(0.0, along);
+            double a = std::fmax(0.0, along - W.mag_push_offset);
+            W.mag_deepest = std::fmin(W.mag_deepest, a);
             show_loc = seat + out * a;
             show_rot = seat_rot;
-            W.mag_insert = interact::InsertProgress(zone, a, old_below);
+            W.mag_insert = interact::InsertProgress(a, max_below, finish);
             if (a < finish && lin.grip_button.down) {
                 W.mag_seating = true;
                 W.seat_from = a;
@@ -3277,12 +3480,36 @@ struct {
     double next_refresh = 0;
     double ready_at = 0;
     std::vector<PressButton> buttons;
+    // Away from home the class is looked for once per level (see below).
+    UObject level_player = 0;
+    bool at_home = true;
+    bool searched_here = false;
 } g_press;
+
+// True when the player's world is the home level (Area000_Home).
+bool PlayerAtHome(UObject player) {
+    UObject o = player;
+    for (int i = 0; o && i < 8; ++i, o = ue::GetOuter(o))
+        if (ue::GetName(ue::GetClass(o)) == "World") return ue::GetName(o).find("Area000_Home") != std::string::npos;
+    return true;  // world not found: behave as before (keep looking)
+}
 
 void RefreshPressButtons(UObject player) {
     if (g_clock < g_press.next_refresh) return;
     g_press.next_refresh = g_clock + 2.0;
-    const UObject cls = g_press.cls.Get();
+    // Each lookup of a class that is not loaded is a pass over every game
+    // object on the game thread: 11-19 ms, one stutter every 10 s in the
+    // Office in the owner's 2026-11-07 run. The timer is a home prop, so away
+    // from home the class is looked for once when the level starts, and only
+    // kept checked after that if that level has it.
+    if (player != g_press.level_player) {
+        g_press.level_player = player;
+        g_press.at_home = PlayerAtHome(player);
+        g_press.searched_here = false;
+    }
+    const bool look = g_press.at_home || !g_press.searched_here || g_press.last_cls;
+    g_press.searched_here = true;
+    const UObject cls = look ? g_press.cls.Get() : 0;
     if (cls != g_press.last_cls) {
         g_press.last_cls = cls;
         if (cls) log::Info("controls: shooting range timer class found; its button can be pressed by hand");
@@ -6275,8 +6502,7 @@ void OnTick(UObject player, float dt) {
             if (!LiveObject(m)) continue;
             UObject in_gun = 0;
             if (W.gun && LiveObject(W.gun) && ue::GetProp(W.gun, "MagazineObj", in_gun) && in_gun == m) continue;
-            DestroyMagazine(m);
-            removed++;
+            if (DestroyMagazine(m)) removed++;
         }
         if (removed) log::Info("controls: removed %d spare magazine(s) of the gun put away", removed);
         W = WeaponState();

@@ -69,6 +69,24 @@ struct WristPole {
 WristPole WristAlignedPole(const Reference& reference, const FVector& shoulder,
                            const FVector& wrist, const FQuat& hand_world);
 
+// Anatomical forearm turn (pronation/supination) from the bend plane and the
+// palm, independent of any mesh's reference roll. upper = shoulder->elbow,
+// forearm = elbow->wrist, palm = direction out of the palm, all in one space;
+// bend_pole is the elbow's direction away from the shoulder->wrist line (used
+// when the arm is straight). side_sign: +1 right arm, -1 left arm. Returns
+// radians: 0 = palm toward the biceps side of the bend (fully supinated),
+// pi/2 = thumb up (palm toward the body's midline), +/-pi = palm away (fully
+// pronated), -pi/2 = palm facing outward (out of reach without the shoulder).
+// NaN when the palm lies along the forearm.
+double ForearmRotation(const FVector& upper, const FVector& forearm, const FVector& palm,
+                       const FVector& bend_pole, double side_sign);
+// The same measure for the skeleton's reference pose: the hand's palm axis
+// (hand space) through the reference forearm-to-hand relation. NaN if the
+// reference has no usable palm. A raw WristTwist of
+// side_sign*(ForearmRotation - this) is that anatomical turn.
+double ReferenceForearmRotation(const Reference& reference, const FVector& palm_axis_hand,
+                                double side_sign);
+
 // A fractional roll has two possible branches at the principal-angle seam.
 // Within ONE authored support attachment, retain the observed palm path using
 // bounded bone angles. This is intentionally path-dependent, not a globally
@@ -94,7 +112,7 @@ SupportTwistResult FollowSupportTwist(const Reference& reference,
 
 struct TwistState {
     bool valid = false;
-    double forearm_radians = 0, twist_radians = 0;
+    double forearm_radians = 0, twist_radians = 0, watch_radians = 0;
     int seam_sign = 0;
     double seam_seconds = 0, seam_vote = 0;
     SupportTwistState support;
@@ -102,7 +120,7 @@ struct TwistState {
 struct TwistResult {
     bool valid = false;
     double raw_radians = 0, target_radians = 0;
-    double forearm_radians = 0, twist_radians = 0;
+    double forearm_radians = 0, twist_radians = 0, watch_radians = 0;
     bool seam_guarded = false;
 };
 // Software seam guard, not a claimed anatomical joint limit. The elbow solver
@@ -119,8 +137,15 @@ constexpr double kTwistBoneRate = 360.0 * kDegToRad; // maximum applied bone rot
 // Full-share bones take the short quaternion-equivalent arc independently.
 // Apply returned bone angles directly to the unrolled frame, with no further
 // sharing. Reset state on tracking/origin/rig changes.
+// center_radians puts the seam opposite that roll instead of opposite the
+// reference pose: pass the raw roll of a thumb-up forearm so the seam sits
+// where the palm faces outward, a turn the forearm cannot make by itself.
+// The target stays within kTwistTargetLimit of the center. watch_share is a
+// third, independent channel (negative: the forearm share) for accessories
+// that keep their own share of the turn.
 TwistResult FollowTwist(double target_radians, double dt, double forearm_share,
-                       double twist_share, TwistState* state);
+                       double twist_share, TwistState* state, double center_radians = 0,
+                       double watch_share = -1);
 
 struct Attachment {
     bool valid = false;

@@ -78,15 +78,13 @@ bool IsInteger(const std::string& v) {
 // Game thread, once with a level loaded: what the game renders with, and
 // room in the virtual shadow map page pool for two eyes.
 //
-// White squares and bars in one eye (owner 2026-11-03): they come during a
-// run, never with a menu up, randomly in either eye; one capture had square
-// blocks of speckled light on a shadowed floor in the left eye only. With
-// virtual shadow maps each eye is its own view with its own directional
+// With virtual shadow maps each eye is its own view with its own directional
 // light clipmap, so two eyes ask for about twice the shadow pages of the flat
 // game. When the pool runs out, the pages that don't fit are drawn without
-// their shadow: square patches of full sunlight (this game's sun patches are
-// near white) in whichever eye lost out. vr_shadow_pages: -1 = twice the
-// game's pool (default), 0 = leave it, N = that many pages (64 KB each).
+// their shadow: square patches of full sunlight in whichever eye lost out.
+// (First thought to be the white squares; those turned out to be stale GPU
+// memory, see Init.) vr_shadow_pages: -1 = twice the game's pool (default),
+// 0 = leave it, N = that many pages (64 KB each).
 void StereoRenderSetup(UObject ksl) {
     static bool s_done = false;
     if (s_done) return;
@@ -181,6 +179,41 @@ void Init() {
         if (aa == kAaModes[i].name) g_aa_index = i;
     if (g_aa_index >= 0) Want("r.AntiAliasingMethod", std::to_string(kAaModes[g_aa_index].method));
     else if (aa != "game") log::Warn("cvars: unknown vr_anti_aliasing=%s, leaving the game's setting", aa.c_str());
+    // White and yellow squares in one eye during runs (2026-11-03 to 11-07):
+    // up close they were scraps of UI text, in the left four columns of 8 px
+    // tiles, coming and going: a render pass reading GPU memory it hadn't
+    // written that frame, memory that last held UI. With the render graph's
+    // memory sharing between passes (transient aliasing) and its async
+    // compute both off, the owner's 2026-11-07 run had none. 1 turns either
+    // back on (less video memory / GPU time; may bring the squares back).
+    // cvar.* lines below still win.
+    const bool sharing = config::GetBool("vr_gpu_memory_sharing", false);
+    const bool async = config::GetBool("vr_async_compute", false);
+    if (!sharing) Want("r.RDG.TransientAllocator", "0");
+    if (!async) Want("r.RDG.AsyncCompute", "0");
+    log::Info("cvars: GPU memory sharing between passes %s, async compute %s (vr_gpu_memory_sharing, "
+              "vr_async_compute; off stops the white squares)",
+              sharing ? "game's" : "off", async ? "game's" : "off");
+    // Frame times: the levels are GPU-bound at about 13.5 ms a frame against
+    // a 13.9 ms slot that also carries SteamVR's ~1.7 ms hand-off. Shadows on
+    // High and Lumen GI probes at half density took the Office from 65.7 to
+    // 71.3 FPS (owner's 2026-11-07 09:21 run, with GI quality 1), but the
+    // owner asked for them back to the game's own the same day. Both stay
+    // here as options: vr_shadow_quality=high, vr_lumen_probes=half.
+    const std::string shadows = config::GetString("vr_shadow_quality", "game");
+    constexpr const char* kQuality[] = {"low", "medium", "high", "epic", "cinematic"};
+    int shadow_level = -1;
+    for (int i = 0; i < 5; ++i)
+        if (shadows == kQuality[i]) shadow_level = i;
+    if (shadow_level >= 0) Want("sg.ShadowQuality", std::to_string(shadow_level));
+    else if (shadows != "game") log::Warn("cvars: unknown vr_shadow_quality=%s, leaving the game's", shadows.c_str());
+    const std::string probes = config::GetString("vr_lumen_probes", "game");
+    if (probes == "half") Want("r.Lumen.ScreenProbeGather.DownsampleFactor", "32");
+    else if (probes == "full") Want("r.Lumen.ScreenProbeGather.DownsampleFactor", "16");
+    else if (probes != "game") log::Warn("cvars: unknown vr_lumen_probes=%s, leaving the game's", probes.c_str());
+    log::Info("cvars: shadows %s, Lumen GI probes %s (vr_shadow_quality, vr_lumen_probes; high and half are "
+              "cheaper than the game's own)",
+              shadows.c_str(), probes.c_str());
     for (const auto& [name, value] : config::WithPrefix("cvar.")) Want(name, value);
     log::Info("cvars: anti-aliasing %s, %zu console variables from hole-vr.ini", aa.c_str(),
               config::WithPrefix("cvar.").size());

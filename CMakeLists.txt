@@ -16,6 +16,7 @@ add_library(hole_vr SHARED
     src/core/perf.cpp
     src/core/sampler.cpp
     src/core/process_metrics.cpp
+    src/core/gpu_share.cpp
     src/ue/names.cpp
     src/ue/objects.cpp
     src/ue/reflection.cpp
@@ -225,9 +226,11 @@ if(HOLEVR_BUILD_TESTS)
     add_executable(test_workbench_bughunt tests/test_workbench_bughunt.cpp src/vr/interact/rifle_carry.cpp)
     add_executable(test_comfort tests/test_comfort.cpp src/vr/comfort_math.cpp)
     add_executable(test_kick tests/test_kick.cpp src/vr/kick.cpp)
+    add_executable(test_turn tests/test_turn.cpp)
+    add_executable(test_gpu_share tests/test_gpu_share.cpp)
     add_executable(test_magwell_zone tests/test_magwell_zone.cpp src/vr/interact/magwell_zone.cpp
                    src/vr/body/ik_math.cpp)
-    foreach(case body grip watch watch_marshal holster_visual holster_audio vr_options menu_input hand_ownership comfort kick workbench_rules bench_vise bench_layout rifle_carry vise_weapons workbench_release attachment_transaction ammo_refresh workbench_bughunt magwell_zone)
+    foreach(case body grip watch watch_marshal holster_visual holster_audio vr_options menu_input hand_ownership comfort kick turn workbench_rules bench_vise bench_layout rifle_carry vise_weapons workbench_release attachment_transaction ammo_refresh workbench_bughunt magwell_zone gpu_share)
         target_include_directories(test_${case} PRIVATE src)
         if(MSVC)
             target_compile_options(test_${case} PRIVATE /EHsc)

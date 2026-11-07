@@ -9,45 +9,49 @@ namespace holevr::vr::vr_menu {
 
 const std::vector<Row>& Rows() {
     using K = RowKind;
-    // Owner 2026-11-06: "Smooth turn, snap turn, teleport all merge into
-    // row", then "add an option to turn off joystick turning altogether".
-    // One row, Movement, for what were Moving (smooth/teleport), Turning
-    // (smooth/snap), Snap turn (how far) and Turn speed, plus no stick
-    // turning (turn_mode=2: you turn with your body): Teleport with no
-    // turning or 30 deg snaps, then walking with no turning, snap turns of
-    // 15-90 deg or smooth turns of 60-240 deg/s (the right arrow steps
-    // toward smooth and faster). locomotion is every choice's first key.
+    // Owner 2026-11-07, after the one Movement row (2026-11-06: "Smooth
+    // turn, snap turn, teleport all merge into row"): "the turning row is
+    // far to dense, we need 1 row for turn style and 1 for turn speed".
+    // Moving: walk or teleport. Turn style: smooth, snap, or off (turn_mode
+    // 1/0/2; off = you turn with your body). Turn speed: one row on screen,
+    // two in the list sharing the label: degrees a second while turning is
+    // smooth, degrees a flick while it snaps; hidden when it is off.
     //
-    // Hidden while they do nothing: Move toward with Teleport (the arc goes
-    // where the stick hand points), Vignette turning unless turning is
+    // Also hidden while they do nothing: Move toward with Teleport (the arc
+    // goes where the stick hand points), Vignette turning unless turning is
     // smooth (a snap is instant), Real crouch and Hop to jump when seated
     // (controls.cpp turns both off then).
-    constexpr unsigned kWalk = 0x1FFCu;         // Movement: the walking choices (2-12)
-    constexpr unsigned kSmoothTurn = 0x1F00u;   // Movement: the smooth turn choices (8-12)
+    constexpr unsigned kWalk = 1u << 0;                    // Moving: Walk
+    constexpr unsigned kSmooth = 1u << 0, kSnap = 1u << 1;  // Turn style: Smooth, Snap (Off = 1 << 2)
     constexpr unsigned kStanding = (1u << 0) | (1u << 1);  // Height: Character, Your own
     // "Aiming eye" (dominant_eye_right) is gone from the tab (owner
     // 2026-11-06: useful before 6DoF aiming, not now): it only chose which
     // eye the rifle's shoulder lock lines the sights up with. The ini key
     // still works (right eye unless set), for a later left-handed mode.
     static const std::vector<Row> rows = {
-        {"Movement",
+        {"Moving", K::kChoice,
+         {{"Walk", {{"locomotion", "smooth"}}}, {"Teleport", {{"locomotion", "teleport"}}}}, 0,
+         "Walk: the stick moves you. Teleport: the stick aims an arc; let go and you move to where it lands."},
+        {"Turn style", K::kChoice,
+         {{"Smooth", {{"turn_mode", "1"}}}, {"Snap", {{"turn_mode", "0"}}}, {"Off", {{"turn_mode", "2"}}}}, 0,
+         "How the turn stick turns you: smoothly while held, one snap per flick, or not at all (you turn with "
+         "your body)."},
+        {"Turn speed",
          K::kChoice,
-         {{"Teleport, no turning", {{"locomotion", "teleport"}, {"turn_mode", "2"}}},
-          {"Teleport, snap turn 30 deg", {{"locomotion", "teleport"}, {"turn_mode", "0"}, {"snap_turn_degrees", "30"}}},
-          {"Walk, no turning", {{"locomotion", "smooth"}, {"turn_mode", "2"}}},
-          {"Walk, snap turn 15 deg", {{"locomotion", "smooth"}, {"turn_mode", "0"}, {"snap_turn_degrees", "15"}}},
-          {"Walk, snap turn 30 deg", {{"locomotion", "smooth"}, {"turn_mode", "0"}, {"snap_turn_degrees", "30"}}},
-          {"Walk, snap turn 45 deg", {{"locomotion", "smooth"}, {"turn_mode", "0"}, {"snap_turn_degrees", "45"}}},
-          {"Walk, snap turn 60 deg", {{"locomotion", "smooth"}, {"turn_mode", "0"}, {"snap_turn_degrees", "60"}}},
-          {"Walk, snap turn 90 deg", {{"locomotion", "smooth"}, {"turn_mode", "0"}, {"snap_turn_degrees", "90"}}},
-          {"Walk, smooth turn 60 deg/s", {{"locomotion", "smooth"}, {"turn_mode", "1"}, {"smooth_turn_speed", "60"}}},
-          {"Walk, smooth turn 90 deg/s", {{"locomotion", "smooth"}, {"turn_mode", "1"}, {"smooth_turn_speed", "90"}}},
-          {"Walk, smooth turn 120 deg/s", {{"locomotion", "smooth"}, {"turn_mode", "1"}, {"smooth_turn_speed", "120"}}},
-          {"Walk, smooth turn 180 deg/s", {{"locomotion", "smooth"}, {"turn_mode", "1"}, {"smooth_turn_speed", "180"}}},
-          {"Walk, smooth turn 240 deg/s", {{"locomotion", "smooth"}, {"turn_mode", "1"}, {"smooth_turn_speed", "240"}}}},
-         9,
-         "Walk with the stick or teleport (aim an arc, let go to move there). Turn by snaps, smoothly, or not "
-         "at all: only with your body."},
+         {{"60 deg/s", {{"smooth_turn_speed", "60"}}},
+          {"90 deg/s", {{"smooth_turn_speed", "90"}}},
+          {"120 deg/s", {{"smooth_turn_speed", "120"}}},
+          {"180 deg/s", {{"smooth_turn_speed", "180"}}},
+          {"240 deg/s", {{"smooth_turn_speed", "240"}}}},
+         1, "How fast you turn while you push the turn stick to the side.", "Turn style", kSmooth},
+        {"Turn speed",
+         K::kChoice,
+         {{"15 deg a flick", {{"snap_turn_degrees", "15"}}},
+          {"30 deg a flick", {{"snap_turn_degrees", "30"}}},
+          {"45 deg a flick", {{"snap_turn_degrees", "45"}}},
+          {"60 deg a flick", {{"snap_turn_degrees", "60"}}},
+          {"90 deg a flick", {{"snap_turn_degrees", "90"}}}},
+         1, "How far one flick of the turn stick turns you.", "Turn style", kSnap},
         {"Move stick", K::kChoice,
          {{"Left", {{"move_stick", "left"}}}, {"Right", {{"move_stick", "right"}}}}, 0,
          "Which hand's stick moves you. The other stick turns, jumps and crouches."},
@@ -55,7 +59,7 @@ const std::vector<Row>& Rows() {
          K::kChoice,
          {{"Where you look", {{"move_direction", "0"}}}, {"Stick hand", {{"move_direction", "1"}}}},
          0, "Pushing the stick forward walks the way your head faces, or the way the moving hand points.",
-         "Movement", kWalk},
+         "Moving", kWalk},
         {"Vignette moving",
          K::kChoice,
          {{"Off", {{"comfort_vignette_move", "0"}}},
@@ -70,7 +74,7 @@ const std::vector<Row>& Rows() {
           {"Medium", {{"comfort_vignette_turn", "0.6"}}},
           {"Strong", {{"comfort_vignette_turn", "0.85"}}}},
          0, "Darkens the edges of your view while the stick turns you smoothly, to ease motion sickness.",
-         "Movement", kSmoothTurn},
+         "Turn style", kSmooth},
         // One row for what were "Head in a wall" (on/off) and "Wall fade
         // starts" (how far): the distance only mattered with the fade on.
         // On/off comes first so it outweighs the distance; among the
@@ -127,11 +131,19 @@ const std::vector<Row>& Rows() {
          "Empty hands stop at walls and tables, and their fingers give way against them."},
         {"Gun kick",
          K::kChoice,
+         // Owner 2026-11-07: "give me 5 more kick strength options with the
+         // fifth being 4x as strong as strong": even steps from Strong (1.5)
+         // to 6.
          {{"Off", {{"gun_recoil_kick", "0"}}},
           {"Light", {{"gun_recoil_kick", "0.5"}}},
           {"Normal", {{"gun_recoil_kick", "1"}}},
-          {"Strong", {{"gun_recoil_kick", "1.5"}}}},
-         2, "How hard each shot flips the gun up and pushes it back in your hand."},
+          {"Strong", {{"gun_recoil_kick", "1.5"}}},
+          {"Stronger", {{"gun_recoil_kick", "2.4"}}},
+          {"Heavy", {{"gun_recoil_kick", "3.3"}}},
+          {"Heavier", {{"gun_recoil_kick", "4.2"}}},
+          {"Brutal", {{"gun_recoil_kick", "5.1"}}},
+          {"Extreme", {{"gun_recoil_kick", "6"}}}},
+         2, "How hard each shot flips the gun up and pushes it back in your hand. Extreme is 4x Strong."},
         {"Monitor shows",
          K::kChoice,
          {{"Right eye", {{"monitor_view", "right"}}},

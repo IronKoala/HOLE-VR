@@ -61,21 +61,40 @@ MagwellZone MeasureMagwell(const std::vector<FVector>& mag_corners, const FVecto
     return z;
 }
 
-double SnapBelow(const MagwellZone& z, double slack, double fallback) {
+double LineUpBelow(const MagwellZone& z, double out_cm, double fallback) {
     if (!z.ok) return fallback;
-    return z.insert + std::max(0.0, slack);
+    return z.insert + std::max(0.0, out_cm);
 }
 
-double SeatFinish(const MagwellZone& z, double finish) {
-    finish = std::max(0.0, finish);
-    if (!z.ok) return finish;
-    return std::min(finish, z.insert * 0.5);
+double SeatLast(const MagwellZone& z, double last) {
+    last = std::max(0.0, last);
+    if (!z.ok) return last;
+    return std::min(last, z.insert * 0.5);
 }
 
-double InsertProgress(const MagwellZone& z, double below, double fallback_insert) {
-    const double insert = z.ok ? z.insert : fallback_insert;
-    if (insert <= 1e-6) return 0.0;
-    return std::clamp((insert - below) / insert, 0.0, 1.0);
+double InsertProgress(double below, double line_up, double last) {
+    const double span = line_up - last;
+    if (span <= 1e-6) return below <= last ? 1.0 : 0.0;
+    return std::clamp((line_up - below) / span, 0.0, 1.0);
+}
+
+TopProbe ProbeTop(const FVector& seat, const FQuat& seat_rot, const FVector& out, double top, const FVector& at,
+                  const FQuat& rot) {
+    TopProbe t;
+    const double len = std::sqrt(Dot(out, out));
+    if (len < 1e-6) return t;
+    const FVector u = out * (1.0 / len);
+    const FQuat inv = seat_rot.Inverse();
+    // Its top (on the magwell axis when seated) and its axis, in its own frame.
+    const FVector top_local = inv.Rotate(u * -top);
+    const FVector axis_local = inv.Rotate(u * -1.0);
+    const FVector d = (at + rot.Rotate(top_local)) - (seat - u * top);
+    t.below = Dot(d, u);
+    const FVector side = d - u * t.below;
+    t.side = std::sqrt(Dot(side, side));
+    const double c = std::clamp(Dot(rot.Rotate(axis_local), u * -1.0), -1.0, 1.0);
+    t.tilt = std::acos(c) * 180.0 / 3.14159265358979;
+    return t;
 }
 
 }  // namespace holevr::vr::interact

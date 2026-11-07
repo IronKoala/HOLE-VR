@@ -33,11 +33,14 @@ whatever the laser is on). A step writes the ini key(s) into `hole-vr.ini` in pl
 
 | Row | Choices | ini key(s) |
 |---|---|---|
-| Movement | Teleport, no turning; Teleport, snap turn 30 deg; Walk, no turning; Walk, snap turn 15, 30, 45, 60, 90 deg; Walk, smooth turn 60, 90, 120, 180, 240 deg/s (default 90) | `locomotion` + `turn_mode` (0 snap, 1 smooth, 2 no stick turning) + `snap_turn_degrees` / `smooth_turn_speed` |
+| Moving | Walk, Teleport | `locomotion` (smooth, teleport) |
+| Turn style | Smooth, Snap, Off | `turn_mode` (1 smooth, 0 snap, 2 off: no stick turning) |
+| Turn speed (Smooth) | 60, 90, 120, 180, 240 deg/s (default 90) | `smooth_turn_speed` |
+| Turn speed (Snap) | 15, 30, 45, 60, 90 deg a flick (default 30) | `snap_turn_degrees` |
 | Move stick | Left, Right | `move_stick` |
-| Move toward (not with Teleport) | Where you look, Stick hand | `move_direction` |
+| Move toward (Walk only) | Where you look, Stick hand | `move_direction` |
 | Vignette moving | Off, Light, Medium, Strong | `comfort_vignette_move` (0, 0.35, 0.6, 0.85) |
-| Vignette turning (Smooth turn only) | Off, Light, Medium, Strong | `comfort_vignette_turn` |
+| Vignette turning (Smooth only) | Off, Light, Medium, Strong | `comfort_vignette_turn` |
 | Wall fade | Off, 5, 10, 15, 20, 25 cm away | `head_wall_fade` + `head_wall_fade_start_cm` (on, 15) |
 | Height | Character, Your own, Seated | `fixed_height` + `height_mode` |
 | Real crouch (not Seated) | On, Off | `physical_crouch` |
@@ -49,7 +52,7 @@ whatever the laser is on). A step writes the ini key(s) into `hole-vr.ini` in pl
 | Rifle stock | On, Off | `rifle_virtual_stock` |
 | Gun stops at walls | On, Off | `gun_wall_collision` |
 | Hands stop at walls | On, Off | `hand_wall_collision` |
-| Gun kick | Off, Light, Normal, Strong | `gun_recoil_kick` |
+| Gun kick | Off, Light, Normal, Strong, Stronger, Heavy, Heavier, Brutal, Extreme | `gun_recoil_kick` (0, 0.5, 1, 1.5, 2.4, 3.3, 4.2, 5.1, 6: Extreme is 4x Strong) |
 | Monitor shows | Right eye, Left eye, Both eyes | `monitor_view` (right, left, both) |
 | Calibrate body | (action) | height → arms forward → arms out → bent elbows → forward check; hold both triggers for 2s to record; left X keeps the current arms |
 | Edit hand grips | (action) | opens the grip editor once the menu closes; while it is open the row reads "open, click to close" and closes it |
@@ -73,12 +76,14 @@ of the rows`, `descriptions follow N row button event(s)`, and `describing
 
 **Hidden rows** (owner 2026-11-06: "are any of them redundant/moot?"). A
 row that does nothing with another row's current choice is collapsed
-(`Row::only_with`): Vignette turning unless Movement is a Smooth turn (a
+(`Row::only_with`): Vignette turning unless Turn style is Smooth (a
 snap is instant, so there is nothing to darken); Move toward with Teleport
 (the arc follows the stick hand); Real crouch and Hop to jump when Seated
-(they are off then). Changing the deciding row shows or hides them at
-once. Log: `vr options: Movement: hidden (they do nothing now): Vignette
-turning`.
+(they are off then). There are two Turn speed rows, deg/s shown only with
+Smooth and deg a flick only with Snap, so one Turn speed row is on the page
+at a time and none with Off. Changing the deciding row shows or hides them
+at once. Log: `vr options: Turn style: hidden (they do nothing now): Turn
+speed, Vignette turning`.
 
 **Removed and merged** (2026-11-06): "Aiming eye" is off the tab: since
 6DoF aiming it only chose which eye the rifle's shoulder lock lines the
@@ -94,6 +99,23 @@ push off (you turn with your body), offered as "Teleport, no turning" and
 "Walk, no turning". A choice's keys that the ini has count for it when they
 match and against it when they don't, so "no turning" (two keys) beats a
 turn choice whose step or speed happens to match the ini.
+
+**Split again** (owner 2026-11-07: "the turning row is far to dense, we
+need 1 row for turn style and 1 for turn speed, also double check that all
+turn styles should be functioning"): Moving (Walk, Teleport), Turn style
+(Smooth, Snap, Off) and Turn speed, whose choices follow the style. Any
+turn style works with either way of moving. The stick-to-degrees math for
+each style is `vr/turn_math.h` (`turn::Step`), checked by
+`tests/test_turn.cpp`: smooth turns the set speed per second at full stick
+and nothing inside the dead zone, snap turns one step per flick (again only
+once the stick comes back under 0.4), and Off never turns. `controls.cpp`
+reads `turn_mode` with the same `turn::StyleFromMode` (unknown values are
+Smooth, as the tab shows them). Same day, "give me 5 more kick strength
+options with the fifth being 4x as strong as 'strong'": Gun kick adds
+Stronger, Heavy, Heavier, Brutal and Extreme in even steps from Strong
+(1.5) to Extreme (6). The kick's peak is about the setting, so Extreme flips
+a one-handed pistol up about 40 degrees and back about 12 cm a shot,
+mostly settled again within 0.2 s (the same timing as every level).
 
 Move holsters is here because the right stick click (which used to be held
 for it) is now the kick. The grip editor (left Y hold) and the arm measure

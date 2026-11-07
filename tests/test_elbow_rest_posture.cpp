@@ -11,8 +11,12 @@ static bool Near(FVector a,FVector b,double e=1e-6){return Length(a-b)<e;}
 static FVector Mirror(FVector v){return {v.X,-v.Y,v.Z};}
 static skel::Xf At(FVector p){skel::Xf x;x.translation=p;return x;}
 // Local coordinates: forward, outward from this shoulder, up.
+// These are rest-style checks with synthetic hand frames (knuckles forward,
+// palm in), not real hands: the human joint ranges would read such a hand as
+// evidence about the elbow. test_arm_posture covers the ranges, including
+// that a hand in line with the rest forearm leaves the rest posture alone.
 static Input Pose(int side,FVector local,double scale=1){
- const double sign=side==0?-1:1;Input in;in.shoulder={0,sign*15*scale,0};
+ const double sign=side==0?-1:1;Input in;in.joint_limits=false;in.shoulder={0,sign*15*scale,0};
  in.wrist=in.shoulder+FVector{local.X,sign*local.Y,local.Z}*scale;in.upper_cm=30*scale;in.forearm_cm=28*scale;
  in.forward={1,0,0};in.outward={0,sign,0};in.down={0,0,-1};in.dt=1./90;
  in.reference=arm_pose::MeasureReference(At(in.shoulder),At(in.shoulder+in.outward*in.upper_cm),At(in.shoulder+in.outward*(in.upper_cm+in.forearm_cm)),in.down);
@@ -83,7 +87,8 @@ static void RequestedReachesRemainPossible(){for(int side=0;side<2;++side)for(FV
  const auto in=Pose(side,p);const auto r=Settle(in);Geometry(in,r);if(p.Y>45)EXPECT(Flare(in,r)>15);
 }}
 static void WristMotionDoesNotRelocateFreeElbows(){for(int side=0;side<2;++side)for(FVector p:{FVector{30,0,0},FVector{10,0,-40},FVector{25,-25,0}}){
- const auto fixed=Pose(side,p);const auto base=Solve(fixed,nullptr);for(FVector axis:{FVector{1,0,0},FVector{0,1,0},FVector{0,0,1}}){State a,b;
+ const auto fixed=Pose(side,p); // with joint limits: test_arm_posture JointLimitsMoveElbow
+ const auto base=Solve(fixed,nullptr);for(FVector axis:{FVector{1,0,0},FVector{0,1,0},FVector{0,0,1}}){State a,b;
   for(int angle=-180;angle<=180;angle+=5){auto moved=fixed;moved.hand_rotation=Normalized(AxisAngle(axis,angle*kDegToRad)*fixed.hand_rotation);
    EXPECT(Near(Solve(moved,nullptr).solved.mid,base.solved.mid));const auto live=Solve(moved,&a),still=Solve(fixed,&b);EXPECT(Near(live.solved.mid,still.solved.mid));}
  }
