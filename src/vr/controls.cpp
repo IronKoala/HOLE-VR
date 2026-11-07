@@ -194,6 +194,17 @@ struct Settings {
     double mag_line_up_side = 3.5;        // cm its top may be off the magwell's axis
     double mag_line_up_tilt = 35.0;       // deg it may lean off the magwell's axis
     double mag_seat_last = 1.0;           // pushed this close to seated, it seats itself (at most half its travel), cm
+    // Owner 2026-11-07 on the pistol's small magazine: "i have to push the
+    // mag to far up" (it seated only in the last centimetre; the real
+    // controllers meet under the grip before that). Before 89e1b99 it was 6
+    // cm, half its travel ("snaps in way to early").
+    double mag_seat_last_pistol = 3.5;    // the same for pistols, cm
+    // Once its top is in the magwell, the magwell holds it: the hand may
+    // drift this far off the magwell's line and still push it in (it let go
+    // at 5 cm before; the right hand with the gun in the left hand stays
+    // about 5 cm to the side, so that reload never went in).
+    double mag_hold_side = 12.0;          // cm
+    double mag_line_up_side_left_gun = 5.0;  // mag_line_up_side with the gun in the left hand, cm
     bool mag_exact_seat = true;           // seat each magazine where the game itself puts it (AttachPoint_Mag)
 };
 Settings g_set;
@@ -273,6 +284,10 @@ void LoadSettings() {
     g_set.mag_line_up_side = std::clamp(config::GetFloat("mag_line_up_side_cm", 3.5f), 1.f, 10.f);
     g_set.mag_line_up_tilt = std::clamp(config::GetFloat("mag_line_up_tilt_deg", 35.f), 10.f, 80.f);
     g_set.mag_seat_last = std::clamp(config::GetFloat("mag_seat_last_cm", 1.f), 0.f, 10.f);
+    g_set.mag_seat_last_pistol = std::clamp(config::GetFloat("mag_seat_last_pistol_cm", 3.5f), 0.f, 10.f);
+    g_set.mag_hold_side = std::clamp(config::GetFloat("mag_hold_side_cm", 12.f), 3.f, 30.f);
+    g_set.mag_line_up_side_left_gun =
+        std::clamp(config::GetFloat("mag_line_up_side_left_gun_cm", 5.f), 1.f, 10.f);
     g_set.mag_exact_seat = config::GetBool("mag_exact_seat", true);
     LoadHolsterSpots();
 }
@@ -1986,6 +2001,10 @@ void RefillPouch(game::Gun& gun, UObject player, const FVector& loc, const FQuat
 // AR-15's magwell is square to the bore.
 double MagwellRake() { return W.is_pistol ? 18.0 : 0.0; }
 double MagLineUpOut() { return W.is_pistol ? g_set.mag_line_up_out_pistol : g_set.mag_line_up_out; }
+double MagSeatLast() { return W.is_pistol ? g_set.mag_seat_last_pistol : g_set.mag_seat_last; }
+double MagLineUpSide() {
+    return GunHand() == input::kLeft ? g_set.mag_line_up_side_left_gun : g_set.mag_line_up_side;
+}
 
 bool MeshBoxInFrame(UObject c, const FQuat& frame_inv, const FVector& grip_w, FVector* lo, FVector* hi);
 std::vector<UObject> MeshComponents(UObject actor);
@@ -2161,9 +2180,9 @@ const interact::MagwellZone& MagwellZoneFor(UObject g, UObject mag, const FVecto
                   "%.1f cm, and the reload plays from lining up to there",
                   mag_cls.c_str(), gun_cls.c_str(), W.zone.top, -W.zone.bottom, W.zone.part.c_str(),
                   std::fabs(W.zone.opening), W.zone.opening < 0 ? "below" : "above", W.zone.insert,
-                  MagLineUpOut(), g_set.mag_line_up_side, g_set.mag_line_up_tilt,
+                  MagLineUpOut(), MagLineUpSide(), g_set.mag_line_up_tilt,
                   interact::LineUpBelow(W.zone, MagLineUpOut(), old_below),
-                  interact::SeatLast(W.zone, g_set.mag_seat_last));
+                  interact::SeatLast(W.zone, MagSeatLast()));
     } else {
         std::string list;
         char buf[160];
@@ -2502,7 +2521,7 @@ void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState hs[
                                                 ? MagwellZoneFor(gun.Object(), W.held_mag, seat, seat_rot, out)
                                                 : kNoZone;
         const double max_below = interact::LineUpBelow(zone, MagLineUpOut(), old_below);
-        const double finish = interact::SeatLast(zone, g_set.mag_seat_last);
+        const double finish = interact::SeatLast(zone, MagSeatLast());
 
         if (W.mag_seating) {
             double t = std::fmin(1.0, (g_clock - W.seat_t0) / 0.1);
@@ -2577,7 +2596,7 @@ void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState hs[
         const double probe_below = zone.ok ? top.below : along;
         const double probe_side = zone.ok ? top.side : lateral;
         const double probe_tilt = zone.ok ? top.tilt : aim_off_deg;
-        const double max_lat = zone.ok ? g_set.mag_line_up_side : W.is_pistol ? 5.5 : 7.5;
+        const double max_lat = zone.ok ? MagLineUpSide() : W.is_pistol ? 5.5 : 7.5;
         const double max_aim = zone.ok ? g_set.mag_line_up_tilt : W.is_pistol ? 40.0 : 60.0;
         if (!W.mag_engaged && g_clock >= W.magwell_log_at && Len(p) < 35.0) {
             W.magwell_log_at = g_clock + 0.5;
@@ -2603,14 +2622,12 @@ void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState hs[
                               "window %.1f cm, not measured)",
                               along, lateral, aim_off_deg, max_below);
             }
-        } else if (probe_side > max_lat + 1.5 || along - W.mag_push_offset > max_below + 3.0 ||
-                   probe_tilt > max_aim + 10.0) {
+        } else if (const char* why = interact::LetGoWhy(zone, along - W.mag_push_offset, max_below, probe_side,
+                                                        probe_tilt, max_lat, max_aim, g_set.mag_hold_side)) {
             W.mag_engaged = false;
             log::Info("controls: magazine came off the magwell (%s): it got to %.1f cm from seated (it seats itself "
                       "from %.1f); its top %.1f cm off the axis, leaning %.0f deg%s",
-                      probe_side > max_lat + 1.5 ? "too far off the axis"
-                      : probe_tilt > max_aim + 10.0 ? "leaning too far" : "pulled back out",
-                      W.mag_deepest, finish, probe_side, probe_tilt,
+                      why, W.mag_deepest, finish, probe_side, probe_tilt,
                       GunHand() == input::kLeft ? " (gun in the left hand)" : "");
         }
         if (W.mag_engaged) {
@@ -2623,6 +2640,9 @@ void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState hs[
                 W.mag_seating = true;
                 W.seat_from = a;
                 W.seat_t0 = g_clock;
+                log::Info("controls: magazine pushed to %.1f cm from seated (it seats itself from %.1f): seating; "
+                          "the hand's magazine top %.1f cm off the axis, leaning %.0f deg%s",
+                          a, finish, probe_side, probe_tilt, GunHand() == input::kLeft ? " (gun in the left hand)" : "");
             }
         }
     } else {

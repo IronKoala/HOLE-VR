@@ -65,6 +65,22 @@ double SeatLast(const MagwellZone& z, double last);
 // time the magazine is fully in (owner 2026-11-07).
 double InsertProgress(double below, double line_up, double last);
 
+// Whether a lined-up magazine lets go of the magwell, and why (nullptr: it
+// stays on). `depth`: how far its origin is below its seat along the axis
+// (the hand's push), cm. `side`, `tilt`: its top against the axis as the
+// hand holds it (TopProbe). `max_side`, `max_tilt`: the line-up limits.
+//
+// Below the opening the old limits hold (1.5 cm and 10 deg past the line-up
+// box). Once its top is in the magwell (depth < insert) the magwell holds
+// it: only pulling it back out, or the hand more than `hold_side` off the
+// axis, lets go. Owner 2026-11-07 ("i have to push the mag to far up";
+// "why can i reload when its in my right hand and not my left?"): the hand
+// drifted 5 cm off the axis while pushing, most of all the right hand with
+// the gun in the left hand, and the magazine dropped off the magwell before
+// it got far enough in to seat.
+const char* LetGoWhy(const MagwellZone& z, double depth, double line_up, double side, double tilt, double max_side,
+                     double max_tilt, double hold_side);
+
 // The held magazine's top against the magwell. The line-up test used the
 // magazine's origin, which on the AR's magazines is 17 cm under its top: a
 // magazine tilted 30-60 deg or 7 cm to the side still lined up with its top

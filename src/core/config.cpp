@@ -540,6 +540,19 @@ const Block kBlocks[] = {
      "; while it is lined up; until then it keeps the grab pose).\n"
      "; pistol / rifle = also play the game's pistol or AR reload on the left hand.\n"
      "mag_insert_anim_ar=off\n"},
+    {"mag_seat_last_pistol_cm",
+     "\n"
+     "; --- Reloading: pushing a magazine home ---\n"
+     "; A pistol magazine clicks in by itself from this close to seated (cm; never\n"
+     "; more than half way). mag_seat_last_cm above is the rifle's.\n"
+     "mag_seat_last_pistol_cm=3.5\n"
+     "; Once a magazine's top is inside the magwell the magwell holds it: the hand\n"
+     "; may wander this far (cm) off the magwell's line and still push it in.\n"
+     "mag_hold_side_cm=12\n"
+     "; With the gun in the left hand, a magazine lines up when its top is within\n"
+     "; this far (cm) of the magwell's line (mag_line_up_side_cm with the gun in the\n"
+     "; right hand).\n"
+     "mag_line_up_side_left_gun_cm=5\n"},
     {"fixed_height",
      "\n"
      "; 1 = your in-game height is always the character's, seated or standing\n"
