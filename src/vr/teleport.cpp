@@ -76,7 +76,50 @@ struct State {
     double move_at = -1;
     FVector move_to;
     double last_log = 0;
+    // The landing's second footstep (the first plays with the move).
+    double step_at = -1;
+    int steps = 0;
 } T;
+
+// ---- the landing footsteps ----
+// Owner 2026-11-07: "the payer needs to make a stepping sound when
+// teleporting to the new location so the enemies can hear it, like with
+// walking". Walking's footsteps are the game's Footstep_AnimNotify (from the
+// locomotion system the player is built on), fired by the walk animation on
+// the character Mesh. Its Received_Notify picks the sound for the surface
+// under the foot, plays it, and reports the noise event enemies hear
+// (AISense_Hearing ReportNoiseEvent, with the player's footstep volume
+// skill), as the class dump of 2026-11-07 shows. So the landing plays the
+// walk-forward animation's own two footstep notifies, left then right, on the
+// player's Mesh at the new place: the same sound and the same noise as two
+// steps of walking. Kept as ObjectRefs: they belong to animation assets.
+constexpr double kSecondStepS = 0.28;
+ue::ObjectRef g_walk_step[2] = {
+    ue::ObjectRef("Footstep_AnimNotify_C /Game/AdvancedLocomotionV4/CharacterAssets/MannequinSkeleton/"
+                  "AnimationExamples/Base/Locomotion/ALS_N_Walk_F.ALS_N_Walk_F:Footstep_Notify_C_0", 5.0),
+    ue::ObjectRef("Footstep_AnimNotify_C /Game/AdvancedLocomotionV4/CharacterAssets/MannequinSkeleton/"
+                  "AnimationExamples/Base/Locomotion/ALS_N_Walk_F.ALS_N_Walk_F:Footstep_Notify_C_1", 5.0),
+};
+
+// One footstep, foot 0 or 1, as walking makes it. Returns false (and logs
+// why, a few times) when the game's footstep or the player's Mesh is missing.
+bool Footstep(UObject player, int foot) {
+    static int complaints = 0;
+    UObject notify = g_walk_step[foot & 1].Get();
+    UObject mesh = 0;
+    const bool have_mesh = ue::GetProp(player, "Mesh", mesh) && mesh;
+    if (!notify || !have_mesh) {
+        if (complaints++ < 3)
+            log::Info("teleport: no landing footstep (%s)",
+                      !notify ? "the game's walking footstep is not loaded" : "the player has no Mesh");
+        return false;
+    }
+    ue::Call c(notify, "Received_Notify");
+    c.Set("MeshComp", mesh).Set("Animation", ue::GetOuter(notify));
+    const bool ok = c.Invoke();
+    if (!ok && complaints++ < 3) log::Info("teleport: the game's footstep could not be called");
+    return ok;
+}
 
 int IndexOf(UObject obj) { return obj ? mem::ReadOr<int32_t>(obj + ue::off::kObjIndex, -1) : -1; }
 bool Alive(UObject obj, int index) { return obj && index >= 0 && ue::objects::Get(index) == obj; }
@@ -317,7 +360,11 @@ void Move(UObject player) {
     FVector d = T.move_to - from;
     double dist = std::sqrt(d.X * d.X + d.Y * d.Y + d.Z * d.Z);
     if (ok) {
-        log::Info("teleport: moved %.0f cm (to %.0f, %.0f, %.0f)", dist, T.move_to.X, T.move_to.Y, T.move_to.Z);
+        const bool stepped = Footstep(player, 0);
+        T.steps = stepped ? 1 : 0;
+        T.step_at = stepped ? NowS() + kSecondStepS : -1;
+        log::Info("teleport: moved %.0f cm (to %.0f, %.0f, %.0f)%s", dist, T.move_to.X, T.move_to.Y, T.move_to.Z,
+                  stepped ? "; footsteps as walking makes them (sound and the noise enemies hear)" : "");
     } else {
         log::Info("teleport: no room for the character there (%.0f cm away); stayed put", dist);
         input::Haptic(input::kLeft, 0.3f, 0.05f);
@@ -330,6 +377,7 @@ void Hide() {
     T.gesture.Reset();
     T.have_target = false;
     T.move_at = -1;
+    T.step_at = -1;
     if (MarkersAlive()) {
         ShowBeads(0);
         ShowDisc(false);
@@ -339,6 +387,10 @@ void Hide() {
 void Update(UObject player, const input::HandInput& stick, int hand) {
     if (!player) return;
     if (T.move_at > 0 && NowS() >= T.move_at) Move(player);
+    if (T.step_at > 0 && NowS() >= T.step_at) {
+        T.step_at = -1;
+        if (Footstep(player, T.steps)) ++T.steps;
+    }
     if (!MakeMarkers(player)) return;
     switch (T.gesture.Update(stick.stick_x, stick.stick_y)) {
         case Gesture::kAiming:
