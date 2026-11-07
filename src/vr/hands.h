@@ -40,6 +40,9 @@ struct HandGrab {
     // each has its own hand pose), -1 where the hand grabbed.
     // kSlideGrab: kPointChargingHandle = a rifle's charging handle held at its
     // rear end (one pose per hand), -1 = a pistol slide (holds by grab spot).
+    // kGunGrip: kPointHolster = the left hand reaching for the holstered
+    // pistol (holster_preview), with its own pose (owner 2026-11-07: the
+    // right hand's grip, mirrored, twisted the left arm).
     int point = -1;
     // Visual-only reach onto a seated pistol; never acquires input ownership
     // or changes the controller. The authored approach clears the shell.
@@ -63,6 +66,7 @@ inline bool HasHeldObject(const HandGrab& pose, const HandInteraction& access,
            HeldGrabKind(pose) != GrabKind::kNone;
 }
 constexpr int kPointChargingHandle = 0;
+constexpr int kPointHolster = 1;
 HandGrab GetGrab(Hand hand);
 // A rifle's charging handle is grabbed at the rear end of its mesh (from
 // 2026-11-04; before, at the handle's origin). shift = the grab point now

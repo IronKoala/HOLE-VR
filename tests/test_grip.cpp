@@ -362,6 +362,9 @@ static void TestSideKeys() {
     EXPECT(UsualKey("BP_Mag_C.mag-right") == "BP_Mag_C.mag");
     EXPECT(UsualKey("BP_AR_C.charging-left") == "BP_AR_C.charging-left");
     EXPECT(UsualKey("BP_AR_C.charging-right") == "BP_AR_C.charging-right");
+    // The left hand's own reach for the holstered pistol (owner 2026-11-07).
+    EXPECT(SideKey("BP_HG_C.holster", false, false) == "BP_HG_C.holster-left");
+    EXPECT(UsualKey("BP_HG_C.holster-left") == "BP_HG_C.holster");
     for (bool right : {false, true})
         for (const char* base : {"BP_HG_C.grip", "BP_AR_C.support-light", "BP_HG_C.slide-front-flat", "M.mag"})
             EXPECT(UsualKey(SideKey(base, right, false)) == base);

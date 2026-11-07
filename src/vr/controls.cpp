@@ -4036,12 +4036,14 @@ int g_holster_reach_hand = input::kRight;   // the hand the holster's hand snap 
 UObject g_holster_owner = 0;
 void UpdateHolsterVisual(UObject player, const hands::HandState hs[2]);
 void DrawHolsterModel(UObject player);
-void ClearHolsterVisual() {
+// keep_model: the grip editor is open (the left hand's reach for the
+// holstered pistol may be posed): the 3D holster stays where it is.
+void ClearHolsterVisual(bool keep_model = false) {
     g_holster_visual.Reset();
     g_holster_feedback.Reset();
     holster_audio::Silence();
     g_holster_reach = {};
-    holster_model::Hide();
+    if (!keep_model) holster_model::Hide();
     std::lock_guard<std::mutex> lock(g_hands_mutex);
     for (int h = 0; h < 2; ++h)
         if (g_grab[h].holster_preview) g_grab[h] = {};
@@ -6051,7 +6053,7 @@ void UpdateHolsterVisual(UObject player, const hands::HandState hs[2]) {
                    : body::CalibrationActive() ? 5 : W.edit_frozen ? 6 : 0;
     if (skip) {
         LogHolsterVisualSkip(skip);
-        ClearHolsterVisual();
+        ClearHolsterVisual(skip == 4 || skip == 6);   // the grip editor: the holster stays in view
         return;
     }
     if (g_holster_owner != player) {
@@ -6119,6 +6121,9 @@ void UpdateHolsterVisual(UObject player, const hands::HandState hs[2]) {
         g_holster_reach.target = grip;
         g_holster_reach.holster_preview = true;
         g_holster_reach.pose_blend = g_holster_visual.HandBlend();
+        // The left hand has its own reach pose (BP_HG_C.holster-left), posed
+        // by the owner; the right hand reaches with its gun grip.
+        if (vh == input::kLeft) g_holster_reach.point = hands::kPointHolster;
     }
     static int last = -1;
     const int state = (!seated ? 0 : g_holster_visual.Near() ? 1 : 2);
@@ -6147,7 +6152,7 @@ void DrawHolsterModel(UObject player) {
 
 void OnLateTick(UObject player, float) {
     if (!g_set.enabled || ui_panel::MenuOpen() || hands::EditorHand() >= 0 || body::CalibrationActive()) {
-        ClearHolsterVisual();
+        ClearHolsterVisual(g_set.enabled && !ui_panel::MenuOpen() && !body::CalibrationActive());
         return;
     }
     {
