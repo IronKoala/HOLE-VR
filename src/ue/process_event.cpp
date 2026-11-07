@@ -1,0 +1,367 @@
+#include "ue/process_event.h"
+
+#include <windows.h>
+
+#include <atomic>
+#include <cstring>
+#include <mutex>
+
+#include "core/log.h"
+#include "core/perf.h"
+#include "core/memory.h"
+#include "ue/reflection.h"
+
+namespace holevr::ue::process_event {
+namespace {
+
+// EFunctionFlags bits used to identify fields and code.
+constexpr uint32_t FUNC_Native = 0x00000400;
+constexpr uint32_t FUNC_Event = 0x00000800;
+constexpr uint32_t FUNC_BlueprintCallable = 0x04000000;
+constexpr uint32_t FUNC_BlueprintEvent = 0x08000000;
+
+uintptr_t g_flags_off = 0;
+int g_index = -1;
+bool g_ready = false;
+
+using ProcessEventFn = void (*)(UObject self, UObject function, void* params);
+
+// One entry per patched vtable. Lookups are lock-free reads; entries are
+// only appended (from the init thread) before the slot is patched.
+struct PatchedTable {
+    uintptr_t vtable = 0;
+    ProcessEventFn original = nullptr;
+};
+constexpr int kMaxTables = 16;
+PatchedTable g_tables[kMaxTables];
+std::atomic<int> g_table_count{0};
+
+struct Callback {
+    UObject function = 0;
+    PreFn pre = nullptr;
+    PostFn post = nullptr;
+};
+constexpr int kMaxCallbacks = 64;
+Callback g_callbacks[kMaxCallbacks];
+std::atomic<int> g_callback_count{0};
+// Registration (not the hook itself) can come from the game thread and from
+// background threads at once; this keeps two of them from taking one slot.
+std::mutex g_register_mutex;
+constexpr int kMaxAny = 4;
+std::atomic<PostFn> g_any[kMaxAny]{};
+
+const mem::Section* Text() { return mem::Game().Find(".text"); }
+
+bool InText(uintptr_t p) {
+    const mem::Section* t = Text();
+    return t && p >= t->start && p < t->start + t->size;
+}
+
+// Follows `jmp rel32` / `jmp [rip+x]` thunks the linker sometimes puts in vtables.
+uintptr_t FollowThunks(uintptr_t fn) {
+    for (int i = 0; i < 4 && InText(fn); ++i) {
+        uint8_t b[6];
+        if (!mem::Read(fn, b)) break;
+        if (b[0] == 0xE9) {
+            int32_t rel;
+            std::memcpy(&rel, b + 1, 4);
+            fn = fn + 5 + rel;
+        } else if (b[0] == 0xFF && b[1] == 0x25) {
+            int32_t rel;
+            std::memcpy(&rel, b + 2, 4);
+            fn = mem::ReadOr<uintptr_t>(fn + 6 + rel);
+        } else {
+            break;
+        }
+    }
+    return fn;
+}
+
+// UFunction::FunctionFlags sits right after UStruct. Find it by checking two
+// functions every UE5 build has: one native and callable, one a Blueprint event.
+bool FindFlagsOffset() {
+    UObject native_fn = FindObject("Function /Script/Engine.Actor:K2_GetActorLocation");
+    UObject event_fn = FindObject("Function /Script/Engine.Actor:ReceiveBeginPlay");
+    if (!native_fn || !event_fn) return false;
+    for (uintptr_t o = 0x90; o <= 0xD0; o += 4) {
+        uint32_t a = mem::ReadOr<uint32_t>(native_fn + o);
+        uint32_t b = mem::ReadOr<uint32_t>(event_fn + o);
+        bool a_ok = (a & FUNC_Native) && (a & FUNC_BlueprintCallable) && !(a & FUNC_Event);
+        bool b_ok = (b & FUNC_Event) && (b & FUNC_BlueprintEvent) && !(b & FUNC_Native);
+        if (a_ok && b_ok) {
+            g_flags_off = o;
+            return true;
+        }
+    }
+    return false;
+}
+
+// ProcessEvent tests `Function->FunctionFlags & FUNC_Native` and
+// `& FUNC_HasOutParms` early on. Look for those tests (dword or byte forms).
+bool LooksLikeProcessEvent(uintptr_t fn) {
+    constexpr size_t kScan = 0x400;
+    if (!InText(fn) || !mem::IsReadable(fn, kScan)) return false;
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(fn);
+    const uint32_t off = static_cast<uint32_t>(g_flags_off);
+    bool native_test = false, outparms_test = false;
+    for (size_t i = 0; i + 10 <= kScan; ++i) {
+        uint32_t disp, imm;
+        if (p[i] == 0xF7 && (p[i + 1] & 0xC0) == 0x80) {  // test dword [reg+disp32], imm32
+            std::memcpy(&disp, p + i + 2, 4);
+            std::memcpy(&imm, p + i + 6, 4);
+            if (disp == off && imm == FUNC_Native) native_test = true;
+            if (disp == off && imm == 0x00400000) outparms_test = true;
+        } else if (p[i] == 0xF6 && (p[i + 1] & 0xC0) == 0x80) {  // test byte [reg+disp32], imm8
+            std::memcpy(&disp, p + i + 2, 4);
+            if (disp == off + 1 && p[i + 6] == 0x04) native_test = true;
+            if (disp == off + 2 && p[i + 6] == 0x40) outparms_test = true;
+        }
+        if (native_test && outparms_test) return true;
+    }
+    return false;
+}
+
+// Prologue of UObject::ProcessEvent in UE 5.x shipping builds (MSVC).
+constexpr const char* kProcessEventPattern =
+    "40 55 56 57 41 54 41 55 41 56 41 57 48 81 EC ?? ?? ?? ?? 48 8D 6C 24 ?? 48 89 9D ?? ?? ?? ?? "
+    "48 8B 05 ?? ?? ?? ?? 48 33 C5 48 89 85 ?? ?? ?? ?? 8B 41 0C 45 33 F6 3B 05 ?? ?? ?? ?? 4D 8B "
+    "F8 48 8B F2 4C 8B E1 41 B8 FF FF 00 00 0F 8D";
+
+bool FindVtableIndex() {
+    UObject cdo = FindObject("Object /Script/CoreUObject.Default__Object");
+    if (!cdo) return false;
+    uintptr_t vt = mem::ReadOr<uintptr_t>(cdo);
+    if (!vt) return false;
+
+    uintptr_t by_pattern = 0;
+    if (const mem::Section* t = Text()) by_pattern = mem::FindPattern(t->start, t->size, kProcessEventPattern);
+
+    int heuristic_index = -1, pattern_index = -1;
+    for (int i = 0; i < 256; ++i) {
+        uintptr_t fn = mem::ReadOr<uintptr_t>(vt + i * 8ull);
+        if (!InText(fn)) break;  // past the end of the table
+        uintptr_t target = FollowThunks(fn);
+        if (by_pattern && target == by_pattern && pattern_index < 0) pattern_index = i;
+        if (heuristic_index < 0 && LooksLikeProcessEvent(target)) heuristic_index = i;
+    }
+    log::Info("process_event: vtable index by code check %d, by pattern %d (pattern at %s)",
+              heuristic_index, pattern_index, by_pattern ? "found" : "not found");
+    if (pattern_index >= 0 && heuristic_index >= 0 && pattern_index != heuristic_index)
+        log::Warn("process_event: the two methods disagree; using the pattern result");
+    g_index = pattern_index >= 0 ? pattern_index : heuristic_index;
+    return g_index >= 0;
+}
+
+ProcessEventFn OriginalFor(uintptr_t vtable) {
+    int n = g_table_count.load(std::memory_order_acquire);
+    for (int i = 0; i < n; ++i)
+        if (g_tables[i].vtable == vtable) return g_tables[i].original;
+    return nullptr;
+}
+
+thread_local int t_depth = 0;
+thread_local int t_open = 0;  // calls at this depth still reach the callbacks (GameCodeScope)
+// Every game event on a hooked class (every Blueprint tick, every animation
+// update, every widget event) passes through Hook, 3,000-20,000 times a
+// second in a level. What we add to each one is measured here, apart from
+// the mod's own callbacks (the mod tick runs inside the player's tick event).
+perf::Counter g_listen_perf{"game events: our listeners"};
+perf::Counter g_cb_perf{"game events: our callbacks"};
+std::atomic<bool> g_perf_registered{false};
+std::atomic<DWORD> g_game_thread{0};
+std::atomic<long long> g_off_thread_events{0};
+
+void Hook(UObject self, UObject function, void* params) {
+    uintptr_t vt = *reinterpret_cast<uintptr_t*>(self);
+    ProcessEventFn original = OriginalFor(vt);
+    if (!original) return;  // cannot happen: only patched tables point here
+    // Do not re-enter our callbacks from calls our callbacks make, and keep
+    // the hook transparent if something deep in the engine recurses a lot.
+    if (t_depth > t_open) {
+        original(self, function, params);
+        return;
+    }
+    if (!g_perf_registered.exchange(true)) {
+        g_listen_perf.per_second_total = true;
+        g_cb_perf.per_second_total = true;
+        perf::Register(&g_listen_perf);
+        perf::Register(&g_cb_perf);
+    }
+    DWORD gt = g_game_thread.load(std::memory_order_relaxed);
+    if (gt && GetCurrentThreadId() != gt) g_off_thread_events.fetch_add(1, std::memory_order_relaxed);
+    const Callback* match = nullptr;
+    int n = g_callback_count.load(std::memory_order_acquire);
+    for (int i = 0; i < n; ++i) {
+        if (g_callbacks[i].function == function) {
+            match = &g_callbacks[i];
+            break;
+        }
+    }
+    bool run = true;
+    if (match && match->pre) {
+        double t = perf::NowMs();
+        ++t_depth;
+        run = match->pre(self, function, params);
+        --t_depth;
+        g_cb_perf.Add(perf::NowMs() - t);
+    }
+
+    if (run) original(self, function, params);
+
+    double t_post = perf::NowMs();
+    ++t_depth;
+    for (int i = 0; i < kMaxAny; ++i)
+        if (PostFn any = g_any[i].load(std::memory_order_acquire)) any(self, function, params);
+    double t_listeners = perf::NowMs();
+    if (match && match->post) match->post(self, function, params);
+    --t_depth;
+    g_listen_perf.Add(t_listeners - t_post);
+    if (match && match->post) g_cb_perf.Add(perf::NowMs() - t_listeners);
+}
+
+}  // namespace
+
+GameCodeScope::GameCodeScope() : saved_(t_open) { t_open = t_depth; }
+GameCodeScope::~GameCodeScope() { t_open = saved_; }
+
+bool Init() {
+    if (g_ready) return true;
+    if (!reflection::Ready()) return false;
+    if (!g_flags_off && !FindFlagsOffset()) return false;
+    if (g_index < 0 && !FindVtableIndex()) {
+        log::Error("process_event: could not find UObject::ProcessEvent");
+        return false;
+    }
+    g_ready = true;
+    log::Info("process_event: FunctionFlags at 0x%llx, ProcessEvent is vtable slot %d",
+              static_cast<unsigned long long>(g_flags_off), g_index);
+    return true;
+}
+
+bool Ready() { return g_ready; }
+
+void SetGameThread(DWORD id) { g_game_thread.store(id, std::memory_order_relaxed); }
+long long TakeOffThreadEvents() { return g_off_thread_events.exchange(0, std::memory_order_relaxed); }
+int VtableIndex() { return g_index; }
+uintptr_t FunctionFlagsOffset() { return g_flags_off; }
+
+void Invoke(UObject obj, UObject function, void* params) {
+    if (!g_ready || !obj || !function) return;
+    uintptr_t vt = mem::ReadOr<uintptr_t>(obj);
+    // Call the original for patched tables so our own calls skip the hook.
+    ProcessEventFn fn = OriginalFor(vt);
+    if (!fn) fn = reinterpret_cast<ProcessEventFn>(mem::ReadOr<uintptr_t>(vt + g_index * 8ull));
+    if (!fn) return;
+    fn(obj, function, params);
+}
+
+bool HookVtableOf(UObject sample) {
+    if (!g_ready || !sample) return false;
+    std::lock_guard<std::mutex> lock(g_register_mutex);
+    uintptr_t vt = mem::ReadOr<uintptr_t>(sample);
+    if (!vt) return false;
+    if (OriginalFor(vt)) return true;
+    int n = g_table_count.load();
+    if (n >= kMaxTables) return false;
+    uintptr_t slot = vt + g_index * 8ull;
+    auto original = reinterpret_cast<ProcessEventFn>(mem::ReadOr<uintptr_t>(slot));
+    if (!original) return false;
+    g_tables[n] = {vt, original};
+    g_table_count.store(n + 1, std::memory_order_release);
+
+    DWORD old;
+    if (!VirtualProtect(reinterpret_cast<void*>(slot), 8, PAGE_READWRITE, &old)) {
+        log::Error("process_event: VirtualProtect failed on vtable %p", reinterpret_cast<void*>(vt));
+        return false;
+    }
+    auto hook = reinterpret_cast<uintptr_t>(&Hook);
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(slot), static_cast<LONG64>(hook));
+    VirtualProtect(reinterpret_cast<void*>(slot), 8, old, &old);
+    log::Info("process_event: hooked vtable exe+0x%llx (%s)",
+              static_cast<unsigned long long>(vt - mem::Game().base), GetFullName(GetClass(sample)).c_str());
+    return true;
+}
+
+bool On(UObject function, PreFn pre, PostFn post) {
+    if (!function) return false;
+    std::lock_guard<std::mutex> lock(g_register_mutex);
+    int n = g_callback_count.load();
+    for (int i = 0; i < n; ++i) {
+        if (g_callbacks[i].function == function) {
+            g_callbacks[i].pre = pre;
+            g_callbacks[i].post = post;
+            return true;
+        }
+    }
+    if (n >= kMaxCallbacks) return false;
+    g_callbacks[n] = {function, pre, post};
+    g_callback_count.store(n + 1, std::memory_order_release);
+    return true;
+}
+
+void OnAny(PostFn post) {
+    for (int i = 0; i < kMaxAny; ++i) {
+        PostFn cur = g_any[i].load(std::memory_order_acquire);
+        if (cur == post) return;
+        if (!cur) {
+            g_any[i].store(post, std::memory_order_release);
+            return;
+        }
+    }
+}
+
+namespace {
+// UFunction::Func: the native thunk pointer a few fields after FunctionFlags.
+// Native functions each have their own thunk in .text; Blueprint events
+// declared in C++ all share UObject::ProcessInternal.
+uintptr_t g_func_off = 0;
+
+bool FindFuncOffset() {
+    if (g_func_off) return true;
+    const char* natives[] = {"Function /Script/Engine.Actor:K2_GetActorLocation",
+                             "Function /Script/Engine.Actor:K2_DestroyActor",
+                             "Function /Script/UMG.Widget:RemoveFromParent",
+                             "Function /Script/Engine.KismetSystemLibrary:IsValid"};
+    const char* events[] = {"Function /Script/Engine.Actor:ReceiveBeginPlay",
+                            "Function /Script/Engine.Actor:ReceiveTick"};
+    UObject n[4], e[2];
+    for (int i = 0; i < 4; ++i)
+        if (!(n[i] = FindObject(natives[i]))) return false;
+    for (int i = 0; i < 2; ++i)
+        if (!(e[i] = FindObject(events[i]))) return false;
+    for (uintptr_t o = g_flags_off + 8; o <= g_flags_off + 0x48; o += 8) {
+        uintptr_t ev0 = mem::ReadOr<uintptr_t>(e[0] + o), ev1 = mem::ReadOr<uintptr_t>(e[1] + o);
+        if (!InText(ev0) || ev0 != ev1) continue;
+        bool ok = true;
+        uintptr_t seen[4];
+        for (int i = 0; i < 4 && ok; ++i) {
+            seen[i] = mem::ReadOr<uintptr_t>(n[i] + o);
+            ok = InText(seen[i]) && seen[i] != ev0;
+            for (int j = 0; j < i && ok; ++j) ok = seen[j] != seen[i];
+        }
+        if (ok) {
+            g_func_off = o;
+            log::Info("process_event: UFunction::Func at 0x%llx", static_cast<unsigned long long>(o));
+            return true;
+        }
+    }
+    log::Error("process_event: UFunction::Func not found");
+    return false;
+}
+}  // namespace
+
+bool HookNative(UObject function, NativeFn hook, NativeFn* original) {
+    if (!g_ready || !function || !hook || !original || !FindFuncOffset()) return false;
+    uint32_t flags = mem::ReadOr<uint32_t>(function + g_flags_off);
+    if (!(flags & FUNC_Native)) return false;
+    uintptr_t slot = function + g_func_off;
+    uintptr_t cur = mem::ReadOr<uintptr_t>(slot);
+    if (cur == reinterpret_cast<uintptr_t>(hook)) return true;
+    if (!InText(cur)) return false;
+    *original = reinterpret_cast<NativeFn>(cur);
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(slot), static_cast<LONG64>(reinterpret_cast<uintptr_t>(hook)));
+    log::Info("process_event: following %s", GetName(function).c_str());
+    return true;
+}
+
+}  // namespace holevr::ue::process_event

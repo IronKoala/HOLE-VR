@@ -1,0 +1,1788 @@
+#include "vr/workbench.h"
+
+#include <windows.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <map>
+#include <string>
+#include <vector>
+
+#include "core/config.h"
+#include "core/log.h"
+#include "core/memory.h"
+#include "game/game.h"
+#include "game/gun.h"
+#include "game/weapon_custom.h"
+#include "ue/call.h"
+#include "ue/names.h"
+#include "ue/objects.h"
+#include "ue/reflection.h"
+#include "vr/hands.h"
+#include "vr/bench_vise.h"
+#include "vr/bench_vise_layout.h"
+#include "vr/bench_layout.h"
+#include "vr/bench_vise_motion.h"
+#include "vr/bench_vise_fit.h"
+#include "vr/input.h"
+#include "vr/math.h"
+#include "vr/workbench_rules.h"
+#include "vr/world_menu.h"
+
+namespace holevr::vr::workbench {
+namespace {
+
+using ue::FName;
+using ue::UObject;
+namespace custom = game::custom;
+
+constexpr const char* kBenchClass =
+    "BlueprintGeneratedClass /Game/GamePlay/LevelComponents/LCBP_WeaponCustom.LCBP_WeaponCustom_C";
+// The hub facility the bench belongs to (LCBP_HomeFacilityBase_C): locked
+// behind a yellow sign until bought.
+constexpr const char* kFacilityClass = "BlueprintGeneratedClass /Game/GamePlay/LevelComponents/HF_WPSWC.HF_WPSWC_C";
+constexpr uint8_t kFacilityUnlocked = 2;  // FacilityState: 0 empty, 1 yellow sign, 2 unlocked (CBP_N_ children)
+// Once bought, the facility spawns LCBPGroup_WPSWC (long tables, parts shop)
+// as its CBP_2_Unlocked child, and the group spawns the bench as its
+// LCBP_WeaponCustom child. Before that the only object of the bench's class
+// is the group Blueprint's child-actor template
+// (LCBP_WeaponCustom_GEN_VARIABLE_LCBP_WeaponCustom_C_CAT): same class, but
+// not in any level, at the world origin. The search below skips it.
+constexpr int kBenchSearches = 15;  // a bought bench not found yet: look again (2 s apart)
+
+// ---------------------------------------------------------------- settings
+struct Settings {
+    bool study = true;
+    bool enabled = true;
+    bool tables_before_unlock = true;
+    double grab_cm = 3.0;
+    double snap_cm = 5.0;
+    double walk_away_cm = 300.0;
+    double bench_reach_cm = 250.0;  // unlocked bench: let go this close to it to lay the gun down
+    double rest_cm = 1.7;           // grab point above the table when the pistol lies on its side
+    // The green zone at the unlocked bench (cm): size along the table edge,
+    // height, depth; how far it sits out from the edge (0 = centred on it)
+    // and above the table top; how far outside it a let-go still counts.
+    // The box's edge lines (cm thick), how far in from them its colour fades
+    // out, and how near your head must be for it to show at all.
+    bool zone = true;
+    double zone_w = 34.0, zone_h = 52.0, zone_d = 14.0, zone_out = 4.0, zone_lift = 2.0, zone_margin = 8.0;
+    double zone_line = 0.6, zone_fade = 4.0, zone_show = 100.0;
+} S;
+
+// ---------------------------------------------------------------- engine helpers
+struct alignas(16) Xf {
+    FQuat rotation;
+    FVector translation;
+    double pad0 = 0;
+    FVector scale{1, 1, 1};
+    double pad1 = 0;
+};
+static_assert(sizeof(Xf) == 0x60, "FTransform layout");
+
+struct Arr {
+    uintptr_t data;
+    int32_t num, max;
+};
+
+double Len(const FVector& v) { return std::sqrt(v.X * v.X + v.Y * v.Y + v.Z * v.Z); }
+FVector Norm(const FVector& v) {
+    const double l = Len(v);
+    return l > 1e-6 ? v * (1.0 / l) : FVector{1, 0, 0};
+}
+double Dot(const FVector& a, const FVector& b) { return a.X * b.X + a.Y * b.Y + a.Z * b.Z; }
+FVector Cross(const FVector& a, const FVector& b) {
+    return {a.Y * b.Z - a.Z * b.Y, a.Z * b.X - a.X * b.Z, a.X * b.Y - a.Y * b.X};
+}
+double Flat(const FVector& a, const FVector& b) { return std::hypot(a.X - b.X, a.Y - b.Y); }
+
+// Rotation whose X/Y/Z axes are the given orthonormal vectors.
+FQuat FromAxes(const FVector& x, const FVector& y, const FVector& z) {
+    const double m00 = x.X, m11 = y.Y, m22 = z.Z, tr = m00 + m11 + m22;
+    FQuat q;
+    if (tr > 0) {
+        const double s = std::sqrt(tr + 1.0) * 2;
+        q.W = 0.25 * s;
+        q.X = (y.Z - z.Y) / s;
+        q.Y = (z.X - x.Z) / s;
+        q.Z = (x.Y - y.X) / s;
+    } else if (m00 > m11 && m00 > m22) {
+        const double s = std::sqrt(1.0 + m00 - m11 - m22) * 2;
+        q.W = (y.Z - z.Y) / s;
+        q.X = 0.25 * s;
+        q.Y = (y.X + x.Y) / s;
+        q.Z = (z.X + x.Z) / s;
+    } else if (m11 > m22) {
+        const double s = std::sqrt(1.0 + m11 - m00 - m22) * 2;
+        q.W = (z.X - x.Z) / s;
+        q.X = (y.X + x.Y) / s;
+        q.Y = 0.25 * s;
+        q.Z = (z.Y + y.Z) / s;
+    } else {
+        const double s = std::sqrt(1.0 + m22 - m00 - m11) * 2;
+        q.W = (x.Y - y.X) / s;
+        q.X = (z.X + x.Z) / s;
+        q.Y = (z.Y + y.Z) / s;
+        q.Z = 0.25 * s;
+    }
+    return q;
+}
+
+UObject Statics() {
+    static UObject s = 0;
+    if (!s) s = ue::FindObject("GameplayStatics /Script/Engine.Default__GameplayStatics");
+    return s;
+}
+UObject Ksl() {
+    static UObject s = 0;
+    if (!s) s = ue::FindObject("KismetSystemLibrary /Script/Engine.Default__KismetSystemLibrary");
+    return s;
+}
+
+FVector ActorLocation(UObject a) {
+    ue::Call c(a, "K2_GetActorLocation");
+    c.Invoke();
+    return c.Result<FVector>();
+}
+FQuat ActorRotation(UObject a) {
+    ue::Call c(a, "K2_GetActorRotation");
+    c.Invoke();
+    return ToQuat(c.Result<FRotator>());
+}
+void SetActorPose(UObject a, const FVector& loc, const FQuat& rot) {
+    ue::Call c(a, "K2_SetActorLocationAndRotation");
+    c.Set("NewLocation", loc).Set("NewRotation", ToRotator(rot)).Set("bSweep", false).Set("bTeleport", true);
+    c.Invoke();
+}
+Xf ComponentToWorld(UObject comp) {
+    ue::Call c(comp, "K2_GetComponentToWorld");
+    if (!c.Invoke()) return Xf{};
+    return c.Result<Xf>();
+}
+Xf RelativeTransform(UObject comp) {
+    ue::Call c(comp, "GetRelativeTransform");
+    if (!c.Invoke()) return Xf{};
+    return c.Result<Xf>();
+}
+void SetHidden(UObject a, bool hidden) {
+    ue::Call c(a, "SetActorHiddenInGame");
+    c.Set("bNewHidden", hidden);
+    c.Invoke();
+}
+bool LiveObject(UObject obj) {
+    if (!obj) return false;
+    const int32_t idx = mem::ReadOr<int32_t>(obj + ue::off::kObjIndex, -1);
+    return idx >= 0 && ue::objects::Get(idx) == obj && ue::GetClass(obj) != 0;
+}
+void DestroyActor(UObject a) {
+    if (!LiveObject(a)) return;
+    ue::Call c(a, "K2_DestroyActor");
+    c.Invoke();
+}
+
+UObject SpawnActor(UObject world_context, UObject cls, const FVector& loc, const FQuat& rot) {
+    if (!Statics() || !cls) return 0;
+    Xf t;
+    t.rotation = rot;
+    t.translation = loc;
+    ue::Call begin(Statics(), "BeginDeferredActorSpawnFromClass");
+    const uint8_t always_spawn = 1;  // ESpawnActorCollisionHandlingMethod::AlwaysSpawn
+    begin.Set("WorldContextObject", world_context).Set("ActorClass", cls).Set("SpawnTransform", t)
+        .Set("CollisionHandlingOverride", always_spawn);
+    if (!begin.Invoke()) return 0;
+    UObject actor = begin.Result<UObject>();
+    if (!actor) return 0;
+    ue::Call finish(Statics(), "FinishSpawningActor");
+    finish.Set("Actor", actor).Set("SpawnTransform", t);
+    finish.Invoke();
+    UObject done = finish.Result<UObject>();
+    if (!done) done = actor;
+    // Loose parts are only looked at and carried: no collision (hands, the
+    // gun and the table traces pass through them).
+    ue::Call col(done, "SetActorEnableCollision");
+    col.Set("bNewActorEnableCollision", false);
+    col.Invoke();
+    return done;
+}
+
+// Straight down from `from` to `to`: the first thing hit, ignoring `ignore`.
+bool TraceDown(UObject world_context, const FVector& from, const FVector& to, const std::vector<UObject>& ignore,
+               FVector* at, FVector* normal, std::string* what) {
+    if (!Ksl() || !Statics()) return false;
+    Arr arr{ignore.empty() ? 0 : reinterpret_cast<uintptr_t>(ignore.data()), static_cast<int32_t>(ignore.size()),
+            static_cast<int32_t>(ignore.size())};
+    ue::Call t(Ksl(), "LineTraceSingle");
+    t.Set("WorldContextObject", world_context).Set("Start", from).Set("End", to).Set("TraceChannel", uint8_t{0})
+        .Set("bTraceComplex", false).Set("ActorsToIgnore", arr).Set("bIgnoreSelf", true);
+    if (!t.Invoke() || !t.Result<bool>()) return false;
+    int32_t hit_size = 0;
+    uint8_t* hit = t.Raw("OutHit", &hit_size);
+    if (!hit) return false;
+    ue::Call br(Statics(), "BreakHitResult");
+    int32_t in_size = 0;
+    uint8_t* in = br.Raw("Hit", &in_size);
+    if (!in || in_size != hit_size) return false;
+    std::memcpy(in, hit, static_cast<size_t>(hit_size));
+    if (!br.Invoke() || !br.Get<bool>("bBlockingHit")) return false;
+    *at = br.Get<FVector>("ImpactPoint");
+    *normal = br.Get<FVector>("ImpactNormal");
+    UObject actor = br.Get<UObject>("HitActor");
+    *what = actor ? ue::GetName(actor) : "something";
+    return true;
+}
+
+// Actors hanging on `actor` (a gun's magazine and parts), for trace ignore lists.
+void AddAttached(UObject actor, std::vector<UObject>* out) {
+    ue::Call c(actor, "GetAttachedActors");
+    if (!c.Valid()) return;
+    int32_t flag = 0;
+    if (c.Raw("bResetArray", &flag) && flag == 1) c.Set("bResetArray", true);
+    if (c.Raw("bRecursivelyIncludeAttachedActors", &flag) && flag == 1)
+        c.Set("bRecursivelyIncludeAttachedActors", true);
+    if (!c.Invoke()) return;
+    int32_t size = 0;
+    const uint8_t* raw = c.Raw("OutActors", &size);
+    Arr arr{};
+    if (!raw || size < 16) return;
+    std::memcpy(&arr, raw, sizeof(Arr));
+    for (int32_t i = 0; i < arr.num && i < 32; ++i)
+        if (UObject a = mem::ReadOr<uintptr_t>(arr.data + i * 8ull)) out->push_back(a);
+}
+
+// An actor's visible static meshes as one box in the actor's own space.
+struct Box {
+    FVector lo{-2, -2, -2}, hi{2, 2, 2};
+    bool measured = false;
+    FVector Center() const { return (lo + hi) * 0.5; }
+};
+Box LocalBox(UObject actor) {
+    Box out;
+    static UObject smc_class = 0;
+    if (!smc_class) smc_class = ue::FindObject("Class /Script/Engine.StaticMeshComponent");
+    if (!smc_class) return out;
+    ue::Call list(actor, "K2_GetComponentsByClass");
+    list.Set("ComponentClass", smc_class);
+    int32_t size = 0;
+    const uint8_t* raw = list.Invoke() ? list.Raw("ReturnValue", &size) : nullptr;
+    Arr arr{};
+    if (raw && size >= 16) std::memcpy(&arr, raw, sizeof(Arr));
+    const FVector al = ActorLocation(actor);
+    const FQuat inv = ActorRotation(actor).Inverse();
+    for (int32_t i = 0; i < arr.num && i < 32; ++i) {
+        UObject c = mem::ReadOr<uintptr_t>(arr.data + i * 8ull);
+        if (!c) continue;
+        ue::Call vis(c, "IsVisible");
+        if (vis.Invoke() && !vis.Result<bool>()) continue;
+        UObject sm = 0;
+        if (!ue::GetProp(c, "StaticMesh", sm) || !sm) continue;
+        ue::Call bb(sm, "GetBoundingBox");
+        int32_t bsz = 0;
+        const uint8_t* b = bb.Invoke() ? bb.Raw("ReturnValue", &bsz) : nullptr;
+        if (!b || bsz < 48) continue;
+        double v[6];
+        std::memcpy(v, b, sizeof(v));
+        // Skip empty meshes and big helper meshes (a flashlight's beam cone).
+        const double dx = v[3] - v[0], dy = v[4] - v[1], dz = v[5] - v[2];
+        if (dx < 0.05 && dy < 0.05 && dz < 0.05) continue;
+        if (dx > 40 || dy > 40 || dz > 40) continue;
+        const Xf w = ComponentToWorld(c);
+        for (int k = 0; k < 8; ++k) {
+            const FVector corner{k & 1 ? v[3] : v[0], k & 2 ? v[4] : v[1], k & 4 ? v[5] : v[2]};
+            const FVector scaled{corner.X * w.scale.X, corner.Y * w.scale.Y, corner.Z * w.scale.Z};
+            const FVector l = inv.Rotate(w.translation + w.rotation.Rotate(scaled) - al);
+            if (!out.measured) {
+                out.lo = out.hi = l;
+                out.measured = true;
+            }
+            out.lo = {std::min(out.lo.X, l.X), std::min(out.lo.Y, l.Y), std::min(out.lo.Z, l.Z)};
+            out.hi = {std::max(out.hi.X, l.X), std::max(out.hi.Y, l.Y), std::max(out.hi.Z, l.Z)};
+        }
+    }
+    return out;
+}
+
+// Distance from a world point to an actor's box (0 inside).
+double DistToBox(const FVector& p, const FVector& loc, const FQuat& rot, const Box& b) {
+    const FVector l = rot.Inverse().Rotate(p - loc);
+    const FVector c{std::clamp(l.X, b.lo.X, b.hi.X), std::clamp(l.Y, b.lo.Y, b.hi.Y), std::clamp(l.Z, b.lo.Z, b.hi.Z)};
+    return Len(l - c);
+}
+
+// ---------------------------------------------------------------- level state
+struct Level {
+    UObject player = 0;
+    double age = 0;
+    bool searched = false;
+    UObject bench = 0;     // the bench actor in this level (0 until the workbench is bought)
+    UObject facility = 0;  // the hub facility it belongs to (only in the hub)
+    int facility_state = -1;
+    bool unlocked = false;
+    int searches = 0;
+    bool logged_missing = false;
+    FVector bench_loc;
+    double next_state_check = 0;
+    bool studied = false;
+    double next_near_check = 0;
+    bool logged_near = false;
+    // Game data, read when a session starts.
+    bool have_db = false;
+    std::vector<custom::PartRow> db;
+} L;
+
+std::atomic<int> g_search_state{0};  // 0 idle, 1 running, 2 done
+std::atomic<UObject> g_found_facility{0}, g_search_for{0};
+std::vector<UObject> g_found_benches;  // written by the search thread before g_search_state = 2
+// Hub classes: freed when you leave the hub and loaded again at a new address
+// when you come back, so kept as ObjectRefs (only the search thread uses them).
+ue::ObjectRef g_bench_class(kBenchClass, 2.0), g_facility_class(kFacilityClass, 2.0);
+
+// ---------------------------------------------------------------- workbench state
+struct Park {
+    bool on = false;
+    bool in_vise = false;
+    double vise_gap = bench_vise::motion::kDefaultLoadedGap;
+    UObject gun = 0;
+    FVector spot;   // where a hand grabs it
+    FQuat frame;    // gun frame in the world
+    double surface_z = 0;
+} P;
+
+// A part lying on the table: our own actor of the part's class.
+struct Loose {
+    std::string row;
+    FName name;
+    UObject actor = 0;
+    Box box;
+    FQuat rest_rot;
+    bool have_rest = false;
+};
+
+// A part in a hand.
+struct Held {
+    bool active = false;
+    std::string row;
+    FName name;
+    UObject actor = 0;          // our actor, following the hand
+    Box box;
+    bool from_gun = false;      // taken off the gun: the gun's own part is hidden until it is settled
+    UObject gun_part = 0;
+    int from_slot = -1;         // slot index it came from
+    FVector rel_loc;            // actor pose in the hand's grip frame
+    FQuat rel_rot;
+    int snapped = -1;           // slot index it sits on now (shown on the gun), -1 none
+    std::string snapped_name;
+};
+
+struct Session {
+    bool on = false;
+    UObject gun = 0;
+    FName weapon_row;
+    std::string weapon;
+    FVector anchor;     // where the gun was laid down
+    FVector along;      // barrel direction, flat
+    FVector toward;     // from the gun toward the player, flat
+    FVector row;        // middle of the row of spare parts on the table
+    bool vise_row = false;
+    double table_half_width = 0;
+    double table_depth = 0;
+    double surface_z = 0;
+    std::vector<FName> owned;
+    bool dirty = false; // the table needs laying out again
+} T;
+
+bench_layout::Layout g_bench_layout;
+void LoadBenchLayout() {
+    const std::wstring path=config::Dir()+L"\\bench-layout.ini";
+    FILE* f=_wfopen(path.c_str(),L"rb");
+    if (!f) return; // Optional: retain the existing automatic arrangement.
+    char bytes[32769];
+    const size_t count=fread(bytes,1,sizeof(bytes),f);
+    const bool failed=ferror(f)!=0;
+    fclose(f);
+    std::string error;
+    if (failed || !bench_layout::Parse(std::string(bytes,count),&g_bench_layout,&error)) {
+        log::Warn("workbench: bench-layout.ini not loaded: %s",failed?"read failed":error.c_str());
+        return;
+    }
+    log::Info("workbench: loaded %zu fixed attachment positions from bench-layout.ini",g_bench_layout.size());
+}
+
+std::vector<Loose> g_table;
+Held g_held[2];
+
+// What a hand would grab (ClaimsGrip decides it, the tick acts on it).
+struct Candidate {
+    int kind = 0;  // 0 none, 1 loose part (index into g_table), 2 part on the gun
+    int index = -1;
+    UObject actor = 0;
+    std::string row;
+    int slot = -1;
+    double dist = 1e9;
+};
+struct Claim {
+    double time = -1;
+    Candidate c;
+} g_claim[2];
+bool g_hover[2] = {false, false};
+std::map<UObject, Box> g_box_cache;
+
+const char* HandName(int h) { return h == 0 ? "left" : "right"; }
+
+const custom::PartRow* Part(const std::string& row) {
+    for (const auto& r : L.db)
+        if (r.name == row) return &r;
+    return nullptr;
+}
+bool IsMagSlot(const std::string& id) { return id.compare(0, 3, "MAG") == 0; }
+bool Owned(const FName& n) {
+    for (const auto& o : T.owned)
+        if (custom::SameName(o, n)) return true;
+    return false;
+}
+UObject CurrentGun() { return L.player ? game::Gun::Current(L.player).Object() : 0; }
+
+// Top-level slots of the gun that take attachments (not magazine or ammo).
+std::vector<custom::Slot> PartSlots(UObject gun) {
+    std::vector<custom::Slot> out;
+    for (auto& s : custom::Slots(gun))
+        if (!s.sub && !IsMagSlot(s.slot_id)) out.push_back(s);
+    return out;
+}
+const custom::Slot* SlotByIndex(const std::vector<custom::Slot>& slots, int index) {
+    for (const auto& s : slots)
+        if (s.index == index) return &s;
+    return nullptr;
+}
+
+// Where a part actor sits when it is fitted to `slot`: the game attaches the
+// part to the slot point, then offsets it by the inverse of its AttachPoint
+// (Init_GenerateWeaponPartsByCustomData). Sub slots (a compensator on the
+// slide) take the part when its AttachSubID matches.
+bool FittedPose(UObject gun, const custom::Slot& slot, const custom::PartRow& part, UObject part_actor, FVector* loc,
+                FQuat* rot, FVector* slot_loc) {
+    UObject target = slot.component;
+    if (!part.attach_sub_id.empty() && part.attach_sub_id != "None") {
+        for (const auto& s : custom::Slots(gun))
+            if (s.sub && s.index == slot.index && s.slot_id == part.attach_sub_id) target = s.component;
+    }
+    UObject ap = 0;
+    if (!target || !ue::GetProp(part_actor, "AttachPoint", ap) || !ap) return false;
+    const Xf sw = ComponentToWorld(target);
+    const Xf rel = RelativeTransform(ap);
+    *rot = sw.rotation * rel.rotation.Inverse();
+    *loc = sw.translation - rot->Rotate(rel.translation);
+    *slot_loc = sw.translation;
+    return true;
+}
+
+// ---------------------------------------------------------------- the table
+void DestroyLoose(Loose& l) {
+    DestroyActor(l.actor);
+    l.actor = 0;
+}
+
+UObject CurrentFittedActor(UObject gun, int slot, const std::string& row) {
+    if (!LiveObject(gun)) return 0;
+    const UObject actor=rules::FittedActor(custom::InstalledParts(gun),slot,row);
+    return LiveObject(actor)?actor:0;
+}
+
+void ReturnHeld(int h, const char* why) {
+    Held& hd = g_held[h];
+    if (!hd.active) return;
+    if (hd.from_gun) {
+        // A destroyed part can remain in UObject storage until collection.
+        // Resolve the current installed actor rather than trusting that old pointer.
+        if (UObject fitted=CurrentFittedActor(T.gun,hd.from_slot,hd.row)) SetHidden(fitted,false);
+        DestroyActor(hd.actor);
+    } else if (T.on && LiveObject(hd.actor)) {
+        Loose l;
+        l.row = hd.row;
+        l.name = hd.name;
+        l.actor = hd.actor;
+        l.box = hd.box;
+        g_table.push_back(l);
+        T.dirty = true;
+    } else {
+        DestroyActor(hd.actor);
+    }
+    if (why) log::Info("workbench: %s back %s", hd.row.c_str(), why);
+    hd = Held{};
+}
+
+void EndSession(const char* why, bool level_gone = false) {
+    if (!T.on && !P.on && g_table.empty() && !g_held[0].active && !g_held[1].active) return;
+    for (int h = 0; h < 2; ++h) {
+        if (level_gone) g_held[h] = Held{};
+        else ReturnHeld(h, nullptr);
+    }
+    if (!level_gone)
+        for (auto& l : g_table) DestroyLoose(l);
+    g_table.clear();
+    g_box_cache.clear();
+    if (P.on) log::Info("workbench: the pistol goes back to the holster (%s)", why);
+    P = Park{};
+    if (T.on) log::Info("workbench: table cleared (%s)", why);
+    T = Session{};
+}
+
+// Owned attachments that fit this gun and are not on it, in a row beside it.
+void LayOutTable() {
+    T.dirty = false;
+    UObject gun = T.gun;
+    if (!T.on || !LiveObject(gun)) return;
+    std::vector<custom::SavedPart> saved;
+    UObject gi = custom::GameInstance(L.player);
+    custom::Saved(gi, T.weapon_row, &saved);
+    const std::vector<custom::Slot> slots = PartSlots(gun);
+    std::vector<const custom::PartRow*> want;
+    for (const auto& r : L.db) {
+        if (!Owned(r.row)) continue;
+        bool fits = false;
+        for (const auto& s : slots)
+            if (s.slot_id == r.attach_id) fits = true;
+        if (!fits) continue;
+        bool fitted = false;
+        for (const auto& sp : saved)
+            if (custom::SameName(sp.row, r.row)) fitted = true;
+        for (const auto& hd : g_held)
+            if (hd.active && hd.row == r.name && !hd.from_gun) fitted = true;  // in a hand
+        if (!fitted) want.push_back(&r);
+    }
+    // Drop what should not lie here any more, then add what is missing.
+    for (auto& l : g_table) {
+        bool keep = LiveObject(l.actor);
+        if (keep) {
+            keep = false;
+            for (auto* w : want)
+                if (w->name == l.row) keep = true;
+        }
+        if (!keep) DestroyLoose(l);
+    }
+    g_table.erase(std::remove_if(g_table.begin(), g_table.end(), [](const Loose& l) { return !l.actor; }),
+                  g_table.end());
+    for (auto* w : want) {
+        bool have = false;
+        for (auto& l : g_table)
+            if (l.row == w->name) have = true;
+        if (have) continue;
+        UObject cls = custom::PartClass(*w);
+        UObject a = cls ? SpawnActor(L.player, cls, T.anchor + FVector{0, 0, 30}, FQuat{}) : 0;
+        if (!a) {
+            log::Warn("workbench: could not make %s to lay on the table (class %s)", w->name.c_str(),
+                      cls ? "found" : "not found");
+            continue;
+        }
+        Loose l;
+        l.row = w->name;
+        l.name = w->row;
+        l.actor = a;
+        l.box = LocalBox(a);
+        g_table.push_back(l);
+    }
+    // Owned and unfitted parts only. Custom rows keep their fixed bench-local
+    // positions; parts without a custom entry keep the automatic arrangement.
+    std::sort(g_table.begin(), g_table.end(), [](const Loose& a, const Loose& b) { return a.row < b.row; });
+    const int n = static_cast<int>(g_table.size());
+    std::string listed;
+    std::vector<UObject> ignore{L.player, gun};
+    AddAttached(gun, &ignore);
+    for (auto& l : g_table) ignore.push_back(l.actor);
+    // Long stocks can hang low beside the jaws. Keep loose parts behind
+    // their full side profile, rather than underneath the stock.
+    bench_vise::layout::PartsRow vise_parts(ue::GetName(ue::GetClass(gun))=="BP_HG_C" ? 2.0 : 12.0);
+    int fixed_positions=0;
+    for (int i = 0; i < n; ++i) {
+        Loose& l = g_table[i];
+        const custom::PartRow* row = Part(l.row);
+        FQuat rot = l.have_rest ? l.rest_rot : FromAxes(T.along, Cross(FVector{0, 0, 1}, T.along), FVector{0, 0, 1});
+        if (row && P.on) {
+            for (const auto& s : slots) {
+                FVector fl, sl;
+                FQuat fr;
+                if (s.slot_id == row->attach_id && FittedPose(gun, s, *row, l.actor, &fl, &fr, &sl)) {
+                    rot = fr;
+                    break;
+                }
+            }
+        }
+        FVector spot = T.row + T.along * ((i - (n - 1) * 0.5) * 9.0);
+        if (T.vise_row) {
+            double half_width = 0, half_depth = 0;
+            const FVector centre = l.box.Center();
+            for (int k = 0; k < 8; ++k) {
+                const FVector corner{k & 1 ? l.box.hi.X : l.box.lo.X, k & 2 ? l.box.hi.Y : l.box.lo.Y,
+                                     k & 4 ? l.box.hi.Z : l.box.lo.Z};
+                const FVector d = rot.Rotate(corner - centre);
+                half_width = std::max(half_width, std::fabs(Dot(d, T.along)));
+                half_depth = std::max(half_depth, std::fabs(Dot(d, T.toward)));
+            }
+            const auto p = vise_parts.Next(half_width, half_depth, T.table_half_width);
+            spot = T.row + T.along * p.along - T.toward * p.inset;
+        }
+        const auto chosen=g_bench_layout.find(l.row);
+        if (T.vise_row && l.box.measured && chosen!=g_bench_layout.end()) {
+            const auto* part=bench_layout::FindPart(l.row);
+            bench_layout::Pose pose;
+            if (part && bench_layout::Place(*part,chosen->second,T.row,T.toward,
+                    T.table_half_width,T.table_depth,l.box.lo,l.box.hi,&pose)) {
+                spot=pose.centre;rot=pose.rotation;++fixed_positions;
+                if (pose.clamped) log::Warn("workbench: %s custom position kept within actual table edges",l.row.c_str());
+            }
+        }
+        l.rest_rot = rot;
+        l.have_rest = true;
+        double surface = T.surface_z;
+        FVector at, normal;
+        std::string what;
+        if (TraceDown(L.player, spot + FVector{0, 0, 20}, spot - FVector{0, 0, 25}, ignore, &at, &normal, &what) &&
+            normal.Z > 0.7)
+            surface = at.Z;
+        double min_z = 1e9;
+        for (int k = 0; k < 8; ++k) {
+            const FVector corner{k & 1 ? l.box.hi.X : l.box.lo.X, k & 2 ? l.box.hi.Y : l.box.lo.Y,
+                                 k & 4 ? l.box.hi.Z : l.box.lo.Z};
+            min_z = std::min(min_z, rot.Rotate(corner).Z);
+        }
+        FVector loc = spot - rot.Rotate(l.box.Center());
+        loc.Z = surface + 0.3 - min_z;
+        SetActorPose(l.actor, loc, rot);
+        listed += (listed.empty() ? "" : ", ") + l.row;
+    }
+    log::Info("workbench: on the table beside the %s: %s", T.weapon.c_str(), listed.empty() ? "nothing" : listed.c_str());
+    if (fixed_positions) log::Info("workbench: used %d fixed attachment positions",fixed_positions);
+}
+
+void StartSession(UObject gun, const FVector& anchor, const FQuat& frame, double surface_z) {
+    if (!L.have_db) {
+        L.have_db = custom::Database(custom::GameInstance(L.player), &L.db);
+        if (!L.have_db) log::Warn("workbench: could not read the game's parts database");
+    }
+    const bool fresh = !T.on || T.gun != gun;
+    if (fresh) {
+        for (auto& l : g_table) DestroyLoose(l);
+        g_table.clear();
+    }
+    T.on = true;
+    T.gun = gun;
+    custom::WeaponRow(gun, &T.weapon_row);
+    T.weapon = custom::NameString(T.weapon_row);
+    T.anchor = anchor;
+    FVector along = frame.Rotate(FVector{1, 0, 0});
+    along.Z = 0;
+    T.along = Norm(along);
+    hands::Pose head;
+    FVector to = hands::Head(&head) ? head.location - anchor : FVector{0, 0, 0} - T.along;
+    to.Z = 0;
+    to = to - T.along * Dot(to, T.along);
+    T.toward = Len(to) > 1.0 ? Norm(to) : Norm(Cross(FVector{0, 0, 1}, T.along));
+    T.row = anchor + T.toward * 14.0;
+    T.vise_row = false;
+    T.surface_z = surface_z;
+    custom::Purchased(custom::GameInstance(L.player), &T.owned);
+    for (auto& l : g_table) l.have_rest = false;
+    T.dirty = true;
+}
+
+// ---------------------------------------------------------------- the green zone
+std::string ListParts(UObject gun);
+
+// Owner 2026-11-04 at the bought bench: "its really hard to reach the table
+// (it was modeled for flatscreen after all)". A see-through green (#00FF8D)
+// box stands upright on the edge of the bench's table, on the side you walk
+// up to. Let go of the pistol inside it and it is held there upright (grip
+// down, barrel along the edge), like in a vise; the spare parts lie on the
+// table behind it. Centred on the player-facing edge alongside the vise,
+// once per hub visit; only used once the workbench is bought.
+// The owner's 2026-11-04 run: the bench's table (DS_Workbench) is 111 x 244
+// cm, top at 90 cm; the game's own display pistol (HG) lies 28 cm in from
+// the long side the owner stood at, and they laid the pistol 24-42 cm in
+// from that edge, the hand at full reach just past it.
+struct TableBox {
+    FVector c, ax, ay;
+    double hx = 0, hy = 0, top = 0;
+};
+
+struct Zone {
+    bool have_table = false;
+    TableBox t;
+    bool placed = false;
+    bool failed = false;
+    FVector center;     // world
+    FVector along;      // the table edge, flat
+    FVector out;        // from the table toward you, flat
+    double table_z = 0;
+    UObject actor = 0;
+    bool shown = false;
+} Z;
+
+// The bench's table (its DS_Workbench mesh) as a flat box in the world.
+FVector Flatten(const FVector& v) { return Norm(FVector{v.X, v.Y, 0}); }
+
+bool BenchTable(TableBox* t) {
+    UObject comp = 0, sm = 0;
+    if (!LiveObject(L.bench) || !ue::GetProp(L.bench, "DS_Workbench", comp) || !comp) return false;
+    if (!ue::GetProp(comp, "StaticMesh", sm) || !sm) return false;
+    ue::Call b(sm, "GetBoundingBox");
+    if (!b.Invoke()) return false;
+    int32_t size = 0;
+    const uint8_t* raw = b.Raw("ReturnValue", &size);
+    if (!raw || size < 48) return false;
+    double v[6];
+    std::memcpy(v, raw, sizeof(v));
+    const Xf x = ComponentToWorld(comp);
+    const FVector a{v[0] * x.scale.X, v[1] * x.scale.Y, v[2] * x.scale.Z};
+    const FVector c{v[3] * x.scale.X, v[4] * x.scale.Y, v[5] * x.scale.Z};
+    const FVector lo{std::min(a.X, c.X), std::min(a.Y, c.Y), std::min(a.Z, c.Z)};
+    const FVector hi{std::max(a.X, c.X), std::max(a.Y, c.Y), std::max(a.Z, c.Z)};
+    if (hi.X - lo.X < 20 || hi.Y - lo.Y < 20) return false;
+    t->c = x.translation + x.rotation.Rotate((lo + hi) * 0.5);
+    t->ax = Flatten(x.rotation.Rotate(FVector{1, 0, 0}));
+    t->ay = Flatten(x.rotation.Rotate(FVector{0, 1, 0}));
+    t->hx = (hi.X - lo.X) * 0.5;
+    t->hy = (hi.Y - lo.Y) * 0.5;
+    t->top = t->c.Z + (hi.Z - lo.Z) * 0.5 - bench_vise::layout::kTopBelowBounds * std::fabs(x.scale.Z);
+    return true;
+}
+
+// Puts the zone on the table's front edge (the side the game's own display
+// pistol lies toward, which is where you stand to use the bench; if that
+// can't be read, the side nearest you), centred along that edge so the
+// placement box always lines up with the permanent visual marker.
+void PlaceZone(const FVector& head) {
+    if (!Z.have_table) {
+        Z.have_table = BenchTable(&Z.t);
+        if (!Z.have_table) {
+            if (!Z.failed) log::Warn("workbench: could not read the bench's table (DS_Workbench), no green zone");
+            Z.failed = true;
+            return;
+        }
+    }
+    const TableBox& t = Z.t;
+    const FVector d = head - t.c;
+    const double u = Dot(d, t.ax), v = Dot(d, t.ay);
+    bool x_side = std::fabs(u) - t.hx > std::fabs(v) - t.hy;
+    double sign = (x_side ? u : v) >= 0 ? 1.0 : -1.0;
+    const char* how = "the side nearest you";
+    UObject hg = 0;
+    if (ue::GetProp(L.bench, "HG", hg) && hg) {
+        const FVector p = ComponentToWorld(hg).translation - t.c;
+        const double hu = Dot(p, t.ax) / t.hx, hv = Dot(p, t.ay) / t.hy;
+        if (std::max(std::fabs(hu), std::fabs(hv)) > 0.2) {
+            x_side = std::fabs(hu) >= std::fabs(hv);
+            sign = (x_side ? hu : hv) >= 0 ? 1.0 : -1.0;
+            how = "the front, where the game's display pistol lies";
+        }
+    }
+    const FVector out = (x_side ? t.ax : t.ay) * sign;
+    const FVector along = x_side ? t.ay : t.ax;
+    const double depth = x_side ? t.hx : t.hy, half = x_side ? t.hy : t.hx;
+    const double s = 0;
+    const FVector edge = t.c + out * depth;
+    // The table top just inside that edge (things lying on it are fine).
+    double top = t.top;
+    std::vector<UObject> ignore{L.player};
+    AddAttached(L.player, &ignore);
+    FVector at, normal;
+    std::string what;
+    const FVector probe = edge - out * bench_vise::layout::kBaseInset;
+    if (TraceDown(L.player, FVector{probe.X, probe.Y, t.top + 40}, FVector{probe.X, probe.Y, t.top - 80}, ignore, &at,
+                  &normal, &what) &&
+        normal.Z > 0.7)
+        top = at.Z;
+    Z.placed = true;
+    Z.out = out;
+    Z.along = along;
+    Z.table_z = top;
+    Z.center = edge + out * S.zone_out;
+    Z.center.Z = top + S.zone_lift + S.zone_h * 0.5;
+    log::Info("workbench: green zone at (%.0f %.0f %.0f) on the table's edge at %s, %.0f cm along it from its middle "
+              "(edge %.0f cm long); table %.0f x %.0f cm, top at %.0f (traced %s); you are %.0f cm from it",
+              Z.center.X, Z.center.Y, Z.center.Z, how, s, half * 2, t.hx * 2, t.hy * 2, top,
+              what.empty() ? "nothing" : what.c_str(), Flat(head, Z.center));
+}
+
+bool InZone(const FVector& p, double margin) {
+    const FVector d = p - Z.center;
+    return Z.placed && std::fabs(Dot(d, Z.along)) <= S.zone_w * 0.5 + margin &&
+           std::fabs(Dot(d, Z.out)) <= S.zone_d * 0.5 + margin && std::fabs(d.Z) <= S.zone_h * 0.5 + margin;
+}
+
+// The box (owner 2026-11-04 07:57: "in the center of it i want 100%
+// visibility, the lines that make the box solid with a quickly gradual
+// decrease in its opacity"): its 12 edges are solid #00FF8D lines, and on
+// each face rings of thin strips step inward from the edges, each fainter,
+// so the colour fades out within a few cm and the middle of every face is
+// clear. Engine cubes drawn with the engine's see-through widget material
+// (one-sided, unlit), one instanced component per opacity level.
+constexpr float kZoneAlpha[] = {1.0f, 0.5f, 0.25f, 0.12f, 0.05f};  // the lines, then each ring inward
+constexpr int kZoneLevels = sizeof(kZoneAlpha) / sizeof(kZoneAlpha[0]);
+
+// One opacity level: an instanced engine cube, tinted #00FF8D at `alpha`.
+UObject MakeZoneLevel(UObject actor, float alpha, bool* tinted) {
+    static UObject ism_cls = ue::FindObject("Class /Script/Engine.InstancedStaticMeshComponent");
+    static UObject cube = ue::FindObject("StaticMesh /Engine/BasicShapes/Cube.Cube");
+    static UObject white = ue::FindObject("Texture2D /Engine/EngineResources/WhiteSquareTexture.WhiteSquareTexture");
+    static UObject base = [] {
+        UObject m = 0;
+        UObject cdo = ue::FindObject("WidgetComponent /Script/UMG.Default__WidgetComponent");
+        if (cdo) ue::GetProp(cdo, "TranslucentMaterial_OneSided", m);
+        return m;
+    }();
+    static FName tint{}, from_tex{}, slate{};
+    static const bool names = ue::names::Find("TintColorAndOpacity", &tint) &&
+                              ue::names::Find("OpacityFromTexture", &from_tex) && ue::names::Find("SlateUI", &slate);
+    if (!ism_cls || !cube) return 0;
+    ue::Call add(actor, "AddComponentByClass");
+    add.Set("Class", ism_cls).Set("bManualAttachment", false).Set("RelativeTransform", Xf{}).Set("bDeferredFinish", false);
+    UObject c = add.Invoke() ? add.Result<UObject>() : 0;
+    if (!c) return 0;
+    ue::Call mob(c, "SetMobility");
+    mob.Set("NewMobility", uint8_t{2});
+    mob.Invoke();
+    ue::Call sm(c, "SetStaticMesh");
+    sm.Set("NewMesh", cube);
+    sm.Invoke();
+    ue::Call col(c, "SetCollisionEnabled");
+    col.Set("NewType", uint8_t{0});
+    col.Invoke();
+    ue::Call sh(c, "SetCastShadow");
+    sh.Set("NewCastShadow", false);
+    sh.Invoke();
+    if (base && names) {
+        ue::Call mid(c, "CreateDynamicMaterialInstance");
+        mid.Set("ElementIndex", int32_t{0}).Set("SourceMaterial", base);
+        UObject m = mid.Invoke() ? mid.Result<UObject>() : 0;
+        if (m) {
+            // #00FF8D in linear colour.
+            struct { float r, g, b, a; } col4{0.0f, 1.0f, 0.266f, alpha};
+            ue::Call v(m, "SetVectorParameterValue");
+            v.Set("ParameterName", tint).Set("Value", col4);
+            *tinted = v.Invoke() && *tinted;
+            ue::Call f(m, "SetScalarParameterValue");
+            f.Set("ParameterName", from_tex).Set("Value", 0.0f);
+            f.Invoke();
+            if (white) {
+                ue::Call tx(m, "SetTextureParameterValue");
+                tx.Set("ParameterName", slate).Set("Value", white);
+                tx.Invoke();
+            }
+        } else {
+            *tinted = false;
+        }
+    } else {
+        *tinted = false;
+    }
+    return c;
+}
+
+UObject MakeZoneActor() {
+    static UObject sma = ue::FindObject("Class /Script/Engine.StaticMeshActor");
+    if (!sma) {
+        log::Warn("workbench: green zone: no StaticMeshActor class");
+        return 0;
+    }
+    UObject a = SpawnActor(L.player, sma, Z.center, FQuat{});
+    UObject root = 0;
+    if (!a || !ue::GetProp(a, "StaticMeshComponent", root) || !root) {
+        if (a) DestroyActor(a);
+        log::Warn("workbench: green zone: could not make its actor");
+        return 0;
+    }
+    ue::Call mob(root, "SetMobility");
+    mob.Set("NewMobility", uint8_t{2});
+    mob.Invoke();
+    bool tinted = true;
+    UObject lv[kZoneLevels] = {};
+    for (int i = 0; i < kZoneLevels; ++i) lv[i] = MakeZoneLevel(a, kZoneAlpha[i], &tinted);
+    if (!lv[0]) {
+        DestroyActor(a);
+        log::Warn("workbench: green zone: could not make its pieces");
+        return 0;
+    }
+    int lines = 0, rings = 0;
+    for (const auto& p : rules::BoxFrame(S.zone_w, S.zone_d, S.zone_h, S.zone_line, S.zone_fade, kZoneLevels)) {
+        UObject ism = lv[p.level];
+        if (!ism) continue;
+        Xf t;
+        t.translation = FVector{p.at[0], p.at[1], p.at[2]};
+        t.scale = FVector{p.size[0] / 100.0, p.size[1] / 100.0, p.size[2] / 100.0};
+        ue::Call c(ism, "AddInstance");
+        c.Set("InstanceTransform", t).Set("bWorldSpace", false);
+        if (c.Invoke()) ++(p.level == 0 ? lines : rings);
+    }
+    const FVector up{0, 0, 1};
+    SetActorPose(a, Z.center, FromAxes(Z.along, Cross(up, Z.along), up));
+    log::Info("workbench: green zone made (%s): %d edge lines, %d fading strips, %.0f x %.0f x %.0f cm, %s",
+              ue::GetName(a).c_str(), lines, rings, S.zone_w, S.zone_d, S.zone_h,
+              tinted ? "see-through green" : "NOT tinted (material or its settings not found)");
+    return a;
+}
+
+void ShowZone(bool show) {
+    if (show && !LiveObject(Z.actor)) {
+        Z.actor = MakeZoneActor();
+        Z.shown = true;
+        if (!Z.actor) {
+            Z.failed = true;
+            return;
+        }
+    }
+    if (!Z.actor || show == Z.shown) return;
+    SetHidden(Z.actor, !show);
+    Z.shown = show;
+}
+
+// Let go inside the zone: the pistol is held there upright, barrel along the
+// edge the way it pointed, grip down; the spare parts lie on the table just
+// behind it.
+// The gun's static frame is the same mesh used for the offline fit. Read
+// its live transform and size, so actor rotations/scale and the calibrated
+// controller offset cannot move the pistol away from the vise jaws.
+bool GripForVise(UObject gun, const FQuat& native_frame, FVector* contact_from_main, double* gap,
+                 FQuat* mesh_in_frame = nullptr) {
+    UObject component=0, main=0, mesh=0;
+    const bench_vise::fit::Profile* profile=nullptr;
+    for (const auto& p:bench_vise::fit::kProfiles) {
+        if (ue::GetProp(gun,p.component,component) && LiveObject(component) &&
+            ue::GetProp(component,"StaticMesh",mesh) && LiveObject(mesh) && ue::GetName(mesh)==p.mesh) {
+            profile=&p;
+            break;
+        }
+    }
+    if (!profile) return false;
+    if (!ue::GetProp(gun,"MainHandPosition",main) || !LiveObject(main) ||
+        !ue::GetProp(component,"StaticMesh",mesh) || !LiveObject(mesh)) return false;
+    ue::Call bounds(mesh,"GetBoundingBox");
+    int32_t bytes=0;
+    const uint8_t* raw=bounds.Invoke() ? bounds.Raw("ReturnValue",&bytes) : nullptr;
+    if (!raw || bytes<48) return false;
+    double b[6]; std::memcpy(b,raw,sizeof(b));
+    for (double v : b) if (!std::isfinite(v)) return false;
+    if (!bench_vise::fit::MatchesBounds(*profile,{b[0],b[1],b[2]},{b[3],b[4],b[5]})) return false;
+    const Xf c=ComponentToWorld(component), m=ComponentToWorld(main);
+    const bench_vise::fit::Sample sample{ActorRotation(gun),native_frame,c.rotation,
+                                        c.translation,c.scale,m.translation};
+    return bench_vise::fit::Measure(*profile,sample,contact_from_main,gap,mesh_in_frame);
+}
+
+bool ParkInZone(UObject gun, const FQuat& native_frame, const FVector& hand_to_main, ReleaseHand released_by) {
+    const FVector up{0, 0, 1};
+    FQuat parked_frame;
+    if (!BenchFrame(Z.out,released_by,&parked_frame)) return false;
+    const FVector x=parked_frame.Rotate({1,0,0});
+    P.on = true;
+    P.gun = gun;
+    P.frame = parked_frame;
+    // The hand's grip point sits behind and below the middle of the gun:
+    // put it there so the gun itself fills the box.
+    P.spot = Z.center - x * 5.0 - up * 4.0;
+    FVector contact_from_main;
+    FQuat mesh_in_frame;
+    P.in_vise=GripForVise(gun,native_frame,&contact_from_main,&P.vise_gap,&mesh_in_frame);
+    if (P.in_vise) {
+        P.frame=parked_frame*mesh_in_frame.Inverse();
+        const FVector seat=bench_vise::layout::Seat(Z.center-Z.out*S.zone_out,Z.out,Z.table_z);
+        const FVector centre=bench_vise::motion::GripCentre(P.vise_gap);
+        const FVector contact=seat+Z.out*centre.X+up*centre.Z;
+        P.spot=bench_vise::motion::HandSpot(contact,P.frame,contact_from_main,hand_to_main);
+        log::Info("workbench: %s seated between vise jaws, gap %.2f cm",ue::GetName(gun).c_str(),P.vise_gap);
+    } else {
+        log::Warn("workbench: unsupported gun geometry; kept original parking pose and vise open");
+    }
+    P.surface_z = Z.table_z;
+    StartSession(gun, P.spot, P.frame, Z.table_z);
+    T.along = x; // spare rows follow the seated mesh, not its internal actor-frame correction
+    T.toward = Z.out;
+    // Keep parts close to the player, either side of the vise. Their full
+    // rotated bounds, including long suppressors, determine the spacing.
+    T.vise_row = true;
+    T.table_half_width = std::fabs(Dot(Z.along, Z.t.ax))*Z.t.hx + std::fabs(Dot(Z.along, Z.t.ay))*Z.t.hy;
+    T.table_depth = 2*(std::fabs(Dot(Z.out,Z.t.ax))*Z.t.hx + std::fabs(Dot(Z.out,Z.t.ay))*Z.t.hy);
+    T.row = Z.center - Z.out * S.zone_out;
+    T.row.Z = Z.table_z;
+    log::Info("workbench: %s-hand release, weapon held upright at (%.0f %.0f %.0f), barrel %s from the player-facing edge; it "
+              "carries %s",
+              released_by==ReleaseHand::kRight?"right":"left",P.spot.X,P.spot.Y,P.spot.Z,
+              released_by==ReleaseHand::kRight?"left":"right",ListParts(gun).c_str());
+    return true;
+}
+
+// ---------------------------------------------------------------- grabbing
+void BuildCandidate(int h, const FVector& hand, Candidate* best) {
+    // Parts lying on the table.
+    for (int i = 0; i < static_cast<int>(g_table.size()); ++i) {
+        const Loose& l = g_table[i];
+        if (!LiveObject(l.actor)) continue;
+        const double d = DistToBox(hand, ActorLocation(l.actor), ActorRotation(l.actor), l.box);
+        if (d < best->dist) *best = Candidate{1, i, l.actor, l.row, -1, d};
+    }
+    // Parts on the gun lying on the table.
+    if (P.on && LiveObject(P.gun)) {
+        const std::vector<custom::Slot> slots = PartSlots(P.gun);
+        const auto installed = custom::InstalledParts(P.gun);
+        for (const auto& in : installed) {
+            if (in.path.size() != 1 || !SlotByIndex(slots, in.path[0]) || !LiveObject(in.actor)) continue;
+            if (!rules::CanTakeFittedPart(installed,in.path[0],in.row,in.actor,g_held)) continue;
+            auto it = g_box_cache.find(in.actor);
+            if (it == g_box_cache.end()) it = g_box_cache.emplace(in.actor, LocalBox(in.actor)).first;
+            const double d = DistToBox(hand, ActorLocation(in.actor), ActorRotation(in.actor), it->second);
+            if (d < best->dist) *best = Candidate{2, -1, in.actor, in.row, in.path[0], d};
+        }
+    }
+    (void)h;
+}
+
+void Grab(int h, const Candidate& c, const hands::HandState& hs) {
+    if (!T.on || !LiveObject(c.actor)) return;
+    Held hd;
+    hd.active = true;
+    hd.row = c.row;
+    const custom::PartRow* row = Part(c.row);
+    if (row) hd.name = row->row;
+    if (c.kind == 1) {
+        // The other hand may already have removed an earlier vector element.
+        // Actor identity, rather than the cached index, identifies this item.
+        const int index = rules::LooseIndex(g_table,c.actor);
+        if (index < 0) return;
+        hd.actor = c.actor;
+        hd.box = g_table[index].box;
+        g_table.erase(g_table.begin() + index);
+        log::Info("workbench: %s hand picked %s up from the table", HandName(h), c.row.c_str());
+    } else {
+        if (!P.on || P.gun != T.gun || !LiveObject(P.gun) ||
+            !rules::CanTakeFittedPart(custom::InstalledParts(P.gun),c.slot,c.row,c.actor,g_held)) return;
+        UObject cls = row ? custom::PartClass(*row) : ue::GetClass(c.actor);
+        const FVector loc = ActorLocation(c.actor);
+        const FQuat rot = ActorRotation(c.actor);
+        UObject a = SpawnActor(L.player, cls ? cls : ue::GetClass(c.actor), loc, rot);
+        if (!a) {
+            log::Warn("workbench: could not take %s off the gun (no copy of it could be made)", c.row.c_str());
+            return;
+        }
+        SetHidden(c.actor, true);
+        hd.actor = a;
+        hd.box = LocalBox(a);
+        hd.from_gun = true;
+        hd.gun_part = c.actor;
+        hd.from_slot = c.slot;
+        const custom::Slot* s = nullptr;
+        const std::vector<custom::Slot> slots = PartSlots(P.gun);
+        s = SlotByIndex(slots, c.slot);
+        log::Info("workbench: %s hand took %s off the %s (slot %s)", HandName(h), c.row.c_str(), T.weapon.c_str(),
+                  s ? s->name.c_str() : "?");
+    }
+    const FQuat inv = hs.grip.rotation.Inverse();
+    hd.rel_rot = inv * ActorRotation(hd.actor);
+    hd.rel_loc = inv.Rotate(ActorLocation(hd.actor) - hs.grip.location);
+    g_held[h] = hd;
+    input::Haptic(static_cast<input::Hand>(h), 0.35f, 0.03f);
+}
+
+// The selected session gun may be parked or held by either hand. A rifle
+// held by its fore-end is published as kSupportGrip, including left-only carry.
+UObject TargetGun() {
+    if (P.on && LiveObject(P.gun)) return P.gun;
+    const UObject gun = CurrentGun();
+    if (!T.on || gun != T.gun || !LiveObject(gun)) return 0;
+    for (const auto hand : {hands::kLeft,hands::kRight})
+        if (rules::HoldsTargetGun(gun,hands::GetGrab(hand))) return gun;
+    return 0;
+}
+
+void FollowHand(int h, const hands::HandState& hs) {
+    Held& hd = g_held[h];
+    if (!LiveObject(hd.actor)) {
+        // The hidden original still belongs on the gun if its temporary
+        // hand-held copy was destroyed. Do not leave it permanently invisible.
+        ReturnHeld(h,"(held part was removed)");
+        return;
+    }
+    FVector loc = hs.grip.location + hs.grip.rotation.Rotate(hd.rel_loc);
+    FQuat rot = hs.grip.rotation * hd.rel_rot;
+    // Near its place on a gun: it snaps there (shown fitted) until it is let
+    // go or pulled away.
+    int snapped = -1;
+    std::string snapped_name;
+    const custom::PartRow* row = Part(hd.row);
+    UObject gun = TargetGun();
+    if (row && gun) {
+        UObject ap = 0;
+        ue::GetProp(hd.actor, "AttachPoint", ap);
+        const Xf rel = ap ? RelativeTransform(ap) : Xf{};
+        const FVector point = loc + rot.Rotate(rel.translation);  // the part's attach point, where the hand has it
+        double best = (hd.snapped >= 0 ? S.snap_cm + 2.0 : S.snap_cm);
+        for (const auto& s : PartSlots(gun)) {
+            if (s.slot_id != row->attach_id) continue;
+            FVector fl, sl;
+            FQuat fr;
+            if (!FittedPose(gun, s, *row, hd.actor, &fl, &fr, &sl)) continue;
+            const double d = Len(point - sl);
+            if (d < best) {
+                best = d;
+                snapped = s.index;
+                snapped_name = s.name;
+                loc = fl;
+                rot = fr;
+            }
+        }
+    }
+    if (snapped >= 0 && snapped != hd.snapped) {
+        input::Haptic(static_cast<input::Hand>(h), 0.5f, 0.03f);
+        log::Info("workbench: %s lines up with %s", hd.row.c_str(), snapped_name.c_str());
+    }
+    hd.snapped = snapped;
+    hd.snapped_name = snapped_name;
+    SetActorPose(hd.actor, loc, rot);
+}
+
+std::string ListParts(UObject gun) {
+    std::string s;
+    for (const auto& in : custom::InstalledParts(gun))
+        s += (s.empty() ? "" : ", ") + in.row + custom::PathString(in.path);
+    return s.empty() ? "none" : s;
+}
+
+// Is the part in this hand still the gun's own part in the slot it came
+// from (the saved list says so)? If the list can't be read, its hidden part
+// still being on the gun decides.
+bool HeldStillFitted(const Held& hd) {
+    if (!hd.from_gun) return false;
+    std::vector<custom::SavedPart> saved;
+    if (!custom::Saved(custom::GameInstance(L.player), T.weapon_row, &saved)) return LiveObject(hd.gun_part);
+    return rules::StillFitted(saved, hd.from_slot, hd.name);
+}
+
+// Another part was fitted where the held one came from: the held one is a
+// loose part now. Letting it go away from the gun puts it on the table
+// instead of emptying the slot (which would take the new part off again).
+void Disown(Held& hd, int h) {
+    if (LiveObject(hd.gun_part)) SetHidden(hd.gun_part, false);
+    log::Info("workbench: %s in the %s hand is no longer on the gun (another part was fitted in its slot); "
+              "it counts as a loose part now",
+              hd.row.c_str(), HandName(h));
+    hd.from_gun = false;
+    hd.gun_part = 0;
+    hd.from_slot = -1;
+}
+
+// The game rebuilt the gun's parts: a part a hand has taken off (and not
+// settled yet) is a new actor now, shown again. Hide that one instead; if
+// another part took its slot, the one in the hand is not the gun's any more.
+void RehideHeld(UObject gun) {
+    for (int h = 0; h < 2; ++h) {
+        Held& hd = g_held[h];
+        if (!hd.active || !hd.from_gun) continue;
+        if (!HeldStillFitted(hd)) {
+            Disown(hd, h);
+            continue;
+        }
+        hd.gun_part=CurrentFittedActor(gun,hd.from_slot,hd.row);
+        if (hd.gun_part) SetHidden(hd.gun_part,true);
+    }
+}
+
+// Fits `row` into `slot` (or empties it with the row "Empty") through the
+// game, then checks what the gun really carries.
+bool Commit(UObject gun, int slot, const FName& row, const char* what, int source_slot = -1) {
+    if (!LiveObject(gun) || gun!=T.gun || gun!=TargetGun()) return false;
+    const auto slots=PartSlots(gun);
+    const auto* target=SlotByIndex(slots,slot);
+    const std::string desired=custom::NameString(row);
+    const auto* part=Part(desired);
+    if (!target || (desired=="Empty" ? !target->can_be_empty : !part || part->attach_id!=target->slot_id)) {
+        log::Warn("workbench: %s rejected: live slot is missing or incompatible",what);
+        return false;
+    }
+    UObject gi = custom::GameInstance(L.player);
+    std::vector<custom::SavedPart> saved;
+    if (!custom::Saved(gi, T.weapon_row, &saved) || saved.empty()) {
+        log::Warn("workbench: no saved attachment list for %s, left as it is", T.weapon.c_str());
+        return false;
+    }
+    FName empty;
+    if (source_slot >= 0 && source_slot != slot) {
+        const auto* source = SlotByIndex(slots,source_slot);
+        if (!source || !source->can_be_empty || !ue::names::Find("Empty",&empty)) {
+            log::Warn("workbench: %s rejected: source slot cannot be emptied",what);
+            return false;
+        }
+    }
+    std::vector<custom::SavedPart> next;
+    if (!rules::SlotEdit(saved,slot,row,source_slot,empty,&next)) {
+        log::Warn("workbench: %s rejected: source attachment changed or invalid slot",what);
+        return false;
+    }
+    std::string why;
+    const bool applied=custom::ApplyLoadout(L.player, gun, next, &why);
+    // A failed rebuild may have restored the previous loadout with NEW
+    // actor identities. Refresh the other hand's hidden original either way.
+    g_box_cache.clear();
+    RehideHeld(gun);
+    if (!applied) {
+        log::Warn("workbench: %s did not happen: %s", what, why.c_str());
+        return false;
+    }
+    std::vector<custom::SavedPart> after;
+    custom::Saved(gi, T.weapon_row, &after);
+    std::string saved_s;
+    for (const auto& p : after) saved_s += (saved_s.empty() ? "" : ", ") + custom::NameString(p.row) + custom::PathString(p.path);
+    // Check: the slot holds the part now (or nothing, when emptied).
+    const std::string want = custom::NameString(row);
+    bool in_slot = false, slot_empty = true;
+    for (const auto& in : custom::InstalledParts(gun))
+        if (in.path.size() == 1 && in.path[0] == slot) {
+            slot_empty = false;
+            if (in.row == want) in_slot = true;
+        }
+    const bool ok = want == "Empty" ? slot_empty : in_slot;
+    log::Info("workbench: %s: %s. The gun now carries %s; saved: %s", what, ok ? "done, checked on the gun" :
+              "the game rebuilt the gun but the slot does not show it", ListParts(gun).c_str(), saved_s.c_str());
+    return ok;
+}
+
+void Release(int h) {
+    Held hd = g_held[h];
+    g_held[h] = Held{};
+    if (!hd.active) return;
+    // Taken off the gun, but another part has been fitted there since.
+    if (hd.from_gun && !HeldStillFitted(hd)) Disown(hd, h);
+    UObject gun = TargetGun();
+    const custom::PartRow* row = Part(hd.row);
+    const std::vector<custom::Slot> slots = gun ? PartSlots(gun) : std::vector<custom::Slot>{};
+    const custom::Slot* from = hd.from_gun ? SlotByIndex(slots, hd.from_slot) : nullptr;
+    rules::LetGoFacts f;
+    f.from_gun = hd.from_gun;
+    f.from_slot = hd.from_slot;
+    f.snapped = row ? hd.snapped : -1;
+    f.have_gun = gun != 0;
+    f.slot_can_be_empty = from && from->can_be_empty;
+    switch (rules::DecideLetGo(f)) {
+    case rules::LetGo::kPutBack:
+        if (LiveObject(hd.gun_part)) SetHidden(hd.gun_part, false);
+        DestroyActor(hd.actor);
+        log::Info("workbench: %s put back on (nothing changed)", hd.row.c_str());
+        return;
+    case rules::LetGo::kFit: {
+        // Fitted: the game makes its own part actor; ours goes.
+        char what[160];
+        snprintf(what, sizeof(what), "fit %s in %s", hd.row.c_str(), hd.snapped_name.c_str());
+        if (Commit(gun, hd.snapped, hd.name, what, hd.from_gun ? hd.from_slot : -1)) {
+            DestroyActor(hd.actor);
+            input::Haptic(static_cast<input::Hand>(h), 0.8f, 0.05f);
+            T.dirty = true;  // a part it replaced lands on the table
+            return;
+        }
+        g_held[h] = hd;
+        ReturnHeld(h, "(the game did not take it)");
+        return;
+    }
+    case rules::LetGo::kEmptySlot: {
+        FName empty;
+        if (!ue::names::Find("Empty", &empty)) {
+            g_held[h] = hd;
+            ReturnHeld(h, "on the gun (no \"Empty\" name in the game)");
+            return;
+        }
+        char what[160];
+        snprintf(what, sizeof(what), "take %s off %s", hd.row.c_str(), from->name.c_str());
+        if (Commit(gun, hd.from_slot, empty, what)) {
+            // The game destroyed its part; ours goes on the table.
+            Loose l;
+            l.row = hd.row;
+            l.name = hd.name;
+            l.actor = hd.actor;
+            l.box = hd.box;
+            g_table.push_back(l);
+            T.dirty = true;
+            return;
+        }
+        g_held[h] = hd;
+        ReturnHeld(h, "on the gun (the game did not take it off)");
+        return;
+    }
+    case rules::LetGo::kBackOnGun:
+        g_held[h] = hd;
+        ReturnHeld(h, from && !from->can_be_empty ? "on the gun: the game always needs a part there" : "on the gun");
+        input::Haptic(static_cast<input::Hand>(h), 0.2f, 0.08f);
+        return;
+    case rules::LetGo::kToTable:
+        break;
+    }
+    g_held[h] = hd;
+    ReturnHeld(h, "on the table");
+}
+
+// ---------------------------------------------------------------- per frame
+// Actors of `cls` that are really in a level: never the class default object
+// or a Blueprint's template (archetype), and owned by a Level when the Level
+// class is known.
+std::vector<UObject> FindInLevels(UObject cls, UObject level_cls, size_t max) {
+    constexpr uint32_t kClassDefaultObject = 0x10, kArchetypeObject = 0x20;  // EObjectFlags
+    std::vector<UObject> out;
+    if (!cls) return out;
+    ue::objects::ForEach([&](int, UObject o) {
+        if (out.size() >= max) return;
+        if (mem::ReadOr<uint32_t>(o + ue::off::kObjFlags, 0) & (kClassDefaultObject | kArchetypeObject)) return;
+        if (!ue::reflection::IsChildOf(ue::GetClass(o), cls)) return;
+        if (level_cls && ue::GetClass(ue::GetOuter(o)) != level_cls) return;
+        out.push_back(o);
+    });
+    return out;
+}
+
+void SearchLevel(UObject player) {
+    if (L.searched || L.age <= 4.0 || g_search_state.load() != 0) return;
+    L.searched = true;
+    ++L.searches;
+    g_search_for = player;
+    g_search_state = 1;
+    if (HANDLE t = CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
+            // Engine class: never freed, so kept as it is.
+            static const UObject level_cls = ue::FindObject("Class /Script/Engine.Level");
+            const UObject bench_cls = g_bench_class.Get(), facility_cls = g_facility_class.Get();
+            g_found_benches = FindInLevels(bench_cls, level_cls, 8);
+            const std::vector<UObject> f = FindInLevels(facility_cls, level_cls, 1);
+            g_found_facility = f.empty() ? 0 : f[0];
+            g_search_state = 2;
+            return 0;
+        }, nullptr, 0, nullptr))
+        CloseHandle(t);
+    else
+        g_search_state = 0;
+}
+
+// Picks the bench from the search: placed somewhere (not at the origin), and
+// the one nearest the workbench facility if there are several.
+void TakeSearch(UObject player) {
+    const UObject before = L.bench;
+    L.facility = g_found_facility.load();
+    L.bench = 0;
+    const FVector fac = L.facility ? ActorLocation(L.facility) : FVector{};
+    double best = 0;
+    for (UObject b : g_found_benches) {
+        if (!LiveObject(b)) continue;
+        const FVector at = ActorLocation(b);
+        if (Len(at) <= 1.0) continue;
+        const double d = L.facility ? Len(at - fac) : 0.0;
+        if (!L.bench || d < best) {
+            L.bench = b;
+            best = d;
+        }
+    }
+    if (L.bench && L.bench != before) {
+        const FVector b = ActorLocation(L.bench);
+        log::Info("workbench: bench %s in this level at (%.0f %.0f %.0f), %.0f cm from the player (%zu found); "
+                  "facility %s",
+                  ue::GetName(L.bench).c_str(), b.X, b.Y, b.Z, Len(b - ActorLocation(player)),
+                  g_found_benches.size(), L.facility ? ue::GetName(L.facility).c_str() : "not found");
+    } else if (!L.bench && L.facility && L.searches == 1) {
+        log::Info("workbench: facility %s in this level, no bench in it (the bench appears once the workbench "
+                  "is bought)",
+                  ue::GetName(L.facility).c_str());
+    }
+}
+
+void CheckFacility() {
+    if (L.age < L.next_state_check) return;
+    L.next_state_check = L.age + 2.0;
+    if (L.bench && !LiveObject(L.bench)) L.bench = 0;
+    L.bench_loc = L.bench ? ActorLocation(L.bench) : FVector{};
+    uint8_t st = 0xFF;
+    const bool have = L.facility && LiveObject(L.facility) && ue::GetProp(L.facility, "FacilityState", st);
+    const int state = have ? st : -1;
+    const bool unlocked = state == kFacilityUnlocked && L.bench && Len(L.bench_loc) > 1.0;
+    // Bought, but its bench not found yet (bought just now, or spawned after
+    // the first search): look again.
+    if (state == kFacilityUnlocked && !L.bench && L.searches < kBenchSearches && g_search_state.load() == 0) {
+        L.searched = false;
+        if (!L.logged_missing) {
+            L.logged_missing = true;
+            log::Info("workbench: the workbench is bought (facility state %d) but its bench was not found yet; "
+                      "looking again",
+                      state);
+        }
+    }
+    if (state != L.facility_state || unlocked != L.unlocked) {
+        L.facility_state = state;
+        L.unlocked = unlocked;
+        log::Info("workbench: workbench %s (facility state %d, bench at %.0f %.0f %.0f)%s",
+                  unlocked ? "UNLOCKED" : "locked", state, L.bench_loc.X, L.bench_loc.Y, L.bench_loc.Z,
+                  unlocked ? ": the pistol can be laid on it"
+                           : (S.tables_before_unlock ? ": any table in the hub works for now" : ""));
+    }
+}
+
+// ---------------------------------------------------------------- light check
+// Owner 2026-11-03: after taking the light off at the bench and putting it
+// back, the weapon light "no longer worked" (in the next level too, where the
+// game builds the gun again from the same saved list). Logs what the pistol's
+// light really does: when it is first seen, whenever its part, mode, power or
+// beam changes, and just after each left-trigger press (controls sends the
+// light press on the left trigger at the gun; the game switches on release).
+struct LightState {
+    UObject gun = 0, part = 0, spot = 0;
+    int mode_index = -1;  // SelectedDeviceModeIndex
+    int mode = -1;        // DeviceMode[index]: 1 and 3 light, 0 and 2 dark
+    double power = -1;    // DevicePower: the beam is LightIntensity * power
+    float intensity = -1; // SpotLight's Intensity (0 while off)
+    int actor_hidden = -1, spot_visible = -1, spot_hidden = -1;
+    bool Same(const LightState& o) const {
+        return gun == o.gun && part == o.part && spot == o.spot && mode_index == o.mode_index && mode == o.mode &&
+               std::fabs(power - o.power) < 0.05 && std::fabs(intensity - o.intensity) < 1.0f &&
+               actor_hidden == o.actor_hidden && spot_visible == o.spot_visible && spot_hidden == o.spot_hidden;
+    }
+};
+struct LightCheck {
+    UObject player = 0;
+    double next_sample = 0, report_at = -1;
+    LightState last;
+    bool have = false;
+    int lines = 0;
+} g_light;
+
+// A bool property, bitfield or not (-1 when the class has none).
+int ReadBool(UObject obj, const char* name) {
+    static std::map<std::pair<UObject, std::string>, ue::reflection::PropertyInfo> cache;
+    const UObject cls = ue::GetClass(obj);
+    if (!cls) return -1;
+    auto key = std::make_pair(cls, std::string(name));
+    auto it = cache.find(key);
+    if (it == cache.end()) {
+        if (cache.size() > 256) cache.clear();
+        it = cache.emplace(key, ue::reflection::FindProperty(cls, name)).first;
+    }
+    const auto& pi = it->second;
+    uint8_t b = 0;
+    if (!pi.valid() || !mem::Read(obj + pi.offset, b)) return -1;
+    return (b & (pi.bool_mask ? pi.bool_mask : 0xFF)) ? 1 : 0;
+}
+
+UObject Pistol(UObject player) {
+    UObject wm = 0, gun = 0;
+    if (!ue::GetProp(player, "WeaponManager", wm) || !LiveObject(wm)) return 0;
+    if (!ue::GetProp(wm, "Obj_SecondaryWeapon", gun) || !LiveObject(gun)) return 0;
+    return gun;
+}
+
+LightState ReadLight(UObject gun) {
+    LightState st;
+    st.gun = gun;
+    for (const auto& in : custom::InstalledParts(gun)) {
+        if (!LiveObject(in.actor) || ue::PropertyOffset(in.actor, "SelectedDeviceModeIndex") < 0) continue;
+        st.part = in.actor;
+        uint8_t idx = 0xFF;
+        if (ue::GetProp(in.actor, "SelectedDeviceModeIndex", idx)) st.mode_index = idx;
+        const int32_t om = ue::PropertyOffset(in.actor, "DeviceMode");
+        Arr modes{};
+        if (om >= 0 && mem::Read(in.actor + om, modes) && modes.data && st.mode_index >= 0 &&
+            st.mode_index < modes.num && modes.num <= 16)
+            st.mode = mem::ReadOr<uint8_t>(modes.data + st.mode_index, 0xFF);
+        ue::GetProp(in.actor, "DevicePower", st.power);
+        st.actor_hidden = ReadBool(in.actor, "bHidden");
+        UObject spot = 0;
+        if (ue::GetProp(in.actor, "SpotLight", spot) && LiveObject(spot)) {
+            st.spot = spot;
+            ue::GetProp(spot, "Intensity", st.intensity);
+            st.spot_visible = ReadBool(spot, "bVisible");
+            st.spot_hidden = ReadBool(spot, "bHiddenInGame");
+        }
+        if (st.spot) break;  // a light; else keep looking (a laser has no SpotLight)
+    }
+    return st;
+}
+
+void LogLight(const char* why, const LightState& st) {
+    if (++g_light.lines > 60) {
+        if (g_light.lines == 61) log::Info("light check: more changes in this level are not logged");
+        return;
+    }
+    if (!st.part) {
+        log::Info("light check (%s): the pistol %s carries no light", why, ue::GetName(st.gun).c_str());
+        return;
+    }
+    const char* mode = st.mode == 1 || st.mode == 3 ? "ON" : st.mode == 0 || st.mode == 2 ? "off" : "unknown";
+    std::string beam = "no spot light";
+    if (st.spot) {
+        // Where the beam points, in the gun actor's own axes (compare before
+        // and after the bench).
+        const Xf sw = ComponentToWorld(st.spot);
+        const FQuat gq = ActorRotation(st.gun);
+        const FVector gl = ActorLocation(st.gun);
+        const FVector at = gq.Inverse().Rotate(sw.translation - gl);
+        const FVector dir = gq.Inverse().Rotate(sw.rotation.Rotate(FVector{1, 0, 0}));
+        UObject parent = 0;
+        ue::GetProp(st.spot, "AttachParent", parent);
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+                 "beam intensity %.0f, at (%.1f %.1f %.1f) pointing (%.2f %.2f %.2f) on the gun, spot visible %d, "
+                 "hidden in game %d, attached to %s",
+                 st.intensity, at.X, at.Y, at.Z, dir.X, dir.Y, dir.Z, st.spot_visible, st.spot_hidden,
+                 parent ? ue::GetName(parent).c_str() : "nothing");
+        beam = buf;
+    }
+    UObject cur = L.player ? game::Gun::Current(L.player).Object() : 0;
+    log::Info("light check (%s): %s on %s: mode %s (index %d), power %.2f, part hidden %d; %s; the game's current "
+              "weapon %s",
+              why, ue::GetName(st.part).c_str(), ue::GetName(st.gun).c_str(), mode, st.mode_index, st.power,
+              st.actor_hidden, beam.c_str(), cur == st.gun ? "is this pistol" : cur ? ue::GetName(cur).c_str() : "none");
+}
+
+void CheckLight(UObject player) {
+    if (player != g_light.player) g_light = LightCheck{}, g_light.player = player;
+    const input::Snapshot snap = input::LastConsumed();
+    if (snap.valid && snap.hand[0].trigger_button.released) g_light.report_at = L.age + 0.25;
+    const bool report = g_light.report_at >= 0 && L.age >= g_light.report_at;
+    if (!report && L.age < g_light.next_sample) return;
+    g_light.next_sample = L.age + 0.2;
+    UObject gun = Pistol(player);
+    if (!gun) return;
+    const LightState st = ReadLight(gun);
+    if (report) {
+        g_light.report_at = -1;
+        LogLight("left trigger let go 0.25 s ago", st);
+    } else if (!g_light.have) {
+        LogLight("first look in this level", st);
+    } else if (!st.Same(g_light.last)) {
+        LogLight(st.part != g_light.last.part ? "the light part changed" : "changed", st);
+    }
+    g_light.last = st;
+    g_light.have = true;
+}
+
+void OnTick(UObject player, float dt) {
+    if (player != L.player) {
+        EndSession("new level", true);
+        bench_vise::Reset();
+        L = Level();
+        Z = Zone{};  // its actor went with the level
+        L.player = player;
+        g_claim[0] = g_claim[1] = Claim{};
+    }
+    if (!player) return;
+    L.age += dt;
+    CheckLight(player);
+    SearchLevel(player);
+    if (g_search_state.load() == 2) {
+        if (g_search_for.load() == player) TakeSearch(player);
+        g_search_state = 0;
+    }
+    // Only in the hub: the workbench facility, or its bench.
+    if (!L.bench && !L.facility) { bench_vise::Hide(); return; }
+    if (S.study && !L.studied && L.bench && L.age > 6.0) {
+        L.studied = true;
+        custom::Study(player, L.bench);
+    }
+    CheckFacility();
+    if (!S.enabled) { bench_vise::Hide(); return; }
+
+    // The physical marker stays visible from across the room. The existing
+    // green zone still appears only nearby and stays hidden during menus.
+    if (L.unlocked && LiveObject(L.bench)) {
+        hands::Pose head;
+        const bool have_head = hands::Head(&head);
+        if (!Z.placed && !Z.failed) PlaceZone(have_head ? head.location : ActorLocation(player));
+        if (Z.placed) {
+            const FVector up{0, 0, 1};
+            const FVector seat = bench_vise::layout::Seat(Z.center - Z.out * S.zone_out, Z.out, Z.table_z);
+            const bool occupied=P.on && P.in_vise && LiveObject(P.gun) && CurrentGun()==P.gun;
+            bench_vise::Show(L.bench, seat, FromAxes(Z.out, Cross(up, Z.out), up), occupied, P.vise_gap, L.age);
+            const double dist = have_head ? Flat(head.location, Z.center) : 1e9;
+            const bool show = S.zone && !Z.failed && have_head &&
+                (dist < S.zone_show || (Z.shown && dist < S.zone_show + 15.0));
+            ShowZone(show && !world_menu::MenuUp());
+        }
+    } else {
+        bench_vise::Hide();
+        if (Z.shown) ShowZone(false);
+    }
+    // The parked gun went away (switched weapon, the game replaced it).
+    if (P.on && (!LiveObject(P.gun) || CurrentGun() != P.gun)) EndSession("the weapon is gone from the table");
+    if (T.on && (!LiveObject(T.gun) || CurrentGun() != T.gun)) EndSession("weapon changed");
+    // Walked away from the table.
+    if (T.on && Flat(ActorLocation(player), T.anchor) > S.walk_away_cm) EndSession("walked away");
+
+    const input::Snapshot snap = input::LastConsumed();
+    for (int h = 0; h < 2; ++h) {
+        const hands::HandState hs = hands::Get(static_cast<hands::Hand>(h));
+        const input::HandInput& in = snap.hand[h];
+        const auto access = hands::GetInteraction(static_cast<hands::Hand>(h));
+        if (g_held[h].active) {
+            if (access.owner != hands::GripOwner::kWorkbench) {
+                ReturnHeld(h, "(the hand is now holding something else)");
+                continue;
+            }
+            if (snap.valid && !in.grip_button.down) {
+                // A menu/editor or lost pose cannot commit an old snap target,
+                // but releasing must still return the part and free the hand.
+                if (!access.actions_allowed || !hs.valid) ReturnHeld(h, "(interaction interrupted)");
+                else {
+                    // Recompute against this frame's hand and live slots.
+                    // The last held-frame snap may no longer be under the hand.
+                    FollowHand(h,hs);
+                    Release(h);
+                }
+            } else if (hs.valid) {
+                FollowHand(h, hs);
+            }
+            continue;
+        }
+        const bool fresh = access.CanAcquire(hands::GripOwner::kWorkbench) &&
+                           g_claim[h].time == hs.time && g_claim[h].c.kind != 0;
+        if (fresh && !g_hover[h]) input::Haptic(static_cast<input::Hand>(h), 0.12f, 0.012f);
+        g_hover[h] = fresh;
+        if (fresh && in.grip_button.pressed && hs.valid) Grab(h, g_claim[h].c, hs);
+    }
+    if (T.on && T.dirty) LayOutTable();
+
+    // First time a hand comes near the bench in a level (geometry check).
+    if (L.age >= L.next_near_check && !L.logged_near && L.unlocked) {
+        L.next_near_check = L.age + 1.0;
+        for (int h = 0; h < 2; ++h) {
+            hands::HandState hs = hands::Get(static_cast<hands::Hand>(h));
+            if (!hs.valid) continue;
+            const double d = Len(hs.grip.location - L.bench_loc);
+            if (d < 120.0) {
+                L.logged_near = true;
+                log::Info("workbench: %s hand at the bench: (%.0f %.0f %.0f), %.0f cm from the bench origin "
+                          "(%.0f cm above it)",
+                          HandName(h), hs.grip.location.X, hs.grip.location.Y, hs.grip.location.Z, d,
+                          hs.grip.location.Z - L.bench_loc.Z);
+                break;
+            }
+        }
+    }
+}
+
+}  // namespace
+
+bool ParkedGun(UObject gun, FVector* spot, FQuat* frame) {
+    if (!P.on || P.gun != gun || !gun) return false;
+    if (spot) *spot = P.spot;
+    if (frame) *frame = P.frame;
+    return true;
+}
+
+bool TryPark(UObject gun, const FQuat& frame, const FQuat& native_frame,
+             const FVector& hand, const FVector& hand_to_main,
+             ReleaseHand released_by) {
+    P.on = false;
+    P.in_vise = false;
+    if (!S.enabled || !L.player || (!L.bench && !L.facility) || !gun) return false;
+    if (L.unlocked && S.zone && !Z.failed) {
+        // The bought bench: only the green zone (if it could be shown).
+        hands::Pose head;
+        if (!Z.placed && hands::Head(&head)) PlaceZone(head.location);
+        if (Z.placed && LiveObject(Z.actor)) {
+            if (!InZone(hand, S.zone_margin)) {
+                // A sniper's fore-end is far ahead of the firing hand.
+                // Releasing with that measured contact in the zone also
+                // counts, so placing the fore-end in the jaws works.
+                FVector contact_from_main;double gap=0;
+                if (!GripForVise(gun,native_frame,&contact_from_main,&gap) ||
+                    !InZone(hand+frame.Rotate(hand_to_main+contact_from_main),S.zone_margin)) return false;
+            }
+            return ParkInZone(gun, native_frame, hand_to_main, released_by);
+        }
+    }
+    if (L.unlocked) {
+        if (Flat(hand, L.bench_loc) > S.bench_reach_cm) return false;
+    } else if (!S.tables_before_unlock) {
+        return false;
+    }
+    std::vector<UObject> ignore{L.player, gun};
+    AddAttached(gun, &ignore);
+    AddAttached(L.player, &ignore);
+    for (auto& l : g_table) ignore.push_back(l.actor);
+    for (auto& hd : g_held)
+        if (hd.active) ignore.push_back(hd.actor);
+    FVector at, normal;
+    std::string what;
+    if (!TraceDown(L.player, hand + FVector{0, 0, 5}, hand - FVector{0, 0, 35}, ignore, &at, &normal, &what)) return false;
+    if (normal.Z < 0.8) {
+        log::Info("workbench: let go over %s, but it is not flat enough to lay the pistol on", what.c_str());
+        return false;
+    }
+    // Lying on its side, barrel where it pointed, the side that faced up
+    // still up.
+    FVector x = frame.Rotate(FVector{1, 0, 0});
+    x.Z = 0;
+    if (Len(x) < 0.2) {
+        hands::Pose head;
+        x = hands::Head(&head) ? head.rotation.Rotate(FVector{1, 0, 0}) : FVector{1, 0, 0};
+        x.Z = 0;
+    }
+    x = Norm(x);
+    const bool right_up = frame.Rotate(FVector{0, 1, 0}).Z >= 0;
+    const FVector y = right_up ? FVector{0, 0, 1} : FVector{0, 0, -1};
+    const FVector z = Cross(x, y);
+    P.on = true;
+    P.gun = gun;
+    P.frame = FromAxes(x, y, z);
+    P.spot = FVector{hand.X, hand.Y, at.Z + S.rest_cm};
+    P.surface_z = at.Z;
+    StartSession(gun, P.spot, P.frame, at.Z);
+    log::Info("workbench: weapon laid on %s at (%.0f %.0f %.0f), %s side up; it carries %s", what.c_str(), at.X,
+              at.Y, at.Z, right_up ? "right" : "left", ListParts(gun).c_str());
+    return true;
+}
+
+void GunTaken() {
+    if (!P.on) return;
+    P.on = false;
+    log::Info("workbench: weapon picked up from the table");
+}
+
+bool HoldsGrip(int hand) { return hand >= 0 && hand < 2 && g_held[hand].active; }
+
+bool ClaimsGrip(int hand) {
+    if (hand < 0 || hand > 1 || !S.enabled) return false;
+    if (g_held[hand].active) return true;
+    if (!T.on) return false;
+    const hands::HandState hs = hands::Get(static_cast<hands::Hand>(hand));
+    Claim& c = g_claim[hand];
+    if (c.time == hs.time) return c.c.kind != 0;
+    c.time = hs.time;
+    c.c = Candidate{};
+    if (!hs.valid) return false;
+    // A hand busy with something of controls' (slide, magazine, the gun) is
+    // left alone.
+    const hands::GrabKind busy = hands::HeldGrabKind(hands::GetGrab(static_cast<hands::Hand>(hand)));
+    if (busy != hands::GrabKind::kNone && busy != hands::GrabKind::kHolster) return false;
+    Candidate best;
+    best.dist = S.grab_cm;
+    BuildCandidate(hand, hs.grip.location, &best);
+    if (best.kind == 0) return false;
+    // The right hand at the gun lying on the table: the gun wins unless the
+    // hand is closer to the part than to where the gun is held.
+    if (hand == 1 && P.on && Len(hs.grip.location - P.spot) <= best.dist) return false;
+    c.c = best;
+    return true;
+}
+
+void Init() {
+    LoadBenchLayout();
+    S.study = config::GetBool("workbench_study", true);
+    S.enabled = config::GetBool("workbench_hands", true);
+    S.tables_before_unlock = config::GetBool("workbench_tables_before_unlock", true);
+    S.grab_cm = config::GetFloat("workbench_grab_cm", 3.0f);
+    S.snap_cm = config::GetFloat("workbench_snap_cm", 5.0f);
+    S.walk_away_cm = config::GetFloat("workbench_walk_away_m", 3.0f) * 100.0;
+    // workbench_box_* replaced workbench_zone_* (2026-11-04), whose sizes an
+    // earlier build already wrote into hole-vr.ini.
+    S.zone = config::GetBool("workbench_box", true);
+    S.zone_w = config::GetFloat("workbench_box_width_cm", 34.0f);
+    S.zone_h = config::GetFloat("workbench_box_height_cm", 52.0f);
+    S.zone_d = config::GetFloat("workbench_box_depth_cm", 14.0f);
+    S.zone_out = config::GetFloat("workbench_box_out_cm", 4.0f);
+    S.zone_lift = config::GetFloat("workbench_box_lift_cm", 2.0f);
+    S.zone_line = config::GetFloat("workbench_box_line_cm", 0.6f);
+    S.zone_fade = config::GetFloat("workbench_box_fade_cm", 4.0f);
+    S.zone_show = config::GetFloat("workbench_box_show_cm", 100.0f);
+    game::AddTickListener(&OnTick);
+}
+
+}  // namespace holevr::vr::workbench

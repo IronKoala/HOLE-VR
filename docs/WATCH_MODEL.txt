@@ -1,0 +1,89 @@
+HOLE wrist watch - combined integration
+
+Ported from the completed hole-watch-integration-v1 source handoff
+(8b61bf6-ik4-watch-v1). The old compiled DLL was not used. This accessory-only
+merge preserves current IK10 calibration, Hands2 contacts, vise/weapon
+handling and saved player settings. Headset validation remains required.
+
+Watch behavior
+- Analog hands always use the device's local time, including during runs.
+- Inset starts at the first player tick in a playable run level. It stops
+  at the exit/results/EndPlay and retains that elapsed time through the hub
+  and transitions until the next playable level loads. Blank before a run.
+- Elapsed wall time includes pause menus and does not follow local clock
+  changes. Display is MM:SS, then HH:MM:SS; maximum 99:59:59.
+- Right index tapping the face opens pause only while the left wrist is
+  raised and the user is looking at its front. Head gaze, not eye tracking.
+- No repeated activation while touching, no menu close toggle, no taps
+  while holding an item in that hand, calibrating, editing grips or in a menu.
+- Fresh contact is swept between frames so a quick tap is not missed.
+- Queued pause requests expire after 200 ms and recheck calibration/editor,
+  menu and tracking state before delivery. Set watch_enabled=0 to disable it.
+- No LOCAL/RUN face text. Original selected colors and inset layout retained.
+
+Native implementation
+vr/watch_math is engine-independent clock, gesture and accessory-mount math.
+body::GetForearm publishes actual solved lowerarm/hand transforms plus their
+reference transforms only after a successful solve. Each body tick first
+invalidates the publication; it does not alter the IK solution.
+The mount is measured back from the solved wrist, so arm length calibration
+does not move the strap toward the elbow or scale its thickness incorrectly.
+WhiteMan skin at this band has 94% lowerarm and 6% hand influence, no twist
+bone influence. The mount follows the primary forearm; the fit envelope
+includes the hand's small skin contribution and IK4 forearm roll.
+
+vr/watch_model uses five native procedural mesh components: fixed case/band,
+three hands, and one inset glyph mesh. 1,920 triangles total. Artwork is
+loaded from hole-vr/watch/dial.png and timer-atlas.png. BOTH are required;
+a failed texture import hides the complete watch and retries after five
+seconds. CMake stages them beside the DLL. The combined installer embeds
+defaults and adds missing artwork without overwriting custom files.
+Native borrowed input
+arrays/strings are const-checked and copied by synchronous engine calls.
+Invalid/stale actor references or partial model setup hide the model.
+The three hands update at the posed wrist each player frame; the existing
+controller/menu pump keeps the clock advancing when the player is paused.
+The tap uses the actual visible fingertip after Hands2 contact solving and
+the same solved wrist as the watch. A raw controller passing behind a
+surface cannot substitute for the visible fingertip contact.
+
+Run tracking uses the player's world and that world's SYS_LevelManager.
+Area000_Home/area-selection worlds retain the previous run. Level exits are
+observed via OpenResults, Open_ResultsUI, NextLevelNoRsltUI, ReceiveEndPlay,
+the exit hole's IsPlayerFalling flag and the existing live results-menu stack.
+There is no timeout that mistakes pausing or inactive tracking for level exit.
+
+Combined integration points
+- CMakeLists.txt: watch sources, artwork copy and watch regression target.
+- main.cpp: watch::InitGame after body and menu/input owners are registered.
+- body/body.h and body.cpp: Forearm publication only; current IK preserved.
+- ui_panel: queued open-only request through existing Escape/menu debounce.
+- world_menu: MenuTick for the clock and ResultsOpened for the run endpoint.
+- New watch*.h/.cpp files, assets/watch and tests/test_watch.cpp.
+Keep an eye on the tick-listener capacity (16); this combined build uses 15
+when all optional listeners register.
+
+Holster preservation
+The exact IK4 package omitted our custom holster model and sounds. This
+staging tree also carries forward the user-approved v5 holster changes:
+raised thumb, index along the shell, empty hood forced open, occupied-hand
+hood lockout, pistol part-offset alignment, game-output audio and tightened
+holstering clip. These use the existing calibrated holster placement.
+Do not restore the earlier body_pose::NeutralCore workaround: the newer IK
+owns torso/body corrections. Preserve any newer IK6 reload fix; the user
+confirmed the empty-reload issue is resolved.
+
+Validation and remaining work
+The original handoff passed 15 native regression suites. The watch portable
+suite also passes against current combined source, and changed runtime
+units compile against the IK10/Hands2 interfaces. Thirteen original posed-skin
+checks found no intersections. Original fit calibration is recorded in the
+model manifest with its hash; the fit is not a claim of headset validation.
+This watch has NOT been loaded into the running game. Confirm texture loading,
+actual level lifecycle events, wrist fit and fingertip/gaze thresholds in
+VR after merging into the settled IK build. Do not overwrite body calibration,
+grip files, holster offsets or any newer installed build during that merge.
+
+Original watch-only Blender/GLB/FBX and previews are in the sibling model
+folder in the handoff package. Extracted HOLE geometry/skin is not distributed.
+The four holster audio files are user-provided exports and retain that provenance.

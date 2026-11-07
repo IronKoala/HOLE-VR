@@ -1,0 +1,112 @@
+#include "vr/interact/slide.h"
+
+#include <algorithm>
+#include <cmath>
+
+namespace holevr::vr::interact {
+
+double Dot(const FVector& a, const FVector& b) { return a.X * b.X + a.Y * b.Y + a.Z * b.Z; }
+double Length(const FVector& a) { return std::sqrt(Dot(a, a)); }
+
+bool Slide::InZone(const FVector& hand) const {
+    if (cfg_.sight_radius > 0.0) {
+        const double t = std::clamp(Dot(hand - cfg_.sight_center, cfg_.axis), 0.0, std::max(0.0, cfg_.sight_back));
+        if (Length(hand - (cfg_.sight_center + cfg_.axis * t)) <= cfg_.sight_radius) return true;
+    }
+    if (cfg_.use_span) {
+        const FVector d = cfg_.span_front - cfg_.span_rear;
+        const double len = Length(d);
+        if (len < 1e-3) return false;
+        const FVector u = d * (1.0 / len);                 // rear -> front
+        const double s = Dot(hand - cfg_.span_rear, u);    // cm in front of the rear end
+        if (s < -cfg_.span_back_margin || s > len + cfg_.span_front_margin) return false;
+        const FVector on = cfg_.span_rear + u * std::clamp(s, 0.0, len);
+        return Length(hand - on) <= cfg_.span_radius;
+    }
+    if (Length(hand - cfg_.grab_center) <= cfg_.grab_radius) return true;
+    const double back = Dot(hand - cfg_.grab_center, cfg_.axis);   // + behind, - forward
+    if (cfg_.grab_forward > 0.0 && back < 0.0) {
+        // Forward along the slide: distance to the segment from grab_center
+        // to grab_center - axis * grab_forward.
+        const double t = std::min(-back, cfg_.grab_forward);
+        if (Length(hand - (cfg_.grab_center - cfg_.axis * t)) <= cfg_.grab_radius_forward) return true;
+    }
+    if (cfg_.grab_back > 0.0 && back > 0.0) {
+        // Behind the slide (pinch): segment from grab_center to
+        // grab_center + axis * grab_back.
+        const double t = std::min(back, cfg_.grab_back);
+        if (Length(hand - (cfg_.grab_center + cfg_.axis * t)) <= cfg_.grab_radius_back) return true;
+    }
+    return false;
+}
+
+SlideEvent Slide::Update(const FVector& hand, bool grab_down, double dt) {
+    const bool pressed = grab_down && !was_grab_down_;
+    was_grab_down_ = grab_down;
+    const double along = Dot(hand - cfg_.grab_center, cfg_.axis);
+    // The hand's offset from the line the slide runs on.
+    const FVector perp = hand - (cfg_.grab_center + cfg_.axis * along);
+
+    if (!held_) {
+        // Spring forward when not held.
+        if (travel_ > rest_) travel_ = std::max(rest_, travel_ - cfg_.return_speed * dt);
+        else travel_ = rest_;
+        const bool accept = accept_next_;
+        if (pressed) accept_next_ = false;
+        if (pressed && (accept || InZone(hand))) {
+            held_ = true;
+            reached_back_ = false;
+            peak_ = travel_;
+            const double grabbed_at = cfg_.grab_at_closed ? 0.0 : travel_;
+            start_ = along - grabbed_at * cfg_.length;
+            handle_ = grabbed_at;
+            grab_perp_ = perp;
+            grab_along_ = along;
+            stats_ = SlideHoldStats{};
+            stats_.start_off_axis = Length(perp);
+            return SlideEvent::kGrabbed;
+        }
+        return SlideEvent::kNone;
+    }
+
+    // The hand slips off only when it is far from the slide's line AND far
+    // from the line it grabbed on. (Before 2026-11-03 only the first: a grab
+    // taken at the edge of the zone, 6-8 cm off the line, let go after
+    // 1-3 cm of sideways wobble.)
+    const double off_axis = Length(perp);
+    const double drift = Length(perp - grab_perp_);
+    const double pull = along - grab_along_;   // cm back from where the hand grabbed
+
+    auto let_go = [&](SlideEvent partial_event) {
+        held_ = false;
+        if (reached_back_) {
+            reached_back_ = false;
+            return SlideEvent::kRacked;
+        }
+        return partial_event;
+    };
+
+    if (!grab_down) return let_go(SlideEvent::kPartialRelease);
+    stats_.frames += 1;
+    stats_.seconds += dt;
+    stats_.last_pull = pull;
+    stats_.max_pull = std::max(stats_.max_pull, stats_.last_pull);
+    stats_.min_pull = std::min(stats_.min_pull, stats_.last_pull);
+    stats_.max_drift = std::max(stats_.max_drift, drift);
+    if (off_axis > cfg_.max_off_axis && drift > cfg_.max_off_axis) {
+        stats_.slipped = true;
+        return let_go(SlideEvent::kSlipped);
+    }
+
+    // A locked-open slide cannot go further forward than the catch.
+    handle_ = std::clamp((along - start_) / cfg_.length, 0.0, 1.0);
+    travel_ = std::clamp((along - start_) / cfg_.length, rest_, 1.0);
+    peak_ = std::max(peak_, travel_);
+    if (!reached_back_ && travel_ >= cfg_.full_threshold) {
+        reached_back_ = true;
+        return SlideEvent::kReachedBack;
+    }
+    return SlideEvent::kNone;
+}
+
+}  // namespace holevr::vr::interact

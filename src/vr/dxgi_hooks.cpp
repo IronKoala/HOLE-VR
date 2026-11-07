@@ -7,8 +7,12 @@
 
 #include "core/config.h"
 #include "core/log.h"
+#include "core/perf.h"
+#include "core/sampler.h"
 #include "hooks/hooks.h"
+#include "vr/gpu_timer.h"
 #include "vr/openxr.h"
+#include "vr/spectator.h"
 
 namespace holevr::vr::dxgi_hooks {
 namespace {
@@ -42,6 +46,7 @@ thread_local bool t_in_present = false;
 UINT BeforePresent(IDXGISwapChain* sc, UINT sync_interval) {
     if (t_in_present || sc != g_game_swapchain.load()) return sync_interval;
     t_in_present = true;
+    sampler::NotePresentThread();
     ID3D12Resource* back_buffer = nullptr;
     IDXGISwapChain3* sc3 = nullptr;
     if (SUCCEEDED(sc->QueryInterface(IID_PPV_ARGS(&sc3)))) {
@@ -49,6 +54,9 @@ UINT BeforePresent(IDXGISwapChain* sc, UINT sync_interval) {
         sc3->Release();
     }
     xr::OnPresent(g_queue.load(), back_buffer);
+    // After the headset copy (queued above on the same queue): the monitor
+    // shows one eye instead of both side by side.
+    spectator::Draw(g_queue.load(), back_buffer);
     // The swap chain keeps its buffers alive; we only borrow this one for the frame.
     if (back_buffer) back_buffer->Release();
     t_in_present = false;
@@ -58,12 +66,43 @@ UINT BeforePresent(IDXGISwapChain* sc, UINT sync_interval) {
     return sync_interval;
 }
 
+// The game's own Present call after ours: long means DXGI made the render
+// thread wait (usually for the GPU to free a back buffer).
+perf::Counter g_perf_present{"game's Present call"};
+
+double TimePresentStart(IDXGISwapChain* sc) {
+    static bool registered = (perf::Register(&g_perf_present), true);
+    (void)registered;
+    return sc == g_game_swapchain.load() ? perf::NowMs() : -1.0;
+}
+
+void TimePresentEnd(double start) {
+    if (start >= 0.0) g_perf_present.Add(perf::NowMs() - start);
+}
+
+// The game's own Present (not one we make, nor another swap chain's).
+bool IsGamePresent(IDXGISwapChain* sc) { return !t_in_present && sc == g_game_swapchain.load(); }
+
 HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* sc, UINT sync, UINT flags) {
-    return o_present(sc, BeforePresent(sc, sync), flags);
+    const bool game = IsGamePresent(sc);
+    if (game) gpu_timer::PresentBegin();  // first: stamps the end of the game's own frame
+    UINT interval = BeforePresent(sc, sync);
+    double t = TimePresentStart(sc);
+    HRESULT hr = o_present(sc, interval, flags);
+    TimePresentEnd(t);
+    if (game) gpu_timer::PresentEnd();
+    return hr;
 }
 
 HRESULT STDMETHODCALLTYPE HookPresent1(IDXGISwapChain1* sc, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* p) {
-    return o_present1(sc, BeforePresent(sc, sync), flags, p);
+    const bool game = IsGamePresent(sc);
+    if (game) gpu_timer::PresentBegin();
+    UINT interval = BeforePresent(sc, sync);
+    double t = TimePresentStart(sc);
+    HRESULT hr = o_present1(sc, interval, flags, p);
+    TimePresentEnd(t);
+    if (game) gpu_timer::PresentEnd();
+    return hr;
 }
 
 void OnSwapChainCreated(IUnknown* device, IDXGISwapChain* sc) {
@@ -84,6 +123,7 @@ void OnSwapChainCreated(IUnknown* device, IDXGISwapChain* sc) {
         sc1->Release();
     }
     log::Info("Game swap chain hooked (D3D12 queue %p)", static_cast<void*>(queue));
+    gpu_timer::Init(queue);
 }
 
 HRESULT STDMETHODCALLTYPE HookCreateSwapChain(IDXGIFactory* f, IUnknown* device, DXGI_SWAP_CHAIN_DESC* desc,

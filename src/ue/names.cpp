@@ -1,6 +1,7 @@
 #include "ue/names.h"
 
 #include <cstring>
+#include <vector>
 
 #include "core/log.h"
 #include "core/memory.h"
@@ -97,6 +98,39 @@ std::string ToString(const FName& name) {
     std::string s = EntryToString(name.comparison_index);
     if (name.number > 0) s += "_" + std::to_string(name.number - 1);
     return s;
+}
+
+bool Find(const std::string& text, FName* out) {
+    if (!g_pool || text.empty() || text.size() > 1024) return false;
+    constexpr uint32_t kBlockBytes = 0x10000u * kStride;
+    uint32_t current_block = mem::ReadOr<uint32_t>(g_pool + 0x08, 0);
+    uint32_t current_cursor = mem::ReadOr<uint32_t>(g_pool + 0x0C, 0);
+    if (current_block >= kMaxBlocks) return false;
+    std::vector<unsigned char> buf;
+    for (uint32_t block = 0; block <= current_block; ++block) {
+        uintptr_t base = mem::ReadOr<uintptr_t>(g_pool + kBlocksOffset + block * 8ull);
+        if (!base) continue;
+        uint32_t limit = block == current_block ? current_cursor : kBlockBytes;
+        if (limit > kBlockBytes || !mem::IsReadable(base, limit)) continue;
+        buf.resize(limit);
+        std::memcpy(buf.data(), reinterpret_cast<const void*>(base), limit);
+        uint32_t off = 0;
+        while (off + 2 <= limit) {
+            uint16_t raw;
+            std::memcpy(&raw, buf.data() + off, 2);
+            Header h = Decode(raw);
+            if (h.len == 0) break;
+            uint32_t bytes = h.wide ? h.len * 2u : h.len;
+            if (off + 2 + bytes > limit) break;
+            if (!h.wide && h.len == text.size() && std::memcmp(buf.data() + off + 2, text.data(), h.len) == 0) {
+                out->comparison_index = (block << 16) | (off / kStride);
+                out->number = 0;
+                return true;
+            }
+            off += (2 + bytes + kStride - 1) & ~(kStride - 1);
+        }
+    }
+    return false;
 }
 
 }  // namespace holevr::ue::names

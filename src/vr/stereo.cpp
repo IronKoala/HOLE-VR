@@ -3,7 +3,9 @@
 #include <windows.h>
 #include <d3d12.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -12,6 +14,8 @@
 
 #include "core/config.h"
 #include "core/log.h"
+#include "ue/process_event.h"
+#include "core/perf.h"
 #include "core/memory.h"
 #include "hooks/hooks.h"
 #include "ue/objects.h"
@@ -81,8 +85,12 @@ bool g_have_frame_views = false;
 
 // Recentering, in UE axes but metres (scaled by WorldToMeters on use).
 std::atomic<bool> g_recenter{true};
+std::atomic<std::uint64_t> g_origin_generation{1};
 FVector g_origin_m;
 double g_origin_yaw = 0.0;
+std::atomic<double> g_standing_eye_m{0.0};   // 0: not measured
+std::atomic<bool> g_standing_apply{false};
+std::atomic<XrTime> g_standing_clear_after{0};
 
 // Logs the first time each hook runs, so a log shows which engine paths are live.
 #define HOLEVR_FIRST_CALL(name)                                  \
@@ -159,7 +167,7 @@ const float* FindNearPlane(uintptr_t projection_fn) {
 bool FrameViews(bool new_sample, xr::EyeView out[2]) {
     std::lock_guard<std::mutex> lock(g_frame_mutex);
     if (new_sample || !g_have_frame_views) {
-        if (!xr::SessionRunning() || !xr::LatestViews(g_frame_views)) return false;
+        if (!xr::SessionRunning() || !xr::ViewsForNewPicture(g_frame_views)) return false;
         g_have_frame_views = true;
     }
     out[0] = g_frame_views[0];
@@ -171,14 +179,16 @@ bool FrameViews(bool new_sample, xr::EyeView out[2]) {
 // hands and held objects land exactly where the eyes say they are.
 struct WorldMapping {
     bool valid = false;
-    FVector camera_location;  // game camera before the headset offset
+    FVector camera_location;  // camera the views are drawn from, before the headset offset (SettleView)
     FQuat base;               // game yaw (or full rotation with use_game_pitch)
     FQuat recenter;
     FVector origin_m;
     double world_to_meters = 100.0;
     double height_drop_m = 0.0;  // fixed_height: real head height above the recentre point, removed from everything
     FVector head_offset_cm;  // midpoint of the eyes from the game camera, world axes, horizontal
+    double raise_cm = 0.0;   // SetViewRaiseCm: added to the eyes' (and hands') height
 };
+std::atomic<double> g_view_raise_cm{0.0};
 std::mutex g_world_mutex;
 WorldMapping g_world;
 // Origin shifts requested by ShiftOriginWorld, applied at the next left-eye
@@ -186,29 +196,336 @@ WorldMapping g_world;
 FVector g_pending_origin_m;
 FVector g_pending_world_cm;
 
-void HookCalcOffset(void* self, int32_t view_index, FRotator* rotation, float world_to_meters, FVector* location) {
+// The camera's expected move during the player's tick (view_lead_math.h).
+// Guarded by g_world_mutex.
+constexpr double kMaxLeadCm = 120.0;  // more than this in one frame is a teleport, not walking
+view_lead::Anchors g_anchor_end;      // after the latest tick's listeners
+view_lead::Anchors g_anchor_view;     // g_anchor_end when the latest left eye was set up
+view_lead::Leads g_leads;             // from the latest tick start since those views
+bool g_leads_set = false;
+int g_lead_used = -1;
+int g_lead_pick = -1;  // the anchor the lead would use, applied or not (g_lead_trust)
+FVector g_lead_cm;  // added to the camera by TrackingToWorld and GameCameraLocation
+// The lead is stopped while its prediction is far off the game's view (the
+// view not following the character: the extraction hole's fall).
+view_lead::LeadTrust g_lead_trust;
+constexpr double kTrustAgainCm = 10.0;  // a measured frame this close starts the lead again
+// The views are drawn from where the mod placed the hands for, eased toward
+// the game's camera (view_lead::SettleView). g_world.camera_location is that
+// drawn camera; g_game_cam_prev is the game's own camera at the same views.
+constexpr double kSnapCm = 30.0;
+FVector g_game_cam_prev;
+bool g_have_game_cam = false;
+// How far off the hands would have been, for the log. Leaf lock: the report
+// line takes it and nothing else is taken while it is held.
+std::mutex g_lead_stats_mutex;
+view_lead::Stats g_lead_stats;
+view_lead::GunShake g_gun_shake;   // also under g_lead_stats_mutex
+view_lead::SettleStats g_settle_stats;  // also under g_lead_stats_mutex
+view_lead::LeadTrust g_trust_log;       // totals only, also under g_lead_stats_mutex
+bool g_moving_this_view = false;   // the camera moved between the latest two views (view thread)
+FVector g_view_shift;              // this frame's views: drawn camera - game camera (view thread)
+
+// view_follow in hole-vr.ini: how much of the game camera's unforeseen
+// move the views take each frame (view_lead::SettleView). 1 = the game's
+// camera exactly (hands and gun jump when it moves suddenly).
+double ViewFollow() { return std::clamp(static_cast<double>(config::GetFloat("view_follow", 0.15f)), 0.05, 1.0); }
+
+// The lead stopped or started again (view_lead::LeadTrust). View thread,
+// no lock held. The first 40 changes of a run are logged one by one; the
+// 10 s line counts them all.
+void LogTrustChange(int change, const FVector& actual, const view_lead::Leads& l, int pick) {
+    static int s_logged = 0;
+    if (s_logged >= 40) return;
+    ++s_logged;
+    const double predicted = pick >= 0 && pick < view_lead::kKinds ? view_lead::Length(l.move[pick]) : 0.0;
+    if (change < 0)
+        log::Info("view lead: stopped; the game's view moved %.1f cm but the character's %s said %.1f cm (the view "
+                  "isn't following the character); hands go with the game's view until they agree again",
+                  view_lead::Length(actual), pick >= 0 ? view_lead::kKindNames[pick] : "anchor", predicted);
+    else
+        log::Info("view lead: on again; the game's view moved %.1f cm and the character's %s said %.1f cm",
+                  view_lead::Length(actual), pick >= 0 ? view_lead::kKindNames[pick] : "anchor", predicted);
+}
+
+// The 10 s report line: how far the hands would have trailed the view, and
+// how far off each anchor's prediction was.
+std::string LeadReport(double) {
+    view_lead::Stats s;
+    view_lead::SettleStats settle;
+    view_lead::LeadTrust trust;
+    {
+        std::lock_guard<std::mutex> lock(g_lead_stats_mutex);
+        s = g_lead_stats;
+        g_lead_stats = {};
+        settle = g_settle_stats;
+        g_settle_stats = {};
+        trust = g_trust_log;
+        g_trust_log = {};
+    }
+    if (s.frames == 0 && s.turn_frames == 0) return {};
+    const int choice = static_cast<int>(config::GetFloat("view_lead", -1.f));
+    std::string each;
+    for (int k = 0; k < view_lead::kKinds; ++k) {
+        if (!s.n[k]) continue;
+        char b[64];
+        std::snprintf(b, sizeof(b), "%s%s %.1f", each.empty() ? "" : ", ", view_lead::kKindNames[k],
+                      s.sum[k] / s.n[k]);
+        each += b;
+    }
+    const long long f = s.frames > 0 ? s.frames : 1;
+    const long long tf = s.turn_frames > 0 ? s.turn_frames : 1;
+    // Where the misses go (forward, sideways, up) and the worst frames.
+    std::string worst;
+    for (int i = 0; i < s.worst_count; ++i) {
+        const view_lead::Stats::Worst& w = s.worst[i];
+        char b[200];
+        std::snprintf(b, sizeof(b), "%s%.1f cm (fwd %.1f side %.1f up %.1f; moved %.1f, predicted", i ? "; " : "",
+                      w.cm, w.miss.X, w.miss.Y, w.miss.Z, view_lead::Length(w.actual));
+        worst += b;
+        for (int k = 0; k < view_lead::kKinds; ++k) {
+            if (!w.leads.valid[k]) continue;
+            std::snprintf(b, sizeof(b), " %s%s %.1f", view_lead::kKindNames[k], k == w.used ? "*" : "",
+                          view_lead::Length(w.leads.move[k]));
+            worst += b;
+        }
+        worst += ")";
+    }
+    // A hand at arm's length (about 45 cm out from the eyes) trails a turn
+    // of a degrees by about 45 * a * pi / 180 cm.
+    char line[640];
+    std::snprintf(line, sizeof(line),
+                  "frame timing: hands vs view while moving: %lld frames; uncorrected they would trail the view by "
+                  "%.1f cm on average (worst %.1f), corrected %.1f cm (worst %.1f) with view_lead %d; by anchor: %s "
+                  "cm; corrected miss forward %.1f, sideways %.1f, up %.1f cm. Turning: %lld frames, %.2f deg a frame "
+                  "on average (worst %.1f), about %.1f cm at arm's length",
+                  s.frames, s.none_sum / f, s.none_max, s.used_sum / f, s.used_max, choice,
+                  each.empty() ? "none" : each.c_str(), s.axis_sum[0] / f, s.axis_sum[1] / f, s.axis_sum[2] / f,
+                  s.turn_frames, s.turn_sum / tf, s.turn_max, 45.0 * (s.turn_sum / tf) * kDegToRad);
+    std::string out = line;
+    if (!worst.empty()) out += ". Worst frames: " + worst;
+    if (settle.frames > 0) {
+        const long long held = settle.frames - settle.snaps;
+        const long long h = held > 0 ? held : 1;
+        char b[400];
+        std::snprintf(b, sizeof(b),
+                      ". Views drawn with the hands (view_follow %.2f): what the mod placed is off them by %.2f cm on "
+                      "average (worst %.1f), the views are %.2f cm from the game's camera on average (worst %.1f); "
+                      "%lld of %lld frames drawn at the game's camera (no tick or a jump)",
+                      ViewFollow(), settle.mismatch_sum / h, settle.mismatch_max, settle.off_sum / h, settle.off_max,
+                      settle.snaps, settle.frames);
+        out += b;
+    }
+    if (trust.stops > 0 || trust.off_frames > 0) {
+        char b[260];
+        std::snprintf(b, sizeof(b),
+                      ". Lead stopped %d times (worst miss %.1f cm: the game's view not following the character), "
+                      "off for %lld frames",
+                      trust.stops, trust.worst_miss, trust.off_frames);
+        out += b;
+    }
+    return out;
+}
+
+// The 10 s report line: how much the held gun shakes as the eyes see it.
+std::string GunReport(double) {
+    view_lead::GunShake g;
+    {
+        std::lock_guard<std::mutex> lock(g_lead_stats_mutex);
+        g = g_gun_shake;
+        g_gun_shake.ResetTotals();
+    }
+    if (g.n[0] + g.n[1] == 0 && g.checked_frames == 0) return {};
+    auto avg = [](double sum, long long n) { return n > 0 ? sum / n : 0.0; };
+    char b[700];
+    std::snprintf(b, sizeof(b),
+                  "frame timing: the gun as seen from the eyes shakes %.2f cm / %.2f deg a frame while moving "
+                  "(worst %.1f cm / %.1f deg, %lld frames) and %.2f cm / %.2f deg standing still (%lld frames); "
+                  "against the controller holding it (the mod's own part) it wobbles %.2f cm / %.2f deg a frame "
+                  "while moving (worst %.1f cm / %.1f deg, %lld frames) and %.2f cm / %.2f deg still (%lld frames); "
+                  "something else moved it after the mod placed it in %lld of %lld frames (worst %.1f cm)",
+                  avg(g.cm_sum[1], g.n[1]), avg(g.deg_sum[1], g.n[1]), g.cm_max[1], g.deg_max[1], g.n[1],
+                  avg(g.cm_sum[0], g.n[0]), avg(g.deg_sum[0], g.n[0]), g.n[0],
+                  avg(g.place_cm_sum[1], g.place_n[1]), avg(g.place_deg_sum[1], g.place_n[1]), g.place_cm_max[1],
+                  g.place_deg_max[1], g.place_n[1], avg(g.place_cm_sum[0], g.place_n[0]),
+                  avg(g.place_deg_sum[0], g.place_n[0]), g.place_n[0], g.moved_frames, g.checked_frames,
+                  g.moved_max);
+    return b;
+}
+
+std::atomic<void (*)()> g_frame_callback{nullptr};
+std::atomic<DWORD> g_view_thread{0};
+
+// Game thread frames: time between one frame's eye views and the next's.
+perf::Counter g_perf_gt_frame{"game thread frame"};
+perf::Counter g_perf_after_eyes{"after-eyes callback (hands)"};
+
+// After the right eye: the frame's head pose and world mapping are final.
+void RunFrameCallback() {
+    static double s_last = 0.0;
+    static bool s_registered = false;
+    double now = perf::NowMs();
+    // Only the thread that set up the views (the game thread) runs it.
+    DWORD me = GetCurrentThreadId();
+    DWORD expected = 0;
+    if (!g_view_thread.compare_exchange_strong(expected, me) && expected != me) return;
+    if (!s_registered) {
+        s_registered = true;
+        perf::Register(&g_perf_gt_frame);
+        perf::Register(&g_perf_after_eyes);
+        perf::AddReportLine(&LeadReport);
+        perf::AddReportLine(&GunReport);
+        ue::process_event::SetGameThread(me);
+    }
+    if (s_last > 0.0 && now - s_last < 1000.0) g_perf_gt_frame.Add(now - s_last);
+    s_last = now;
+    auto fn = g_frame_callback.load();
+    if (!fn) return;
+    static bool running = false;
+    if (running) return;
+    running = true;
+    {
+        perf::Scope t(g_perf_after_eyes);
+        fn();
+    }
+    running = false;
+}
+
+// world_scale: how big the world looks. 1 = true size; 1.2 = the world looks
+// 20% bigger (you feel smaller). Done by scaling the tracking-to-world factor,
+// which scales the eye spacing, head movement and hands together.
+double WorldScale() {
+    double s = config::GetFloat("world_scale", 1.f);
+    if (!(s > 0)) s = 1.0;
+    return std::clamp(s, 0.5, 2.0);
+}
+
+void HookCalcOffset(void* self, int32_t view_index, FRotator* rotation, float engine_world_to_meters,
+                    FVector* location) {
     HOLEVR_FIRST_CALL("CalculateStereoViewOffset");
+    struct AfterRightEye {
+        int32_t i;
+        ~AfterRightEye() {
+            if (i == 1) RunFrameCallback();
+        }
+    } after{view_index};
     xr::EyeView views[2];
     // A left-eye request starts a new frame: take a fresh tracking sample.
     if (view_index < 0 || view_index > 1 || !FrameViews(view_index == 0, views)) {
-        o_calc_offset(self, view_index, rotation, world_to_meters, location);
+        if (view_index == 0) g_view_shift = FVector{};
+        o_calc_offset(self, view_index, rotation, engine_world_to_meters, location);
         return;
     }
+    const double world_to_meters = engine_world_to_meters / WorldScale();
     if (view_index == 1) xr::SetRenderedViews(views);
     if (view_index == 0) {
-        std::lock_guard<std::mutex> lock(g_world_mutex);
-        g_origin_m = g_origin_m + g_pending_origin_m;
-        g_pending_origin_m = FVector{};
-        g_pending_world_cm = FVector{};
+        view_lead::Leads leads;
+        int used = -1;
+        FVector actual;
+        bool measured = false;
+        double turn = 0;
+        view_lead::Settle settle;
+        settle.view = *location;
+        bool have_settle = false;
+        int trust_changed = 0;  // 1 the lead started again, -1 it stopped
+        int pick = -1;
+        view_lead::LeadTrust trust;  // this frame's totals, for the log
+        {
+            std::lock_guard<std::mutex> lock(g_world_mutex);
+            static double s_last_yaw = 0;
+            turn = NormalizeAxis(rotation->Yaw - s_last_yaw);
+            s_last_yaw = rotation->Yaw;
+            // How the game's camera really moved since the latest views, less
+            // the room-scale steps (already taken off the tracking origin):
+            // what the tick's prediction should have said.
+            if (g_leads_set && g_world.valid && g_have_game_cam) {
+                measured = true;
+                leads = g_leads;
+                used = g_lead_used;
+                pick = g_lead_pick;
+                actual = *location - g_game_cam_prev - g_pending_world_cm;
+            }
+            // Draw the views from where this tick placed the hands for, eased
+            // toward the game's camera.
+            if (g_world.valid) {
+                const FVector placed_for = g_world.camera_location + g_pending_world_cm + g_lead_cm;
+                settle = view_lead::SettleView(*location, placed_for, ViewFollow(), g_leads_set && g_lead_used >= 0,
+                                               kSnapCm);
+                have_settle = true;
+            }
+            // Judge the lead by this frame, whether or not it was applied,
+            // for the next tick (view_lead::LeadTrust).
+            if (measured) {
+                const bool was = g_lead_trust.trusted;
+                g_lead_trust.Update(actual, leads, pick, kSnapCm, kTrustAgainCm);
+                if (was != g_lead_trust.trusted) trust_changed = g_lead_trust.trusted ? 1 : -1;
+                trust = g_lead_trust;
+                g_lead_trust.ResetTotals();
+            }
+            g_game_cam_prev = *location;
+            g_have_game_cam = true;
+            g_origin_m = g_origin_m + g_pending_origin_m;
+            g_pending_origin_m = FVector{};
+            g_pending_world_cm = FVector{};
+            // From here the camera is where the character is: no lead until
+            // the next tick moves it again.
+            g_anchor_view = g_anchor_end;
+            g_leads = {};
+            g_leads_set = false;
+            g_lead_used = -1;
+            g_lead_pick = -1;
+            g_lead_cm = FVector{};
+        }
+        if (trust_changed) LogTrustChange(trust_changed, actual, leads, pick);
+        g_moving_this_view = measured && view_lead::Length(actual) > 0.5;
+        g_view_shift = settle.view - *location;
+        if (measured || have_settle) {
+            std::lock_guard<std::mutex> lock(g_lead_stats_mutex);
+            if (measured) {
+                g_lead_stats.Add(actual, leads, used, rotation->Yaw);
+                g_lead_stats.AddTurn(turn);
+                g_trust_log.off_frames += trust.off_frames;
+                g_trust_log.stops += trust.stops;
+                if (trust.worst_miss > g_trust_log.worst_miss) g_trust_log.worst_miss = trust.worst_miss;
+            }
+            if (have_settle) g_settle_stats.Add(settle);
+        }
     }
 
-    if (g_recenter.exchange(false)) {
+    const bool recentered_now = g_recenter.exchange(false);
+    if (recentered_now) {
         const XrVector3f& a = views[0].pose.position;
         const XrVector3f& b = views[1].pose.position;
         g_origin_m = XrToUePosition((a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f, (a.z + b.z) * 0.5f, 1.0);
         const XrQuaternionf& q = views[0].pose.orientation;
         g_origin_yaw = YawOf(XrToUeQuat(q.x, q.y, q.z, q.w));
         log::Info("stereo: recentered (yaw %.1f)", g_origin_yaw);
+    }
+    const bool standing_requested = g_standing_apply.exchange(false);
+    if (recentered_now || standing_requested) {
+        const double y = g_standing_eye_m.load();
+        if (y > 0.5 && y < 2.5 && xr::StandingSpace()) {
+            const double before = g_origin_m.Z;
+            g_origin_m.Z = XrToUePosition(0, static_cast<float>(y), 0, 1.0).Z;
+            log::Info("stereo: standing eye height %.0f cm from your measurement (the head was %.0f cm %s it at the "
+                      "recentre)", y * 100.0, std::fabs(before - g_origin_m.Z) * 100.0,
+                      before >= g_origin_m.Z ? "above" : "below");
+        } else if (standing_requested) {
+            const double head_y = (static_cast<double>(views[0].pose.position.y) + views[1].pose.position.y) * 0.5;
+            // View caches can retain the last valid pose during tracking loss.
+            // A clear must wait for a new observation rather than reusing it.
+            const bool fresh = y > 0 || (views[0].base_time > g_standing_clear_after.load() &&
+                                        views[1].base_time > g_standing_clear_after.load());
+            if (fresh && std::isfinite(head_y)) {
+                const double before = g_origin_m.Z;
+                g_origin_m.Z = head_y;  // UE tracking Z equals OpenXR Y, in metres
+                if (std::fabs(before - head_y) > 1e-6) ++g_origin_generation;
+                log::Info("stereo: standing reference inactive; vertical origin reset to current head %.1f cm (XY/yaw kept)",
+                          head_y * 100.0);
+            } else {
+                g_standing_apply = true;  // retry at the next fresh valid picture
+            }
+        }
     }
 
     const XrPosef& pose = views[view_index].pose;
@@ -228,6 +545,8 @@ void HookCalcOffset(void* self, int32_t view_index, FRotator* rotation, float wo
         height_drop_m = XrToUePosition(0, (a.y + b.y) * 0.5f, 0, 1.0).Z - g_origin_m.Z;
         local_p.Z -= height_drop_m * world_to_meters;
     }
+    const double raise_cm = g_view_raise_cm.load();
+    local_p.Z += raise_cm;
 
     // The game keeps steering yaw (mouse/stick turning); the headset owns
     // pitch and roll so the horizon never moves on its own.
@@ -239,11 +558,37 @@ void HookCalcOffset(void* self, int32_t view_index, FRotator* rotation, float wo
         FVector head_p = XrToUePosition((a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f, (a.z + b.z) * 0.5f, 1.0);
         FVector head_offset = base.Rotate(recenter.Rotate(head_p - g_origin_m) * world_to_meters);
         head_offset.Z = 0;
-        g_world = {true, *location, base, FQuat{recenter.X, recenter.Y, recenter.Z, recenter.W}, g_origin_m,
-                   world_to_meters, height_drop_m, head_offset};
+        const FVector drawn_cam = *location + g_view_shift;
+        g_world = {true, drawn_cam, base, FQuat{recenter.X, recenter.Y, recenter.Z, recenter.W}, g_origin_m,
+                   world_to_meters, height_drop_m, head_offset, raise_cm};
+        // The held gun as this picture's eyes see it (eye-yaw axes), for the
+        // shake line in the log. g_anchor_view is this frame's tick end.
+        FVector eye_local = recenter.Rotate(head_p - g_origin_m) * world_to_meters;
+        eye_local.Z += raise_cm - height_drop_m * world_to_meters;
+        const FVector eye = drawn_cam + base.Rotate(eye_local);
+        const bool held = g_anchor_view.held != 0;
+        const FQuat inv = base.Inverse();
+        const FVector gun_at = held ? inv.Rotate(g_anchor_view.held_at - eye) : FVector{};
+        const FQuat gun_rot = held ? inv * g_anchor_view.held_rot : FQuat{};
+        // The gun in the controller's own axes, the controller as these eyes
+        // see it (same tracking frame as the tick that placed the gun). The
+        // origin, fixed height and raise cancel between eyes and hand.
+        const bool grip = held && g_anchor_view.grip;
+        FVector in_hand;
+        FQuat in_hand_rot;
+        if (grip) {
+            const FQuat hand_rot = recenter * g_anchor_view.grip_rot;
+            const FVector hand_at = recenter.Rotate(g_anchor_view.grip_m - head_p) * world_to_meters;
+            const FQuat hand_inv = hand_rot.Inverse();
+            in_hand = hand_inv.Rotate(gun_at - hand_at);
+            in_hand_rot = hand_inv * gun_rot;
+        }
+        std::lock_guard<std::mutex> stats(g_lead_stats_mutex);  // leaf, taken inside g_world_mutex only here
+        g_gun_shake.Add(held, gun_at, gun_rot, g_moving_this_view);
+        g_gun_shake.AddPlacement(grip, in_hand, in_hand_rot, g_moving_this_view);
     }
     *rotation = ToRotator(base * local_q);
-    *location = *location + base.Rotate(local_p);
+    *location = *location + g_view_shift + base.Rotate(local_p);
 }
 
 double* HookProjection(void* self, double* out, int32_t view_index) {
@@ -480,20 +825,51 @@ bool Install() {
     return true;
 }
 
-void Recenter() { g_recenter = true; }
+void Recenter() { ++g_origin_generation; g_recenter = true; }
+std::uint64_t OriginGeneration() { return g_origin_generation.load(); }
+double TrackingScale() {
+    std::lock_guard<std::mutex> lock(g_world_mutex);
+    return g_world.valid && g_world.world_to_meters > 0 ? g_world.world_to_meters / 100.0 : 1.0;
+}
+void SetStandingEyeHeight(double floor_to_eye_m) {
+    if (!std::isfinite(floor_to_eye_m) ||
+        (floor_to_eye_m != 0 && !(floor_to_eye_m > 0.5 && floor_to_eye_m < 2.5))) return;
+    if (floor_to_eye_m == 0) {
+        xr::EyeView views[2];
+        g_standing_clear_after = xr::LatestViews(views) ? std::max(views[0].base_time, views[1].base_time) : 0;
+    }
+    g_standing_eye_m = floor_to_eye_m;
+    g_standing_apply = true;
+}
+
+void SetGameFrameCallback(void (*fn)()) { g_frame_callback.store(fn); }
 
 bool TrackingToWorld(const XrPosef& pose, FVector* world_location, FQuat* world_rotation) {
     WorldMapping m;
+    FVector lead;
     {
         std::lock_guard<std::mutex> lock(g_world_mutex);
         m = g_world;
+        lead = g_lead_cm;
     }
     if (!m.valid) return false;
     FQuat q = XrToUeQuat(pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w);
     FVector p = XrToUePosition(pose.position.x, pose.position.y, pose.position.z, 1.0);
     FVector local_p = m.recenter.Rotate(p - m.origin_m) * m.world_to_meters;
-    local_p.Z -= m.height_drop_m * m.world_to_meters;
-    if (world_location) *world_location = m.camera_location + m.base.Rotate(local_p);
+    // Fixed height takes the head's own height off everything. Use the head
+    // of the picture these poses are for, not the latest frame's: the hands
+    // are for that picture's moment, and with the latest frame's head every
+    // real crouch or head bob moved the gun up and down against the view by
+    // a frame of head movement (more when frame times vary).
+    double drop_m = m.height_drop_m;
+    if (m.height_drop_m != 0.0) {
+        xr::EyeView v[2];
+        if (xr::ViewsForNewPicture(v))
+            drop_m = XrToUePosition(0, (v[0].pose.position.y + v[1].pose.position.y) * 0.5f, 0, 1.0).Z - m.origin_m.Z;
+    }
+    local_p.Z -= drop_m * m.world_to_meters;
+    local_p.Z += m.raise_cm;
+    if (world_location) *world_location = m.camera_location + lead + m.base.Rotate(local_p);
     if (world_rotation) *world_rotation = m.base * (m.recenter * q);
     return true;
 }
@@ -520,5 +896,34 @@ bool ShiftOriginWorld(const FVector& world_delta_cm) {
     g_pending_world_cm = g_pending_world_cm + d;
     return true;
 }
+
+bool GameCameraLocation(FVector* world_cm) {
+    std::lock_guard<std::mutex> lock(g_world_mutex);
+    if (!g_world.valid) return false;
+    *world_cm = g_world.camera_location + g_lead_cm;
+    return true;
+}
+
+void CharacterAtTickStart(const view_lead::Anchors& now) {
+    const int choice = static_cast<int>(config::GetFloat("view_lead", -1.f));
+    std::lock_guard<std::mutex> lock(g_world_mutex);
+    if (now.held && now.held == g_anchor_end.held) {
+        std::lock_guard<std::mutex> stats(g_lead_stats_mutex);
+        g_gun_shake.AddMovedAfter(view_lead::Length(now.held_at - g_anchor_end.held_at));
+    }
+    if (!g_world.valid) return;
+    g_leads = view_lead::Predict(g_anchor_view, now, g_world.camera_location, kMaxLeadCm);
+    g_leads_set = true;
+    g_lead_pick = view_lead::Pick(g_leads, choice);
+    g_lead_used = g_lead_trust.trusted ? g_lead_pick : -1;
+    g_lead_cm = g_lead_used >= 0 ? g_leads.move[g_lead_used] : FVector{};
+}
+
+void CharacterAtTickEnd(const view_lead::Anchors& now) {
+    std::lock_guard<std::mutex> lock(g_world_mutex);
+    g_anchor_end = now;
+}
+
+void SetViewRaiseCm(double cm) { g_view_raise_cm.store(cm); }
 
 }  // namespace holevr::vr::stereo
