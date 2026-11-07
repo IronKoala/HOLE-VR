@@ -99,6 +99,21 @@ void StereoRenderSetup(UObject ksl) {
     log::Info("cvars: the game renders with virtual shadow maps %s (%d pages, cache %d), shadow quality %d, "
               "global illumination method %d, reflection method %d",
               vsm == 1 ? "on" : vsm == 0 ? "off" : "unknown", pages, cache, quality, gi, refl);
+    // What decides how much is drawn twice, once per eye (2026-11-07 fixed
+    // cost study). Instanced stereo would draw both eyes in one pass, but it
+    // is a start-up setting that needs the game's shaders built for it.
+    int isr = -1, nanite = -1, occlusion = -1, hzb = -1, turns = -1, fog = -1, translucency = -1, dfao = -1;
+    ReadInt(ksl, "vr.InstancedStereo", &isr);
+    ReadInt(ksl, "r.Nanite", &nanite);
+    ReadInt(ksl, "r.AllowOcclusionQueries", &occlusion);
+    ReadInt(ksl, "r.HZBOcclusion", &hzb);
+    ReadInt(ksl, "vr.RoundRobinOcclusion", &turns);
+    ReadInt(ksl, "r.VolumetricFog", &fog);
+    ReadInt(ksl, "r.Lumen.TranslucencyVolume.Enable", &translucency);
+    ReadInt(ksl, "r.DistanceFieldAO", &dfao);
+    log::Info("cvars: per-eye work: instanced stereo %d, Nanite %d, occlusion queries %d (HZB %d, eyes taking turns "
+              "%d), volumetric fog %d, Lumen on see-through things %d, distance field AO %d",
+              isr, nanite, occlusion, hzb, turns, fog, translucency, dfao);
     if (vsm != 1 || pages <= 0) return;
     int target = config::GetInt("vr_shadow_pages", -1);
     if (target < 0) target = pages * 2;
@@ -195,24 +210,24 @@ void Init() {
               "vr_async_compute; off stops the white squares)",
               sharing ? "game's" : "off", async ? "game's" : "off");
     // Frame times: the levels are GPU-bound at about 13.5 ms a frame against
-    // a 13.9 ms slot that also carries SteamVR's ~1.7 ms hand-off. The GPU
-    // cost test in the owner's 2026-11-07 Office run measured shadows on High
-    // instead of Epic at -0.67 ms a frame and Lumen GI probes at half density
-    // at -0.88 ms (missed headset slots 8% -> 2.5% and 6% -> 0.4% alone).
-    // VR asks for both; "epic"/"full" or "game" gives the game's own back.
-    const std::string shadows = config::GetString("vr_shadow_quality", "high");
+    // a 13.9 ms slot that also carries SteamVR's ~1.7 ms hand-off. Shadows on
+    // High and Lumen GI probes at half density took the Office from 65.7 to
+    // 71.3 FPS (owner's 2026-11-07 09:21 run, with GI quality 1), but the
+    // owner asked for them back to the game's own the same day. Both stay
+    // here as options: vr_shadow_quality=high, vr_lumen_probes=half.
+    const std::string shadows = config::GetString("vr_shadow_quality", "game");
     constexpr const char* kQuality[] = {"low", "medium", "high", "epic", "cinematic"};
     int shadow_level = -1;
     for (int i = 0; i < 5; ++i)
         if (shadows == kQuality[i]) shadow_level = i;
     if (shadow_level >= 0) Want("sg.ShadowQuality", std::to_string(shadow_level));
     else if (shadows != "game") log::Warn("cvars: unknown vr_shadow_quality=%s, leaving the game's", shadows.c_str());
-    const std::string probes = config::GetString("vr_lumen_probes", "half");
+    const std::string probes = config::GetString("vr_lumen_probes", "game");
     if (probes == "half") Want("r.Lumen.ScreenProbeGather.DownsampleFactor", "32");
     else if (probes == "full") Want("r.Lumen.ScreenProbeGather.DownsampleFactor", "16");
     else if (probes != "game") log::Warn("cvars: unknown vr_lumen_probes=%s, leaving the game's", probes.c_str());
-    log::Info("cvars: shadows %s, Lumen GI probes %s (vr_shadow_quality, vr_lumen_probes; cheaper than the game's "
-              "Epic for 72 Hz)",
+    log::Info("cvars: shadows %s, Lumen GI probes %s (vr_shadow_quality, vr_lumen_probes; high and half are "
+              "cheaper than the game's own)",
               shadows.c_str(), probes.c_str());
     for (const auto& [name, value] : config::WithPrefix("cvar.")) Want(name, value);
     log::Info("cvars: anti-aliasing %s, %zu console variables from hole-vr.ini", aa.c_str(),

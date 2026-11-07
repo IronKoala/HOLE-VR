@@ -10,12 +10,13 @@
 #include "core/perf.h"
 #include "ue/call.h"
 #include "vr/body/hand_walls.h"
+#include "vr/wall_shapes.h"
 
 namespace holevr::vr::finger_world {
 namespace {
 using namespace finger_world_query;
 bool g_enabled = true;
-bool g_trace_complex = false;
+wall_shapes::Mode g_shapes = wall_shapes::Mode::kNearest;
 Settings g_settings;
 State g_state[2];
 ue::UObject g_player[2]{};
@@ -55,17 +56,44 @@ struct Adapter final : Backend {
         hit_break.Raw("Hit",&break_hit_size);
         if ((radius_size != 4 && radius_size != 8) || trace_hit_size <= 0 || trace_hit_size != break_hit_size) return;
         const Arr array{ignore.data(),static_cast<int32_t>(ignore.size()),static_cast<int32_t>(ignore.size())};
-        trace.Set("WorldContextObject",player).Set("TraceChannel",uint8_t{0}).Set("bTraceComplex",g_trace_complex)
+        trace.Set("WorldContextObject",player).Set("TraceChannel",uint8_t{0}).Set("bTraceComplex",false)
              .Set("ActorsToIgnore",array).Set("bIgnoreSelf",true);
         usable=true;
     }
 
+    // The sweep against the shapes the wall_shape setting names; with both,
+    // the nearest hit wins (an overlap at the start first). Either failing
+    // fails the whole sweep.
     QueryStatus Sweep(const FVector& from, const FVector& to, double radius_cm, Hit& hit) override {
         hit={};
         if (!usable) return QueryStatus::unavailable;
         trace.Set("Start",from).Set("End",to);
         if (radius_size==4) trace.Set("Radius",static_cast<float>(radius_cm));
         else trace.Set("Radius",radius_cm);
+        QueryStatus best=QueryStatus::clear;
+        const int passes=wall_shapes::Passes(g_shapes);
+        for (int pass=0; pass<passes; ++pass) {
+            trace.Set("bTraceComplex",wall_shapes::Complex(g_shapes,pass));
+            Hit got;
+            const QueryStatus status=One(got);
+            if (status==QueryStatus::unavailable) { hit={}; return status; }
+            if (status!=QueryStatus::hit) continue;
+            const auto distance=[&](const Hit& h) {
+                const FVector d=h.center-from;
+                return d.X*d.X+d.Y*d.Y+d.Z*d.Z;
+            };
+            if (best!=QueryStatus::hit ||
+                (!hit.initial_overlap && (got.initial_overlap || distance(got)<distance(hit)))) {
+                hit=got;
+                best=QueryStatus::hit;
+            }
+        }
+        return best;
+    }
+
+    // One sweep as the call is set up now.
+    QueryStatus One(Hit& hit) {
+        hit={};
         if (!trace.Invoke()) return QueryStatus::unavailable;
         if (!trace.Result<bool>()) return QueryStatus::clear;
         int32_t source_size=0,target_size=0;
@@ -100,7 +128,7 @@ void Reset(int side) {
 }
 void LoadSettings() {
     g_enabled=config::GetBool("hand_individual_finger_collision",true);
-    g_trace_complex=config::GetBool("hand_world_trace_complex",false);
+    g_shapes=wall_shapes::ModeSetting();  // the shapes you see and the hit boxes, nearest first
     g_settings.max_casts=std::clamp(config::GetInt("hand_finger_query_budget",32),16,64);
     const double refresh=config::GetFloat("hand_finger_contact_refresh_ms",50.f)/1000.0;
     g_settings.clear_refresh_seconds=std::clamp(std::isfinite(refresh)?refresh:0.05,0.005,0.05);

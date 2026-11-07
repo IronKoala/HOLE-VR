@@ -52,7 +52,11 @@ whatever the laser is on). A step writes the ini key(s) into `hole-vr.ini` in pl
 | Rifle stock | On, Off | `rifle_virtual_stock` |
 | Gun stops at walls | On, Off | `gun_wall_collision` |
 | Hands stop at walls | On, Off | `hand_wall_collision` |
-| Gun kick | Off, Light, Normal, Strong, Stronger, Heavy, Heavier, Brutal, Extreme | `gun_recoil_kick` (0, 0.5, 1, 1.5, 2.4, 3.3, 4.2, 5.1, 6: Extreme is 4x Strong) |
+| Gun kick (every other gun: shotgun, sniper rifle) | Off, Light, Normal, Strong, Stronger, Heavy, Heavier, Brutal, Extreme (default Normal) | `gun_recoil_kick` (0, 0.5, 1, 1.5, 2.4, 3.3, 4.2, 5.1, 6: Extreme is 4x Strong) |
+| Pistol kick, one hand | the same (default Stronger) | `gun_kick_pistol_one_hand` |
+| Pistol kick, two hands | the same (default Normal) | `gun_kick_pistol_two_hands` |
+| Rifle kick, one hand | the same (default Heavy) | `gun_kick_rifle_one_hand` |
+| Rifle kick, two hands | the same (default Strong) | `gun_kick_rifle_two_hands` |
 | Monitor shows | Right eye, Left eye, Both eyes | `monitor_view` (right, left, both) |
 | Calibrate body | (action) | height → arms forward → arms out → bent elbows → forward check; hold both triggers for 2s to record; left X keeps the current arms |
 | Edit hand grips | (action) | opens the grip editor once the menu closes; while it is open the row reads "open, click to close" and closes it |
@@ -117,13 +121,29 @@ Stronger, Heavy, Heavier, Brutal and Extreme in even steps from Strong
 a one-handed pistol up about 40 degrees and back about 12 cm a shot,
 mostly settled again within 0.2 s (the same timing as every level).
 
+**Kick by gun and grip** (owner, later on 2026-11-07: "when the AR is being
+one handed i want the recoil at heavy, when its two handed set to strong.
+when the pistol is being one handed, stronger, when the gun is two handed,
+normal"). Four rows with the same nine strengths, those four as defaults.
+Gun kick stays for every other gun (owner: "i never told you to remove them
+in the first place, we still have two more guns to test"): the shotgun
+(`BP_SG`) and sniper rifle (`BP_SR`); the rifle rows are for `BP_AR` only.
+The strength is chosen once a shot. The rifle is two-handed while the other hand holds its front (the
+support grip; on the shoulder or not). The pistol has no support grip yet,
+so it counts as two-handed while the other controller is "basically
+touching" the gun hand's: grip centres under `pistol_both_hands_cm` (13)
+apart, with nothing in that hand. Log: `controls: gun kick 2.4 (pistol, one
+hand; hands 31 cm apart)` for the first three shots and each change of gun
+or grip.
+
 Move holsters is here because the right stick click (which used to be held
 for it) is now the kick. The grip editor (left Y hold) and the arm measure
 (left stick click hold) still open on their buttons too.
 
 Right-stick kick automatically chooses the right leg when you aim right of
 the body; left/centre uses the left leg. Aim and side lock when the kick starts.
-The existing rifle fire-selector use of the button is unchanged. The VR body
+Rifles kick too: their fire selector is left X (the click only with the
+rifle in the left hand). The VR body
 and native kick trace share the chosen side/direction, with the game's extra
 upward trace offset removed. If the bilateral adapter or body is unavailable,
 the native kick remains the fallback. No arm recalibration is required.
@@ -235,7 +255,23 @@ floor you can stand on: not steeper than about 45 degrees, not more than
 there: the view blinks black for 0.2 s and the character is moved with the
 engine's own teleport (`K2_TeleportTo`, which refuses a spot the capsule
 does not fit). Pull the stick back to cancel. Turning stays on the other
-stick. The balls and disc are the engine's sphere mesh, made once per level
+stick.
+
+**Landing footsteps** (owner 2026-11-07: "the payer needs to make a
+stepping sound when teleporting to the new location so the enemies can hear
+it, like with walking"). Walking's footsteps are the game's
+`Footstep_AnimNotify_C` (the locomotion system's footstep), fired by the
+walk animations on the character `Mesh`. Its `Received_Notify` picks the
+sound for the surface under the foot (`SelectSoundBySurface`), plays it
+(`SpawnSoundAttached`) and reports the noise enemies hear
+(`AISense_Hearing::ReportNoiseEvent`, with the player's footstep volume
+skill); the class dump of 2026-11-07 lists those calls. After a teleport the
+mod calls the walk-forward animation's own two footstep notifies
+(`ALS_N_Walk_F:Footstep_Notify_C_0`, then `_1` 0.28 s later) with the
+player's `Mesh`, at the new place: the same sound and the same noise as two
+walking steps. They are kept as `ue::ObjectRef`s (animation assets). Log:
+`teleport: moved N cm ...; footsteps as walking makes them`, or `teleport:
+no landing footstep (...)`. The balls and disc are the engine's sphere mesh, made once per level
 on the player, with no collision and no shadow.
 
 ## World size
@@ -347,8 +383,8 @@ hand.
   the menu laser still use where the controller really is, so nothing gets
   harder to reach.
 - A hand holding something follows that object: the gun keeps itself out of
-  walls (`gun_wall_collision`, a trace from the eyes to the muzzle), and the
-  support hand and slide hand follow the gun.
+  walls (`gun_wall_collision`; the whole gun since 2026-11-07, see "The whole
+  gun stops at walls" below), and the support hand and slide hand follow it.
 - If the eyes themselves are inside something (leaning through a wall), the
   hands are not stopped, since there is no sensible surface to stop them at.
 - The forearm menu and wrist HUD panels are ignored too (they block the
@@ -421,6 +457,68 @@ the line across the knuckles pointing into the surface) keep their angle.
 The fingers follow the controller's curl less the flatness.
 `hand_press_flat_on_walls=1` (on); it needs the hand wall check.
 
+## The whole gun stops at walls; the shapes you see (src/vr/gun_walls_math.cpp, src/vr/wall_shapes.cpp)
+
+Owner 2026-11-07: "The hit boxes in the hub need to be refined so the current
+physics hands and guns collide correctly and not sink into the wall."
+
+Two causes, both fixed:
+
+- **Only the muzzle line was checked.** The held gun was kept out of walls by
+  one line from the eyes to the muzzle, so the sides of the slide, the grip
+  and magazine, a rifle's stock and handguard, and the hands holding the gun
+  (they are skipped by the empty-hand check) went into walls freely: a gun
+  laid along a wall, or a rifle turned until its stock met one, sank in. Now
+  the gun's parts are measured as boxes in the gun frame when it is taken and
+  every 4 s (its meshes, the magazine in it, and fitted parts: light, sight,
+  suppressor; a light's beam cone and anything far off are skipped), plus a
+  box round each hand on it, placed round the hand the body drew last frame
+  (palm and back). Their outline points (the furthest corners in 26
+  directions, and for a rifle the widest point each way every 20 cm along it;
+  about 20 points for a pistol, 35 for a rifle) are each looked at from the
+  eyes; a point behind a surface means that part is in it, and the whole gun
+  moves out along the surface's normal by the deepest point's depth + 1 cm.
+  A second pass handles corners. A rifle's points are split into up to three
+  groups along it; a group's points are only looked at when a ball round
+  them, swept from the eyes, finds anything at all (every line from the eyes
+  to those points lies inside that sweep, so it never misses one), so a wall
+  by the muzzle doesn't cost the stock's lines.
+  `gun_wall_whole_gun=0` brings back the muzzle line alone.
+- **The game's hit boxes.** Every wall check used Unreal's "simple"
+  collision: the boxes and hulls the game's meshes were given, which can be
+  smaller than the wall you see, or missing. Hands, fingers and the gun now
+  also check each mesh's own triangles ("complex" collision, the shape you
+  see) and stop at whichever comes first: `wall_shape=nearest` (default), so
+  they go into neither, and a mesh without collision triangles still stops
+  them at its hit box as before. Each hand and finger sweep and each gun line
+  is made twice for this. `wall_shape=visible` uses only the shapes you see,
+  `wall_shape=game` only the hit boxes (before 2026-11-07); the older
+  `hand_world_trace_complex=1` with `wall_shape=game` means visible.
+
+Log lines:
+
+- `wall shapes: hands and the held gun stop at whichever comes first, the
+  shape you see or the game's hit box` at start and on a settings change;
+  `hand proxy: on (... against whichever comes first ...)`.
+- `gun walls: BP_HG_C is checked against walls as N part boxes (N of the gun,
+  N of its magazine, N fitted to it), from X to X cm along the barrel and Z to
+  Z cm up from the grip point, plus the hands on it`, once per gun taken.
+- `gun wall push: ... in N of M frames (most X cm, against <thing>) ...; part
+  furthest in: gun N, gun hand N, magazine N, support hand N; something near
+  the gun in N frames, N outline points, N looks a frame then`, every 10 s
+  while it pushed. "gun hand" pushes are the ones the old check missed.
+- `wall shapes (where the hands and gun touched things; the game's hit box vs
+  the shape you see): | <mesh>: N looks (hands N, gun N); hit box X cm behind
+  the surface N times (worst X); hit box X cm in front of it N times; same
+  place N times; NO hit box on the line N times`, every 10 s while hands or
+  the gun touch something (`wall_shape_report=1`). Up to four looks a second
+  for the hands and four for the gun, each two line traces from the eyes
+  through the touched spot. "Behind" = things sank into that mesh with the
+  game's hit boxes; "NO hit box" = they went straight through it. When the
+  hit box belongs to something else (an invisible blocking volume) its name
+  follows in brackets.
+- The perf report has a `gun wall collision` timer.
+
 ## Log lines to check after a test
 
 - `vr options: ready (a VR tab is added to Options)` at start.
@@ -466,6 +564,11 @@ The fingers follow the controller's curl less the flatness.
 
 ## Tests
 
+- `tests/test_gun_walls.cpp`: the gun outline (muzzle, hand sides, magazine
+  bottom, no point in a pistol's empty space under the barrel, rifle slices),
+  the push out of a wall beside the gun (missed by the old muzzle line), into
+  a wall, a rifle stock into a wall behind, a corner, eyes inside, the 40 cm
+  cap, clear space, and the groups' near check (same push, fewer lines).
 - `tests/test_comfort.cpp`: vignette texture, levels, smoothing, real crouch
   and jump, aim smoothing, grip toggle.
 - `tests/test_finger_rest.cpp`: fingers against a plane (the bend path, a

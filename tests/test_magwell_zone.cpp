@@ -220,6 +220,36 @@ void Animation() {
     ra::Delta(c, 1.0, &d);
     Check(Turn(own * d.joint[3][0], own * AxisAngle(axis, 1.1)) < 1e-6, "delta on a posed joint");
 }
+
+// Letting go of the magwell (owner 2026-11-07: "i have to push the mag to far
+// up"; with the gun in the left hand it never went in). The run's pistol
+// magazine: travel 11.6 cm, lines up 15.4 cm below, 3.5 cm and 35 deg.
+void LetGo() {
+    MagwellZone z;
+    z.ok = true;
+    z.top = 11.7;
+    z.opening = 0.1;
+    z.insert = 11.6;
+    const double up = 15.4;
+    // The run: top 5.0-5.4 cm off the axis 1.3-7.5 cm from seated let go
+    // ("too far off the axis"). In the magwell it now stays on.
+    Check(LetGoWhy(z, 1.3, up, 5.1, 12, 3.5, 35, 12) == nullptr, "in the magwell: 5 cm drift holds");
+    Check(LetGoWhy(z, 7.5, up, 5.3, 47, 3.5, 35, 12) == nullptr, "in the magwell: lean holds");
+    Check(LetGoWhy(z, 4.0, up, 12.5, 10, 3.5, 35, 12) != nullptr, "in the magwell: hand far off lets go");
+    // Below the opening the old limits.
+    Check(LetGoWhy(z, 13.0, up, 5.1, 10, 3.5, 35, 12) != nullptr, "below the opening: 5 cm drift lets go");
+    Check(LetGoWhy(z, 13.0, up, 4.9, 10, 3.5, 35, 12) == nullptr, "below the opening: within 1.5 cm holds");
+    Check(LetGoWhy(z, 13.0, up, 1.0, 46, 3.5, 35, 12) != nullptr, "below the opening: leaning lets go");
+    // Pulled back out, wherever the hand is.
+    Check(LetGoWhy(z, 18.5, up, 0.0, 0, 3.5, 35, 12) != nullptr, "pulled out lets go");
+    Check(LetGoWhy(z, 18.3, up, 0.0, 0, 3.5, 35, 12) == nullptr, "not yet pulled out");
+    // Not measured: no magwell to hold it.
+    MagwellZone none;
+    Check(LetGoWhy(none, 2.0, 14.0, 7.5, 10, 5.5, 40, 12) != nullptr, "not measured: drift lets go");
+    // The pistol now seats itself 3.5 cm from seated (half its travel at most).
+    Check(std::fabs(SeatLast(z, 3.5) - 3.5) < 1e-9, "pistol seats from 3.5 cm");
+    Check(std::fabs(InsertProgress(3.5, up, SeatLast(z, 3.5)) - 1.0) < 1e-9, "animation done where it seats");
+}
 }  // namespace
 
 int main() {
@@ -228,6 +258,7 @@ int main() {
     Edges();
     Progress();
     Probe();
+    LetGo();
     Animation();
     std::printf("magwell_zone: %d checks passed\n", checks);
     return 0;

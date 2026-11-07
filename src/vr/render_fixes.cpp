@@ -1,5 +1,6 @@
 #include "vr/render_fixes.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -184,16 +185,27 @@ struct Kind {
     bool is_capture = false;
 };
 
-UObject g_cls_pp_component = 0, g_cls_pp_volume = 0, g_cls_camera = 0, g_cls_capture2d = 0;
+UObject g_cls_pp_component = 0, g_cls_pp_volume = 0, g_cls_camera = 0, g_cls_capture = 0;
 int32_t g_pp_component_settings = -1, g_pp_volume_settings = -1, g_camera_settings = -1;
-refl::PropertyInfo g_capture_every_frame, g_capture_on_movement;
+refl::PropertyInfo g_capture_every_frame, g_capture_on_movement, g_component_visible;
 bool g_disable_player_capture = true;
+bool g_kill_shot_camera_when_shown = false;
 bool g_ready = false;
-// The player's scene captures we stop (Apply), so the death screen can run
-// them again (AllowPlayerCapture), and whether it currently does.
+// The scene captures we stop (Apply): the player's, and the kill shot room's
+// with vr_kill_shot_camera_when_shown=1. The death screen runs them again
+// (AllowPlayerCapture); g_allow_capture says whether it currently does.
 std::mutex g_captures_mutex;
 std::vector<Target> g_captures;
 std::atomic<bool> g_allow_capture{false};
+// Scene captures that draw the level into a picture every frame and that the
+// mod leaves running (Apply), and the ones the GPU cost test paused
+// (PauseSceneCaptures). Both under g_captures_mutex.
+std::vector<Target> g_live_captures;
+std::vector<Target> g_paused_captures;
+std::vector<Target> g_seen_live;
+std::string g_live_names;
+// The last list of scene captures logged (background thread only).
+std::string g_census_logged;
 std::unordered_map<UObject, Kind> g_kinds;
 
 // Per-run counters so the log says what was touched without repeating itself.
@@ -288,7 +300,7 @@ Kind Classify(UObject cls) {
         k.settings_offset = g_pp_component_settings;
     else if (g_cls_pp_volume && refl::IsChildOf(cls, g_cls_pp_volume))
         k.settings_offset = g_pp_volume_settings;
-    else if (g_cls_capture2d && refl::IsChildOf(cls, g_cls_capture2d)) k.is_capture = true;
+    else if (g_cls_capture && refl::IsChildOf(cls, g_cls_capture)) k.is_capture = true;
     return k;
 }
 
@@ -302,6 +314,51 @@ bool IsPlayerCapture(UObject comp) {
     return cls.rfind("BP_Player", 0) == 0;
 }
 
+// The kill shot room (LCBP_DeadReviewRoom) photographs your body for the
+// death and results screens with its own scene capture, 1280x544, set to take
+// a picture every frame (owner's 2026-11-07 run). Only those screens show the
+// picture, and while one is up the capture runs again (AllowPlayerCapture)
+// and the forearm menu asks it for pictures. vr_kill_shot_camera_when_shown=1
+// stops it the rest of the time.
+bool IsKillShotCapture(UObject comp) {
+    UObject outer = ue::GetOuter(comp);
+    if (!outer) return false;
+    return ue::GetName(ue::GetClass(outer)).rfind("LCBP_DeadReviewRoom", 0) == 0;
+}
+
+bool Bit(UObject obj, const refl::PropertyInfo& p) {
+    return p.valid() && p.bool_mask && (mem::ReadOr<uint8_t>(obj + p.offset, 0) & p.bool_mask) != 0;
+}
+
+bool Alive(const Target& t) {
+    if (t.index < 0 || ue::objects::Get(t.index) != t.obj) return false;
+    return !(mem::ReadOr<uint32_t>(t.obj + ue::off::kObjFlags, kSkipFlags) & kSkipFlags);
+}
+
+// One scene capture for the log: "LCBP_DeadReviewRoom_C_1.SceneCaptureComponent2D
+// shown, every frame, into DeadReviewCamera 1280x544, source 2".
+std::string DescribeCapture(UObject obj, bool every, bool stopped) {
+    UObject outer = ue::GetOuter(obj), target = 0;
+    ue::GetProp(obj, "TextureTarget", target);
+    int32_t sx = 0, sy = 0;
+    uint8_t source = 255;
+    ue::GetProp(obj, "CaptureSource", source);
+    if (target) {
+        ue::GetProp(target, "SizeX", sx);
+        ue::GetProp(target, "SizeY", sy);
+    }
+    const bool moving = Bit(obj, g_capture_on_movement);
+    char b[320];
+    std::snprintf(b, sizeof(b), "%s.%s (%s) %s, %s, into %s %dx%d, source %d%s",
+                  outer ? ue::GetName(outer).c_str() : "?", ue::GetName(obj).c_str(),
+                  ue::GetName(ue::GetClass(obj)).c_str(),
+                  !g_component_visible.valid() ? "shown?" : Bit(obj, g_component_visible) ? "shown" : "hidden",
+                  every ? "every frame" : moving ? "when it moves" : "only when asked",
+                  target ? ue::GetName(target).c_str() : "nothing", sx, sy, source,
+                  stopped ? ", stopped in VR" : "");
+    return b;
+}
+
 }  // namespace
 
 bool Init() {
@@ -309,7 +366,9 @@ bool Init() {
     g_cls_pp_component = ue::FindObject("Class /Script/Engine.PostProcessComponent");
     g_cls_pp_volume = ue::FindObject("Class /Script/Engine.PostProcessVolume");
     g_cls_camera = ue::FindObject("Class /Script/Engine.CameraComponent");
-    g_cls_capture2d = ue::FindObject("Class /Script/Engine.SceneCaptureComponent2D");
+    // Every kind of scene capture (2D, cube, planar reflection) is a
+    // SceneCaptureComponent, which holds the capture flags.
+    g_cls_capture = ue::FindObject("Class /Script/Engine.SceneCaptureComponent");
     UObject pp_struct = ue::FindObject("ScriptStruct /Script/Engine.PostProcessSettings");
     if (!pp_struct || !g_cls_camera) {
         log::Warn("render fixes: engine post-process types not found, fixes disabled");
@@ -319,11 +378,18 @@ bool Init() {
         g_pp_component_settings = refl::FindPropertyOffset(g_cls_pp_component, "Settings");
     if (g_cls_pp_volume) g_pp_volume_settings = refl::FindPropertyOffset(g_cls_pp_volume, "Settings");
     g_camera_settings = refl::FindPropertyOffset(g_cls_camera, "PostProcessSettings");
-    if (g_cls_capture2d) {
-        g_capture_every_frame = refl::FindProperty(g_cls_capture2d, "bCaptureEveryFrame");
-        g_capture_on_movement = refl::FindProperty(g_cls_capture2d, "bCaptureOnMovement");
+    if (g_cls_capture) {
+        g_capture_every_frame = refl::FindProperty(g_cls_capture, "bCaptureEveryFrame");
+        g_capture_on_movement = refl::FindProperty(g_cls_capture, "bCaptureOnMovement");
+        if (!g_capture_every_frame.bool_mask) g_capture_every_frame = {};
+        if (!g_capture_on_movement.bool_mask) g_capture_on_movement = {};
+    }
+    if (UObject scene_component = ue::FindObject("Class /Script/Engine.SceneComponent")) {
+        g_component_visible = refl::FindProperty(scene_component, "bVisible");
+        if (!g_component_visible.bool_mask) g_component_visible = {};
     }
     g_disable_player_capture = config::GetBool("vr_disable_player_scene_capture", true);
+    g_kill_shot_camera_when_shown = config::GetBool("vr_kill_shot_camera_when_shown", false);
     {
         int found = 0;
         for (Field* f : {&g_exp_method, &g_exp_bias, &g_exp_physical, &g_exp_fstop, &g_exp_shutter, &g_exp_iso}) {
@@ -420,9 +486,12 @@ bool Init() {
         }
     }
     log::Info("render fixes: %d post-process overrides active; camera settings at 0x%x, "
-              "component 0x%x, volume 0x%x; player scene capture %s",
+              "component 0x%x, volume 0x%x; player scene capture %s; kill shot room camera %s "
+              "(vr_kill_shot_camera_when_shown); capture flags %s",
               enabled, g_camera_settings, g_pp_component_settings, g_pp_volume_settings,
-              g_disable_player_capture ? "off" : "left on");
+              g_disable_player_capture ? "off" : "left on",
+              g_kill_shot_camera_when_shown ? "only while its picture shows" : "left as the game set it",
+              g_capture_every_frame.valid() && g_component_visible.valid() ? "readable" : "NOT readable");
     g_ready = true;
     return true;
 }
@@ -433,7 +502,13 @@ void Apply() {
     // pass, or most reads ask Windows again (2026-11-03 performance pass).
     mem::ScopedRegionCache region_cache;
     Counts c;
-    std::vector<Target> targets, captures;
+    std::vector<Target> targets, captures, live, paused_now;
+    std::vector<std::string> census;
+    std::string live_names;
+    {
+        std::lock_guard<std::mutex> lock(g_captures_mutex);
+        paused_now = g_paused_captures;
+    }
     ue::objects::ForEach([&](int, UObject obj) {
         uint32_t flags = mem::ReadOr<uint32_t>(obj + ue::off::kObjFlags, kSkipFlags);
         if (flags & kSkipFlags) return;
@@ -454,8 +529,26 @@ void Apply() {
             if (k.settings_offset == g_camera_settings) ++c.cameras;
             else if (k.settings_offset == g_pp_component_settings) ++c.components;
             else ++c.volumes;
-        } else if (k.is_capture && g_disable_player_capture && IsPlayerCapture(obj)) {
-            captures.push_back({obj, mem::ReadOr<int32_t>(obj + ue::off::kObjIndex, -1), 0});
+        } else if (k.is_capture) {
+            const int index = mem::ReadOr<int32_t>(obj + ue::off::kObjIndex, -1);
+            const bool stop = (g_disable_player_capture && IsPlayerCapture(obj)) ||
+                              (g_kill_shot_camera_when_shown && IsKillShotCapture(obj));
+            if (!stop) {
+                // Left running: counted for the log and the GPU cost test.
+                const bool paused = std::any_of(paused_now.begin(), paused_now.end(),
+                                                [&](const Target& t) { return t.obj == obj; });
+                const bool every = paused || Bit(obj, g_capture_every_frame);
+                const bool shown = !g_component_visible.valid() || Bit(obj, g_component_visible);
+                census.push_back(DescribeCapture(obj, every, false));
+                if (every && shown && !paused) {
+                    live.push_back({obj, index, 0});
+                    if (!live_names.empty()) live_names += ", ";
+                    live_names += ue::GetName(ue::GetOuter(obj));
+                }
+                return;
+            }
+            captures.push_back({obj, index, 0});
+            census.push_back(DescribeCapture(obj, g_allow_capture.load(), true));
             if (g_allow_capture.load()) return;  // the death screen shows its picture
             bool ok = true;
             if (g_capture_every_frame.bool_mask)
@@ -472,6 +565,28 @@ void Apply() {
     {
         std::lock_guard<std::mutex> lock(g_captures_mutex);
         g_captures.swap(captures);
+        g_live_captures.swap(live);
+        g_live_names = live_names;
+    }
+    // Every scene capture in the world: each one that takes a picture every
+    // frame draws the level again, with its own shadows, lighting and post
+    // effects, on top of the two eyes (2026-11-07: the frame's fixed GPU
+    // cost had about 4 ms nobody could place).
+    {
+        std::sort(census.begin(), census.end());
+        int every = 0;
+        std::string line;
+        for (const std::string& e : census) {
+            line += " | " + e;
+            if (e.find(", every frame,") != std::string::npos && e.find(" shown,") != std::string::npos &&
+                e.find("stopped in VR") == std::string::npos)
+                ++every;
+        }
+        if (line != g_census_logged) {
+            g_census_logged = line;
+            log::Info("render fixes: scene captures in the world: %zu, %d drawing the level every frame%s",
+                      census.size(), every, line.c_str());
+        }
     }
     if (c != g_last) {
         log::Info("render fixes applied: %d cameras, %d post-process components, %d volumes, "
@@ -559,12 +674,51 @@ int AllowPlayerCapture(bool allow) {
             ue::Call c(t.obj, "CaptureScene");
             c.Invoke();
         }
-        log::Info("render fixes: player scene capture %s %s (picture into %s)", ue::GetName(t.obj).c_str(),
+        log::Info("render fixes: scene capture %s.%s %s (picture into %s)",
+                  ue::GetName(ue::GetOuter(t.obj)).c_str(), ue::GetName(t.obj).c_str(),
                   allow ? "running again for the death screen" : "stopped again",
                   target ? ue::GetName(target).c_str() : "nothing");
         ++n;
     }
     return n;
+}
+
+int PauseSceneCaptures(bool pause, std::string* names) {
+    if (!g_capture_every_frame.valid()) return 0;
+    std::lock_guard<std::mutex> lock(g_captures_mutex);
+    auto has = [](const std::vector<Target>& v, const Target& t) {
+        return std::any_of(v.begin(), v.end(), [&](const Target& o) { return o.obj == t.obj; });
+    };
+    int n = 0;
+    if (!pause) {
+        for (const Target& t : g_paused_captures)
+            if (Alive(t) && SetBool(t.obj + g_capture_every_frame.offset, g_capture_every_frame.bool_mask, true)) ++n;
+        g_paused_captures.clear();
+        return n;
+    }
+    // Apply may have run while they were paused and not listed them; the
+    // ones paused before are remembered so every test window gets them all.
+    g_seen_live.erase(std::remove_if(g_seen_live.begin(), g_seen_live.end(), [](const Target& t) { return !Alive(t); }),
+                      g_seen_live.end());
+    for (const Target& t : g_live_captures)
+        if (!has(g_seen_live, t)) g_seen_live.push_back(t);
+    std::string list;
+    for (const Target& t : g_seen_live) {
+        if (has(g_paused_captures, t) || !Bit(t.obj, g_capture_every_frame)) continue;
+        if (!SetBool(t.obj + g_capture_every_frame.offset, g_capture_every_frame.bool_mask, false)) continue;
+        g_paused_captures.push_back(t);
+        if (!list.empty()) list += ", ";
+        list += ue::GetName(ue::GetOuter(t.obj));
+        ++n;
+    }
+    if (names) *names = list;
+    return n;
+}
+
+int LiveSceneCaptures(std::string* names) {
+    std::lock_guard<std::mutex> lock(g_captures_mutex);
+    if (names) *names = g_live_names;
+    return static_cast<int>(g_live_captures.size() + g_paused_captures.size());
 }
 
 namespace {

@@ -10,13 +10,15 @@
 #include "core/memory.h"
 #include "core/perf.h"
 #include "ue/call.h"
+#include "vr/wall_shapes.h"
 #include "vr/world_menu.h"
 
 namespace holevr::vr::body::hand_walls {
 namespace {
 using namespace ik;
 struct Settings {
-    bool on = true, complex = false, legacy_probe = false;
+    bool on = true, legacy_probe = false;
+    wall_shapes::Mode shapes = wall_shapes::Mode::kNearest;
     double probe = 14.0;
     hand_motion::Settings motion;
 } S;
@@ -108,7 +110,7 @@ struct TraceAdapter {
             !Has(unpack, "ImpactNormal", sizeof(FVector)) || !Has(unpack, "Normal", sizeof(FVector)) ||
             !Has(unpack, "HitActor", sizeof(UObject))) return;
         TArrayRaw ignore{g_ignore.data(), static_cast<int32_t>(g_ignore.size()), static_cast<int32_t>(g_ignore.size())};
-        trace.Set("WorldContextObject", player).Set("TraceChannel", uint8_t{0}).Set("bTraceComplex", S.complex)
+        trace.Set("WorldContextObject", player).Set("TraceChannel", uint8_t{0}).Set("bTraceComplex", false)
             .Set("ActorsToIgnore", ignore).Set("bIgnoreSelf", true);
         usable = true;
         int32_t box_hit_size = 0;
@@ -119,7 +121,7 @@ struct TraceAdapter {
             Has(box, "bTraceComplex", sizeof(bool)) && Has(box, "ActorsToIgnore", sizeof(TArrayRaw)) &&
             Has(box, "bIgnoreSelf", sizeof(bool)) && Has(box, "ReturnValue", sizeof(bool));
         if (box_usable)
-            box.Set("WorldContextObject", player).Set("TraceChannel", uint8_t{0}).Set("bTraceComplex", S.complex)
+            box.Set("WorldContextObject", player).Set("TraceChannel", uint8_t{0}).Set("bTraceComplex", false)
                 .Set("ActorsToIgnore", ignore).Set("bIgnoreSelf", true);
         static bool warned = false;
         if (!box_usable && !warned) log::Warn("hand palm: BoxTraceSingle reflection unavailable; palm queries fail closed");
@@ -151,20 +153,44 @@ struct TraceAdapter {
         if (actor) *actor = contact;
         return hit;
     }
+    // The query against the shapes the wall_shape setting names; with both,
+    // the nearest hit wins (an overlap at the start first), so the hand goes
+    // into neither the surface you see nor the game's hit box. Either query
+    // failing fails the whole query (closed).
+    hand_motion::Sweep Shapes(ue::Call& call, const FVector& from, Kept* actor) {
+        hand_motion::Sweep best;
+        Kept best_actor;
+        const int passes = wall_shapes::Passes(S.shapes);
+        for (int pass = 0; pass < passes; ++pass) {
+            call.Set("bTraceComplex", wall_shapes::Complex(S.shapes, pass));
+            Kept got;
+            const hand_motion::Sweep hit = Run(call, &got);
+            if (!hit.available) {
+                if (actor) *actor = {};
+                return hit;
+            }
+            bool better = pass == 0 || (hit.hit && !best.hit);
+            if (!better && hit.hit && best.hit && !best.initial_overlap)
+                better = hit.initial_overlap || Length(hit.centre - from) < Length(best.centre - from);
+            if (better) best = hit, best_actor = got;
+        }
+        if (actor) *actor = best_actor;
+        return best;
+    }
     hand_motion::Sweep Trace(const FVector& from, FVector to, double radius, Kept* actor = nullptr) {
         if (!usable) return {};
         if (Length(to - from) < 1e-5) to = from + FVector{0.001, 0, 0};
         trace.Set("Start", from).Set("End", to);
         if (radius_size == 4) trace.Set("Radius", static_cast<float>(radius));
         else trace.Set("Radius", radius);
-        return Run(trace, actor);
+        return Shapes(trace, from, actor);
     }
     hand_motion::Sweep Box(const FVector& from, FVector to, const FVector& half, const FQuat& rotation,
                            Kept* actor = nullptr) {
         if (!box_usable) return {};
         if (Length(to - from) < 1e-5) to = from + FVector{0.001, 0, 0};
         box.Set("Start", from).Set("End", to).Set("HalfSize", half).Set("Orientation", ToRotator(rotation));
-        return Run(box, actor);
+        return Shapes(box, from, actor);
     }
 };
 void Remember(Side& side, const FVector& point, const FVector& normal, const Kept& actor) {
@@ -192,7 +218,10 @@ void Reset(int side) {
 
 void LoadSettings() {
     S.on = config::GetBool("hand_wall_collision", true);
-    S.complex = config::GetBool("hand_world_trace_complex", false);
+    // The shapes you see and the game's hit boxes, whichever is nearer, unless
+    // wall_shape says otherwise (owner 2026-11-07: hands sank into the hub's
+    // walls; vr/wall_shapes.h).
+    S.shapes = wall_shapes::ModeSetting();
     S.legacy_probe = !config::GetBool("hand_individual_finger_collision", true) ||
                      !config::GetBool("hand_fingers_rest_on_walls", true);
     auto& m = S.motion;
@@ -212,8 +241,10 @@ void Apply(UObject player, const hands::Pose& head, hands::HandState hs[2], cons
     (void)registered;
     if (g_announced != S.on) {
         g_announced = S.on;
-        log::Info("hand proxy: %s (calibrated palm box, %.1f cm sphere fallback, checked rotation, %.0f N virtual force cap)",
-                  S.on ? "on" : "off", S.motion.radius_cm, S.motion.max_force_n);
+        log::Info("hand proxy: %s (calibrated palm box, %.1f cm sphere fallback, checked rotation, %.0f N virtual force cap, "
+                  "against %s)",
+                  S.on ? "on" : "off", S.motion.radius_cm, S.motion.max_force_n,
+                  wall_shapes::ModeName(S.shapes));
     }
     if (!player || !ue::IsLive(player)) { Reset(); return; }
     if (g_player.obj != player || !Alive(g_player)) {
@@ -278,7 +309,14 @@ void Apply(UObject player, const hands::Pose& head, hands::HandState hs[2], cons
         // anchor) must not silently fall through to the raw tracked pose.
         // This is only the body copy; controls retain their actual tracking.
         if (!s.result.valid) { h.valid = false; continue; }
-        if (s.result.touching) Remember(s, s.result.point, s.result.normal, contact_actor);
+        if (s.result.touching) {
+            Remember(s, s.result.point, s.result.normal, contact_actor);
+            // Where the game's hit box is against what you see, on a line
+            // from the eyes through the touched spot (the "wall shapes" log).
+            const FVector to = s.result.point - s.result.normal * 3.0;
+            if (Length(to - head.location) > 1.0)
+                wall_shapes::Compare(player, head.location, to, g_ignore, wall_shapes::kHand);
+        }
 
         const FQuat turn = Normalized(s.result.rotation * raw_rotation.Inverse());
         h.aim.location = s.result.position + turn.Rotate(h.aim.location - raw_position);

@@ -1776,13 +1776,13 @@ void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* back_buffer) {
     static bool s_end_setup = false;  // Present thread
     if (!s_end_setup) {
         s_end_setup = true;
-        const int setting = std::clamp(config::GetInt("xr_end_async", 2), 0, 2);
+        const int setting = std::clamp(config::GetInt("xr_end_async", 1), 0, 2);
         g_async_setting = setting;
         if (setting) {
             g_end_thread_started = true;
             std::thread(EndLoop).detach();
             if (setting == 1) SetAsyncEnd(true, "xr_end_async=1");
-            else if (config::GetBool("gpu_cost_test", true))
+            else if (config::GetInt("gpu_cost_test", 0) != 0)
                 log::Info("OpenXR: xrEndFrame stays on the Present thread until the GPU cost test has measured it "
                           "on its own thread (xr_end_async=2; 1 = always, 0 = never)");
             else

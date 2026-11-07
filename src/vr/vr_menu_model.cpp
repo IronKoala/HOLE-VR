@@ -6,6 +6,17 @@
 #include <cstring>
 
 namespace holevr::vr::vr_menu {
+namespace {
+
+// The nine kick strengths for one ini key: Off, Light, Normal (1), Strong
+// (1.5), then even steps to Extreme (6, 4x Strong).
+std::vector<Choice> KickChoices(const char* key) {
+    return {{"Off", {{key, "0"}}},        {"Light", {{key, "0.5"}}},   {"Normal", {{key, "1"}}},
+            {"Strong", {{key, "1.5"}}},   {"Stronger", {{key, "2.4"}}}, {"Heavy", {{key, "3.3"}}},
+            {"Heavier", {{key, "4.2"}}},  {"Brutal", {{key, "5.1"}}},  {"Extreme", {{key, "6"}}}};
+}
+
+}  // namespace
 
 const std::vector<Row>& Rows() {
     using K = RowKind;
@@ -129,21 +140,25 @@ const std::vector<Row>& Rows() {
         {"Hands stop at walls", K::kChoice,
          {{"On", {{"hand_wall_collision", "1"}}}, {"Off", {{"hand_wall_collision", "0"}}}}, 0,
          "Empty hands stop at walls and tables, and their fingers give way against them."},
-        {"Gun kick",
-         K::kChoice,
-         // Owner 2026-11-07: "give me 5 more kick strength options with the
-         // fifth being 4x as strong as strong": even steps from Strong (1.5)
-         // to 6.
-         {{"Off", {{"gun_recoil_kick", "0"}}},
-          {"Light", {{"gun_recoil_kick", "0.5"}}},
-          {"Normal", {{"gun_recoil_kick", "1"}}},
-          {"Strong", {{"gun_recoil_kick", "1.5"}}},
-          {"Stronger", {{"gun_recoil_kick", "2.4"}}},
-          {"Heavy", {{"gun_recoil_kick", "3.3"}}},
-          {"Heavier", {{"gun_recoil_kick", "4.2"}}},
-          {"Brutal", {{"gun_recoil_kick", "5.1"}}},
-          {"Extreme", {{"gun_recoil_kick", "6"}}}},
-         2, "How hard each shot flips the gun up and pushes it back in your hand. Extreme is 4x Strong."},
+        // Gun kick by gun and grip (owner 2026-11-07: "when the AR is being
+        // one handed i want the recoil at heavy, when its two handed set to
+        // strong. when the pistol is being one handed, stronger, when the gun
+        // is two handed, normal"). Same nine strengths each (earlier the same
+        // day: five past Strong, the fifth 4x Strong). The pistol counts as
+        // two-handed while the other hand touches the gun hand.
+        // Gun kick stays for every other gun (owner: "i never told you to
+        // remove them in the first place, we still have two more guns to
+        // test"): the shotgun and sniper rifle.
+        {"Gun kick", K::kChoice, KickChoices("gun_recoil_kick"), 2,
+         "How hard each shot kicks guns without their own rows below (shotgun, sniper rifle). Extreme is 4x Strong."},
+        {"Pistol kick, one hand", K::kChoice, KickChoices("gun_kick_pistol_one_hand"), 4,
+         "How hard each shot kicks the pistol in one hand. Extreme is 4x Strong."},
+        {"Pistol kick, two hands", K::kChoice, KickChoices("gun_kick_pistol_two_hands"), 2,
+         "How hard each shot kicks the pistol while your other hand touches the gun hand."},
+        {"Rifle kick, one hand", K::kChoice, KickChoices("gun_kick_rifle_one_hand"), 5,
+         "How hard each shot kicks the rifle with no hand on its front."},
+        {"Rifle kick, two hands", K::kChoice, KickChoices("gun_kick_rifle_two_hands"), 3,
+         "How hard each shot kicks the rifle while your other hand holds its front."},
         {"Monitor shows",
          K::kChoice,
          {{"Right eye", {{"monitor_view", "right"}}},
