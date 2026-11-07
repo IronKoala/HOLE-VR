@@ -95,8 +95,15 @@ struct Settings {
     double max_stretch_unmeasured = 1.15;
     double shoulder_below = 0.0;   // 0 = calibrated shoulder offset or stable fallback
     double shoulder_behind = 0.0;
-    double forearm_roll_share = 0.5;
-    double twist_bone_share = 1.0;
+    double forearm_roll_share = 0.5;   // the wrist display's share of the hand's turn
+    // Skin: share of the hand's turn at the elbow end of the forearm and at
+    // its middle twist joint (owner 2026-11-07: it looked like all the twist
+    // was in the elbow). A real forearm turns from nothing at the elbow to
+    // all of it at the wrist.
+    double twist_at_elbow = 0.0;
+    double twist_at_middle = 0.5;
+    bool arm_joint_limits = true;      // human shoulder, forearm and wrist ranges (arm_posture.h)
+    double shoulder_twist_share = 0.15;
     bool elbow_relieves_wrist = true;
     bool grip_records = true;
     bool joint_limits = true;      // posed finger joints keep to human ranges (joint_limits.h)
@@ -149,7 +156,12 @@ void LoadSettings() {
     S.shoulder_below = config::GetFloat("body_shoulder_below_eyes_cm", 0.f);
     S.shoulder_behind = config::GetFloat("body_shoulder_behind_eyes_cm", 0.f);
     S.forearm_roll_share = std::clamp<double>(config::GetFloat("body_forearm_roll_share", 0.5f), 0.0, 1.0);
-    S.twist_bone_share = std::clamp<double>(config::GetFloat("body_forearm_twist_bone_share", 1.0f), 0.0, 1.0);
+    // body_forearm_twist_bone_share (old: 1.0 on the middle twist joint) is
+    // replaced by body_forearm_twist_at_elbow / _at_middle.
+    S.twist_at_elbow = std::clamp<double>(config::GetFloat("body_forearm_twist_at_elbow", 0.0f), 0.0, 1.0);
+    S.twist_at_middle = std::clamp<double>(config::GetFloat("body_forearm_twist_at_middle", 0.5f), 0.0, 1.0);
+    S.arm_joint_limits = config::GetBool("body_arm_joint_limits", true);
+    S.shoulder_twist_share = std::clamp<double>(config::GetFloat("body_shoulder_twist_share", 0.15f), 0.0, 0.9);
     S.elbow_relieves_wrist = config::GetBool("body_elbow_relieves_wrist", true);
     S.grip_records = config::GetBool("hand_grip_records", true);
     S.joint_limits = config::GetBool("hand_joint_limits", true);
@@ -582,6 +594,7 @@ struct State {
     bool have_actor = false;
     int steps_taken = 0;
     arm_pose::TwistState twist_state[2];
+    double rest_turn_logged[2] = {1e9, 1e9};
     double arm_sample_ms[2] = {}; // signed pose snapshots, at most one per five seconds/hand
     double body_dz = 0;  // extra tracked crouch; fixed/seated preserve the game's pelvis
     double torso_spine_scale = 1, torso_shoulder_residual = 0;
@@ -3893,7 +3906,13 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
     // cannot tuck its elbow at the expense of a sharply folded rifle wrist.
     posture_input.wrist_relief = S.elbow_relieves_wrist && recorded && rig.ok &&
         (grab.kind == hands::GrabKind::kGunGrip || grab.kind == hands::GrabKind::kSupportGrip);
-    posture_input.straight_wrist = S.gun_wrist_straight && recorded && rig.ok && grab.kind == hands::GrabKind::kGunGrip;
+    // A straight wrist (forearm in line behind the gun) is a pistol hold. On
+    // a shouldered rifle it pulled the trigger elbow over the shoulder.
+    posture_input.straight_wrist = S.gun_wrist_straight && recorded && rig.ok &&
+        grab.kind == hands::GrabKind::kGunGrip && g.key.rfind("BP_HG", 0) == 0;
+    posture_input.joint_limits = S.arm_joint_limits;
+    posture_input.shoulder_twist_share = S.shoulder_twist_share;
+    posture_input.radial_axis_hand = rig.across_h;
     posture_input.dt = dt;
     const auto posture = arm_posture::Solve(posture_input, &G.posture_state[side]);
     if (!posture.valid) { ResetHandPhysics(side); return; }
@@ -3920,17 +3939,29 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
             G.upper_twist_ref[side], upper_arm, sol.mid, &attachment))
         SetWX(k.upperarm_twist[side], attachment);
     const FVector fa = Normalize(sol.end - sol.mid);
-    auto twist = arm_pose::FollowTwist(
-        posture.raw_roll, dt, S.forearm_roll_share, S.twist_bone_share, &G.twist_state[side]);
-    // The authored support palm remains planted on the rifle. Its forearm
-    // must not choose a new half-roll branch when the IK frame crosses pi.
-    // Only this lower-arm skin roll follows the bounded attachment history;
-    // the authored hand, finger wrap and full-share skin target are untouched.
+    // How the reference pose's forearm is turned (0 palm toward the biceps,
+    // 90 deg thumb up). The skin twist's seam goes opposite a thumb-up
+    // forearm, where the palm faces outward: a turn no forearm makes alone.
+    const double side_sign = side == kR ? 1.0 : -1.0;
+    const double rest_turn = arm_pose::ReferenceForearmRotation(reference, rig.palm_h, side_sign);
+    const double twist_center = std::isfinite(rest_turn) ? side_sign * (kPi / 2 - rest_turn) : 0.0;
+    if (std::isfinite(rest_turn) && !(std::fabs(rest_turn - G.rest_turn_logged[side]) < kDegToRad)) {
+        G.rest_turn_logged[side] = rest_turn;
+        log::Info("body: %s forearm in the skeleton's reference pose is turned %.0f deg from palm-toward-biceps "
+                  "(90 = thumb up); skin twist %.2f at the elbow, %.2f at mid-forearm, all at the wrist",
+                  side == kL ? "left" : "right", rest_turn * kRadToDeg, S.twist_at_elbow, S.twist_at_middle);
+    }
+    auto twist = arm_pose::FollowTwist(posture.raw_roll, dt, S.twist_at_elbow, S.twist_at_middle,
+                                       &G.twist_state[side], twist_center, S.forearm_roll_share);
+    // The authored support palm remains planted on the rifle. The wrist
+    // display's share of its turn must not choose a new half-roll branch when
+    // the IK frame crosses pi: it follows the bounded attachment history.
+    // The authored hand, finger wrap and skin shares are untouched.
     bool support_palm = false;
     if(recorded && grab.kind == hands::GrabKind::kSupportGrip) {
         const auto support = arm_pose::FollowSupportTwist(reference, forearm.rotation, hand_rot,
-            rig.palm_h, dt, S.forearm_roll_share, &G.twist_state[side].support, twist.forearm_radians);
-        if(support.valid) { twist.forearm_radians=support.forearm_radians; support_palm=support.observable; }
+            rig.palm_h, dt, S.forearm_roll_share, &G.twist_state[side].support, twist.watch_radians);
+        if(support.valid) { twist.watch_radians=support.forearm_radians; support_palm=support.observable; }
     } else G.twist_state[side].support = {};
     Xf rolled_forearm = forearm;
     rolled_forearm.rotation = Normalized(AxisAngle(fa, twist.forearm_radians) * forearm.rotation);
@@ -3949,7 +3980,10 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
     // Publish only after a successful solve, never a previous frame's pose
     // when one of the validation paths above returned early.
     auto& accessory = G.watch_arm[side];
-    accessory.lower = WX(k.lowerarm[side]);
+    // The wrist display keeps its own share of the turn (as before the skin
+    // twist moved toward the wrist).
+    accessory.lower = forearm;
+    accessory.lower.rotation = Normalized(AxisAngle(fa, twist.watch_radians) * forearm.rotation);
     // A rigid watch follows the wrist and ordinary body scale, not the skin's
     // new longitudinal ratio. Its thickness and wrist setback stay unchanged.
     accessory.lower.scale = forearm_skin_scale;
@@ -3991,14 +4025,17 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
             const FVector el = inv.Rotate(sol.mid - shoulder), wr = inv.Rotate(sol.end - shoulder);
             const FQuat hq = Normalized(inv * hand_rot);
             log::Info("body arm sample %s: calibrated=%d head=%d grab=%d lengths=%.2f/%.2f reach=%.3f "
-                      "roll raw/target/lower/skin=%+.1f/%+.1f/%+.1f/%+.1f seam=%d support-palm=%d "
-                      "bend=%+.1f/%+.1f swivel=%+.1f constrained=%d candidates=%u clearance=%.1f "
+                      "roll raw/target/lower/skin/watch=%+.1f/%+.1f/%+.1f/%+.1f/%+.1f seam=%d support-palm=%d "
+                      "bend=%+.1f/%+.1f swivel=%+.1f forearm-turn=%+.0f elbow-up/limit=%.1f/%.1f "
+                      "constrained=%d candidates=%u clearance=%.1f "
                       "shoulder=(%.2f,%.2f,%.2f) elbow=(%.2f,%.2f,%.2f) wrist=(%.2f,%.2f,%.2f) "
                       "hand-q=(%.4f,%.4f,%.4f,%.4f)",
                       side == kL ? "left" : "right", calibrated, head_valid, static_cast<int>(grab.kind), upper, lower, dist/reach,
                       twist.raw_radians*kRadToDeg, twist.target_radians*kRadToDeg,
-                      twist.forearm_radians*kRadToDeg, twist.twist_radians*kRadToDeg, twist.seam_guarded, support_palm,
+                      twist.forearm_radians*kRadToDeg, twist.twist_radians*kRadToDeg, twist.watch_radians*kRadToDeg,
+                      twist.seam_guarded, support_palm,
                       posture.flex*kRadToDeg, posture.deviation*kRadToDeg, posture.swivel*kRadToDeg,
+                      posture.forearm_rotation*kRadToDeg, posture.elbow_height_cm, posture.elbow_cap_cm,
                       posture.constrained, posture.candidates, posture.torso_clearance_cm,
                       sh.X,sh.Y,sh.Z,el.X,el.Y,el.Z,wr.X,wr.Y,wr.Z,hq.X,hq.Y,hq.Z,hq.W);
         }
