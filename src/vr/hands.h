@@ -111,7 +111,6 @@ FingerInput GetFingers(Hand hand);
 struct EditButtons {
     bool y_down = false;              // left Y / secondary
     bool left_stick_pressed = false;  // left stick click, went down this frame
-    bool left_stick_down = false;
     bool grip_down[2] = {false, false};
 };
 EditButtons GetEditButtons();

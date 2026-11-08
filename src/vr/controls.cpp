@@ -596,13 +596,12 @@ void UpdateHands(const input::Snapshot& s) {
         g_edit_buttons.grip_down[i] = in.grip_value > 0.6f;
     }
     // The grip editor opens on left Y held 1 s (or from the VR tab, which
-    // holds Y for it for 1.1 s); left stick click held 2 s measures the arms.
+    // holds Y for it for 1.1 s). Body setup starts only from the VR tab.
     const bool editor_open = hands::EditorHand() >= 0;
     const bool synth_y = g_clock < g_editor_y_until;
     (void)editor_open;
     g_edit_buttons.y_down = synth_y || s.hand[input::kLeft].secondary.down;
     g_edit_buttons.left_stick_pressed = s.hand[input::kLeft].stick_click.pressed;
-    g_edit_buttons.left_stick_down = s.hand[input::kLeft].stick_click.down;
     g_hands[0] = h[0];
     g_hands[1] = h[1];
     g_head = head;

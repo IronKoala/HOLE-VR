@@ -2694,10 +2694,8 @@ std::mutex g_calibration_hud_mutex;
 CalibrationHud g_calibration_hud;
 double g_calibration_hud_until = 0;
 body_calibration::Session g_calibration;
-double g_measure_hold = 0;
 XrTime g_measure_sample_time = 0;
 double g_measure_sample_seen_ms = 0;
-bool g_measure_hotkey_armed = true;
 bool g_measure_height_only = false;
 double g_measure_scale = 1;
 unsigned g_measure_attempt = 0;
@@ -2753,8 +2751,6 @@ void EndCalibration(const char* reason) {
     g_calibration_skip_arms = false;
     g_calibration_trigger_bits = 0; g_calibration_trigger_interrupted = false;
     g_calibration_trigger_hold.Reset(); StopCalibrationHaptics();
-    g_measure_hold = 0;
-    g_measure_hotkey_armed = false;
     g_calibration.Reset();
     CalibrationText("Body setup stopped", reason, "Previous fit kept.", "Retry in VR Options.", 0, 7);
     log::Warn("body calibration: %s; previous fit retained", reason);
@@ -2772,18 +2768,12 @@ bool SaveCalibration(const body_calibration::Profile& profile) {
     return MoveFileExW(temporary.c_str(), destination.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
 }
 
-void StepMeasure(double dt) {
+void StepMeasure(double /*dt*/) {
     const double now = perf::NowMs();
-    const auto buttons = hands::GetEditButtons();
-    if (!buttons.left_stick_down) g_measure_hotkey_armed = true;
-    if (g_measure_hotkey_armed && !g_calibration_active && !ui_panel::MenuOpen() && !g_editor.Active()) {
-        g_measure_hold = buttons.left_stick_down ? g_measure_hold + dt : 0;
-        if (g_measure_hold >= 2.0) {
-            g_measure_requested = true;
-            g_measure_hold = 0;
-            g_measure_hotkey_armed = false;
-        }
-    }
+    // Body setup starts only from the VR tab (Calibrate body). Holding the
+    // left stick click 2 s used to start it too, but that click also sprints
+    // (or kicks with move_stick=right), so a held sprint mid-level started
+    // setup and took every button (2026-11-08 button-overlap check).
     if (g_calibration_cancel.exchange(false)) {
         EndCalibration("Cancelled.");
         return;
@@ -3040,7 +3030,6 @@ void StepMeasure(double dt) {
             input::SetCalibrationCapture(false);
             g_calibration_skip_arms = false;
             g_calibration_trigger_bits = 0; g_calibration_trigger_interrupted = false;
-            g_measure_hold = 0;
             if (!arms_measured && !height_measured) {
                 CalibrationText("Existing fit kept", sample.height_mode == body_calibration::HeightMode::Fixed ? "Character height stays fixed." : "No new height reference recorded.", "Arm poses were skipped.", "Nothing was changed.", 0, 9);
                 log::Info("body calibration: arms skipped, no new posture reference; existing profile unchanged");
