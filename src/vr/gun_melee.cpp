@@ -31,6 +31,8 @@ constexpr uint8_t kGameHitChannel = 4;
 
 struct Settings {
     bool on = true;
+    bool stance_on = true;
+    StanceTuning stance;
     Tuning pistol, long_gun;
     double pistol_push = 6000.0, long_push = 10000.0;  // shove on a body that is already a ragdoll
 } S;
@@ -51,6 +53,11 @@ void LoadSettings() {
     S.pistol.stun_share = Setting("gun_melee_pistol_stun", 0.7, 0.0, 5.0);
     S.long_gun.damage_share = Setting("gun_melee_long_gun_damage", 0.25, 0.0, 2.0);
     S.long_gun.stun_share = Setting("gun_melee_long_gun_stun", 1.2, 0.0, 5.0);
+    S.stance_on = config::GetBool("butt_strike_pose", true);
+    S.stance.near_head_cm = Setting("butt_strike_pose_near_head_cm", 30.0, 5.0, 80.0);
+    S.stance.off_above_cm = Setting("butt_strike_pose_off_hand_above_cm", 10.0, -40.0, 80.0);
+    S.stance.off_view_deg = Setting("butt_strike_pose_barrel_off_view_deg", 50.0, 0.0, 180.0);
+    S.stance.hold_s = Setting("butt_strike_pose_hold_s", 0.5, 0.0, 3.0);
 }
 
 perf::Counter g_perf{"gun melee"};
@@ -611,6 +618,55 @@ void Init() {
     log::Info("gun melee: %s (a hit needs %.1f m/s, full at %.1f m/s; pistol %.0f%% of max HP, long gun %.0f%%)",
               S.on ? "on" : "off", S.pistol.min_speed, S.pistol.full_speed, S.pistol.damage_share * 100.0,
               S.long_gun.damage_share * 100.0);
+}
+
+namespace {
+Stance g_stance;
+uintptr_t g_stance_gun = 0;
+int g_stance_lines = 0;
+}  // namespace
+
+void ButtStrikeStanceReset() {
+    if (g_stance.On() && g_stance_lines < 40) {
+        ++g_stance_lines;
+        log::Info("gun melee: butt-strike stance off (the long gun left the hand)");
+    }
+    g_stance.Reset();
+    g_stance_gun = 0;
+}
+
+bool ButtStrikeStance(uintptr_t gun, const hands::Pose& main, const hands::Pose& off, const hands::Pose& head,
+                      const FQuat& gun_frame, bool tracked, double clock) {
+    if (!S.stance_on || !gun) {
+        ButtStrikeStanceReset();
+        return false;
+    }
+    if (gun != g_stance_gun) {
+        g_stance.Reset();
+        g_stance_gun = gun;
+    }
+    // Real distances: the world can be scaled (world scale).
+    double scale = stereo::TrackingScale();
+    if (!(scale > 1e-3)) scale = 1.0;
+    StanceInput in;
+    in.valid = tracked;
+    in.main = main.location * (1.0 / scale);
+    in.off = off.location * (1.0 / scale);
+    in.eyes = head.location * (1.0 / scale);
+    in.view = head.rotation.Rotate(FVector{1, 0, 0});
+    in.barrel = gun_frame.Rotate(FVector{1, 0, 0});
+    in.now = clock;
+    const bool was = g_stance.On();
+    const bool on = g_stance.Update(in, S.stance);
+    if (on != was && g_stance_lines < 40) {
+        ++g_stance_lines;
+        log::Info("gun melee: butt-strike stance %s (main hand %.0f cm from the eyes, off hand %.0f cm above it, "
+                  "barrel %.0f deg off your view; in at <= %.0f cm, >= %.0f cm, >= %.0f deg)%s",
+                  on ? "on: the main hand takes its butt-strike pose" : "off", g_stance.head_cm, g_stance.above_cm,
+                  g_stance.view_deg, S.stance.near_head_cm, S.stance.off_above_cm, S.stance.off_view_deg,
+                  g_stance_lines == 40 ? " (stance changes stop being logged here)" : "");
+    }
+    return on;
 }
 
 void Update(const Frame& f) {

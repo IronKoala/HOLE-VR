@@ -5332,6 +5332,9 @@ void ClearHolsterVisual(bool keep_model = false) {
         if (g_grab[h].holster_preview) g_grab[h] = {};
 }
 
+// The main hand is in its butt-strike pose (gun_melee::ButtStrikeStance).
+bool g_butt_stance = false;
+
 // What each hand holds, for the VR body. hs: both hands' states.
 void PublishGrabs(game::Gun& gun, const hands::HandState hs[2]) {
     hands::HandGrab g[2];
@@ -5350,6 +5353,22 @@ void PublishGrabs(game::Gun& gun, const hands::HandState hs[2]) {
         } else {
             g[gh].target = rh.grip;
         }
+        // A long gun pulled back for a butt strike (main hand by the head, off
+        // hand up high): the main hand's own pose, <class>.butt-strike, posed
+        // by the owner. Held as it was while the grip editor is open.
+        if (W.is_pistol) {
+            g_butt_stance = false;
+            gun_melee::ButtStrikeStanceReset();
+        } else if (!W.edit_frozen) {
+            hands::Pose head;
+            const bool head_ok = hands::Head(&head);
+            g_butt_stance = gun_melee::ButtStrikeStance(gun.Object(), rh.grip, lh.grip, head, W.frame_rot,
+                                                        head_ok && rh.valid && lh.valid && W.have_pose, g_clock);
+        }
+        if (!W.is_pistol && g_butt_stance) g[gh].point = hands::kPointButtStrike;
+    } else {
+        g_butt_stance = false;
+        gun_melee::ButtStrikeStanceReset();
     }
     // The gun hand on the charging handle of the rifle the other hand holds
     // by itself: the rifle's own frame at the handle's rear end.

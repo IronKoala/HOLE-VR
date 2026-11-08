@@ -2,6 +2,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 
 using namespace holevr::vr;
 using namespace holevr::vr::gun_melee;
@@ -16,19 +17,18 @@ bool Near(FVector a, FVector b, double eps = 1e-6) { return Length(a - b) < eps;
 }  // namespace
 
 int main() {
-    // Strike points.
+    // Strike points: pistol hammer-fist only, long guns butt only.
     StrikePoint p[kMaxPoints];
     int n = StrikePoints(GunKind::kPistol, 18.0, 6.0, false, {}, p);
-    Check(n == 3, "pistol has three strike points");
-    Check(p[0].local.X > p[1].local.X && p[1].local.X > 0, "pistol muzzle ahead of the slide's middle");
-    Check(p[2].local.Z < -5 && p[2].local.X < 0, "pistol grip base under and behind the grip point");
+    Check(n == 1 && std::string(p[0].name) == "grip base", "pistol hits with the grip base only");
+    Check(p[0].local.Z < -5 && p[0].local.X < 0, "pistol grip base under and behind the grip point");
     n = StrikePoints(GunKind::kLongGun, 50.0, 7.0, true, {-31.0, 0, 4.0}, p);
-    Check(n == 3 && Near(p[0].local, FVector{-31.0, 0, 4.0}), "long gun uses its measured butt");
-    Check(Near(p[1].local, FVector{50.0, 0, 7.0}), "long gun muzzle at the bore's end");
+    Check(n == 1 && std::string(p[0].name) == "butt", "long gun hits with the butt only");
+    Check(Near(p[0].local, FVector{-31.0, 0, 4.0}), "long gun uses its measured butt");
     n = StrikePoints(GunKind::kLongGun, 50.0, 7.0, true, {-3.0, 0, 4.0}, p);
     Check(Near(p[0].local, FVector{-28.0, 0, 4.0}), "an implausible stock falls back to an AR-15's butt");
-    n = StrikePoints(GunKind::kPistol, NAN, 1000.0, false, {}, p);
-    Check(std::isfinite(p[0].local.X) && std::fabs(p[0].local.Z) < 20, "bad measurements fall back to sizes");
+    n = StrikePoints(GunKind::kLongGun, 50.0, 1000.0, false, {}, p);
+    Check(std::isfinite(p[0].local.Z) && std::fabs(p[0].local.Z) < 20, "bad measurements fall back to sizes");
 
     // Tracking-space point: the world moved (walk, stick turn, recentre),
     // the controller and gun did not move for real: same tracking point.
@@ -85,7 +85,7 @@ int main() {
     Tuning t;
     t.damage_share = 0.15;
     t.stun_share = 0.7;
-    Check(Near(Damage(t, 200.0, 1.0, 1.0), 30.0), "full pistol whip: 15% of max HP");
+    Check(Near(Damage(t, 200.0, 1.0, 1.0), 30.0), "full pistol hammer-fist: 15% of max HP");
     Check(Near(Damage(t, 200.0, 0.5, 2.0), 30.0), "half swing to a x2 body part");
     Check(Near(Damage(t, -1.0, 1.0, 1.0), 15.0), "unknown HP counts as 100");
     Check(Damage(t, 100.0, 1.0, NAN) == 15.0, "bad multiplier counts as 1");
@@ -103,6 +103,48 @@ int main() {
     Check(!c.Ready(29, 11.3, 0.45), "the newest of many targets is remembered");
     c.Clear();
     Check(c.Ready(29, 11.3, 0.45), "clear forgets");
+
+    // Butt-strike stance: main hand by the head, off hand high, not aiming.
+    {
+        StanceTuning st;
+        auto in = [](FVector main, FVector off, FVector barrel, double now) {
+            StanceInput i;
+            i.valid = true;
+            i.eyes = {0, 0, 160};
+            i.view = {1, 0, 0};
+            i.main = main;
+            i.off = off;
+            i.barrel = barrel;
+            i.now = now;
+            return i;
+        };
+        // Pulled back by the head, rifle near upright, butt forward-down.
+        const FVector main{5, 15, 145}, off{-5, 10, 185}, up_back{-0.3, -0.1, 1.0};
+        Stance a;
+        Check(a.Update(in(main, off, up_back, 0.0), st), "main hand by the head, off hand high: the stance");
+        // Shouldered and aiming up at 45 degrees: off hand high too, but you look along the barrel.
+        Stance b;
+        StanceInput aim = in({8, 12, 148}, {35, 8, 175}, {1, 0, 1}, 0.0);
+        aim.view = {1, 0, 1};
+        Check(!b.Update(aim, st), "aiming upwards is not the stance");
+        // Hip or low ready: main hand far from the head.
+        Check(!b.Update(in({30, 20, 100}, {60, 10, 120}, {0.3, 0, 1}, 0.1), st), "main hand low: no stance");
+        // Off hand below the main hand (rifle upside down near the head).
+        Check(!b.Update(in(main, {0, 10, 120}, {0, 0, -1}, 0.2), st), "off hand low: no stance");
+        // The strike: the main hand drives forward, away from the head. Kept
+        // for hold_s, then off.
+        Check(a.Update(in({25, 15, 140}, off, up_back, 0.1), st), "a little out of it: still on (slack)");
+        Check(a.Update(in({60, 15, 130}, {40, 10, 170}, {-0.6, 0, 0.8}, 0.2), st), "the strike keeps the pose");
+        Check(a.Update(in({70, 15, 125}, {50, 10, 160}, {-0.6, 0, 0.8}, 0.6), st), "still within hold_s");
+        Check(!a.Update(in({70, 15, 125}, {50, 10, 160}, {-0.6, 0, 0.8}, 0.75), st), "after hold_s: off");
+        // Lost tracking is not the stance; a clock going back does not stick it on.
+        Stance c;
+        Check(!c.Update(StanceInput{}, st), "no tracking: no stance");
+        c.Update(in(main, off, up_back, 5.0), st);
+        Check(c.Update(in({70, 15, 125}, {50, 10, 160}, {-0.6, 0, 0.8}, 5.1), st), "leaving starts the hold");
+        Check(c.Update(in({70, 15, 125}, {50, 10, 160}, {-0.6, 0, 0.8}, 1.0), st), "clock back: hold restarts");
+        Check(!c.Update(in({70, 15, 125}, {50, 10, 160}, {-0.6, 0, 0.8}, 1.6), st), "then ends");
+    }
 
     std::printf("gun melee: %d checks passed\n", checks);
     return 0;

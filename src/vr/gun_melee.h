@@ -1,7 +1,7 @@
 #pragma once
-// Gun melee: a held gun that is swung into something hits it. A pistol whips
-// with its slide and muzzle or strikes with the bottom of its grip; a rifle
-// (or any long gun) hits with its butt, muzzle or handguard. There is no
+// Gun melee: a held gun that is swung into something hits it. A pistol
+// strikes with the bottom of its grip (hammer-fist); a rifle, shotgun or
+// sniper rifle with its butt. There is no
 // button and no gesture to start it: the gun has to really touch the target
 // while it moves at a hitting speed (gun_melee_min_speed). Slow contact is
 // just a touch.
@@ -51,6 +51,17 @@ struct Frame {
 
 // Reads the settings and follows changes to them.
 void Init();
+
+// The main hand's butt-strike pose (owner 2026-11-08): a long gun with the
+// main hand brought near the head and the off hand up high, not aimed (the
+// barrel well off where you look), kept briefly after so the strike keeps
+// it. Only picks the hand pose (controls publishes it, the body draws the
+// saved "<gun class>.butt-strike" pose); it starts nothing. Hands and head
+// in the world, cm; `clock` in s. Logs each change ("gun melee:
+// butt-strike stance ...").
+bool ButtStrikeStance(uintptr_t gun, const hands::Pose& main, const hands::Pose& off, const hands::Pose& head,
+                      const FQuat& gun_frame, bool tracked, double clock);
+void ButtStrikeStanceReset();
 // Once a game frame, while the player can fight (no menu, no grip editor).
 void Update(const Frame& f);
 

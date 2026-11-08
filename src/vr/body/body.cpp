@@ -1395,7 +1395,10 @@ std::string BaseRecordKey(int side, const hands::HandGrab& grab) {
     switch (grab.kind) {
         // A hand reaching for the holstered pistol with its own pose
         // (kPointHolster): one per hand, see RecordKey.
+        // The main hand on a long gun pulled back for a butt strike
+        // (kPointButtStrike, gun_melee::ButtStrikeStance): its own pose.
         case hands::GrabKind::kGunGrip:
+            if (grab.point == hands::kPointButtStrike) return cls + ".butt-strike";
             return grab.point == hands::kPointHolster ? cls + ".holster" : cls + ".grip";
         // A rifle's charging handle (grab.point = kPointChargingHandle): one
         // pose for each hand (owner, 2026-11-04: "one for left hand, one for
@@ -2033,6 +2036,27 @@ bool GripRecord(int side, hands::GrabKind kind, UObject object, const std::strin
                           key.c_str(), usual.c_str(), key.c_str());
         }
     }
+    // The butt-strike pose (kPointButtStrike) not posed yet: this hand's gun
+    // grip on that gun (its own, else the usual hand's mirrored), so the hand
+    // looks as it did until the owner poses it.
+    const std::string butt_tail = ".butt-strike";
+    if (!found && kind == hands::GrabKind::kGunGrip && usual.size() > butt_tail.size() &&
+        usual.compare(usual.size() - butt_tail.size(), butt_tail.size(), butt_tail) == 0) {
+        const std::string grip_usual = usual.substr(0, usual.size() - butt_tail.size()) + ".grip";
+        const std::string grip_own = gr::SideKey(grip_usual, side == kR, side == kR);
+        for (const std::string& k : {grip_own, grip_usual}) {
+            if (!ReadText(RecordPath(k), &text)) continue;
+            found = true;
+            file_key = k;
+            break;
+        }
+        static std::set<std::string> told;
+        if (told.insert(key).second)
+            log::Info("body: %s not posed yet: using %s (to pose it: hold the gun in the butt-strike stance, main "
+                      "hand by your head and the off hand up high, hold left Y 1 s, pose the main hand with the "
+                      "other controller, tap Y to save)",
+                      key.c_str(), found ? file_key.c_str() : "the built-in grip");
+    }
     // A slide grip saved before there were three slide holds: use it for any
     // hold not posed yet.
     if (!found && kind == hands::GrabKind::kSlideGrab && object && usual.find(".charging-") == std::string::npos) {
@@ -2442,8 +2466,13 @@ void UpdateEditor(const hands::HandGrab grab[2], const hands::HandState hs[2], c
     auto own_reach = [&](int s) {
         return OwnReach(grab[s]) && grab[s].object && grab[s].pose_blend > 0.95;
     };
+    // The main hand in its butt-strike pose comes before the off hand on the
+    // handguard (the off hand is the one up high, holding the gun).
+    auto butt = [&](int s) { return grab[s].kind == hands::GrabKind::kGunGrip && grab[s].point == hands::kPointButtStrike; };
     if (g_editor.Active() && g_edit_side >= 0 && IsGrab(grab[g_edit_side].kind)) side = g_edit_side;
     else if (right_kind == hands::GrabKind::kSlideGrab) side = kR;
+    else if (butt(kR)) side = kR;
+    else if (butt(kL)) side = kL;
     else if (IsGrab(left_kind) && left_kind != hands::GrabKind::kGunGrip) side = kL;
     else if (IsGrab(right_kind) && right_kind != hands::GrabKind::kGunGrip) side = kR;
     else if (own_reach(kL)) side = kL;
@@ -2508,6 +2537,9 @@ void UpdateEditor(const hands::HandGrab grab[2], const hands::HandState hs[2], c
                       : "hold on the pistol with the gun held out",
                       RecordKey(side, grab[side]).c_str());
         }
+        if (butt(side))
+            log::Info("body: grip editor: posing the %s hand's butt-strike pose (%s)", side == kL ? "left" : "right",
+                      RecordKey(side, grab[side]).c_str());
         log::Info("body: grip editor: hands and %s frozen in place; the %s controller's grab point is live",
                   is_mag ? "magazine" : "gun", ctrl == kR ? "right" : "left");
         g_edit_side = side;

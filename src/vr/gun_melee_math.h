@@ -1,5 +1,5 @@
 #pragma once
-// Gun melee (pistol whip, rifle butt and muzzle strikes): the parts of a held
+// Gun melee (pistol hammer-fist, long-gun butt strikes): the parts of a held
 // gun that can hit, how fast they move, and how hard a hit is. No engine
 // access, so it can be tested on its own (tests/test_gun_melee.cpp).
 //
@@ -25,29 +25,26 @@ struct StrikePoint {
 };
 constexpr int kMaxPoints = 4;
 
-// A pistol: the muzzle end of the slide, the middle of the slide (the side
-// of the gun in a backhand whip) and the bottom of the grip (a hammer-fist
-// strike with the magazine base plate). The grip point sits about two thirds
-// of the way up the grip, so the base plate is ~7 cm under it and, with the
-// grip's ~20 degree rake, ~2.5 cm behind it.
-// A long gun: the butt (the measured stock pad when there is one), the
-// muzzle and the middle of the handguard.
+// What can strike (owner 2026-11-08: "Set Pistol to hammer-fist only.
+// AR/SG/SR to butt strikes only"):
+// A pistol: the bottom of the grip only (a hammer-fist strike with the
+// magazine base plate). The grip point sits about two thirds of the way up
+// the grip, so the base plate is ~7 cm under it and, with the grip's ~20
+// degree rake, ~2.5 cm behind it.
+// A long gun (rifle, shotgun, sniper rifle): the butt only (the measured
+// stock pad when there is one).
 inline int StrikePoints(GunKind kind, double muzzle_dist, double bore_height, bool have_stock,
                         const FVector& stock, StrikePoint out[kMaxPoints]) {
-    if (!std::isfinite(muzzle_dist) || muzzle_dist < 5.0) muzzle_dist = kind == GunKind::kPistol ? 18.0 : 45.0;
+    (void)muzzle_dist;
     if (!std::isfinite(bore_height) || std::fabs(bore_height) > 20.0) bore_height = 6.0;
     if (kind == GunKind::kPistol) {
-        out[0] = {"muzzle", {muzzle_dist - 1.5, 0, bore_height}, 3.5};
-        out[1] = {"slide", {muzzle_dist * 0.45, 0, bore_height}, 3.5};
-        out[2] = {"grip base", {-2.5, 0, -7.0}, 3.5};
-        return 3;
+        out[0] = {"grip base", {-2.5, 0, -7.0}, 3.5};
+        return 1;
     }
     FVector butt = have_stock ? stock : FVector{-28.0, 0, bore_height - 3.0};
     if (!std::isfinite(butt.X) || butt.X > -10.0 || butt.X < -60.0) butt = FVector{-28.0, 0, bore_height - 3.0};
     out[0] = {"butt", butt, 5.0};
-    out[1] = {"muzzle", {muzzle_dist, 0, bore_height}, 4.0};
-    out[2] = {"handguard", {muzzle_dist * 0.5, 0, bore_height}, 4.0};
-    return 3;
+    return 1;
 }
 
 // Where a world point that moves with a controller is in tracking space
@@ -139,6 +136,70 @@ public:
 private:
     struct Entry { uintptr_t target = 0; double at = -1e9; };
     Entry e_[8];
+};
+
+// The butt-strike stance (owner 2026-11-08: "When the player goes in for a
+// butt strike and their off hand is up high and their main hand has been
+// brought near their head i want to set a custom pose for that, for the main
+// hand"): the main hand near the eyes, the off hand higher than it, and the
+// barrel well off where you look (so shouldering and aiming, even upwards,
+// never count). Once in, it holds with some slack, and for hold_s after
+// that, so the strike itself keeps the pose. Only a hand pose: it starts no
+// action.
+struct StanceTuning {
+    double near_head_cm = 30.0;  // main hand at most this far from the eyes (real cm)
+    double off_above_cm = 10.0;  // off hand at least this much higher than the main hand
+    double off_view_deg = 50.0;  // barrel at least this far from the view direction
+    double hold_s = 0.5;         // kept this long after leaving the stance
+};
+struct StanceInput {
+    bool valid = false;          // both hands and the head tracked
+    FVector main, off, eyes;     // real cm, one frame, Z up
+    FVector view, barrel;        // directions (need not be unit length)
+    double now = 0;              // s
+};
+class Stance {
+public:
+    // Slack once in: the stance is left only past these.
+    static constexpr double kNearSlackCm = 10.0, kAboveSlackCm = 6.0, kViewSlackDeg = 15.0;
+    bool Update(const StanceInput& in, const StanceTuning& t) {
+        head_cm = above_cm = view_deg = 0;
+        bool strict = false, loose = false;
+        if (in.valid) {
+            head_cm = Length(in.main - in.eyes);
+            above_cm = in.off.Z - in.main.Z;
+            const double lv = Length(in.view), lb = Length(in.barrel);
+            const double c = lv > 1e-6 && lb > 1e-6
+                                 ? (in.view.X * in.barrel.X + in.view.Y * in.barrel.Y + in.view.Z * in.barrel.Z) / (lv * lb)
+                                 : 1.0;
+            view_deg = std::acos(std::clamp(c, -1.0, 1.0)) * 57.29577951308232;
+            const bool ok = std::isfinite(head_cm) && std::isfinite(above_cm) && std::isfinite(view_deg);
+            strict = ok && head_cm <= t.near_head_cm && above_cm >= t.off_above_cm && view_deg >= t.off_view_deg;
+            loose = ok && head_cm <= t.near_head_cm + kNearSlackCm && above_cm >= t.off_above_cm - kAboveSlackCm &&
+                    view_deg >= t.off_view_deg - kViewSlackDeg;
+        }
+        if (!on_) {
+            on_ = strict;
+            left_at_ = -1;
+        } else if (loose) {
+            left_at_ = -1;
+        } else {
+            if (left_at_ < 0 || in.now < left_at_) left_at_ = in.now;
+            if (!(in.now - left_at_ < t.hold_s)) {
+                on_ = false;
+                left_at_ = -1;
+            }
+        }
+        return on_;
+    }
+    bool On() const { return on_; }
+    void Reset() { on_ = false; left_at_ = -1; }
+    // Last measured, for the log.
+    double head_cm = 0, above_cm = 0, view_deg = 0;
+
+private:
+    bool on_ = false;
+    double left_at_ = -1;
 };
 
 }  // namespace holevr::vr::gun_melee

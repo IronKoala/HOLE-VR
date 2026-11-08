@@ -1,4 +1,4 @@
-# Gun melee (pistol whip, rifle butt and muzzle strikes)
+# Gun melee (pistol hammer-fist, rifle butt strikes)
 
 Swing a held gun into an enemy (or one of the hub's mannequins or shooting
 targets) and it hits. There is no button and no gesture to start it: the gun
@@ -7,12 +7,37 @@ is just a touch, so aiming, holstering and reloading near an enemy never hit.
 
 ## What can hit
 
-| Gun | Parts that hit (ball radius) |
+Owner 2026-11-08: "Set Pistol to hammer-fist only. AR/SG/SR to butt strikes
+only."
+
+| Gun | Part that hits (ball radius) |
 |---|---|
-| Pistol | muzzle end of the slide (3.5 cm), middle of the slide for a backhand whip (3.5 cm), bottom of the grip for a hammer-fist strike (3.5 cm) |
-| Long gun (rifle, shotgun) | butt (the measured stock pad when there is one, 5 cm), muzzle (4 cm), middle of the handguard (4 cm) |
+| Pistol | the bottom of the grip, a hammer-fist strike (3.5 cm) |
+| Rifle, shotgun, sniper rifle | the butt: the measured stock pad when there is one (5 cm) |
 
 A rifle carried in the off hand (one-handed, by its foregrip) can hit too.
+
+## Butt-strike hand pose
+
+With a rifle, shotgun or sniper rifle in the main hand, bring the main hand
+near your head with the off hand up high: the main hand takes its own pose,
+`<gun class>.butt-strike` (for example `BP_AR_C.butt-strike`; the left hand's
+is `...butt-strike-left`). It is only a hand pose; it starts nothing.
+
+- The stance: the main hand within 30 cm of the eyes
+  (`butt_strike_pose_near_head_cm`), the off hand 10 cm or more above it
+  (`butt_strike_pose_off_hand_above_cm`), and the barrel 50 degrees or more
+  off where you look (`butt_strike_pose_barrel_off_view_deg`), so shouldering
+  and aiming, even upwards, never count. Once in, it holds with some slack
+  (10 cm, 6 cm, 15 degrees) and for 0.5 s after (`butt_strike_pose_hold_s`),
+  so the strike itself keeps the pose. `butt_strike_pose=0` turns it off.
+- To pose it: get into the stance, hold left Y 1 s (the grip editor poses the
+  main hand first in this stance, not the off hand on the handguard), pose
+  the main hand with the left controller, tap Y to save.
+- Until it is posed the hand keeps its normal grip on that gun.
+- Log lines: `gun melee: butt-strike stance on|off (main hand N cm from the
+  eyes, off hand N cm above it, barrel N deg off your view ...)`, and `body:
+  <class>.butt-strike not posed yet: using ...`.
 
 ## How a hit is decided
 
@@ -57,7 +82,7 @@ Turn it off with `gun_melee=0` in `hole-vr.ini`. All settings apply live.
 
 Log lines start `gun melee:`:
 
-- `... can hit with: ...` once per gun picked up (the strike points).
+- `... can hit with: ...` once per gun picked up (the strike point).
 - `... hit enemy|target NAME (CLASS, part BONE, surface N) at X m/s ...` for
   every hit, with the damage and stun worked out, then `NAME HP a -> b`.
 - `... swung at X m/s, touched nothing it can hit (stopped by NAME) (wall push
