@@ -1413,12 +1413,16 @@ void PlayerGuns(UObject* rifle, UObject* pistol);
 // gun changes; only live ones are given out.
 std::vector<UObject> g_own_gear;
 double g_own_gear_at = -1e9;
-UObject g_own_gear_gun = 0;
+UObject g_own_gear_gun = 0, g_own_gear_player = 0;
 
 const std::vector<UObject>& OwnGear() {
-    if (g_clock - g_own_gear_at < 0.5 && g_clock >= g_own_gear_at && g_own_gear_gun == W.gun) return g_own_gear;
+    const UObject player = game::Player();
+    if (g_clock - g_own_gear_at < 0.5 && g_clock >= g_own_gear_at && g_own_gear_gun == W.gun &&
+        g_own_gear_player == player)
+        return g_own_gear;
     g_own_gear_at = g_clock;
     g_own_gear_gun = W.gun;
+    g_own_gear_player = player;
     std::vector<UObject> found;
     auto add = [&](UObject a) {
         if (a && ue::IsLive(a) && std::find(found.begin(), found.end(), a) == found.end()) found.push_back(a);
@@ -1475,11 +1479,17 @@ FVector WallPushback(UObject gun, const FQuat& frame, const FVector& grip, bool 
     // them, magazines and what the hands hold): the gun must never be pushed
     // out of its own sight or light, or the lines to a gun held low stopped
     // by the other gun in its holster.
+    // Only actors that still exist go to the engine: it reads each one, and
+    // the lists kept between frames can hold the last level's (owner
+    // 2026-11-08 16:12, "fatal error" on Retry/Home after dying: on the new
+    // level's first frame the body's list still had the old level's player
+    // and gear, freed by the level change, because the body is made again
+    // only after the gun is first placed).
     std::vector<UObject> ignore{gun};
     auto ignore_too = [&](UObject a) {
-        if (a && std::find(ignore.begin(), ignore.end(), a) == ignore.end()) ignore.push_back(a);
+        if (a && ue::IsLive(a) && std::find(ignore.begin(), ignore.end(), a) == ignore.end()) ignore.push_back(a);
     };
-    for (UObject a : OwnGear()) if (ue::IsLive(a)) ignore_too(a);
+    for (UObject a : OwnGear()) ignore_too(a);
     // This frame's (OwnGear is found twice a second).
     ignore_too(W.held_mag);
     ignore_too(W.pouch_mag);

@@ -259,7 +259,7 @@ void Apply(UObject player, const hands::Pose& head, hands::HandState hs[2], cons
     g_ignore.clear();
     g_ignore.push_back(player);
     for (const Kept& kept : g_attached) if (Alive(kept)) g_ignore.push_back(kept.obj);
-    for (int i = 0; i < 2; ++i) if (grab[i].object) g_ignore.push_back(grab[i].object);
+    for (int i = 0; i < 2; ++i) if (grab[i].object && ue::IsLive(grab[i].object)) g_ignore.push_back(grab[i].object);
     if (UObject holder = world_menu::PanelHolder()) g_ignore.push_back(holder);
     for (UObject a : g_own_gear)
         if (ue::IsLive(a) && std::find(g_ignore.begin(), g_ignore.end(), a) == g_ignore.end()) g_ignore.push_back(a);
@@ -361,7 +361,16 @@ void Apply(UObject player, const hands::Pose& head, hands::HandState hs[2], cons
     }
 }
 
-const std::vector<UObject>& IgnoredActors() { return g_ignore; }
+// Only the ones that still exist. The list is made in Apply, which runs only
+// while the body is drawn: after a level change (Retry or Home after dying)
+// it still held the last level's player and gear, freed with that level, and
+// the held gun's wall check gave them to the engine before the body was made
+// again: a "fatal error" (owner 2026-11-08 16:12).
+const std::vector<UObject>& IgnoredActors() {
+    g_ignore.erase(std::remove_if(g_ignore.begin(), g_ignore.end(), [](UObject a) { return !ue::IsLive(a); }),
+                   g_ignore.end());
+    return g_ignore;
+}
 void SetOwnGear(const std::vector<UObject>& actors) { g_own_gear = actors; }
 void SetPalmShape(int side, const hand_motion::PalmShape& shape) {
     if (side < 0 || side > 1) return;
