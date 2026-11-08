@@ -47,25 +47,39 @@ is `...butt-strike-left`). It is only a hand pose; it starts nothing.
   striking part (`gun_melee_min_speed`); a full hit is 4.5 m/s
   (`gun_melee_full_speed`). In between, the hit scales from 40 % to 100 %.
   Steady aiming is under 1 m/s.
-- **Contact** is a swept ball from where the striking part was last frame to
-  where it is now: first on the game's own bullet channel (finds mannequins,
-  targets, and enemies whose bodies answer to it; a wall in the way stops it),
-  then on each nearby enemy's own body shapes, so a hit lands on a real body
-  part (head, arm, chest...).
+- **Contact** is a ball swept from where the striking part was last frame to
+  where it is now, the way the game's own kick looks for what it hits: a
+  multi sweep, which lists everything the ball passes through and then the
+  one thing that stops it. The hub's mannequins and targets only overlap the
+  game's hit channel (bullets and the kick pass through them), so a sweep
+  that reports only what stops it never saw them: that was the "no damage,
+  no stun, no sound" on the hub dummies (owner, 2026-11-08). In order:
+  1. the game's own hit channel (what bullets and the kick use),
+  2. the visibility channel by the game's hit boxes, then by the shapes you
+     see (the gun's wall check meets the mannequins there),
+  3. each nearby enemy's own body shapes, so a hit lands on a real body part
+     (head, arm, chest...).
+
+  The first thing that can be hit wins, unless something that cannot be hit
+  stopped the ball before it (a wall). What the ball only passes through (a
+  trigger volume, an enemy's capsule, what it carries) is neither.
 - **The swing is the hand's own path.** The wall check holds the drawn gun out
   of whatever it reaches (a wall, a mannequin, an enemy); the speed and the
   contact use where your hand is taking the gun, so being held at a target
   does not slow the hit. A wall (anything that cannot be hit) between the gun
   and an enemy still stops it; what an enemy carries or wears does not.
-- A shot's kick moving the gun is never a swing. One swing through a body is
-  one hit (`gun_melee_cooldown_s`, 0.45 s per target).
+- A shot's kick moving the gun is never a swing. Neither is the gun jumping:
+  over 15 m/s (the gun snapping into a hand reads 58 m/s), or the first
+  0.3 s after a gun comes into a hand. One swing through a body is one hit
+  (`gun_melee_cooldown_s`, 0.45 s per target).
 
 ## What a hit does
 
 It goes through the game's own hit event (the one bullets, the kick and enemy
 melee weapons use), so targets react the game's way.
 
-- **Damage** = share of the target's own max HP × swing × the game's body-part
+- **Damage** = share of the target's own max HP (an enemy's GetHP, a
+  mannequin's HP and MaxHP numbers) × swing × the game's body-part
   and armour multiplier. Pistol 15 % (`gun_melee_pistol_damage`), long gun
   25 % (`gun_melee_long_gun_damage`) for a full swing. Armour soaks it the
   way it soaks the game's melee.
@@ -83,12 +97,18 @@ Turn it off with `gun_melee=0` in `hole-vr.ini`. All settings apply live.
 Log lines start `gun melee:`:
 
 - `... can hit with: ...` once per gun picked up (the strike point).
-- `... hit enemy|target NAME (CLASS, part BONE, surface N) at X m/s ...` for
-  every hit, with the damage and stun worked out, then `NAME HP a -> b`.
-- `... swung at X m/s, touched nothing it can hit (stopped by NAME) (wall push
-  N cm)` for the first 12 fast swings that missed: the speed reached, what was
-  in the way, and how far the wall check was holding the gun back.
-- `N fast swing frames, M hits so far` once a minute while swinging.
+- `... hit enemy|target NAME (CLASS, part BONE, surface N) at X m/s (...,
+  found by SWEEP) ...` for every hit, with the damage and stun worked out,
+  then `NAME HP a -> b`.
+- `hit sound NAME, hit splash ready` at the first hit (the hammer sound, or
+  the kick's when the hammer one is not loaded).
+- `... swing hit nothing: N frame(s) at hitting speed, top X m/s; the sweeps
+  met ...` for each of the first 40 swings that missed: what each sweep met
+  (`hit channel:`, `visibility:`, `shapes you see:`, each NAME as `a wall`,
+  `passed through`, or `can be hit, but behind a wall`) and the nearest
+  enemy.
+- `so far N swings (M frames at hitting speed), K hits (found by ...); J
+  jumps of the gun ... not counted as swings` at most once a minute.
 
 Code: `src/vr/gun_melee.cpp` (engine side), `src/vr/gun_melee_math.h`
 (tested in `tests/test_gun_melee.cpp`), called from `MeleeStrikes` in

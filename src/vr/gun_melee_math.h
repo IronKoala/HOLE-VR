@@ -113,6 +113,46 @@ inline double Stun(const Tuning& t, double kick_stun, double swing, double game_
     return std::max(0.0, t.stun_share * kick_stun * swing * game_multiplier);
 }
 
+// A strike point moving faster than this (m/s) jumped (the gun snapping into
+// a hand, a grip change, a lost frame): not a swing. A hard punch is about
+// 10 m/s; the logs show 58 m/s spikes as a gun is taken.
+constexpr double kMaxSwingSpeed = 15.0;
+// After a gun comes into a hand (or changes hands) its first moments are the
+// grab settling, not a swing.
+constexpr double kSettleS = 0.3;
+
+// One thing a sweep met, in the order the sweep met them (nearest first, as
+// the engine returns a multi sweep: its overlaps, then the one blocking hit).
+enum class TouchKind {
+    kTarget,       // something the game's hit event can hit (a mannequin, a target, an enemy's body part)
+    kPassThrough,  // an enemy's capsule or what it carries, the player: neither a hit nor a wall
+    kOther,        // anything else (a wall, the floor, a trigger volume)
+};
+struct Touch {
+    TouchKind kind = TouchKind::kOther;
+    bool blocking = false;  // the sweep stopped here
+    double dist = 0;        // cm from where the strike point was last frame
+};
+
+// Which touch is the hit, or -1: the first target that lies on this side of
+// whatever stopped the sweep (and of `wall_before`, a wall another check
+// found, plus the ball's radius). The first blocking thing that is not a
+// target is a wall: its distance goes to *wall_at. Something that only
+// overlaps (a trigger volume) is neither.
+inline int PickTouch(const Touch* t, int n, double wall_before, double radius, double* wall_at) {
+    for (int i = 0; i < n; ++i) {
+        if (t[i].kind == TouchKind::kTarget) {
+            if (t[i].dist <= wall_before + radius) return i;
+            return -1;
+        }
+        if (t[i].kind == TouchKind::kOther && t[i].blocking) {
+            if (wall_at && t[i].dist < *wall_at) *wall_at = t[i].dist;
+            return -1;
+        }
+    }
+    return -1;
+}
+
 // Each target is hit at most once per `cooldown` seconds, so one swing
 // through a body is one hit, not one per frame.
 class Cooldowns {

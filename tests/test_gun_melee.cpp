@@ -146,6 +146,40 @@ int main() {
         Check(!c.Update(in({70, 15, 125}, {50, 10, 160}, {-0.6, 0, 0.8}, 1.6), st), "then ends");
     }
 
+    // Picking the hit from a multi sweep (nearest first; overlaps, then the
+    // one thing that stopped it).
+    {
+        auto T = [](TouchKind k, bool blocking, double dist) {
+            Touch t;
+            t.kind = k;
+            t.blocking = blocking;
+            t.dist = dist;
+            return t;
+        };
+        double wall = 1e9;
+        // The hub's mannequin only overlaps the game's hit channel, then the floor stops the ball.
+        Touch dummy[] = {T(TouchKind::kTarget, false, 2.0), T(TouchKind::kOther, true, 30.0)};
+        Check(PickTouch(dummy, 2, 1e9, 5.0, &wall) == 0, "a target the ball passes through is a hit");
+        // A wall first: the target behind it is not hit, and the wall is reported.
+        Touch behind[] = {T(TouchKind::kOther, true, 4.0), T(TouchKind::kTarget, false, 9.0)};
+        wall = 1e9;
+        Check(PickTouch(behind, 2, 1e9, 5.0, &wall) == -1 && Near(wall, 4.0), "a wall in front stops the hit");
+        // A trigger volume (overlap, not blocking) is neither a hit nor a wall.
+        Touch trigger[] = {T(TouchKind::kOther, false, 1.0), T(TouchKind::kTarget, true, 6.0)};
+        wall = 1e9;
+        Check(PickTouch(trigger, 2, 1e9, 5.0, &wall) == 1 && wall > 1e8, "a trigger volume is passed through");
+        // An enemy's capsule is passed through: its body part behind it is the hit.
+        Touch enemy[] = {T(TouchKind::kPassThrough, false, 0.0), T(TouchKind::kTarget, true, 8.0)};
+        Check(PickTouch(enemy, 2, 1e9, 5.0, nullptr) == 1, "an enemy capsule does not hide its body");
+        // A wall another check found (the game's hit channel) still counts.
+        Touch seen[] = {T(TouchKind::kTarget, true, 12.0)};
+        Check(PickTouch(seen, 1, 3.0, 5.0, nullptr) == -1, "a target beyond the hit channel's wall is not hit");
+        Check(PickTouch(seen, 1, 9.0, 5.0, nullptr) == 0, "within the ball's radius of that wall it is");
+        Check(PickTouch(seen, 0, 1e9, 5.0, nullptr) == -1, "nothing met: no hit");
+        // Speeds: a believable swing is under the jump limit, the logged spikes are not.
+        Check(4.5 < kMaxSwingSpeed && 58.5 > kMaxSwingSpeed, "a grab's 58 m/s spike is a jump, a swing is not");
+    }
+
     std::printf("gun melee: %d checks passed\n", checks);
     return 0;
 }
