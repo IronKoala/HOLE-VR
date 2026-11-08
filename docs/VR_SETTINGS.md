@@ -142,7 +142,7 @@ for it) is now the kick. The grip editor (left Y hold) and the arm measure
 
 Right-stick kick automatically chooses the right leg when you aim right of
 the body; left/centre uses the left leg. Aim and side lock when the kick starts.
-Rifles kick too: their fire selector is left X (the click only with the
+Rifles kick too: their fire selector is left X (right B with the
 rifle in the left hand). The VR body
 and native kick trace share the chosen side/direction, with the game's extra
 upward trace offset removed. If the bilateral adapter or body is unavailable,

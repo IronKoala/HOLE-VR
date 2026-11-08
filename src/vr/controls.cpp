@@ -631,6 +631,13 @@ double Locomotion(UObject player, const input::Snapshot& s, double dt) {
     if (teleport_now) teleport::Update(player, left, g_set.swap_sticks ? input::kRight : input::kLeft);
     else if (s_teleport_on) teleport::Hide();
     s_teleport_on = teleport_now;
+    // A game menu that doesn't pause the game (area select, results) keeps
+    // the player ticking, and the sticks scroll the menu: don't also walk or
+    // turn (overlap check 2026-11-08).
+    if (ui_panel::MenuOpen()) {
+        comfort::SetMotion(0.0, 0.0);
+        return 0;
+    }
     if (!g_set.teleport && mag > g_set.deadzone) {
         double scale = std::fmin(1.0, (mag - g_set.deadzone) / (1.0 - g_set.deadzone)) / mag;
         if (g_sprint_full && mag > 0.5) scale = 1.0 / mag;
@@ -3990,8 +3997,10 @@ void SupportGrip(const hands::HandState& lh, const input::HandInput& lin, double
 // Fire selector (safe / semi / auto, as the gun allows): left X with the
 // rifle in the right hand. Owner 2026-11-07: it shared the right stick click
 // with the kick, so a rifle could not kick. With the rifle in the left hand
-// (left X is its magazine release) it stays on the right stick click.
-bool SelectorOnStick() { return GunHand() == input::kLeft; }
+// (left X is its magazine release, left Y its bolt release, right A the only
+// weapon switch) it is right B, which otherwise only shows objective markers.
+// The right stick click is the kick with every gun in either hand.
+bool SelectorOnRightB() { return GunHand() == input::kLeft; }
 
 bool AimingEye(FVector* out);
 // The gun hand's B (Y in the left hand), held with a rifle: past 0.4 s (a
@@ -4047,8 +4056,8 @@ void CheekWeldButton(game::Gun& gun, const input::HandInput& gin) {
 void FireSelector(game::Gun& gun, const input::Snapshot& s) {
     // Rifles only: a Glock has no selector.
     if (W.is_pistol) return;
-    const bool pressed = SelectorOnStick() ? s.hand[input::kRight].stick_click.pressed
-                                           : s.hand[input::kLeft].primary.pressed;
+    const bool pressed = SelectorOnRightB() ? s.hand[input::kRight].secondary.pressed
+                                            : s.hand[input::kLeft].primary.pressed;
     if (!pressed) return;
     ue::Call c(gun.Object(), "Gun_SwitchFireMode");
     c.Invoke();
@@ -4356,7 +4365,7 @@ void PhysicalCrouchAndJump(UObject player) {
 //   Left Y                tap: switch weapon (slide release with the gun in the left hand); hold 1 s: grip editor
 //   Left X                magazine release with the gun in the left hand
 //   Right stick           left/right turn, up jump, down crouch / stand; click: kick
-//   Left X                rifle fire selector with the rifle in the right hand
+//   Left X                rifle fire selector with the rifle in the right hand (right B with it in the left)
 //   Right B held          rifle in the right hand: cheek weld (rifle follows the hands while held;
 //                         let go after 2 s to save where the eye sits; a tap is still the bolt release)
 //   Gun hand's trigger    fire
@@ -5149,7 +5158,8 @@ void GameActions(UObject player, const input::Snapshot& s) {
     // gun in the left hand Y is its slide release instead.
     if (l.secondary.pressed) GA.y_down_at = g_clock;
     if (l.secondary.released && GA.y_down_at > 0) {
-        if (g_clock - GA.y_down_at < 0.4 && !left_has_gun) {
+        if (g_clock - GA.y_down_at < 0.4 && !left_has_gun &&
+            hands::GetInteraction(hands::kLeft).owner == hands::GripOwner::kNone) {
             ue::Call c(player, "PlayerInput_ScrollWeapon");
             c.Set("IsUp", true);
             c.Invoke();
@@ -5173,20 +5183,23 @@ void GameActions(UObject player, const input::Snapshot& s) {
     // the left hand): switch weapon / objective markers. With the gun in the
     // right hand they are the magazine release and the slide release
     // (MagazineHandling).
-    if (!right_has_gun && r.primary.pressed) {
+    // Overlap check 2026-11-08: not while that hand holds anything (a
+    // magazine, the slide, a drink, an attachment): a stray press switched
+    // weapon (and removed the put-away gun's spare magazines).
+    const bool right_busy = hands::GetInteraction(hands::kRight).owner != hands::GripOwner::kNone;
+    if (!right_has_gun && !right_busy && r.primary.pressed) {
         ue::Call c(player, "PlayerInput_ScrollWeapon");
         c.Set("IsUp", true);
         c.Invoke();
         log::Info("controls: switch weapon (right A, hand empty)");
     }
-    if (!right_has_gun && r.secondary.pressed) {
+    if (!right_has_gun && !right_busy && !(left_has_gun && GunIsRifle(player)) && r.secondary.pressed) {
         FireEvent(player, GA.nav);
         log::Info("controls: objective markers (right B, hand empty)");
     }
 
-    // Right stick click: kick (the game's melee), with any gun. Only a rifle
-    // held in the left hand keeps its fire selector there (FireSelector).
-    if (r.stick_click.pressed && !(GunIsRifle(player) && SelectorOnStick()) && g_clock >= GA.melee_ready_at) {
+    // Right stick click: kick (the game's melee), with any gun in either hand.
+    if (r.stick_click.pressed && g_clock >= GA.melee_ready_at) {
         BeginKick(player);
         ue::Call c(player, "PlayerInput_MeleeAttack");
         c.Set("Press Released", false);
