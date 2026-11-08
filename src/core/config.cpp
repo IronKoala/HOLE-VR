@@ -924,8 +924,9 @@ const Block kBlocks[] = {
      "; Frame times: hand each frame to the headset (xrEndFrame) on a thread of the\n"
      "; mod's own, so the game's Present thread doesn't wait on it. 0 = never,\n"
      "; 1 = always, 2 = decided each run by the GPU cost test (on only if the\n"
-     "; headset missed fewer frames with it).\n"
-     "xr_end_async=1\n"},
+     "; headset missed fewer frames with it). 1 made the picture jitter when\n"
+     "; turning the head (2026-11-08), so 0 is the default.\n"
+     "xr_end_async=0\n"},
     {"gpu_cost_test",
      "\n"
      "; Frame times (diagnostic): 45 s into the first run level, switch render\n"
