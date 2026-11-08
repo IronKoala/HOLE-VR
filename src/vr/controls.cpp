@@ -35,7 +35,6 @@
 #include "vr/workbench.h"
 #include "vr/workbench_carry.h"
 #include "vr/drinks.h"
-#include "vr/gun_melee.h"
 #include "vr/input.h"
 #include "vr/interact/grip_points.h"
 #include "vr/interact/holster.h"
@@ -803,7 +802,6 @@ struct WeaponState {
     bool two_hand = false;        // support hand on the handguard
     FVector support_local;        // support hand point in the gun frame, from the grip
     FVector grip_world;           // gun-frame origin (the firing hand's grip point)
-    FVector wall_push;            // how far the wall check moved the gun this frame (grip_world includes it)
     bool handle_moved = false;    // charging handle moved off its rest
     double bore_height = 6.0;     // bore above the grip point, cm (gun frame Z)
     bool have_handle_grab = false;
@@ -1144,10 +1142,10 @@ std::string WallPushReport(double) {
 
 // What the held gun hits rather than stops at: characters (pawns: enemies,
 // the nurse) and anything with the game's bullet-hit event (the hub's
-// mannequins and shooting targets, breakable boards; gun_melee's list).
+// mannequins and shooting targets, breakable boards).
 // Owner's run 2026-11-08: swinging at the hub's mannequins pushed the gun up
-// to 40 cm out of them, which threw it about, and gun melee needs the gun to
-// reach them. Per class; the table belongs to the player's level.
+// to 40 cm out of them, which threw it about. Per class; the table belongs
+// to the player's level.
 std::map<UObject, bool> g_strike_class;
 UObject g_strike_class_player = 0;
 bool IsStrikeTarget(UObject actor) {
@@ -1913,7 +1911,6 @@ void HoldGun(game::Gun& gun, const hands::HandState& rh) {
     FVector push = WallPushback(g, hand, grip_w, two);
     loc = loc + push;
     W.grip_world = grip_w + push;
-    W.wall_push = push;
     W.have_support_point = two;
     if (two) W.support_point = W.grip_world + hand.Rotate(W.support_id >= 0 ? W.support_draw : W.support_local);
     SetActorTransform(g, loc, rot);
@@ -5496,9 +5493,6 @@ void ClearHolsterVisual(bool keep_model = false) {
         if (g_grab[h].holster_preview) g_grab[h] = {};
 }
 
-// The main hand is in its butt-strike pose (gun_melee::ButtStrikeStance).
-bool g_butt_stance = false;
-
 // What each hand holds, for the VR body. hs: both hands' states.
 void PublishGrabs(game::Gun& gun, const hands::HandState hs[2]) {
     hands::HandGrab g[2];
@@ -5517,22 +5511,6 @@ void PublishGrabs(game::Gun& gun, const hands::HandState hs[2]) {
         } else {
             g[gh].target = rh.grip;
         }
-        // A long gun pulled back for a butt strike (main hand by the head, off
-        // hand up high): the main hand's own pose, <class>.butt-strike, posed
-        // by the owner. Held as it was while the grip editor is open.
-        if (W.is_pistol) {
-            g_butt_stance = false;
-            gun_melee::ButtStrikeStanceReset();
-        } else if (!W.edit_frozen) {
-            hands::Pose head;
-            const bool head_ok = hands::Head(&head);
-            g_butt_stance = gun_melee::ButtStrikeStance(gun.Object(), rh.grip, lh.grip, head, W.frame_rot,
-                                                        head_ok && rh.valid && lh.valid && W.have_pose, g_clock);
-        }
-        if (!W.is_pistol && g_butt_stance) g[gh].point = hands::kPointButtStrike;
-    } else {
-        g_butt_stance = false;
-        gun_melee::ButtStrikeStanceReset();
     }
     // The gun hand on the charging handle of the rifle the other hand holds
     // by itself: the rifle's own frame at the handle's rear end.
@@ -7735,53 +7713,6 @@ void OnLateTick(UObject player, float) {
     DrawHolsterModel(player);
 }
 
-// Gun melee (vr/gun_melee): the gun in the gun hand, and the rifle the other
-// hand carries by itself, hit what they are swung into. No button or gesture
-// starts it; only a real swing that touches something.
-void MeleeStrikes(UObject player, const hands::HandState hs[2], const input::Snapshot& s) {
-    gun_melee::Frame f;
-    f.player = player;
-    f.clock = g_clock;
-    f.frame = g_controls_frame;
-    f.xr_time = s.time;
-    auto add = [&](UObject gun, bool pistol, const FQuat& frame, const FVector& grip, double muzzle, double bore,
-                   bool have_stock, const FVector& stock, int hand, int second, bool kicking, const FVector& push) {
-        if (!gun || f.count >= 2 || hand < 0 || hand > 1 || !hs[hand].valid || !s.hand[hand].grip_valid) return;
-        gun_melee::HeldGun& g = f.guns[f.count++];
-        g.gun = gun;
-        g.pistol = pistol;
-        g.frame = frame;
-        g.grip = grip;
-        g.muzzle_dist = muzzle;
-        g.bore_height = bore;
-        g.have_stock = have_stock;
-        g.stock = stock;
-        g.hand = hand;
-        g.hand_world = hs[hand].grip;
-        g.hand_tracking = s.hand[hand].grip;
-        g.second_hand = second;
-        g.kicking = kicking;
-        g.wall_push = push;
-    };
-    const bool gun_in_hand = W.gun && W.in_hand && W.have_pose && !W.right_let_go && !W.edit_frozen;
-    if (gun_in_hand)
-        add(W.gun, W.is_pistol, W.frame_rot, W.grip_world, W.muzzle_dist, W.bore_height, W.have_stock, W.stock_local,
-            GunHand(), W.two_hand ? OtherHand() : -1, W.kick_t0 >= 0 && g_clock - W.kick_t0 < 0.3, W.wall_push);
-    if (g_rc.carried && g_rc.rifle && g_rc.rg.ok && !(gun_in_hand && W.gun == g_rc.rifle)) {
-        const bool own_stock = g_rc.rifle == W.gun && W.have_stock;
-        add(g_rc.rifle, false, g_rc.frame_world, g_rc.grip_world, g_rc.rg.muzzle_dist, g_rc.rg.bore_height, own_stock,
-            own_stock ? W.stock_local : FVector{}, OtherHand(), -1, false, FVector{});
-    }
-    if (!f.count) return;
-    for (UObject o : {W.gun, W.held_mag, W.pouch_mag, g_rc.rifle, g_rc.pistol})
-        if (o) f.ignore.push_back(o);
-    if (UObject holder = static_cast<UObject>(world_menu::PanelHolder())) f.ignore.push_back(holder);
-    // What hangs on the player (the walls' own list): never a wall for a swing.
-    for (UObject a : body::hand_walls::IgnoredActors())
-        if (a && std::find(f.ignore.begin(), f.ignore.end(), a) == f.ignore.end()) f.ignore.push_back(a);
-    gun_melee::Update(f);
-}
-
 void OnTick(UObject player, float dt) {
     g_clock += dt;
     ++g_controls_frame;
@@ -8091,7 +8022,6 @@ void OnTick(UObject player, float dt) {
         FireSelector(gun, s);
         CheekWeldButton(gun, s.hand[GunHand()]);
         RifleCarry(player, rh, lh, s.hand[O], s.hand[G], dt, true);
-        MeleeStrikes(player, hs, s);
     }
     {
         perf::Scope t(g_perf_holster_visual);
@@ -8159,7 +8089,6 @@ void Init() {
     LoadSettings();
     LoadMagSeats();
     LoadWelds();
-    gun_melee::Init();
     holster_audio::Init(config::Dir());
     config::AddChangeListener(&ReloadSettings);
     game::AddTickListener(&OnTick);

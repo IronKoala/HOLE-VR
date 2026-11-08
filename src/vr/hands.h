@@ -47,9 +47,6 @@ struct HandGrab {
     // onto the pistol in the other hand (holster_preview; controls'
     // offhand_snap): the gun held out, or near the chest. Each hand has its
     // own pose of each.
-    // kGunGrip: kPointButtStrike = the main hand on a long gun pulled back
-    // for a butt strike (gun_melee::ButtStrikeStance), with its own pose
-    // (owner 2026-11-08).
     int point = -1;
     // Visual-only reach onto a seated pistol (or the off hand onto the
     // pistol in the other hand); never acquires input ownership or changes
@@ -79,7 +76,6 @@ constexpr int kPointHolster = 1;
 constexpr int kPointOffhand = 10;
 constexpr int kPointOffhandChest = 11;
 inline bool OffhandPoint(int point) { return point == kPointOffhand || point == kPointOffhandChest; }
-constexpr int kPointButtStrike = 12;
 // kMagHeld: shotgun shells in the hand (controls' smart reload), the point
 // is kPointShells + how many the hold was taken as (4 quad, 2 twin, 1
 // single); each hold has its own pose, "shells.quad" etc. (owner poses them).

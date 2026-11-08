@@ -514,8 +514,8 @@ it'll jump around like crazy, especially the AR"):
   twice a second and when the held gun changes.
 - **The gun was thrown out of mannequins.** Swinging at the hub's mannequins
   pushed the gun up to 40 cm out of them. Characters (pawns) and anything
-  with the game's bullet-hit event (mannequins, shooting targets, enemies,
-  the same list gun melee hits) are not walls for the held gun any more. A
+  with the game's bullet-hit event (mannequins, shooting targets, enemies)
+  are not walls for the held gun any more. A
   line that meets one is looked along again without it, so a wall behind a
   mannequin still counts. Hands still stop at them.
 
