@@ -7633,8 +7633,11 @@ void UpdateOffhandSnap(game::Gun& gun, const hands::HandState hs[2]) {
     in.allowed = g_set.offhand_snap && pistol && gh.valid && free && !ui_panel::MenuOpen() &&
                  hands::EditorHand() < 0 && !body::CalibrationActive() && !W.edit_frozen;
     in.hands_apart = gh.valid && oh.valid ? Len(oh.grip.location - gh.grip.location) : 1e9;
-    in.gun_to_chest =
-        g_hw.valid ? Len(W.grip_world - g_hw.anchor[static_cast<int>(interact::HolsterAnchor::kChest)].location) : 1e9;
+    // From the gun hand's controller, not the drawn gun, which a kick or a
+    // wall push moves (2026-11-08 run: the gun pushed off its own sight
+    // flipped the pose every frame).
+    in.gun_to_chest = g_hw.valid && gh.valid
+        ? Len(gh.grip.location - g_hw.anchor[static_cast<int>(interact::HolsterAnchor::kChest)].location) : 1e9;
     // One distance for the snap and for the pistol's two-hand kick.
     in.snap_cm = g_set.pistol_both_hands_cm;
     in.release_cm = g_set.pistol_both_hands_cm + 4.0;
@@ -7645,12 +7648,16 @@ void UpdateOffhandSnap(game::Gun& gun, const hands::HandState hs[2]) {
     g_offhand.Update(in);
     // The log says how close the controllers came, so the distance can be
     // set from a run (pistol_both_hands_cm).
+    // armed: the hands have been 25 cm apart since the last snap, so
+    // pulling away after one is not counted as a near miss.
     static double since = 0, closest = 1e9, told_closest_at = -1e9;
+    static bool armed = true;
     if (g_offhand.Near() != was_near) {
+        if (!g_offhand.Near()) armed = false;
         if (g_offhand.Near()) {
             since = g_clock;
-            log::Info("controls: %s hand on the pistol (controllers %.1f cm apart, snaps within %.0f); gun %.0f cm "
-                      "from the chest: %s pose",
+            log::Info("controls: %s hand on the pistol (controllers %.1f cm apart, snaps within %.0f); gun hand %.0f "
+                      "cm from the chest: %s pose",
                       HandName(O), in.hands_apart, in.snap_cm, in.gun_to_chest < 1e8 ? in.gun_to_chest : -1.0,
                       g_offhand.Chest() ? "chest" : "held-out");
         } else {
@@ -7659,10 +7666,11 @@ void UpdateOffhandSnap(game::Gun& gun, const hands::HandState hs[2]) {
                       in.allowed ? "" : "; the hand took something, a menu or the editor opened, or tracking was lost");
         }
     } else if (g_offhand.Near() && g_offhand.Chest() != was_chest) {
-        log::Info("controls: %s hand on the pistol: %s pose (gun %.0f cm from the chest, changes at %.0f)", HandName(O),
-                  g_offhand.Chest() ? "chest" : "held-out", in.gun_to_chest, in.chest_cm);
+        log::Info("controls: %s hand on the pistol: %s pose (gun hand %.0f cm from the chest, changes at %.0f)",
+                  HandName(O), g_offhand.Chest() ? "chest" : "held-out", in.gun_to_chest, in.chest_cm);
     }
-    if (in.allowed && !g_offhand.Near() && in.hands_apart < 25.0) {
+    if (in.hands_apart >= 25.0) armed = true;
+    if (armed && in.allowed && !g_offhand.Near() && in.hands_apart < 25.0) {
         closest = std::fmin(closest, in.hands_apart);
     } else if (closest < 1e8) {
         // Came near without snapping: worth knowing if the snap distance is
