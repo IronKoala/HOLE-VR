@@ -302,8 +302,9 @@ void Session::FitBent() {
         // Only now compare the result with the separate straight-arm fit.
         // Correlated elbow translation can mimic forearm length, so a small
         // residual alone is not enough to claim a usable segment split.
+        // A split no human arm has means the elbow itself moved while bending.
         if(reason==Reason::None && (upper<10||upper>75||fit.forearm_cm<10||fit.forearm_cm>70||
-            fit.forearm_cm/total<.20||fit.forearm_cm/total>.80||
+            fit.forearm_cm/total<.20||fit.forearm_cm/total>.80||!PlausibleSplit(upper,fit.forearm_cm)||
             std::fabs(total-reach_[side])>std::max(3.0,.06*reach_[side]))) reason=Reason::UncertainBend;
         status_.bend_reason[side]=reason;
         if(reason==Reason::None) {
@@ -741,6 +742,21 @@ bool MergeProfile(const Profile* previous,const Profile& result,Profile* out) {
     if(!Validate(merged)) return false;
     *out=merged; return true;
 }
+bool PlausibleSplit(double upper_cm, double forearm_cm) {
+    const double total = upper_cm + forearm_cm;
+    if (!std::isfinite(total) || upper_cm <= 0 || forearm_cm <= 0) return false;
+    const double share = forearm_cm / total;
+    return share >= kMinForearmShare && share <= kMaxForearmShare;
+}
+bool UsableSegments(const Arm& arm, double* upper_cm, double* forearm_cm) {
+    if (PlausibleSplit(arm.upper_cm, arm.forearm_cm)) {
+        *upper_cm = arm.upper_cm; *forearm_cm = arm.forearm_cm;
+        return true;
+    }
+    const double total = arm.upper_cm + arm.forearm_cm;
+    *forearm_cm = total * kDefaultForearmShare; *upper_cm = total - *forearm_cm;
+    return false;
+}
 bool MapArmTarget(const Profile& profile, int side, const FVector& head_world,
                   const FQuat& body_yaw, double tracking_scale,
                   FVector* shoulder_world, double* upper_world, double* forearm_world) {
@@ -751,9 +767,11 @@ bool MapArmTarget(const Profile& profile, int side, const FVector& head_world,
     const auto& arm = profile.arm[side];
     const FVector shoulder = head_world + yaw.Rotate(arm.shoulder * tracking_scale);
     if (!Finite(shoulder)) return false;
+    double upper = 0, forearm = 0;
+    UsableSegments(arm, &upper, &forearm);
     *shoulder_world = shoulder;
-    *upper_world = arm.upper_cm * tracking_scale;
-    *forearm_world = arm.forearm_cm * tracking_scale;
+    *upper_world = upper * tracking_scale;
+    *forearm_world = forearm * tracking_scale;
     return true;
 }
 

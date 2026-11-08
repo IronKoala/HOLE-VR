@@ -774,8 +774,55 @@ static void HeldCaptureReleaseAndAcceptance() {
     EXPECT(status.phase==Phase::VerifyForward && status.reason==Reason::VerificationMismatch && !status.pose_confirmed);
 }
 
+static void ImplausibleSplitIsNotUsed() {
+    // 2026-11-06 owner profile: the left elbow fit read 20.8 cm of a 59.4 cm
+    // arm (35%), the right arm kept the avatar's 47%. Human arms are ~41-47%.
+    EXPECT(!PlausibleSplit(38.619820529954083,20.822743817518582));
+    EXPECT(PlausibleSplit(33.110188379277069,29.438200558590854));
+    // Every proportion the other tests use stays a human arm.
+    EXPECT(PlausibleSplit(31,28) && PlausibleSplit(35,30) && PlausibleSplit(22,18) && PlausibleSplit(48,37) && PlausibleSplit(45,40));
+    EXPECT(!PlausibleSplit(0,20) && !PlausibleSplit(30,-1) && !PlausibleSplit(std::nan(""),20) && !PlausibleSplit(30,40));
+    Arm owner_left; owner_left.upper_cm=38.619820529954083; owner_left.forearm_cm=20.822743817518582;
+    double upper=0,forearm=0;
+    EXPECT(!UsableSegments(owner_left,&upper,&forearm));
+    EXPECT(Near(upper+forearm,owner_left.upper_cm+owner_left.forearm_cm,1e-9));
+    EXPECT(Near(forearm/(upper+forearm),kDefaultForearmShare,1e-12) && forearm>27.9 && forearm<28);
+    Arm normal; normal.upper_cm=33.11; normal.forearm_cm=29.44;
+    EXPECT(UsableSegments(normal,&upper,&forearm) && upper==33.11 && forearm==29.44);
+
+    // A saved profile with that split draws the arm with the usual split on
+    // the same reach; a plausible arm is untouched. The file is not changed.
+    Run saved; saved.Full(); const auto* sp=saved.session.GetProfile(); EXPECT(sp);
+    if(sp) {
+        Profile profile=*sp; profile.arm[0].upper_cm=38.619820529954083; profile.arm[0].forearm_cm=20.822743817518582;
+        EXPECT(Validate(profile));
+        const std::string text=Serialize(profile); Profile parsed; EXPECT(Parse(text,&parsed));
+        EXPECT(parsed.arm[0].upper_cm==profile.arm[0].upper_cm && parsed.arm[0].forearm_cm==profile.arm[0].forearm_cm);
+        for(double scale:{.8,1.,1.3}) {
+            FVector shoulder; double u=0,f=0; const FVector head{200,-90,170}; const auto q=YawOnly(31);
+            EXPECT(MapArmTarget(parsed,0,head,q,scale,&shoulder,&u,&f));
+            EXPECT(Near(u+f,(38.619820529954083+20.822743817518582)*scale,1e-8) && Near(f/(u+f),kDefaultForearmShare,1e-12));
+            EXPECT(MapArmTarget(parsed,1,head,q,scale,&shoulder,&u,&f));
+            EXPECT(Near(u,parsed.arm[1].upper_cm*scale,1e-8) && Near(f,parsed.arm[1].forearm_cm*scale,1e-8));
+        }
+    }
+
+    // A new setup no longer saves such a bend fit: that side keeps its
+    // straight-arm reach with the prior split; the other side's fit stands.
+    Run odd; odd.rig.upper[0]=40; odd.rig.lower[0]=20; // 33%: what a moving elbow reads
+    odd.Full(); EXPECT(odd.session.GetStatus().phase==Phase::Complete);
+    if(const auto* p=odd.session.GetProfile()) {
+        EXPECT(!p->arm[0].forearm_measured && !p->arm[0].segments_measured);
+        EXPECT(odd.session.GetStatus().bend_reason[0]==Reason::UncertainBend);
+        EXPECT(Near(p->arm[0].upper_cm+p->arm[0].forearm_cm,60,.15) && Near(p->arm[0].forearm_cm/(p->arm[0].upper_cm+p->arm[0].forearm_cm),odd.prior[0],1e-9));
+        EXPECT(PlausibleSplit(p->arm[0].upper_cm,p->arm[0].forearm_cm));
+        EXPECT(p->arm[1].forearm_measured && Near(p->arm[1].forearm_cm,odd.rig.lower[1],.15));
+    } else EXPECT(false);
+}
+
 int main() {
     std::setvbuf(stdout,nullptr,_IONBF,0);
+    ImplausibleSplitIsNotUsed();
     StagesAndRates(); MotionAndOutliers(); WristWindowsAndFrozenMapping(); ReachObservabilityAndComfort(); TrackingPausesAndTransactions();
     WrongPriorsAndPerSideEvidence();
     OneBendSurvivesALongComfortablePause();
