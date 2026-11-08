@@ -1113,6 +1113,8 @@ struct WallPushLog {
     long long looks = 0;        // lines from the eyes to outline points
     long long by_part[static_cast<int>(gun_walls::Part::kCount)] = {};  // pushed frames by the deepest part
     int points = 0;             // outline points (last frame)
+    long long strike_frames = 0;  // frames a line met an enemy, mannequin or target (looked past it)
+    int own_gear = 0;           // the player's own things left out of the checks (last frame)
 };
 std::mutex g_push_log_mutex;
 WallPushLog g_push_log;
@@ -1124,49 +1126,109 @@ std::string WallPushReport(double) {
         w = g_push_log;
         g_push_log = {};
     }
-    if (w.pushed == 0 && w.eyes_inside == 0) return {};
-    char b[700];
+    if (w.pushed == 0 && w.eyes_inside == 0 && w.strike_frames == 0) return {};
+    char b[900];
     std::snprintf(b, sizeof(b),
                   "gun wall push: the held gun was pushed out of something in %lld of %lld frames (most %.1f cm, "
                   "against %s); the push changed by over 3 cm in a frame %lld times (worst %.1f cm); eyes inside "
                   "something (no push) %lld frames; part furthest in: gun %lld, gun hand %lld, magazine %lld, "
                   "support hand %lld; something near the gun in %lld frames, %d outline points, %.1f looks a frame "
-                  "then",
+                  "then; went into an enemy, mannequin or target (not a wall) in %lld frames; %d of your own things "
+                  "(guns, what is fitted to them, magazines) left out",
                   w.pushed, w.frames, w.push_max, w.worst_what.empty() ? "nothing" : w.worst_what.c_str(), w.jumps,
                   w.jump_max, w.eyes_inside, w.by_part[0], w.by_part[1], w.by_part[2], w.by_part[3], w.near_frames, w.points,
-                  w.near_frames ? static_cast<double>(w.looks) / static_cast<double>(w.near_frames) : 0.0);
+                  w.near_frames ? static_cast<double>(w.looks) / static_cast<double>(w.near_frames) : 0.0,
+                  w.strike_frames, w.own_gear);
     return b;
+}
+
+// What the held gun hits rather than stops at: characters (pawns: enemies,
+// the nurse) and anything with the game's bullet-hit event (the hub's
+// mannequins and shooting targets, breakable boards; gun_melee's list).
+// Owner's run 2026-11-08: swinging at the hub's mannequins pushed the gun up
+// to 40 cm out of them, which threw it about, and gun melee needs the gun to
+// reach them. Per class; the table belongs to the player's level.
+std::map<UObject, bool> g_strike_class;
+UObject g_strike_class_player = 0;
+bool IsStrikeTarget(UObject actor) {
+    if (!actor || !ue::IsLive(actor)) return false;
+    const UObject player = game::Player();
+    if (player != g_strike_class_player) {
+        g_strike_class.clear();
+        g_strike_class_player = player;
+    }
+    if (actor == player) return false;
+    const UObject cls = ue::GetClass(actor);
+    if (!cls) return false;
+    auto it = g_strike_class.find(cls);
+    if (it != g_strike_class.end()) return it->second;
+    bool yes = ue::FindFunction(cls, "BulletHitEvent") != 0;
+    for (UObject s = cls; s && !yes; s = ue::reflection::GetSuper(s))
+        if (ue::GetName(s) == "Pawn") yes = true;
+    if (g_strike_class.size() > 512) g_strike_class.clear();
+    g_strike_class.emplace(cls, yes);
+    return yes;
+}
+// Strike targets the gun's lines met in the last 3 s: left out from the start
+// of each frame, so a mannequin beside the gun costs one extra line once.
+struct SeenTarget {
+    UObject actor = 0;
+    double at = 0;
+};
+std::vector<SeenTarget> g_targets_seen;
+std::vector<UObject> StrikeTargetsSeen() {
+    std::vector<UObject> out;
+    std::vector<SeenTarget> kept;
+    for (const SeenTarget& t : g_targets_seen)
+        if (g_clock - t.at < 3.0 && g_clock >= t.at && ue::IsLive(t.actor)) kept.push_back(t), out.push_back(t.actor);
+    g_targets_seen.swap(kept);
+    return out;
+}
+void SawStrikeTarget(UObject actor) {
+    for (SeenTarget& t : g_targets_seen)
+        if (t.actor == actor) { t.at = g_clock; return; }
+    if (g_targets_seen.size() < 16) g_targets_seen.push_back({actor, g_clock});
 }
 
 // Lines and the near test from the eyes against the world, for one frame:
 // the reflected calls are laid out once and reused for every line (building
 // a call costs more than the trace). Shapes (wall_shape setting): what you
 // see (complex), the game's hit boxes (simple), or both with the nearest hit
-// winning.
+// winning. A line that meets a strike target (IsStrikeTarget) is looked
+// along again without it, so a wall behind a mannequin still counts.
 struct GunWallTraces {
     ue::Call line, sphere, unpack;
     int32_t hit_size = 0, radius_size = 0;
     bool ok = false, sphere_ok = false;
     wall_shapes::Mode shapes;
+    std::vector<UObject> ignore;
+    int strike_skips = 0;   // lines that met a strike target this frame
 
-    GunWallTraces(UObject ksl, UObject gps, UObject player, const std::vector<UObject>& ignore,
+    GunWallTraces(UObject ksl, UObject gps, UObject player, const std::vector<UObject>& ignore_list,
                   wall_shapes::Mode mode)
         : line(ksl, "LineTraceSingle"), sphere(ksl, "SphereTraceSingle"), unpack(gps, "BreakHitResult"),
-          shapes(mode) {
+          shapes(mode), ignore(ignore_list) {
         int32_t in_size = 0;
         if (!line.Valid() || !unpack.Valid() || !line.Raw("OutHit", &hit_size) || hit_size <= 0 ||
             !unpack.Raw("Hit", &in_size) || in_size != hit_size)
             return;
-        TArrayRaw arr{ignore.data(), static_cast<int32_t>(ignore.size()), static_cast<int32_t>(ignore.size())};
         line.Set("WorldContextObject", player).Set("TraceChannel", uint8_t{0}).Set("bTraceComplex", false)
-            .Set("ActorsToIgnore", arr).Set("bIgnoreSelf", true);
+            .Set("bIgnoreSelf", true);
         ok = true;
         int32_t sphere_hit = 0;
         sphere_ok = sphere.Valid() && sphere.Raw("OutHit", &sphere_hit) && sphere_hit == hit_size &&
                     sphere.Raw("Radius", &radius_size) && (radius_size == 4 || radius_size == 8);
         if (sphere_ok)
             sphere.Set("WorldContextObject", player).Set("TraceChannel", uint8_t{0}).Set("bTraceComplex", false)
-                .Set("ActorsToIgnore", arr).Set("bIgnoreSelf", true);
+                .Set("bIgnoreSelf", true);
+        SetIgnore();
+    }
+
+    // The ignore array points into `ignore`: set again whenever it grows.
+    void SetIgnore() {
+        TArrayRaw arr{ignore.data(), static_cast<int32_t>(ignore.size()), static_cast<int32_t>(ignore.size())};
+        line.Set("ActorsToIgnore", arr);
+        if (sphere_ok) sphere.Set("ActorsToIgnore", arr);
     }
 
     // Unpacks the call's hit. False: no usable hit.
@@ -1180,15 +1242,34 @@ struct GunWallTraces {
     }
 
     gun_walls::Hit Line(const FVector& from, const FVector& to) {
+        return gun_walls::LookPast(
+            [&](const FVector& a, const FVector& b) { return LineOnce(a, b); },
+            [](std::uintptr_t what) { return IsStrikeTarget(static_cast<UObject>(what)); },
+            [&](std::uintptr_t what) {
+                // A strike target: not a wall. Looked along again without it.
+                ++strike_skips;
+                SawStrikeTarget(static_cast<UObject>(what));
+                ignore.push_back(static_cast<UObject>(what));
+                SetIgnore();
+            },
+            from, to);
+    }
+
+    gun_walls::Hit LineOnce(const FVector& from, const FVector& to) {
         gun_walls::Hit best;
         if (!ok) return best;
         line.Set("Start", from).Set("End", to);
         for (int pass = 0; pass < wall_shapes::Passes(shapes); ++pass) {
             line.Set("bTraceComplex", wall_shapes::Complex(shapes, pass)).Set("ReturnValue", false);
             if (!line.Invoke() || !line.Result<bool>() || !Unpack(line)) continue;
+            const UObject what = unpack.Get<UObject>("HitActor");
             if (unpack.Get<bool>("bInitialOverlap")) {
+                // The eyes inside a mannequin or an enemy are not inside a
+                // wall: look again without it (Line).
                 gun_walls::Hit h;
-                h.eyes_inside = true;
+                h.eyes_inside = !IsStrikeTarget(what);
+                h.hit = !h.eyes_inside;
+                h.what = what;
                 return h;
             }
             const FVector at = unpack.Get<FVector>("ImpactPoint");
@@ -1196,7 +1277,7 @@ struct GunWallTraces {
             best.hit = true;
             best.impact = at;
             best.normal = unpack.Get<FVector>("ImpactNormal");
-            best.what = unpack.Get<UObject>("HitActor");
+            best.what = what;
         }
         return best;
     }
@@ -1322,6 +1403,49 @@ bool HandBoxOnGun(int side, gun_walls::Box* out) {
 // The player's rifle and pistol (RifleCarry's), held or put away.
 void PlayerGuns(UObject* rifle, UObject* pistol);
 
+// The player's own gear: the held gun, both guns (held or put away), the
+// magazines in them, in the hands and in the pouch, and everything fitted to
+// them, which are separate actors (sights, lights, stocks, handguards,
+// rounds). The game gave none of these hit boxes, so the walls checks
+// (hit boxes only) never met them. The shapes you see do have them: owner
+// 2026-11-08, "when I hold a gun it'll jump around like crazy, especially
+// the AR". The gun was pushed out of its own sight and light every few
+// frames, and the empty hand stopped at the rifle on the back. Every wall
+// check leaves all of it out. Found again twice a second and when the held
+// gun changes; only live ones are given out.
+std::vector<UObject> g_own_gear;
+double g_own_gear_at = -1e9;
+UObject g_own_gear_gun = 0;
+
+const std::vector<UObject>& OwnGear() {
+    if (g_clock - g_own_gear_at < 0.5 && g_clock >= g_own_gear_at && g_own_gear_gun == W.gun) return g_own_gear;
+    g_own_gear_at = g_clock;
+    g_own_gear_gun = W.gun;
+    std::vector<UObject> found;
+    auto add = [&](UObject a) {
+        if (a && ue::IsLive(a) && std::find(found.begin(), found.end(), a) == found.end()) found.push_back(a);
+    };
+    UObject rifle = 0, pistol = 0;
+    PlayerGuns(&rifle, &pistol);
+    std::vector<UObject> roots;
+    for (UObject g : {W.gun, rifle, pistol}) {
+        if (!g || !ue::IsLive(g)) continue;
+        roots.push_back(g);
+        UObject in_mag = 0;
+        if (ue::GetProp(g, "MagazineObj", in_mag) && in_mag) roots.push_back(in_mag);
+    }
+    for (int h = 0; h < 2; ++h)
+        if (UObject held = hands::GetGrab(static_cast<hands::Hand>(h)).object) roots.push_back(held);
+    for (UObject m : {W.held_mag, W.pouch_mag}) roots.push_back(m);
+    for (UObject r : roots) {
+        if (!r || !ue::IsLive(r)) continue;
+        add(r);
+        for (UObject a : AttachedActors(r)) add(a);
+    }
+    g_own_gear.swap(found);
+    return g_own_gear;
+}
+
 // Keeps the held gun out of walls, like Half-Life: Alyx: the gun's outline
 // (its parts, magazine and fitted parts, and the hands on it) is looked at
 // from the eyes; any outline point behind a surface puts the gun in it, and
@@ -1349,23 +1473,26 @@ FVector WallPushback(UObject gun, const FQuat& frame, const FVector& grip, bool 
     // Not the gun or what the hands hold, not the forearm menu or wrist HUD
     // (they sit in front of the eyes whenever the left wrist is up), and not
     // the player or what hangs on it (body::hand_walls' list).
+    // Also all of the player's gear (OwnGear: both guns, what is fitted to
+    // them, magazines and what the hands hold): the gun must never be pushed
+    // out of its own sight or light, or the lines to a gun held low stopped
+    // by the other gun in its holster.
     std::vector<UObject> ignore{gun};
-    if (W.held_mag) ignore.push_back(W.held_mag);
-    if (W.pouch_mag) ignore.push_back(W.pouch_mag);
+    auto ignore_too = [&](UObject a) {
+        if (a && std::find(ignore.begin(), ignore.end(), a) == ignore.end()) ignore.push_back(a);
+    };
+    for (UObject a : OwnGear()) if (ue::IsLive(a)) ignore_too(a);
+    // This frame's (OwnGear is found twice a second).
+    ignore_too(W.held_mag);
+    ignore_too(W.pouch_mag);
     UObject in_mag = 0;
-    ue::GetProp(gun, "MagazineObj", in_mag);
-    if (in_mag) ignore.push_back(in_mag);
-    const hands::HandGrab other = hands::GetGrab(HandOf(OtherHand()));
-    if (other.object && other.object != gun) ignore.push_back(other.object);
-    if (UObject holder = static_cast<UObject>(world_menu::PanelHolder())) ignore.push_back(holder);
-    // The other gun in its holster (on the chest, behind the shoulder): the
-    // lines to the hand on a gun held low can pass it.
-    UObject rifle = 0, pistol = 0;
-    PlayerGuns(&rifle, &pistol);
-    for (UObject other_gun : {rifle, pistol})
-        if (other_gun && other_gun != gun) ignore.push_back(other_gun);
-    for (UObject a : body::hand_walls::IgnoredActors())
-        if (std::find(ignore.begin(), ignore.end(), a) == ignore.end()) ignore.push_back(a);
+    if (ue::GetProp(gun, "MagazineObj", in_mag)) ignore_too(in_mag);
+    ignore_too(hands::GetGrab(HandOf(OtherHand())).object);
+    if (UObject holder = static_cast<UObject>(world_menu::PanelHolder())) ignore_too(holder);
+    for (UObject a : body::hand_walls::IgnoredActors()) ignore_too(a);
+    // Enemies, mannequins and targets met lately (GunWallTraces: the gun is
+    // not pushed out of what it can hit).
+    for (UObject a : StrikeTargetsSeen()) ignore_too(a);
 
     // The outline, gun frame.
     std::vector<gun_walls::PartBox> boxes;
@@ -1413,7 +1540,8 @@ FVector WallPushback(UObject gun, const FQuat& frame, const FVector& grip, bool 
         const FVector to = points[r.deepest];
         const FVector dir = to - head.location;
         const double len = Len(dir);
-        if (len > 1.0) wall_shapes::Compare(player, head.location, to + dir * (3.0 / len), ignore, wall_shapes::kGun);
+        if (len > 1.0)
+            wall_shapes::Compare(player, head.location, to + dir * (3.0 / len), traces.ignore, wall_shapes::kGun);
     }
     // For the log.
     static FVector s_last;
@@ -1428,6 +1556,8 @@ FVector WallPushback(UObject gun, const FQuat& frame, const FVector& grip, bool 
         std::lock_guard<std::mutex> lock(g_push_log_mutex);
         ++g_push_log.frames;
         g_push_log.points = static_cast<int>(points.size());
+        g_push_log.own_gear = static_cast<int>(OwnGear().size());
+        if (traces.strike_skips > 0) ++g_push_log.strike_frames;
         if (close) ++g_push_log.near_frames, g_push_log.looks += r.queries;
         if (r.eyes_inside) ++g_push_log.eyes_inside;
         if (size > 0) {
@@ -7647,6 +7777,9 @@ void MeleeStrikes(UObject player, const hands::HandState hs[2], const input::Sna
 void OnTick(UObject player, float dt) {
     g_clock += dt;
     ++g_controls_frame;
+    // The hands and fingers leave the player's guns and what is fitted to
+    // them out of their wall checks too.
+    body::hand_walls::SetOwnGear(OwnGear());
     RefreshKick(player);
     g_dt = dt;
     HookGameAxes(player);

@@ -32,8 +32,15 @@ bool Enabled();
 void Reset(int side = -1);
 
 // Populated by Apply, reused by individual finger traces later in the same
-// body frame. Contains player, validated attached actors, held objects and UI.
+// body frame. Contains player, validated attached actors, held objects and UI,
+// and the player's own gear (SetOwnGear).
 const std::vector<UObject>& IgnoredActors();
+// The player's guns (held or put away), their magazines and everything
+// fitted to them (controls' list, set every frame). These have no hit boxes
+// but do have visible shapes, so with wall_shape=nearest or visible the hand
+// stopped at the rifle on the back and at the held gun's own parts (owner
+// 2026-11-08). Only live ones are used.
+void SetOwnGear(const std::vector<UObject>& actors);
 hand_motion::Result Motion(int side);
 // Rebuilt by body from FreeHand and rig landmarks before Apply. Extents include
 // the full palm volume; the palm-facing surface is centre + rotated Z * half.Z.

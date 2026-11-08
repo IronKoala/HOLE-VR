@@ -83,6 +83,17 @@ struct Hit {
 };
 using LineFn = std::function<Hit(const FVector& from, const FVector& to)>;
 
+// A line that looks past what is not a wall: when `once` meets something
+// `skip` says the gun goes into rather than stops at (an enemy, a mannequin,
+// a target), `leave_out` takes it out of the world and the line is looked
+// along again, at most `tries` times in all. A wall behind a mannequin still
+// counts; the mannequin alone gives no hit. Owner 2026-11-08: the gun was
+// thrown up to 40 cm out of the hub's mannequins.
+using SkipFn = std::function<bool(std::uintptr_t what)>;
+using LeaveOutFn = std::function<void(std::uintptr_t what)>;
+Hit LookPast(const LineFn& once, const SkipFn& skip, const LeaveOutFn& leave_out, const FVector& from,
+             const FVector& to, int tries = 3);
+
 // Anything at all within `radius` of the path from `from` to `centre` (a
 // ball swept along it). Every line from `from` to a point within `radius` of
 // `centre` lies inside that sweep, so when it is clear none of those lines
