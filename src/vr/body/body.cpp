@@ -652,6 +652,18 @@ void LoadMeasure() {
             log::Info("body: %s loaded (profile v%u; standing %.1f, seated %.1f, unclassified %.1f cm)",
                       M.calibrated ? "calibrated arms" : "height-only profile, keeping legacy/default arms",
                       M.profile.version, M.profile.standing_eye_cm, M.profile.seated_eye_cm, M.profile.legacy_eye_cm);
+            for (int s = 0; M.calibrated && s < 2; ++s) {
+                const auto& arm = M.profile.arm[s];
+                double upper = 0, forearm = 0;
+                if (!body_calibration::UsableSegments(arm, &upper, &forearm))
+                    log::Info("body: %s arm's saved split (upper %.1f, forearm %.1f cm, forearm %.0f%% of the arm) is "
+                              "outside a human arm's %.0f-%.0f%%: the elbow moved during setup's bend. Using upper %.1f, "
+                              "forearm %.1f cm (same %.1f cm reach); the saved file is unchanged",
+                              s == kL ? "left" : "right", arm.upper_cm, arm.forearm_cm,
+                              100.0 * arm.forearm_cm / (arm.upper_cm + arm.forearm_cm),
+                              100.0 * body_calibration::kMinForearmShare, 100.0 * body_calibration::kMaxForearmShare,
+                              upper, forearm, upper + forearm);
+            }
             if (M.profile.standing_eye_cm > 0) {
                 M.standing_eye_cm = M.profile.standing_eye_cm;
                 if (xr::StandingSpace()) stereo::SetStandingEyeHeight(M.standing_eye_cm / 100.0);
@@ -2903,7 +2915,8 @@ void StepMeasure(double /*dt*/) {
         if(M.calibrated && sum>0) {
             sample.prior_shoulder[h]=arm.shoulder; sample.prior_reach_cm[h]=sum;
         }
-        if(M.calibrated && M.profile.version>=5 && arm.segments_measured && sum>0) {
+        if(M.calibrated && M.profile.version>=5 && arm.segments_measured && sum>0 &&
+           body_calibration::PlausibleSplit(arm.upper_cm,arm.forearm_cm)) {
             sample.prior_forearm_fraction[h]=arm.forearm_cm/sum;
         } else if(G.arm_ref[h].valid) {
             const auto& frame=G.arm_ref[h];
@@ -4415,7 +4428,9 @@ void FitLog(double dt, double yaw_lag) {
                           "(flex/side), applied forearm roll mean-abs %.0f deg, elbow swing %+.0f deg, controller offset %.1f cm / %.0f deg",
                           s == kL ? "left" : "right",
                           S.arm_scale_override > 0 ? "override" : M.calibrated
-                              ? (M.profile.arm[s].segments_measured ? "fitted upper and forearm" : M.profile.arm[s].forearm_measured
+                              ? (!body_calibration::PlausibleSplit(M.profile.arm[s].upper_cm, M.profile.arm[s].forearm_cm)
+                                  ? "usual proportions; saved split not human"
+                                  : M.profile.arm[s].segments_measured ? "fitted upper and forearm" : M.profile.arm[s].forearm_measured
                                   ? "fitted forearm; estimated upper" : "estimated proportions") : "avatar proportions",
                           100.0 * G.fit_reach[s] / n, G.fit_gap[s] / n, G.max_gap[s],
                           G.fit_flex[s] / n, G.fit_dev[s] / n, G.fit_twist[s] / n, G.fit_swivel[s] / n,
