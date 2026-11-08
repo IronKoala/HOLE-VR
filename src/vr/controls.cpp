@@ -828,6 +828,7 @@ struct WeaponState {
     double support_lost_for = 0;
     bool last_has_mag = false;
     double kick_t0 = -1;          // time of the last shot, for the in-hand kick
+    double release_press_at = -1; // left Y went down (the gun in the left hand: slide release on a tap)
     double kick_level_for = -1;   // the shot (kick_t0) kick_level was chosen for
     double kick_level = 0;        // that shot's strength, from the gun and the grip
     double kick_side = 0;         // this shot's random sideways part, -1..1
@@ -2719,13 +2720,34 @@ void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState hs[
             log::Info("controls: slide stop pushed up, slide will stay open");
         }
     }
-    if (rin.secondary.pressed && !W.slide.Held() && W.in_hand) {
+    // With the gun in the LEFT hand its Y is also the grip editor (held
+    // 1 s): the release is taken when Y comes back up after a tap (under
+    // 0.4 s, like left Y's weapon switch), so holding Y to pose a left-hand
+    // grip leaves a locked slide locked. The right hand's B releases on the
+    // press. (A press made while the editor or a menu had the buttons is
+    // long past by its release, so it never counts as a tap.)
+    bool release = rin.secondary.pressed;
+    if (GunHand() == input::kLeft) {
+        release = false;
+        if (rin.secondary.pressed) W.release_press_at = g_clock;
+        if (rin.secondary.released && W.release_press_at >= 0) {
+            release = g_clock - W.release_press_at < 0.4;
+            if (!release && gun.State().slide_locked)
+                log::Info("controls: left Y held %.1f s: no slide release (a hold is the grip editor; tap to release)",
+                          g_clock - W.release_press_at);
+            W.release_press_at = -1;
+        }
+    } else {
+        W.release_press_at = -1;
+    }
+    if (release && !W.slide.Held() && W.in_hand) {
         game::GunState st = gun.State();
         // An empty magazine's follower holds the lever up: B can't drop it.
         if (st.slide_locked && st.has_magazine && st.magazine == 0 && !W.is_shotgun) {
             log::Info("controls: slide release blocked by the empty magazine");
         } else if (st.slide_locked) {
-            log::Info("controls: slide release (B), before: %s", st.Describe().c_str());
+            log::Info("controls: slide release (%s), before: %s", GunHand() == input::kLeft ? "left Y tap" : "B",
+                      st.Describe().c_str());
             gun.ReleaseSlideCatch();
             W.dead_trigger = false;
             W.end_charging_at = g_clock + 0.4;

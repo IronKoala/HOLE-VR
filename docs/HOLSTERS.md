@@ -138,7 +138,9 @@ magazines, as before).
 - **Two roles instead of two hands.** The gun hand holds the current gun by
   its grip: its trigger fires, its A / X drops the magazine, its B / Y
   releases the slide (the left Y tap no longer switches weapons while the left
-  hand holds the gun). The other hand racks, reloads, holds the handguard,
+  hand holds the gun). The left Y releases on a tap, when it comes back up
+  under 0.4 s: holding it 1 s is the grip editor, which must not drop a
+  locked slide first (2026-11-08). The right B releases on the press. The other hand racks, reloads, holds the handguard,
   works the light (its trigger next to the gun) or holds the rifle by itself.
   `GunHand()` / `OtherHand()` in `controls.cpp`; the weapon code reads the
   same whichever hand has the gun.
