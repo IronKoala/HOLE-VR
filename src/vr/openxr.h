@@ -24,7 +24,9 @@ struct Listener {
     // Once per frame after xrWaitFrame, on the thread that presents (render side).
     virtual void OnFrame(XrSession session, XrSpace tracking_space, XrTime predicted_display_time) {}
     // Extra composition layers (e.g. quad layers for menus), submitted on top
-    // of the eye images in xrEndFrame. Pointers must stay valid until it returns.
+    // of the eye images in xrEndFrame. Pointers must stay valid until it
+    // returns, which can be after this frame's Present (xr_end_async): keep
+    // the layers in storage that lives until the next AddLayers call.
     virtual void AddLayers(XrSession session, XrSpace tracking_space, XrTime display_time,
                            std::vector<const XrCompositionLayerBaseHeader*>& layers) {}
     virtual void OnSessionEnding() {}
@@ -48,14 +50,47 @@ void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* back_buffer);
 
 // The texture the engine rendered both eyes into (left half / right half).
 void SetEyeTexture(ID3D12Resource* texture);
-void SetFallbackTexture(ID3D12Resource* texture);
+
+// xrEndFrame on its own thread (see openxr.cpp): the xr_end_async setting
+// (0 never, 1 always, 2 decided by the GPU cost test; -1 before the first
+// frame or with 0), switching it (any thread; takes effect next frame), and
+// whether it is on.
+int AsyncEndSetting();
+void SetAsyncEnd(bool on, const char* why);
+bool AsyncEndOn();
+// Headset frames sent and display slots missed since the start (any thread).
+void HeadsetFrameTotals(long long* sent, long long* missed);
 
 struct EyeView {
     XrPosef pose;  // in tracking space
     XrFovf fov;
+    // The display time of the headset frame these views were located at
+    // (before predicting ahead). 0 if unknown.
+    XrTime base_time = 0;
+    // The display time they were predicted for. 0 if unknown.
+    XrTime shown_time = 0;
 };
-// Latest predicted eye views. Returns false until tracking is running.
+// How far past the current headset frame's display time the game's hand
+// poses are predicted: the game shows a picture about this much later than
+// the frame it took its poses at (its own pipeline, smoothed). 0 when off.
+XrDuration PredictAhead();
+// The eye views of the picture being prepared (same as ViewsForNewPicture).
+// Returns false until tracking is running.
 bool LatestViews(EyeView out[2]);
+// True when tracking is in the standing (room-scale, floor-level) space, so
+// heights are measured from the floor and the same from run to run.
+bool StandingSpace();
+// Game thread, once per picture as it starts drawing: the eye views predicted
+// for the headset frame that picture will be shown in.
+bool ViewsForNewPicture(EyeView out[2]);
+// From a Listener's OnFrame: the head is located this frame for k = lo..hi
+// headset frames past its predicted display time (period apart), so other
+// poses can be located for the same moments.
+void PictureFrames(int* lo, int* hi, XrDuration* period);
+// Game thread: the display time the next picture's head views are predicted
+// for (their shown_time), so the controllers can be taken at the same
+// moment. 0 if unknown.
+XrTime NewPictureShownTime();
 // Tell the frame loop which views the engine actually rendered with, so the
 // headset reprojects from the right pose.
 void SetRenderedViews(const EyeView views[2]);
@@ -66,5 +101,17 @@ XrSession Session();
 XrSpace TrackingSpace();
 // The game's D3D12 device (valid once the session exists).
 ID3D12Device* Device();
+
+// Saves the next picture sent to the headset (both eyes, half size) as
+// <mod folder>/capture-<tag>.bmp. For checking what the player sees.
+void RequestCapture(const char* tag);
+
+// Opt-in forensic capture: source before CopyEyes and both eye images after
+// CopyEyes, from one GPU submission. Full-resolution BMPs plus exact packed
+// pixel comparison/metadata. Only completed fences are read. Returns false
+// when disabled, another request is in flight, or the per-process limit is hit.
+// Automatic detections request the NEXT copied frame, not the detected strip's
+// earlier frame. Runtime composition/reprojection is outside these captures.
+bool RequestPairedCapture(const char* tag);
 
 }  // namespace holevr::vr::xr
