@@ -32,6 +32,7 @@
 #include "vr/teleport.h"
 #include "ue/names.h"
 #include "vr/hands.h"
+#include "vr/render_fixes.h"
 #include "vr/workbench.h"
 #include "vr/workbench_carry.h"
 #include "vr/drinks.h"
@@ -7729,6 +7730,14 @@ void OnTick(UObject player, float dt) {
     // The hands and fingers leave the player's guns and what is fitted to
     // them out of their wall checks too.
     body::hand_walls::SetOwnGear(OwnGear());
+    {
+        // Gun scopes draw their view only while at the aiming eye
+        // (vr_scope_view; render_fixes::UpdateScopes).
+        hands::Pose head;
+        FVector eye;
+        const bool have = hands::Head(&head) && AimingEye(&eye);
+        render_fixes::UpdateScopes(have, eye, have ? head.rotation.Rotate(FVector{1, 0, 0}) : FVector{}, g_clock);
+    }
     RefreshKick(player);
     g_dt = dt;
     HookGameAxes(player);

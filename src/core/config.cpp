@@ -83,6 +83,14 @@ const Block kBlocks[] = {
      "; 1 = only while one of those screens is up (the same pictures, less GPU\n"
      "; work while you play). 0 = as the game runs it.\n"
      "vr_kill_shot_camera_when_shown=0\n"},
+    {"vr_scope_view",
+     "\n"
+     "; A gun scope's lens shows a second picture of the level, and the game\n"
+     "; draws it whenever the gun moves, which in a headset is every frame, even\n"
+     "; with the gun on your back. near_eye = only while the scope is at your\n"
+     "; aiming eye (the lens keeps its last picture otherwise). always = as the\n"
+     "; game does.\n"
+     "vr_scope_view=near_eye\n"},
     {"vr_anti_aliasing",
      "\n"
      "; --- Anti-aliasing and console variables ---\n"

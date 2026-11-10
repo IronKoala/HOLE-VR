@@ -3,6 +3,7 @@
 #include <string>
 
 #include "ue/objects.h"
+#include "vr/math.h"
 
 namespace holevr::vr::render_fixes {
 // Turns off post-process effects that look wrong or cause discomfort in a
@@ -37,6 +38,12 @@ int LiveSceneCaptures(std::string* names = nullptr);
 // GPU cost test, game thread: stops those captures (pause) or starts the ones
 // it stopped again. Returns how many were switched.
 int PauseSceneCaptures(bool pause, std::string* names = nullptr);
+// Game thread, every frame: a gun scope's lens camera draws the level a second
+// time whenever the gun moves, which in a headset is every frame. With
+// vr_scope_view=near_eye (default) it draws only while the scope is at the
+// aiming eye (eye: that eye's position; look: where the head points), and
+// keeps its last picture otherwise; vr_scope_view=always leaves it to the game.
+void UpdateScopes(bool have_eye, const FVector& eye, const FVector& look, double now_s);
 
 // The exposure one object's post-process settings ask for (a camera,
 // post-process component or volume). The game raises it in dark areas
