@@ -90,6 +90,8 @@ add_library(hole_vr SHARED
     src/vr/body/finger_world_query.cpp
     src/vr/body/thumb_pose.cpp
     src/vr/body/hand_motion.cpp
+    src/vr/body/hand_rigid_contact.cpp
+    src/vr/body/hand_collision_shape.cpp
     src/vr/body/grip_record.cpp
     src/vr/body/grip_editor.cpp
     src/vr/body/body.cpp
@@ -275,7 +277,7 @@ if(HOLEVR_BUILD_TESTS)
         target_sources(test_${case} PRIVATE src/vr/body/${case}.cpp src/vr/body/finger_solve.cpp
                        src/vr/body/skeleton.cpp src/vr/body/ik_math.cpp)
     endforeach()
-    foreach(case finger_contact finger_self thumb_pose finger_world hand_motion hand_contact_pipeline)
+    foreach(case finger_contact finger_self thumb_pose finger_world hand_motion hand_contact_pipeline hand_collision_shape)
         add_executable(test_${case} tests/test_${case}.cpp src/vr/body/ik_math.cpp)
         target_include_directories(test_${case} PRIVATE src)
         if(MSVC)
@@ -285,21 +287,21 @@ if(HOLEVR_BUILD_TESTS)
         endif()
         add_test(NAME ${case} COMMAND test_${case})
     endforeach()
-    foreach(case finger_contact finger_self thumb_pose finger_world hand_contact_pipeline)
-        target_sources(test_${case} PRIVATE src/vr/body/finger_solve.cpp src/vr/body/skeleton.cpp)
+    foreach(case finger_contact finger_self thumb_pose finger_world hand_contact_pipeline hand_collision_shape)
+        target_sources(test_${case} PRIVATE src/vr/body/finger_solve.cpp src/vr/body/skeleton.cpp src/vr/body/hand_collision_shape.cpp)
     endforeach()
-    foreach(case finger_contact finger_self thumb_pose hand_contact_pipeline)
+    foreach(case finger_contact finger_self thumb_pose hand_contact_pipeline hand_collision_shape)
         target_sources(test_${case} PRIVATE src/vr/body/finger_contact.cpp src/vr/body/joint_limits.cpp)
     endforeach()
-    foreach(case thumb_pose hand_contact_pipeline)
+    foreach(case thumb_pose hand_contact_pipeline hand_collision_shape)
         target_sources(test_${case} PRIVATE src/vr/body/thumb_pose.cpp)
     endforeach()
     foreach(case finger_world hand_contact_pipeline)
         target_sources(test_${case} PRIVATE src/vr/body/finger_world_query.cpp)
     endforeach()
-    target_sources(test_finger_self PRIVATE src/vr/body/finger_self.cpp)
-    target_sources(test_hand_contact_pipeline PRIVATE src/vr/body/finger_self.cpp)
-    target_sources(test_hand_motion PRIVATE src/vr/body/hand_motion.cpp)
+    target_sources(test_finger_self PRIVATE src/vr/body/finger_self.cpp src/vr/body/thumb_pose.cpp)
+    target_sources(test_hand_contact_pipeline PRIVATE src/vr/body/finger_self.cpp src/vr/body/hand_rigid_contact.cpp src/vr/body/hand_motion.cpp)
+    target_sources(test_hand_motion PRIVATE src/vr/body/hand_motion.cpp src/vr/body/hand_rigid_contact.cpp)
 endif()
 
 # ---- Release dxgi.dll: the same DLL without its debug data ----

@@ -4,10 +4,12 @@
 #include <limits>
 #include <vector>
 #include "vr/body/hand_motion.h"
+#include "vr/body/hand_rigid_contact.h"
 
 using namespace holevr::vr;
 using namespace holevr::vr::ik;
 namespace hm = holevr::vr::body::hand_motion;
+namespace rigid = holevr::vr::body::hand_rigid_contact;
 static int failures = 0;
 #define EXPECT(c) do { if (!(c)) { std::printf("FAIL line %d: %s\n", __LINE__, #c); ++failures; } } while (0)
 
@@ -324,6 +326,113 @@ int main() {
         EXPECT(Length(rb.position-(origin+turn.Rotate(ra.position)))<1e-5);
         EXPECT(std::fabs(ra.flatness-rb.flatness)<1e-6);
         EXPECT(std::fabs(PalmGap(ra,ia.palm,a.planes[0])-PalmGap(rb,ib.palm,b.planes[0]))<1e-5);
+    }
+    // The observed 1.104 cm plateau is an immovable thumb base, not missing
+    // finger curl: root palm station2.1335 - boxface1.5 - skin.03 + radius.5.
+    // All points translate together, preserving the requested rigid shape.
+    for(double mirror:{-1.0,1.0}) {
+        const FVector normal{0,0,1};
+        const FVector root{mirror*3,2,-0.6035};
+        rigid::Plane plane[]{{{},normal,{0,0,1.5},1.5},{{},normal,root,0.5}};
+        const auto r=rigid::Resolve(plane,2);
+        EXPECT(r.valid && r.feasible && r.planes==1);
+        EXPECT(std::fabs(r.translation.Z-1.1335)<1e-6 && r.residual_cm<1e-6);
+        const FVector tip=root+FVector{0,5,0};
+        EXPECT(Length((tip+r.translation)-(root+r.translation)-(tip-root))<1e-9);
+        EXPECT(Dot(root+r.translation,normal)-0.5>=0.02999);
+    }
+    // Palm, CMC and deep finger contacts push the whole hand back; a corner
+    // contributes independent normals without forcing arbitrary joint curls.
+    {
+        rigid::Plane planes[]{{{},{0,0,1},{0,0,1.5},1.5},
+                              {{},{0,0,1},{0,0,-.6035},.5},
+                              {{},{0,0,1},{0,0,-2},.5},
+                              {{},{1,0,0},{-1,0,0},.5}};
+        const auto r=rigid::Resolve(planes,4);
+        EXPECT(r.valid && r.feasible && r.planes==2);
+        EXPECT(std::fabs(r.translation.X-1.53)<1e-6 && std::fabs(r.translation.Z-2.53)<1e-6);
+        for(const auto& p:planes) EXPECT(Dot(p.sample+r.translation-p.point,p.normal)-p.radius>=.02999);
+        rigid::Settings limited; limited.maximum_translation_cm=1;
+        const auto short_step=rigid::Resolve(planes,4,limited);
+        EXPECT(short_step.valid && !short_step.feasible && Length(short_step.translation)<=1.000001);
+        rigid::Plane impossible[]{{{2,0,0},{1,0,0},{},0},{{1,0,0},{-1,0,0},{},0}};
+        EXPECT(!rigid::Resolve(impossible,2).feasible);
+    }
+    // Reach-aware projection can move sideways as needed to retain both
+    // world clearance and valid arm length; incompatible constraints reject.
+    {
+        rigid::Settings settings; settings.skin_cm=0;
+        rigid::Plane plane{{0,4,0},{0,1,0},{},0};
+        const auto reachable=rigid::Resolve(&plane,1,settings,{{4,0,0},{},5});
+        EXPECT(reachable.valid && reachable.feasible && reachable.residual_cm<.015);
+        EXPECT(Length(FVector{4,0,0}+reachable.translation)<=5.00001);
+        EXPECT(reachable.translation.Y>3.985 && reachable.translation.X<-.98);
+        plane.point={0,6,0};
+        EXPECT(!rigid::Resolve(&plane,1,settings,{{},{},5}).feasible);
+        EXPECT(!rigid::Resolve(nullptr,0,settings,{{1e308,0,0},{-1e308,0,0},5}).valid);
+    }
+    // Post-IK/backpressure correction checks the full palm from the acquired
+    // proxy, immediately arrests blocked motion, and keeps raw history intact.
+    {
+        World w{{{{10,0,0},{-1,0,0}}}};
+        hm::State s; hm::Input in; in.palm=Palm(); Initialize(s,cfg,in,w);
+        in.target={9,0,0}; for(int i=0;i<60;++i) Step(s,cfg,in,w);
+        const FVector raw=s.last_target, anchor=s.last_anchor;
+        auto guard=[&](const FVector& target,const FQuat& rotation,const hm::Settings& settings) {
+            return hm::Constrain(s,settings,in.palm,target,rotation,
+                [&](const FVector&a,const FVector&b,double radius){return w(a,b,radius);},
+                [&](const FVector&a,const FVector&b,const FVector&half,const FQuat&q){return w.Box(a,b,half,q);});
+        };
+        const auto arrested=guard(s.position+FVector{2.304,0,0},s.rotation,cfg);
+        EXPECT(arrested.valid && arrested.touching && PalmGap(arrested,in.palm,w.planes[0])>=0.02999);
+        EXPECT(Length(s.last_target-raw)<1e-9 && Length(s.last_anchor-anchor)<1e-9);
+        const auto retracted=guard({5,0,0},s.rotation,cfg);
+        EXPECT(retracted.valid && std::fabs(s.position.X-5)<1e-7);
+        const auto saved=s.position; w.available=false;
+        EXPECT(!guard({7,0,0},ToQuat({0,35,0}),cfg).valid && Length(s.position-saved)<1e-9);
+        w.available=true; auto none=cfg; none.max_queries=0;
+        const auto no_budget=guard({7,0,0},s.rotation,none);
+        EXPECT(!no_budget.valid && no_budget.budget_limited && no_budget.queries==0 && Length(s.position-saved)<1e-9);
+    }
+    // At a low35Hz game tick, world cost stays bounded during a turn; after
+    // settling, tiny tracking jitter needs only the fresh contact queries.
+    {
+        World w{{{{10,0,0},{-1,0,0}}}};
+        hm::State s; hm::Input in; in.palm=Palm(); Initialize(s,cfg,in,w);
+        in.dt=1.0/35; in.target={20,0,0}; in.rotation=ToQuat({0,35,0});
+        hm::Result r;
+        for(int i=0;i<70;++i) {r=Step(s,cfg,in,w); EXPECT(r.queries<=24 && PalmGap(r,in.palm,w.planes[0])>=-1e-6);}
+        for(int i=0;i<70;++i) {
+            in.rotation=ToQuat({0,35+(i%2?.05:-.05),0}); r=Step(s,cfg,in,w);
+            EXPECT(r.queries<=3 && r.flatness>.99);
+        }
+    }
+    // Fresh rigid-root memory prevents spring/retraction/cache invalidation
+    // on every frame: the thumbbase itself becomes a bounded contact support.
+    // Expiry or a clear re-observation releases it; it cannot hide query loss.
+    {
+        World w{{{{10,0,0},{-1,0,0}}}};
+        hm::State s; hm::Input in; in.palm=Palm(); Initialize(s,cfg,in,w);
+        hm::RootSupport root{{10,0,0},{-1,0,0},{.6335,0,0},.5,.05};
+        in.supports=&root; in.support_count=1; in.dt=1.0/35; in.target={20,0,0};
+        hm::Result r;
+        for(int i=0;i<35;++i) {
+            // A stationary surface is re-observed at least every50ms.
+            root.remaining_seconds=(i%2==0)?.05:.05-1.0/35;
+            r=Step(s,cfg,in,w);
+            EXPECT(r.valid && r.queries<=3 && r.position.X<=8.83651);
+        }
+        EXPECT(std::fabs(r.position.X-8.8365)<1e-5 && r.touching);
+        const auto old=s.position;
+        const auto blocked=hm::Constrain(s,cfg,in.palm,{9.5,0,0},s.rotation,
+            [&](const FVector&a,const FVector&b,double radius){return w(a,b,radius);},
+            [&](const FVector&a,const FVector&b,const FVector&half,const FQuat&q){return w.Box(a,b,half,q);},&root,1);
+        EXPECT(blocked.valid && std::fabs(s.position.X-old.X)<1e-6);
+        w.available=false; r=Step(s,cfg,in,w);
+        EXPECT(r.query_failed && !r.touching && Length(s.position-old)<1e-6);
+        w.available=true; w.planes.clear(); root.remaining_seconds=0;
+        r=Step(s,cfg,in,w);
+        EXPECT(r.valid && !r.touching && r.position.X>old.X && r.flatness==0);
     }
     std::printf("hand motion: %d failure(s); positions at 72/90/120 Hz %.3f / %.3f / %.3f cm\n",failures,ends[0].X,ends[1].X,ends[2].X);
     return failures?1:0;

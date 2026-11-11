@@ -1,8 +1,10 @@
 #include "vr/body/hand_walls.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
+#include <optional>
 #include <string>
 
 #include "core/config.h"
@@ -37,7 +39,14 @@ struct Side {
     FVector plane_point, plane_normal;
     double plane_ms = 0;
     Kept plane_actor;
+    int frame_queries = 0;
+    bool verified = false;
+    double checked_ms = 0;
+    struct Support { hand_motion::RootSupport plane; double expires_ms=0; };
+    std::array<Support,80> supports{};
+    int support_count=0;
 };
+constexpr int kFrameQueryBudget = 32;
 Side g_side[2];
 hand_motion::PalmShape g_palm[2];
 perf::Counter g_perf{"body hand proxy collision"};
@@ -53,6 +62,17 @@ double g_log_age = 0;
 unsigned g_log_queries = 0, g_log_blocked = 0, g_log_recovery = 0;
 unsigned g_log_budget = 0, g_log_rotation_blocked = 0, g_log_max_queries = 0;
 double g_log_error = 0;
+
+int ActiveSupports(const Side& side, std::array<hand_motion::RootSupport,80>& out) {
+    const double now=perf::NowMs(); int count=0;
+    for(int i=0;i<side.support_count;++i) {
+        const auto& cached=side.supports[i];
+        const double remaining=(cached.expires_ms-now)/1000.0;
+        if(remaining<=0) continue;
+        out[count]=cached.plane; out[count].remaining_seconds=std::min(remaining,.05); ++count;
+    }
+    return count;
+}
 
 void RefreshAttached(UObject player, double dt) {
     g_attached_age += dt;
@@ -132,6 +152,13 @@ struct TraceAdapter {
     hand_motion::Sweep Run(ue::Call& call, Kept* actor) {
         hand_motion::Sweep hit;
         if (actor) *actor = {};
+        // The final-wrist guard reuses this adapter after finger queries have
+        // refreshed the shared ignore list. Rebind its current live extent;
+        // retaining the constructor's count could include an erased actor.
+        const auto& live_ignore = IgnoredActors();
+        TArrayRaw ignore{live_ignore.data(), static_cast<int32_t>(live_ignore.size()),
+                         static_cast<int32_t>(live_ignore.size())};
+        call.Set("ActorsToIgnore", ignore);
         call.Set("ReturnValue", false);
         if (!call.Invoke()) return hit;
         hit.available = true;
@@ -194,6 +221,7 @@ struct TraceAdapter {
         return Shapes(box, from, actor);
     }
 };
+std::optional<TraceAdapter> g_backend;
 void Remember(Side& side, const FVector& point, const FVector& normal, const Kept& actor) {
     if (Length(normal) < 0.5) return;
     side.have_plane = true;
@@ -215,6 +243,7 @@ void Reset(int side) {
     g_attached.clear();
     g_attached_age = 1e9;
     g_player = {};
+    g_backend.reset();
 }
 
 void LoadSettings() {
@@ -273,9 +302,11 @@ void Apply(UObject player, const hands::Pose& head, hands::HandState hs[2], cons
     }
     // An unavailable backend follows Step's unavailable-query policy too:
     // preserve an acquired position, or mark this local body hand invalid.
-    TraceAdapter backend(player);
+    g_backend.emplace(player);
+    TraceAdapter& backend = *g_backend;
     for (int side = 0; side < 2; ++side) {
         Side& s = g_side[side];
+        s.frame_queries = 0;
         hands::HandState& h = hs[side];
         const auto ownership = hands::GetInteraction(static_cast<hands::Hand>(side));
         if (!h.valid || grab[side].kind != hands::GrabKind::kNone ||
@@ -296,6 +327,8 @@ void Apply(UObject player, const hands::Pose& head, hands::HandState hs[2], cons
         input.anchor = head.location;
         input.dt = dt;
         input.palm = g_palm[side];
+        std::array<hand_motion::RootSupport,80> supports;
+        input.support_count=ActiveSupports(s,supports); input.supports=supports.data();
         s.result = hand_motion::Step(s.motion, S.motion, input,
             [&](const FVector& from, const FVector& to, double radius) {
                 Kept actor;
@@ -308,6 +341,10 @@ void Apply(UObject player, const hands::Pose& head, hands::HandState hs[2], cons
                 if (hit.hit && !hit.initial_overlap) contact_actor = actor;
                 return hit;
             });
+        s.frame_queries = s.result.queries;
+        if(s.result.reset) s.support_count=0;
+        s.verified = s.result.valid && !s.result.query_failed && !s.result.budget_limited;
+        s.checked_ms = perf::NowMs();
         // No verified physical placement (for example an overlapping reset
         // anchor) must not silently fall through to the raw tracked pose.
         // This is only the body copy; controls retain their actual tracking.
@@ -337,6 +374,7 @@ void Apply(UObject player, const hands::Pose& head, hands::HandState hs[2], cons
             const FVector forward = h.grip.rotation.Rotate(FVector{1,0,0});
             auto hit = backend.Trace(h.grip.location, h.grip.location + forward * S.probe, kProbeRadius, &actor);
             ++s.result.queries;
+            ++s.frame_queries;
             if (hit.available && hit.hit && !hit.initial_overlap && Length(hit.normal) > 0.5) {
                 s.ahead = true;
                 Remember(s, hit.point, hit.normal, actor);
@@ -372,6 +410,68 @@ const std::vector<UObject>& IgnoredActors() {
     return g_ignore;
 }
 void SetOwnGear(const std::vector<UObject>& actors) { g_own_gear = actors; }
+
+hand_motion::Result ConstrainFinal(int side, const hands::Pose& requestedGrip) {
+    hand_motion::Result unavailable;
+    if (side<0 || side>1 || !S.on || !g_backend || !Alive(g_player)) return unavailable;
+    Side& s=g_side[side];
+    if (!s.motion.valid || !s.result.valid || perf::NowMs()-s.checked_ms>100.0) return unavailable;
+    // Apply already verified this exact pose during the same body frame.
+    if (s.verified && Length(requestedGrip.location-s.motion.position)<1e-7 &&
+        Length((Normalized(requestedGrip.rotation*s.motion.rotation.Inverse())).Rotate({1,0,0})-FVector{1,0,0})<1e-9 &&
+        Length((Normalized(requestedGrip.rotation*s.motion.rotation.Inverse())).Rotate({0,1,0})-FVector{0,1,0})<1e-9) {
+        auto same=s.result; same.queries=0; return same;
+    }
+    hand_motion::Settings settings=S.motion;
+    settings.max_queries=std::max(0,kFrameQueryBudget-s.frame_queries);
+    Kept actor;
+    std::array<hand_motion::RootSupport,80> supports;
+    const int support_count=ActiveSupports(s,supports);
+    perf::Scope timer(g_perf);
+    auto result=hand_motion::Constrain(s.motion,settings,g_palm[side],requestedGrip.location,requestedGrip.rotation,
+        [&](const FVector& from,const FVector& to,double radius) {
+            Kept hit_actor; auto hit=g_backend->Trace(from,to,radius,&hit_actor);
+            if(hit.hit && !hit.initial_overlap) actor=hit_actor;
+            return hit;
+        },[&](const FVector& from,const FVector& to,const FVector& half,const FQuat& rotation) {
+            Kept hit_actor; auto hit=g_backend->Box(from,to,half,rotation,&hit_actor);
+            if(hit.hit && !hit.initial_overlap) actor=hit_actor;
+            return hit;
+        },supports.data(),support_count);
+    s.frame_queries+=result.queries;
+    g_log_queries+=result.queries;
+    g_log_budget+=result.budget_limited?1:0;
+    g_log_rotation_blocked+=result.rotation_blocked?1:0;
+    g_log_max_queries=std::max(g_log_max_queries,static_cast<unsigned>(s.frame_queries));
+    if (result.valid) {
+        s.verified=true; s.checked_ms=perf::NowMs();
+        // Retain measured pressure only while the same fresh palm plane still
+        // supports the checked correction. No stale plane survives failure.
+        if(result.touching && s.result.touching && Dot(result.normal,s.result.normal)>.95)
+            result.flatness=s.result.flatness;
+        s.result=result; s.result.queries=s.frame_queries;
+        s.have_plane=false; s.ahead=false;
+        if(result.touching) Remember(s,result.point,result.normal,actor);
+    } else { s.have_plane=false; s.ahead=false; s.verified=false; }
+    return result;
+}
+void SetRigidSupports(int side, const hand_rigid_contact::Plane* planes, const double* age_seconds, int count) {
+    if(side<0 || side>1) return;
+    Side& s=g_side[side];
+    if(count==0) {s.support_count=0;return;}
+    if(count<0 || count>80 || !planes || !age_seconds || !s.verified || !s.motion.valid) return;
+    s.support_count=0;
+    const double now=perf::NowMs(); const FQuat inverse=s.motion.rotation.Inverse();
+    for(int i=0;i<count;++i) {
+        const auto& p=planes[i]; const double age=age_seconds[i];
+        if(!std::isfinite(age)||age<0||age>=.05 || !std::isfinite(Length(p.point)) ||
+           !std::isfinite(Length(p.sample)) || !std::isfinite(Length(p.normal)) || Length(p.normal)<.5 ||
+           !std::isfinite(p.radius)||p.radius<0||p.radius>20) continue;
+        auto& saved=s.supports[s.support_count++];
+        saved.plane={p.point,Normalize(p.normal),inverse.Rotate(p.sample-s.motion.position),p.radius,.05-age};
+        saved.expires_ms=now+(.05-age)*1000.0;
+    }
+}
 void SetPalmShape(int side, const hand_motion::PalmShape& shape) {
     if (side < 0 || side > 1) return;
     const auto& before = g_palm[side];

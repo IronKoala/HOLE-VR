@@ -1,14 +1,15 @@
-# Combined build: ik14-combined
+# Combined build: hands4-8914320
 
-This checkout retains the calibration, hand physics, weapon vise, watch and holster
-updates together. The incremental source patch starts from IK13 commit
-`e87033ac43fc400d9c17bbd8495d4500af0a89ef`.
+This checkout retains calibration, hand physics, weapon vise, watch and holster
+updates together. The hand patch starts from the installed November 11 source
+`8914320dd273f209061c179bf634967973dd4976`. This includes the newer arm limits,
+reload poses, visible-wall queries, own-gear exclusions, scope and audio updates.
 
 | Component | Included source |
 | --- | --- |
-| Elbow posture | IK14: body-near rest preference, persistent medial cost and continuous full-domain search |
+| Elbow posture | Current joint limits, rifle elbow preference, support relief and shoulder twist |
 | Calibration | IK13: dual-trigger capture/haptics over IK12 comfortable-pose fitting and v6 provenance |
-| Hand physics | Hands3, frozen patch SHA256 `050f7104730ed58619632466156f2c5207b7a6387894f9d888801e37b3cb6601` |
+| Hand physics | Hands4: firm object contact, cooperative self-contact, fitted geometry, fresh queries and final wrist verification |
 | Vise | V4, retained-ammunition fix, audit1 patch `2f74611ea01ca0e5997b2d4514f01c876a78e1a1a9839f11bc8e077b5679f947` |
 | Watch | Model v3/integration v1, runtime filename reflection fix |
 | Holster | Model v4/runtime v5 |
@@ -27,14 +28,14 @@ The IK11 skin correction remains: solved segment lengths scale the longitudinal
 bone direction while limb thickness, hand/finger size and rigid watch size remain
 independent. Saved calibration geometry is unchanged by installation or loading.
 
-Accessory ownership guards and the complete Hands3 delta remain integrated.
+Accessory ownership guards remain integrated. Hands4 extends the complete Hands3 baseline.
 The installer embeds two watch PNGs and four holster WAVs. It creates missing
 defaults while preserving existing calibration, settings, grips, artwork and sounds.
 A fresh hash-verified full mod backup precedes deployment.
 
 Build with both `HOLEVR_BUILD_TESTS=ON` and `HOLEVR_BUILD_HAND_TESTS=ON`.
-The package records every passing suite, installer fixture checks, exact committed
-source and content hashes. Installer fixtures cover absent defaults, custom files
+The package records every passing suite, installer fixture checks, the source base plus the exact hand patch,
+source manifest and content hashes. Installer fixtures cover absent defaults, custom files
 and an asset-folder failure before replacing the DLL.
 
 The dual-trigger regression drives the actual calibration Session at multiple

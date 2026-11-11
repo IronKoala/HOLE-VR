@@ -19,6 +19,7 @@
 #include "ue/objects.h"
 #include "vr/hands.h"
 #include "vr/body/hand_motion.h"
+#include "vr/body/hand_rigid_contact.h"
 #include <vector>
 
 namespace holevr::vr::body::hand_walls {
@@ -45,6 +46,16 @@ hand_motion::Result Motion(int side);
 // Rebuilt by body from FreeHand and rig landmarks before Apply. Extents include
 // the full palm volume; the palm-facing surface is centre + rotated Z * half.Z.
 void SetPalmShape(int side, const hand_motion::PalmShape& shape);
+// Rigid finger backpressure/final IK guard. requestedGrip must represent the
+// actual drawn wrist mapping. Re-solve the arm if the checked pose differs;
+// never move only the hand bone. Invalid means retain a previously verified
+// pose or suppress this draw, not accept requestedGrip. Shares Apply's budget.
+hand_motion::Result ConstrainFinal(int side, const hands::Pose& requestedGrip);
+// After accepting the final wrist+finger geometry, remember its world-space
+// witnesses in checked grip-local coordinates. Ages are the ORIGINAL query
+// ages, not zeroed because a cached contact was reused. Max80; count0 clears.
+// Constraints expire after only the remainder of that50ms observation window.
+void SetRigidSupports(int side, const hand_rigid_contact::Plane* planes, const double* age_seconds, int count);
 
 // hs: this frame's local body hand copies. The proxy's translation/rotation
 // are applied consistently to grip, aim, wrist and palm direction.

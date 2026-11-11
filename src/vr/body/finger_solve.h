@@ -12,6 +12,7 @@
 #include <functional>
 
 #include "vr/body/skeleton.h"
+#include "vr/body/hand_collision_shape.h"
 
 namespace holevr::vr::fingers {
 
@@ -23,6 +24,7 @@ struct Chain {
     FVector flex[3];        // flex axis of each joint, in that joint's reference frame (+ = curl)
     FVector spread;         // sideways axis of the base joint, in its reference frame
     double length = 0;      // base joint to fingertip, straight
+    hand_collision_shape::Segment collision[3];
 };
 
 // joints: the finger's three joints in hand space (reference pose).

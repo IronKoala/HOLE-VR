@@ -30,8 +30,8 @@ bool ValidHit(const Sweep& hit) {
 
 void Reset(State& state) { state = {}; }
 
-Result Step(State& state, const Settings& settings, const Input& input, const SweepFn& sweep,
-            const BoxSweepFn& box_sweep) {
+static Result StepImpl(State& state, const Settings& settings, const Input& input, const SweepFn& sweep,
+                       const BoxSweepFn& box_sweep, bool direct) {
     using namespace ik;
     Result result;
     if (!input.tracked || !Finite(input.target) || !Finite(input.anchor) || !Finite(input.rotation) || !sweep) {
@@ -45,17 +45,29 @@ Result Step(State& state, const Settings& settings, const Input& input, const Sw
         palm.half.X < 0.05 || palm.half.Y < 0.05 || palm.half.Z < 0.05 || Length(palm.half) > 50 || Length(palm.centre) > 100)) {
         Reset(state); result.reset = true; return result;
     }
+    if(input.support_count<0 || input.support_count>80 || (input.support_count && !input.supports)) {
+        result.query_failed=true; return result;
+    }
+    for(int i=0;i<input.support_count;++i) {
+        const auto& p=input.supports[i];
+        if(!Finite(p.point)||!Finite(p.normal)||!Finite(p.local_sample)||!std::isfinite(Length(p.normal))||
+           Length(p.normal)<.5 || Length(p.local_sample)>100 ||
+           !std::isfinite(p.remaining_seconds)||!std::isfinite(p.radius)||p.radius<0||p.radius>20) {
+            result.query_failed=true; return result;
+        }
+    }
     const double dt = std::isfinite(input.dt) ? std::clamp(input.dt, 0.0, settings.max_frame_seconds) : 0.0;
     const bool jump = state.valid && (Length(input.target - state.last_target) > settings.discontinuity_cm ||
                                      Length(input.anchor - state.last_anchor) > settings.discontinuity_cm);
-    if (input.discontinuity || jump || input.dt > settings.max_frame_seconds) {
+    int support_count = state.valid ? input.support_count : 0;
+    if (!direct && (input.discontinuity || jump || input.dt > settings.max_frame_seconds)) {
         Reset(state);
+        support_count=0;
         result.reset = true;
     }
-    state.last_target = input.target;
-    state.last_anchor = input.anchor;
+    if (!direct) { state.last_target = input.target; state.last_anchor = input.anchor; }
     auto query = [&](const FVector& from, const FVector& to, const FQuat& rotation, double padding = 0.0) {
-        if (result.queries >= std::clamp(settings.max_queries, 8, 128)) {
+        if (result.queries >= std::clamp(settings.max_queries, 0, 128)) {
             result.budget_limited = true;
             return Sweep{};
         }
@@ -76,6 +88,31 @@ Result Step(State& state, const Settings& settings, const Input& input, const Sw
             result.query_failed = true;
         }
         if (hit.hit && hit.available) hit.normal = Normalize(hit.normal);
+        if (hit.available) {
+            const FVector movement=to-from;
+            const double length2=Dot(movement,movement);
+            double earliest=hit.hit ? (hit.initial_overlap ? -1.0 :
+                (length2>1e-12 ? std::clamp(Dot(hit.centre-from,movement)/length2,0.0,1.0) : 0.0)) : 2.0;
+            // These observations keep a corrected rigid hand from repeatedly
+            // re-entering a known wall while its expensive geometry audit is
+            // cached. They never outlive the original50ms observation window.
+            for(int i=0;i<support_count && earliest>=0;++i) {
+                const auto& p=input.supports[i];
+                if(p.remaining_seconds<=0 || p.remaining_seconds>.050001) continue;
+                const FVector n=Normalize(p.normal), offset=rotation.Rotate(p.local_sample);
+                const double radius=p.radius+padding;
+                const double d0=Dot(from+offset-p.point,n), d1=Dot(to+offset-p.point,n);
+                if(d0<radius-1e-7) {
+                    hit.hit=hit.initial_overlap=true; hit.centre=from;
+                    hit.point=p.point; hit.normal=n; earliest=-1; break;
+                }
+                if(d1>=radius-1e-10 || d0-d1<1e-12) continue;
+                const double t=std::clamp((d0-radius)/(d0-d1),0.0,1.0);
+                if(t>=earliest) continue;
+                earliest=t; hit.hit=true; hit.initial_overlap=false;
+                hit.centre=from+movement*t; hit.point=p.point; hit.normal=n;
+            }
+        }
         return hit;
     };
     auto contact = [&](const Sweep& hit) {
@@ -99,13 +136,14 @@ Result Step(State& state, const Settings& settings, const Input& input, const Sw
         return true;
     };
     if (!state.valid) {
+        if (direct) { result.query_failed = true; return result; }
         result.reset = true;
         if (!reacquire()) return result;
     } else {
         const FVector start = state.position;
         const bool was_touching = state.touching;
         const FVector old_normal = state.normal;
-        FVector proposed = start;
+        FVector proposed = direct ? input.target : start;
         const double omega = 2.0 * kPi * settings.frequency_hz;
         const double mass = std::max(0.01, settings.virtual_mass_kg);
         const double max_acceleration = std::max(0.0, settings.max_force_n) * 100.0 / mass;
@@ -131,6 +169,7 @@ Result Step(State& state, const Settings& settings, const Input& input, const Sw
             // A moving object overtook the previous proxy. Reacquire only
             // along a verified anchor path; never teleport to the raw target.
             result.recovering = true;
+            if (direct) { result.query_failed = true; return result; }
             if (!reacquire()) return result;
         } else if (move.hit) {
             contact(move);
@@ -178,7 +217,7 @@ Result Step(State& state, const Settings& settings, const Input& input, const Sw
                         std::clamp((0.85 - side) / 0.25, 0.0, 1.0);
             wanted = Normalized(Scale(Arc(raw_box.Rotate({0,0,1}), into), pressure) * wanted);
         }
-        FQuat proposed_rotation = state.rotation;
+        FQuat proposed_rotation = direct ? wanted : state.rotation;
         const double angular_omega = 2.0 * kPi * settings.angular_frequency_hz;
         const double inertia = std::max(1e-6, settings.virtual_inertia);
         const double max_angular_acceleration = std::max(0.0, settings.max_torque_nm) / inertia;
@@ -201,15 +240,40 @@ Result Step(State& state, const Settings& settings, const Input& input, const Sw
             // toward the spring target. Every intermediate motion is checked;
             // corners can reject rotation instead of accepting a buried palm.
             const double angle = Length(RotationError(proposed_rotation, state.rotation));
-            const int turns = angle > 1e-7 ? static_cast<int>(std::ceil(angle / (5.0*kDegToRad))) : 0;
+            // Sub-degree tracking noise does not justify repeated expanded
+            // box/retreat/seating queries against a stationary wall.
+            const double angular_deadzone = direct ? 1e-7 : 0.2*kDegToRad;
+            const int turns = angle > angular_deadzone ? static_cast<int>(std::ceil(angle / (5.0*kDegToRad))) : 0;
             const FQuat begin_rotation = state.rotation;
             const FQuat delta = Normalized(proposed_rotation * begin_rotation.Inverse());
             for (int turn = 1; turn <= turns; ++turn) {
                 const FQuat next = Normalized(Scale(delta, static_cast<double>(turn)/turns) * begin_rotation);
                 const double part = Length(RotationError(next, state.rotation));
-                const double padding = 2.0 * (Length(palm.centre) + Length(palm.half)) * std::sin(part * 0.5) + 1e-5;
+                double envelope_radius=Length(palm.centre)+Length(palm.half);
+                for(int i=0;i<support_count;++i) if(input.supports[i].remaining_seconds>0)
+                    envelope_radius=std::max(envelope_radius,Length(input.supports[i].local_sample));
+                const double padding = 2.0 * envelope_radius * std::sin(part * 0.5) + 1e-5;
                 FVector clearance = state.position;
                 bool clear = false;
+                // This frame already established this plane using the real
+                // palm. Start with its exact clearance instead of asking an
+                // expanded overlap and then rediscovering the same wall.
+                if (result.touching) {
+                    const FQuat box = Normalized(state.rotation * palm.rotation);
+                    const FVector n = result.normal;
+                    const double x = std::fabs(Dot(box.Rotate({1,0,0}),n));
+                    const double y = std::fabs(Dot(box.Rotate({0,1,0}),n));
+                    const double z = std::fabs(Dot(box.Rotate({0,0,1}),n));
+                    const double support = palm.half.X*x + palm.half.Y*y + palm.half.Z*z;
+                    const double gap = Dot(clearance + state.rotation.Rotate(palm.centre) - result.point,n) - support;
+                    const double amount = padding*(x+y+z)+settings.skin_cm-gap;
+                    if (amount > 1e-6) {
+                        const FVector out = clearance+n*amount;
+                        const Sweep retreat = query(clearance,out,state.rotation);
+                        if (!retreat.available) { state.angular_velocity={}; result.rotation_blocked=true; break; }
+                        if (!retreat.hit) clearance=out;
+                    }
+                }
                 for (int attempt = 0; attempt < 4; ++attempt) {
                     const Sweep guard = query(clearance, clearance, state.rotation, padding);
                     if (!guard.available) break;
@@ -228,6 +292,11 @@ Result Step(State& state, const Settings& settings, const Input& input, const Sw
                     clearance = out;
                 }
                 if (!clear) { state.angular_velocity = {}; result.rotation_blocked = true; break; }
+                if (!result.touching && Length(clearance-proposed)<1e-8) {
+                    // The empty rotation envelope already proves this pose.
+                    state.rotation=next;
+                    continue;
+                }
                 const Sweep seated = query(clearance, proposed, next);
                 if (!seated.available || seated.initial_overlap) { state.angular_velocity = {}; result.rotation_blocked = true; break; }
                 state.position = seated.hit ? seated.centre + seated.normal * settings.skin_cm : proposed;
@@ -257,6 +326,34 @@ Result Step(State& state, const Settings& settings, const Input& input, const Sw
     // Persistent disagreement changes recovery state, never the positional
     // collision rule. Force is already capped; releasing is always possible.
     result.recovering = result.recovering || state.blocked_seconds >= settings.recovery_seconds;
+    return result;
+}
+
+Result Step(State& state, const Settings& settings, const Input& input, const SweepFn& sweep,
+            const BoxSweepFn& box_sweep) {
+    return StepImpl(state,settings,input,sweep,box_sweep,false);
+}
+
+Result Constrain(State& state, const Settings& settings, const PalmShape& palm,
+                 const FVector& position, const FQuat& rotation, const SweepFn& sweep,
+                 const BoxSweepFn& box_sweep, const RootSupport* supports, int support_count) {
+    State candidate=state;
+    Input input; input.target=position; input.rotation=rotation;
+    input.anchor=state.last_anchor; input.palm=palm; input.palm.flatten=false;
+    input.supports=supports; input.support_count=support_count;
+    auto result=StepImpl(candidate,settings,input,sweep,box_sweep,true);
+    if (result.query_failed || result.budget_limited) { result.valid=false; return result; }
+    if (result.valid) {
+        // A rigid obstruction should stop normal velocity, not accumulate
+        // spring energy that fights the corrected wrist on the next frame.
+        const FVector shift=candidate.position-state.position;
+        if (Length(shift)>1e-7) {
+            const FVector normal=Normalize(shift);
+            const double inward=Dot(candidate.velocity,normal);
+            if (inward<0) candidate.velocity=candidate.velocity-normal*inward;
+        }
+        state=candidate;
+    }
     return result;
 }
 

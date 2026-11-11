@@ -20,6 +20,22 @@ fingers::Angles Pose(const jl::Turn t[3], const finger_contact::Bounds& b) {
     for (int j = 0; j < 3; ++j) a.extra[j] = jl::Compose(b.axes[j], Limit(b.limits[j], t[j]));
     return a;
 }
+jl::Turn OpenBase(const fingers::Chain& c,const FVector& palm,const finger_contact::Bounds& bounds) {
+    jl::Turn open[3];
+    open[1].flex=5.0*kDegToRad-bounds.limits[1].ref_bend;
+    open[2].flex=3.0*kDegToRad-bounds.limits[2].ref_bend;
+    skel::Xf joints[3]; FVector tip;
+    fingers::Fk(c,Pose(open,bounds),joints,&tip);
+    const FVector ray=tip-joints[0].translation;
+    const FVector tangent=Reject(ray,Normalize(palm));
+    if(Length(ray)<1e-6 || Length(tangent)<1e-6) return {};
+    // The free open thumb belongs in its anatomical palm plane. A baked
+    // saddle reference can point the entire chain several centimeters out
+    // of that plane even at zero input. Rotate the generated open ray about
+    // its fixed CMC origin; do not move the origin or use a world contact.
+    const auto q=c.ref[0].rotation.Inverse()*Arc(ray,tangent)*c.ref[0].rotation;
+    return Limit(bounds.limits[0],jl::Decompose(bounds.axes[0],q));
+}
 } // namespace
 
 FVector PadDirection(const fingers::Chain& c, const fingers::Angles& pose, const FVector& palm) {
@@ -66,6 +82,14 @@ fingers::Angles Target(const fingers::Chain& c, const FVector& palm, const FVect
     const double initial = alignment(0);
     for (int trial = 0; trial < 5 && alignment(twist) < initial; ++trial) twist *= 0.5;
     if (alignment(twist) >= initial) turn[0].twist = twist;
+    // Full power grip and pinch retain their existing targets. The neutral
+    // saddle orientation fades out smoothly as opposition takes over.
+    if(opposition<1.0) {
+        const jl::Turn open_base=OpenBase(c,palm,bounds);
+        turn[0].flex=open_base.flex*(1.0-opposition)+turn[0].flex*opposition;
+        turn[0].side=open_base.side*(1.0-opposition)+turn[0].side;
+        turn[0].twist=open_base.twist*(1.0-opposition)+turn[0].twist;
+    }
     return Pose(turn, bounds);
 }
 

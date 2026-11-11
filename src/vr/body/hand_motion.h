@@ -15,7 +15,7 @@ struct Settings {
     double friction_per_s = 5.0;
     double recovery_distance_cm = 40.0, recovery_seconds = 0.25;
     double discontinuity_cm = 80.0, max_frame_seconds = 0.10;
-    int max_queries = 48; // Includes translation, slide, rotation clearance and seating.
+    int max_queries = 24; // Includes translation, slide, rotation clearance and seating.
 };
 
 struct Sweep {
@@ -34,6 +34,10 @@ struct PalmShape {
     bool flatten = true;
     double press_cm = 4.0;
 };
+struct RootSupport {
+    FVector point, normal, local_sample; // witness centre in grip-local space
+    double radius = 0, remaining_seconds = 0;
+};
 
 struct Input {
     bool tracked = true, discontinuity = false;
@@ -41,6 +45,8 @@ struct Input {
     FQuat rotation;
     double dt = 0;
     PalmShape palm;
+    const RootSupport* supports = nullptr;
+    int support_count = 0;
 };
 struct State {
     bool valid = false, touching = false;
@@ -66,5 +72,11 @@ void Reset(State& state);
 // placing the proxy; a blocked hand is never snapped to its raw target.
 Result Step(State& state, const Settings& settings, const Input& input, const SweepFn& sweep,
             const BoxSweepFn& box_sweep = {});
+// Check a requested rigid correction/final IK pose from an already acquired
+// proxy. No spring lag or tracking reset; returns a blocked/partial safe pose
+// when necessary. Failure is explicit and does not commit tentative motion.
+Result Constrain(State& state, const Settings& settings, const PalmShape& palm,
+                 const FVector& position, const FQuat& rotation, const SweepFn& sweep,
+                 const BoxSweepFn& box_sweep = {}, const RootSupport* supports = nullptr, int support_count = 0);
 
 } // namespace holevr::vr::body::hand_motion

@@ -3,6 +3,7 @@
 #include <cstdio>
 
 #include "vr/body/thumb_pose.h"
+#include "fixtures/white_man_hands.h"
 
 using namespace holevr::vr;
 using namespace holevr::vr::ik;
@@ -53,6 +54,9 @@ int main() {
     std::printf("thumb pad toward index: without base axial rotation %.3f, with opposition %.3f\n",before,after);
     // Pinch and power wrapping use distinct MCP/IP configurations.
     EXPECT(std::fabs(jl::Decompose(b.axes[1],pinch.extra[1]).flex-jl::Decompose(b.axes[1],wrap.extra[1]).flex)>0.1);
+    // Full opposition endpoints retain the original input curves.
+    EXPECT(std::fabs(jl::Decompose(b.axes[0],wrap.extra[0]).flex-35*kDegToRad)<1e-7);
+    EXPECT(std::fabs(jl::Decompose(b.axes[0],pinch.extra[0]).flex-25*kDegToRad)<1e-7);
 
     // Curves remain continuous and bounded as trigger/grip vary.
     auto last=open;
@@ -99,6 +103,62 @@ int main() {
         Bounded(curled,pose,cb);
         const double anatomical=jl::Decompose(cb.axes[1],pose.extra[1]).flex+cb.limits[1].ref_bend;
         EXPECT(std::fabs(anatomical-5*kDegToRad)<1e-7);
+    }
+    // The actual game's baked thumb reference points out through the palm
+    // plane. Neutral input rotates the generated CMC orientation without
+    // moving its fixed origin or changing the MCP/IP anatomical open bend.
+    for(int side=0;side<2;++side) {
+        fingers::Chain chains[5]; fc::Bounds bounds[5]; FVector normal;
+        white_man_hands::Build(side,chains,bounds,&normal);
+        const auto pose=tp::Target(chains[0],normal,chains[1].ref[0].translation,{},bounds[0]);
+        Bounded(chains[0],pose,bounds[0]);
+        skel::Xf joints[3]; FVector tip;
+        fingers::Fk(chains[0],pose,joints,&tip);
+        const double root=Dot(joints[0].translation,normal);
+        const double stations[4]={root,Dot(joints[1].translation,normal),Dot(joints[2].translation,normal),Dot(tip,normal)};
+        const auto base=jl::Decompose(bounds[0].axes[0],pose.extra[0]);
+        std::printf("actual thumb side%d open palm stations %.3f %.3f %.3f %.3f cm; CMC %.2f %.2f %.2f deg\n",
+                    side,stations[0],stations[1],stations[2],stations[3],base.flex*kRadToDeg,base.side*kRadToDeg,base.twist*kRadToDeg);
+        EXPECT(Length(joints[0].translation-chains[0].ref[0].translation)<1e-9);
+        EXPECT(std::fabs(root-2.1335)<.001);
+        EXPECT(*std::max_element(stations,stations+4)<=root+.30);
+        EXPECT(std::fabs(jl::Decompose(bounds[0].axes[1],pose.extra[1]).flex+bounds[0].limits[1].ref_bend-5*kDegToRad)<1e-7);
+        EXPECT(std::fabs(jl::Decompose(bounds[0].axes[2],pose.extra[2]).flex+bounds[0].limits[2].ref_bend-3*kDegToRad)<1e-7);
+        // Changing thumb intention cannot mutate the other chains or their
+        // independent generated open targets.
+        skel::Xf other_before[3],other_after[3]; FVector before_tip,after_tip;
+        const auto other=fc::CurlTarget(chains[1],0,bounds[1]);
+        fingers::Fk(chains[1],other,other_before,&before_tip);
+        for(int mode=0;mode<2;++mode) {
+            auto previous=pose;
+            for(int step=1;step<=200;++step) {
+                const double amount=step/200.0;
+                const auto current=tp::Target(chains[0],normal,chains[1].ref[0].translation,
+                    {mode==0?amount:0,mode==1?amount:0,false},bounds[0]);
+                Bounded(chains[0],current,bounds[0]);
+                for(int j=0;j<3;++j) {
+                    const auto delta=Normalized(current.extra[j]*previous.extra[j].Inverse());
+                    EXPECT(std::fabs(delta.W)>.999);
+                }
+                previous=current;
+            }
+        }
+        fingers::Fk(chains[1],other,other_after,&after_tip);
+        EXPECT(Length(after_tip-before_tip)<1e-12);
+    }
+    // The neutral correction is defined in anatomical hand space, so a
+    // different bone roll or mirrored rig cannot change its geometry.
+    {
+        const auto left=Thumb(true),rolled=Thumb(false,true);
+        const auto lb=fc::MakeBounds(left,0),rb=fc::MakeBounds(rolled,0);
+        const auto lpose=tp::Target(left,{0,-1,0},{index.X,-index.Y,index.Z},{},lb);
+        const auto rpose=tp::Target(rolled,palm,index,{},rb);
+        skel::Xf joints[3]; FVector tip,ltip,rtip;
+        fingers::Fk(c,open,joints,&tip);
+        fingers::Fk(left,lpose,joints,&ltip); fingers::Fk(rolled,rpose,joints,&rtip);
+        EXPECT(Length(ltip-FVector{tip.X,-tip.Y,tip.Z})<1e-7);
+        EXPECT(Length(rtip-tip)<1e-7);
+        Bounded(left,lpose,lb); Bounded(rolled,rpose,rb);
     }
     if(failures) { std::printf("thumb pose: %d failures\n",failures); return 1; }
     std::puts("thumb pose: all tests passed"); return 0;

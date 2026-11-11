@@ -8,6 +8,10 @@ using Stats = finger_world_query::Stats;
 void LoadSettings();
 bool Enabled();
 void Reset(int side = -1);
+void InvalidateGeometry(int side);
+using Verification = finger_world_query::Verification;
+Verification VerifyGeometry(ue::UObject player, int side, const fingers::Chain chains[5],
+                            const fingers::Angles resolved[5], const skel::Xf& hand, double radius_cm);
 
 // Game thread, after hand_walls::Apply has refreshed its ignore list. Query
 // requested geometry, then pass the returned per-digit patches to the pure

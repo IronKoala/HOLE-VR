@@ -23,11 +23,13 @@ ue::UObject g_player[2]{};
 ue::UObject g_ksl=0, g_gps=0;
 double g_next_lookup_ms=0;
 perf::Counter g_perf{"body individual finger geometry queries", {}, {}, {}, true};
+perf::Counter g_verify_perf{"body final finger geometry verification", {}, {}, {}, true};
 
 struct Adapter final : Backend {
     ue::Call trace, hit_break;
     int radius_size=0, trace_hit_size=0, break_hit_size=0;
     bool usable=false;
+    int invocations=0;
     const std::vector<ue::UObject>& ignore;
 
     Adapter(ue::UObject player, const std::vector<ue::UObject>& ignored)
@@ -94,6 +96,7 @@ struct Adapter final : Backend {
     // One sweep as the call is set up now.
     QueryStatus One(Hit& hit) {
         hit={};
+        ++invocations;
         if (!trace.Invoke()) return QueryStatus::unavailable;
         if (!trace.Result<bool>()) return QueryStatus::clear;
         int32_t source_size=0,target_size=0;
@@ -102,6 +105,7 @@ struct Adapter final : Backend {
         if (!source || !target || source_size!=trace_hit_size || target_size!=source_size)
             return QueryStatus::unavailable;
         std::memcpy(target,source,static_cast<size_t>(source_size));
+        ++invocations;
         if (!hit_break.Invoke()) return QueryStatus::unavailable;
         if (!hit_break.Get<bool>("bBlockingHit")) return QueryStatus::clear;
         const auto actor=hit_break.Get<ue::UObject>("HitActor");
@@ -118,6 +122,23 @@ struct Adapter final : Backend {
         hit.surface_id=component ? component : actor;
         return QueryStatus::hit;
     }
+    bool SurfaceTransform(std::uint64_t identity,skel::Xf& frame) override {
+        const auto component=static_cast<ue::UObject>(identity);
+        // Only a rigid, ordinary static mesh has one transform for all its
+        // collision features. Instanced/skeletal/procedural subclasses and
+        // actor fallbacks intentionally use real sweeps instead.
+        if(!ue::IsLive(component) || ue::GetName(ue::GetClass(component))!="StaticMeshComponent") return false;
+        const auto owner=ue::GetOuter(component);
+        if(std::find(ignore.begin(),ignore.end(),owner)!=ignore.end()) return false;
+        ue::Call transform(component,"K2_GetComponentToWorld");
+        int32_t size=0;
+        if(!transform.Valid() || !transform.Raw("ReturnValue",&size) || size!=sizeof(skel::Xf)) return false;
+        ++invocations;
+        if(!transform.Invoke()) return false;
+        frame=transform.Result<skel::Xf>();
+        return true;
+    }
+    int InvocationCount() const override { return invocations; }
 };
 }  // namespace
 
@@ -136,6 +157,19 @@ void LoadSettings() {
     Reset();
 }
 bool Enabled() { return g_enabled; }
+void InvalidateGeometry(int side) {
+    if(side>=0 && side<2) finger_world_query::InvalidateGeometry(g_state[side]);
+}
+Verification VerifyGeometry(ue::UObject player,int side,const fingers::Chain chains[5],
+                            const fingers::Angles resolved[5],const skel::Xf& hand,double radius_cm) {
+    if(side<0 || side>1 || !g_enabled || !player || player!=g_player[side] ||
+       !ue::IsLive(player) || !g_ksl || !g_gps) return {};
+    perf::Scope timer(g_verify_perf);
+    Adapter backend(player,body::hand_walls::IgnoredActors());
+    if(!backend.usable) return {};
+    return finger_world_query::VerifyGeometry(g_state[side],MakeGeometry(chains,resolved,hand,radius_cm),
+                                              backend,g_settings);
+}
 
 Stats Update(ue::UObject player, int side, const fingers::Chain chains[5],
              const fingers::Angles proposed[5], const skel::Xf& hand,
@@ -152,7 +186,7 @@ Stats Update(ue::UObject player, int side, const fingers::Chain chains[5],
         g_gps=ue::FindObject("GameplayStatics /Script/Engine.Default__GameplayStatics");
     }
     if (!g_ksl || !g_gps) { Reset(side); return {}; }
-    static const bool registered=[] { perf::Register(&g_perf); return true; }();
+    static const bool registered=[] { perf::Register(&g_perf); perf::Register(&g_verify_perf); return true; }();
     (void)registered;
     perf::Scope timer(g_perf);
     Adapter backend(player,body::hand_walls::IgnoredActors());
