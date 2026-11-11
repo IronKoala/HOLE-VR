@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <iterator>
 #include <mutex>
 #include <string>
@@ -189,7 +190,7 @@ struct Kind {
 
 UObject g_cls_pp_component = 0, g_cls_pp_volume = 0, g_cls_camera = 0, g_cls_capture = 0;
 int32_t g_pp_component_settings = -1, g_pp_volume_settings = -1, g_camera_settings = -1;
-refl::PropertyInfo g_capture_every_frame, g_capture_on_movement, g_component_visible;
+refl::PropertyInfo g_capture_every_frame, g_capture_on_movement, g_component_visible, g_capture_fov;
 bool g_disable_player_capture = true;
 bool g_kill_shot_camera_when_shown = false;
 bool g_ready = false;
@@ -210,6 +211,8 @@ std::string g_live_names;
 // g_captures_mutex. UpdateScopes (game thread) switches them.
 std::vector<Target> g_scopes;
 bool g_scope_near_eye = true;  // vr_scope_view=near_eye
+bool g_scope_zoom_eye = true;  // vr_scope_zoom=eye or flat (not game)
+bool g_scope_zoom_flat = false; // vr_scope_zoom=flat
 // The last list of scene captures logged (background thread only).
 std::string g_census_logged;
 std::unordered_map<UObject, Kind> g_kinds;
@@ -406,6 +409,8 @@ bool Init() {
         g_capture_on_movement = refl::FindProperty(g_cls_capture, "bCaptureOnMovement");
         if (!g_capture_every_frame.bool_mask) g_capture_every_frame = {};
         if (!g_capture_on_movement.bool_mask) g_capture_on_movement = {};
+        g_capture_fov = refl::FindProperty(g_cls_capture, "FOVAngle");
+        if (g_capture_fov.type != "FloatProperty" || g_capture_fov.element_size != 4) g_capture_fov = {};
     }
     if (UObject scene_component = ue::FindObject("Class /Script/Engine.SceneComponent")) {
         g_component_visible = refl::FindProperty(scene_component, "bVisible");
@@ -417,6 +422,10 @@ bool Init() {
         std::string v = config::GetString("vr_scope_view", "near_eye");
         for (char& ch : v) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
         g_scope_near_eye = v != "always" && v != "game";
+        std::string z = config::GetString("vr_scope_zoom", "eye");
+        for (char& ch : z) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        g_scope_zoom_eye = z != "game";
+        g_scope_zoom_flat = z == "flat";
     }
     {
         int found = 0;
@@ -805,10 +814,28 @@ struct ScopeState {
     int index = -1;
     bool off = false;          // we switched its capture off
     double near_at = -1e9;     // last time it was at the eye
+    // Zoom (vr_scope_zoom=eye), from MeasureLens.
+    int lens_tries = 0;
+    bool lens_ok = false;
+    float game_fov = 0;        // FOVAngle as the game set it (90 x k / M)
+    double mag = 0;            // LensMagnificationFactor (M), 0 when out of range
+    double radius = 0;         // eyepiece lens radius, cm
+    double ads_dist = 0;       // the game's aiming camera (ADSPoint) to the lens centre, cm
+    FVector lens_c;            // lens centre in the lens camera's own space
+    float set_fov = -1;        // the FOVAngle we last wrote
 };
 std::vector<ScopeState> g_scope_state;
 std::atomic<int> g_scope_frames{0}, g_scope_drawn_frames{0}, g_scope_switches{0};
 int g_scope_logged = 0;
+int g_lens_logged = 0;
+// What the zoom did since the last report (game thread writes, report reads).
+std::mutex g_zoom_mutex;
+struct ZoomStats {
+    int frames = 0;
+    double fov_lo = 1e9, fov_hi = 0, d_lo = 1e9, d_hi = 0;
+    float game_fov = 0;
+    double ads_dist = 0;
+} g_zoom;
 
 struct alignas(16) Xform {
     FQuat rotation;
@@ -825,10 +852,124 @@ std::string ScopeReport(double) {
     const int frames = g_scope_frames.exchange(0), drawn = g_scope_drawn_frames.exchange(0);
     const int switches = g_scope_switches.exchange(0);
     if (frames <= 0) return {};
-    char b[200];
-    std::snprintf(b, sizeof(b), "scope view: drawn in %d of %d frames, switched %d times (%s)", drawn, frames,
-                  switches, g_scope_near_eye ? "only at the eye, vr_scope_view=near_eye" : "always, as the game does");
+    char b[400];
+    int n = std::snprintf(b, sizeof(b), "scope view: drawn in %d of %d frames, switched %d times (%s)", drawn, frames,
+                          switches,
+                          g_scope_near_eye ? "only at the eye, vr_scope_view=near_eye" : "always, as the game does");
+    ZoomStats z;
+    {
+        std::lock_guard<std::mutex> lock(g_zoom_mutex);
+        z = g_zoom;
+        g_zoom = ZoomStats{};
+    }
+    if (z.frames > 0 && n > 0 && n < (int)sizeof(b))
+        std::snprintf(b + n, sizeof(b) - n,
+                      "; lens view %.1f-%.1f deg for your eye %.1f-%.1f cm from the lens in %d frames (the game's: "
+                      "%.1f deg, for its camera %.1f cm from it; vr_scope_zoom=%s)",
+                      z.fov_lo, z.fov_hi, z.d_lo, z.d_hi, z.frames, z.game_fov, z.ads_dist,
+                      g_scope_zoom_flat ? "flat" : "eye");
     return b;
+}
+
+Xform ComponentXform(UObject comp, bool* ok) {
+    ue::Call c(comp, "K2_GetComponentToWorld");
+    *ok = c.Invoke();
+    return *ok ? c.Result<Xform>() : Xform{};
+}
+
+// A scope's eyepiece lens, measured once (BP_ScopeBase: EyepieceLens shows
+// the lens camera's picture; LensMagnificationFactor M; LensMagnification-
+// Factor_ByEyeRelief k; the sight's ADSPoint, where the game puts its
+// flat-screen camera when aiming). The game sets the lens camera to
+// 90 x k / M degrees once (SetMagnificationFactor, at BeginPlay): sized for
+// its own camera at the ADSPoint, close behind the lens. Your eye sits
+// further back (the rifle's sight point plus eye relief), the lens takes up
+// less of your view, and the same picture in it looks zoomed out (owner
+// 2026-11-11: "the 2x scope isn't zooming in, but is instead zooming out").
+bool MeasureLens(UObject capture, const Xform& cap, ScopeState& st) {
+    UObject scope = ue::GetOuter(capture);
+    const std::string name = scope ? ue::GetName(scope) : std::string("?");
+    auto fail = [&](const char* why) {
+        if (g_lens_logged < 6) {
+            ++g_lens_logged;
+            log::Info("render fixes: %s's lens not measured (%s): its zoom stays as the game set it", name.c_str(),
+                      why);
+        }
+        return false;
+    };
+    double m = 0, k = 0;
+    if (!scope || !ue::GetProp(scope, "LensMagnificationFactor", m) ||
+        !ue::GetProp(scope, "LensMagnificationFactor_ByEyeRelief", k))
+        return fail("no magnification on the scope");
+    const float fov = mem::ReadOr<float>(capture + g_capture_fov.offset, 0.f);
+    if (!(fov > 0.5f && fov < 120.f)) return fail("its lens camera's view angle is out of range");
+    UObject lens = 0, ads = 0, sm = 0;
+    ue::GetProp(scope, "EyepieceLens", lens);
+    ue::GetProp(scope, "ADSPoint", ads);
+    if (!lens || !ue::IsLive(lens) || !ads || !ue::IsLive(ads)) return fail("no eyepiece lens or aiming point");
+    if (!ue::GetProp(lens, "StaticMesh", sm) || !sm) return fail("the eyepiece lens has no mesh");
+    ue::Call bb(sm, "GetBoundingBox");
+    int32_t bsz = 0;
+    const uint8_t* raw = bb.Invoke() ? bb.Raw("ReturnValue", &bsz) : nullptr;
+    if (!raw || bsz < 48) return fail("the lens mesh has no box");
+    double v[6];
+    std::memcpy(v, raw, sizeof(v));
+    for (double x : v)
+        if (!std::isfinite(x) || std::fabs(x) > 1e4) return fail("the lens mesh box is not finite");
+    bool lok = false, aok = false;
+    const Xform lx = ComponentXform(lens, &lok), ax = ComponentXform(ads, &aok);
+    if (!lok || !aok) return fail("the lens or aiming point has no place");
+    // The lens is a disc: its thinnest side is along the sight line, the
+    // other two are its width.
+    const double sc[3] = {std::fabs(lx.scale.X), std::fabs(lx.scale.Y), std::fabs(lx.scale.Z)};
+    double e[3];
+    for (int i = 0; i < 3; ++i) e[i] = (v[3 + i] - v[i]) * sc[i];
+    int thin = 0;
+    for (int i = 1; i < 3; ++i)
+        if (e[i] < e[thin]) thin = i;
+    const double w1 = e[(thin + 1) % 3], w2 = e[(thin + 2) % 3];
+    if (!(std::fmin(w1, w2) > 0.5 && std::fmax(w1, w2) < 15.0 && e[thin] < 0.6 * std::fmin(w1, w2)))
+        return fail("the lens mesh is not a disc 0.5-15 cm across");
+    const FVector mid{(v[0] + v[3]) * 0.5 * lx.scale.X, (v[1] + v[4]) * 0.5 * lx.scale.Y,
+                      (v[2] + v[5]) * 0.5 * lx.scale.Z};
+    const FVector centre = lx.translation + lx.rotation.Rotate(mid);
+    const double d_ads = Length(ax.translation - centre);
+    if (!(d_ads > 1.5 && d_ads < 40.0)) return fail("the game's aiming point is not 1.5-40 cm from the lens");
+    st.radius = 0.25 * (w1 + w2);
+    st.ads_dist = d_ads;
+    st.game_fov = fov;
+    st.mag = m >= 1.0 && m <= 20.0 ? m : 0.0;
+    st.lens_c = cap.rotation.Inverse().Rotate(centre - cap.translation);
+    if (g_lens_logged < 6) {
+        ++g_lens_logged;
+        const double lens_deg = 2.0 * std::atan(st.radius / d_ads) * 180.0 / 3.14159265358979;
+        log::Info("render fixes: %s lens: magnification %.2f (by eye relief %.3f), the game's lens view %.1f deg "
+                  "(90 x %.3f / %.2f = %.1f); eyepiece lens %.1f cm across, the game's aiming camera %.1f cm behind "
+                  "it, where the lens is %.1f deg wide (%.2fx on a flat screen); in the headset the view follows "
+                  "how far your eye is from the lens, %s",
+                  name.c_str(), m, k, fov, k, m, 90.0 * k / (m > 0 ? m : 1), 2.0 * st.radius, d_ads, lens_deg,
+                  lens_deg / fov,
+                  g_scope_zoom_flat || st.mag <= 0 ? "magnifying as the flat screen does (vr_scope_zoom=flat)"
+                                                   : "magnifying as marked (vr_scope_zoom=eye)");
+    }
+    return true;
+}
+
+// The lens camera's view angle for an eye d cm from the lens. eye: the lens
+// takes up 2 x atan(r / d) of your view and shows M times less than that, so
+// things in it look M times as big as beside it (a 2x scope, twice). flat:
+// the lens shows the same share of its picture per degree of your view as
+// it does for the game's flat-screen camera (the game's own tuning, k).
+float EyeFov(const ScopeState& st, double d) {
+    constexpr double kDeg = 180.0 / 3.14159265358979;
+    const double eye_lens = std::atan(st.radius / std::fmax(d, 0.5));
+    double fov;
+    if (!g_scope_zoom_flat && st.mag > 0)
+        fov = 2.0 * eye_lens * kDeg / st.mag;
+    else
+        fov = st.game_fov * eye_lens / std::atan(st.radius / st.ads_dist);
+    fov = std::fmax(0.5, std::fmin(fov, 120.0));
+    return static_cast<float>(fov);
 }
 }  // namespace
 
@@ -860,24 +1001,60 @@ void UpdateScopes(bool have_eye, const FVector& eye, const FVector& look, double
             it = g_scope_state.end() - 1;
         }
         ScopeState& st = *it;
+        bool have_x = false;
+        Xform x;
+        if (have_eye) x = ComponentXform(t.obj, &have_x);
         bool want = true;
         if (g_scope_near_eye) {
             // At the eye: the lens camera within 40 cm of the aiming eye and
             // pointing within 35 degrees of where the head looks. Kept on for
             // 0.3 s after, so a wobble at the edge doesn't switch it.
             bool at_eye = false;
-            if (have_eye && look_len > 1e-6) {
-                ue::Call c(t.obj, "K2_GetComponentToWorld");
-                if (c.Invoke()) {
-                    const Xform x = c.Result<Xform>();
-                    const FVector fwd = x.rotation.Rotate(FVector{1, 0, 0});
-                    const double cosine =
-                        (fwd.X * look.X + fwd.Y * look.Y + fwd.Z * look.Z) / (Length(fwd) * look_len + 1e-9);
-                    at_eye = Length(x.translation - eye) < 40.0 && cosine > 0.82;
-                }
+            if (have_x && look_len > 1e-6) {
+                const FVector fwd = x.rotation.Rotate(FVector{1, 0, 0});
+                const double cosine =
+                    (fwd.X * look.X + fwd.Y * look.Y + fwd.Z * look.Z) / (Length(fwd) * look_len + 1e-9);
+                at_eye = Length(x.translation - eye) < 40.0 && cosine > 0.82;
             }
             if (at_eye) st.near_at = now_s;
             want = now_s - st.near_at < 0.3 && now_s >= st.near_at;
+        }
+        // Zoom for where your eye is (vr_scope_zoom=eye): only a scope near
+        // the eye; the others keep the last view angle.
+        if (g_scope_zoom_eye && g_capture_fov.valid() && have_x && Length(x.translation - eye) < 60.0) {
+            if (!st.lens_ok && st.lens_tries < 3) {
+                ++st.lens_tries;
+                st.lens_ok = MeasureLens(t.obj, x, st);
+            }
+            if (st.lens_ok) {
+                const FVector lens_w = x.translation + x.rotation.Rotate(st.lens_c);
+                const double d = Length(eye - lens_w);
+                const float fov = EyeFov(st, d);
+                // Against what the lens camera has now, in case the game sets
+                // it again (it is set once at BeginPlay in the scripts read).
+                const float now_fov = mem::ReadOr<float>(t.obj + g_capture_fov.offset, -1.f);
+                static int game_resets = 0;
+                if (st.set_fov > 0 && std::fabs(now_fov - st.set_fov) > 0.05f && game_resets < 3) {
+                    ++game_resets;
+                    log::Info("render fixes: the game set %s's lens view again (%.1f deg; ours was %.1f)",
+                              ue::GetName(ue::GetOuter(t.obj)).c_str(), now_fov, st.set_fov);
+                }
+                if (std::fabs(fov - now_fov) > 0.05f && mem::Write<float>(t.obj + g_capture_fov.offset, fov)) {
+                    if (st.set_fov < 0)
+                        log::Info("render fixes: %s's lens view set for your eye: %.1f deg with the lens %.1f cm from "
+                                  "it (the game's %.1f deg was for its camera %.1f cm away)",
+                                  ue::GetName(ue::GetOuter(t.obj)).c_str(), fov, d, st.game_fov, st.ads_dist);
+                    st.set_fov = fov;
+                }
+                std::lock_guard<std::mutex> lock(g_zoom_mutex);
+                ++g_zoom.frames;
+                g_zoom.fov_lo = std::fmin(g_zoom.fov_lo, fov);
+                g_zoom.fov_hi = std::fmax(g_zoom.fov_hi, fov);
+                g_zoom.d_lo = std::fmin(g_zoom.d_lo, d);
+                g_zoom.d_hi = std::fmax(g_zoom.d_hi, d);
+                g_zoom.game_fov = st.game_fov;
+                g_zoom.ads_dist = st.ads_dist;
+            }
         }
         bool switched = false;
         if (want) {

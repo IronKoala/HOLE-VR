@@ -91,6 +91,15 @@ const Block kBlocks[] = {
      "; aiming eye (the lens keeps its last picture otherwise). always = as the\n"
      "; game does.\n"
      "vr_scope_view=near_eye\n"},
+    {"vr_scope_zoom",
+     "\n"
+     "; How much a gun scope magnifies. The game sizes the lens picture for its\n"
+     "; flat-screen camera, which sits close behind the lens; your eye sits\n"
+     "; further back, the lens looks smaller and the picture zoomed out. The\n"
+     "; picture follows how far your eye is from the lens: eye = magnifies as\n"
+     "; marked (a 2x scope shows things twice as big as beside it); flat = as\n"
+     "; much as the game's flat-screen view does. game = as the game sets it.\n"
+     "vr_scope_zoom=eye\n"},
     {"vr_anti_aliasing",
      "\n"
      "; --- Anti-aliasing and console variables ---\n"
