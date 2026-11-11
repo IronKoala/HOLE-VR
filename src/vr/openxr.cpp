@@ -1376,8 +1376,12 @@ void ReleaseEyeImages() {
 // frame to a thread of ours that calls xrEndFrame. The next frame's
 // xrWaitFrame/xrBeginFrame wait for that call to return first (OpenXR: a
 // frame is ended before the next one begins), as does the keep-alive.
-// xr_end_async: 0 off, 1 on, 2 (default) off until the GPU cost test has
+// xr_end_async: 0 off (default), 1 on, 2 off until the GPU cost test has
 // measured it both ways in a level, then whichever was better.
+// Owner 2026-11-08: on its own thread (1, the default from 2026-11-07 15:58)
+// the head-turn picture jittered badly (09:03 run); back on the Present
+// thread (0) it was fixed (09:20 run: 0.23 missed headset frames a second,
+// against 0.17 in the smooth 2026-11-07 15:21 run, also on the Present thread).
 struct PendingEnd {
     XrTime display_time = 0;
     XrCompositionLayerProjection layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
@@ -1776,18 +1780,20 @@ void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* back_buffer) {
     static bool s_end_setup = false;  // Present thread
     if (!s_end_setup) {
         s_end_setup = true;
-        const int setting = std::clamp(config::GetInt("xr_end_async", 2), 0, 2);
+        const int setting = std::clamp(config::GetInt("xr_end_async", 0), 0, 2);
         g_async_setting = setting;
         if (setting) {
             g_end_thread_started = true;
             std::thread(EndLoop).detach();
             if (setting == 1) SetAsyncEnd(true, "xr_end_async=1");
-            else if (config::GetBool("gpu_cost_test", true))
+            else if (config::GetInt("gpu_cost_test", 0) != 0)
                 log::Info("OpenXR: xrEndFrame stays on the Present thread until the GPU cost test has measured it "
                           "on its own thread (xr_end_async=2; 1 = always, 0 = never)");
             else
                 log::Info("OpenXR: xrEndFrame stays on the Present thread (xr_end_async=2 waits for the GPU cost "
                           "test, which is off; xr_end_async=1 puts it on its own thread)");
+        } else {
+            log::Info("OpenXR: xrEndFrame on the game's Present thread (xr_end_async=0)");
         }
     }
     {

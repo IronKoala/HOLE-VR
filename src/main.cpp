@@ -160,7 +160,7 @@ DWORD WINAPI InitThread(LPVOID) {
     // Before the slow start-up work: the title screen is up within seconds.
     vr::launch::Init();
 
-    if (config::GetBool("dump_on_start", true)) ue::dumper::DumpAll(mod_dir);
+    if (config::GetBool("dump_on_start", false)) ue::dumper::DumpAll(mod_dir);
     const bool render_fixes = config::GetBool("vr_render_fixes", true) && vr::render_fixes::Init();
 
     log::Info("Press Ctrl+F9 in game to write a fresh dump (after loading a level, "
@@ -203,7 +203,7 @@ DWORD WINAPI InitThread(LPVOID) {
     // player) are loaded, so the class list always covers them without a
     // keypress (the start-up dump runs before any level and misses them).
     int game_classes_seen_at = -1;
-    bool ingame_dumped = !config::GetBool("dump_in_game", true);
+    bool ingame_dumped = !config::GetBool("dump_in_game", false);
     // Time spent on each job of this loop ("= N ms/s" in the perf lines is
     // its share of one CPU core). It used to spend most of every second
     // rescanning every game object (2026-11-03 performance pass).

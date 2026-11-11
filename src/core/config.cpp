@@ -32,8 +32,9 @@ const Block kBlocks[] = {
      "; HOLE VR settings. Lines starting with ; are comments.\n"
      "\n"
      "; Write a list of every class, function and property in the game to the\n"
-     "; dump folder on startup. Needed while the mod is being developed.\n"
-     "dump_on_start=1\n"},
+     "; dump folder on startup. Only needed while the mod is being developed\n"
+     "; (Ctrl+F9 in game writes one at any time).\n"
+     "dump_on_start=0\n"},
     {"engine_wait_seconds",
      "\n"
      "; Seconds to wait for the engine to finish starting before giving up.\n"
@@ -75,6 +76,21 @@ const Block kBlocks[] = {
      "; The player's extra scene capture renders the level a second time\n"
      "; (the game's Capture2D option). Stopping it saves a lot of GPU time.\n"
      "vr_disable_player_scene_capture=1\n"},
+    {"vr_kill_shot_camera_when_shown",
+     "\n"
+     "; The kill shot room's camera photographs your body for the death and\n"
+     "; results screens, and the game sets it to take a picture every frame.\n"
+     "; 1 = only while one of those screens is up (the same pictures, less GPU\n"
+     "; work while you play). 0 = as the game runs it.\n"
+     "vr_kill_shot_camera_when_shown=0\n"},
+    {"vr_scope_view",
+     "\n"
+     "; A gun scope's lens shows a second picture of the level, and the game\n"
+     "; draws it whenever the gun moves, which in a headset is every frame, even\n"
+     "; with the gun on your back. near_eye = only while the scope is at your\n"
+     "; aiming eye (the lens keeps its last picture otherwise). always = as the\n"
+     "; game does.\n"
+     "vr_scope_view=near_eye\n"},
     {"vr_anti_aliasing",
      "\n"
      "; --- Anti-aliasing and console variables ---\n"
@@ -106,11 +122,26 @@ const Block kBlocks[] = {
      "menu_button_pauses=1\n"},
     {"hand_world_trace_complex",
      "\n"
-     "; Diagnostic surface mode shared by empty-hand palm and finger checks.\n"
-     "; 0 = the game's simple collision, 1 = complex mesh collision.\n"
-     "; Compare only when visible surfaces lack contact; this does not create\n"
-     "; collision on meshes that disable it, and detailed queries may cost more.\n"
+     "; Older switch for the surfaces empty hands and fingers stop at; replaced by\n"
+     "; wall_shape below (1 here with wall_shape=game means visible).\n"
      "hand_world_trace_complex=0\n"},
+    {"wall_shape",
+     "\n"
+     "; --- What your hands and the held gun stop at ---\n"
+     "; nearest = whichever comes first: the shape you see (each wall's or\n"
+     ";   object's own triangles) or the game's simplified hit box, so hands,\n"
+     ";   fingers and guns go into neither, even where the game's hit boxes are\n"
+     ";   smaller than the wall you see or missing.\n"
+     "; visible = only the shapes you see. game = only the game's hit boxes\n"
+     ";   (the mod before 2026-11-07).\n"
+     "wall_shape=nearest\n"
+     "; 1 = the whole held gun stops at walls: its slide, grip, magazine, stock,\n"
+     "; fitted parts and the hands on it. 0 = only the line from your eyes to the\n"
+     "; muzzle (before 2026-11-07).\n"
+     "gun_wall_whole_gun=1\n"
+     "; 1 = the log says, per wall or object your hands and gun touch, how far the\n"
+     "; game's hit box is from the surface you see (\"wall shapes:\" lines).\n"
+     "wall_shape_report=1\n"},
     {"hand_individual_finger_collision",
      "\n"
      "; Empty fingers check each of their three segments against nearby objects.\n"
@@ -359,8 +390,18 @@ const Block kBlocks[] = {
      "; once the real hand is this far (cm) past where the drawn hand stopped.\n"
      "hand_press_flat_on_walls=1\n"
      "hand_press_flat_push_cm=4\n"
-     "; Strength of the gun's kick in your hand when it fires (0 = off, 1 = normal).\n"
+     "; Strength of the gun's kick in your hand when it fires, by gun and grip\n"
+     "; (0 = off, 1 = normal, 1.5 strong, 6 = 4x strong). The pistol counts as in\n"
+     "; both hands while the other controller is within pistol_both_hands_cm of\n"
+     "; the gun hand's (with offhand_snap=1: while the off hand is drawn on it); the\n"
+     "; rifle while the other hand holds its front. Every other gun (shotgun,\n"
+     "; sniper rifle) uses gun_recoil_kick.\n"
      "gun_recoil_kick=1\n"
+     "gun_kick_pistol_one_hand=2.4\n"
+     "gun_kick_pistol_two_hands=1\n"
+     "gun_kick_rifle_one_hand=3.3\n"
+     "gun_kick_rifle_two_hands=1.5\n"
+     "pistol_both_hands_cm=13\n"
      "; Comfort: let the game's recoil move your view and aim (0 = off; the gun\n"
      "; still kicks in your hand), and the game's camera shake (0 = off).\n"
      "game_camera_recoil=0\n"
@@ -492,6 +533,19 @@ const Block kBlocks[] = {
      "; (B or Y); the other hand racks, reloads, holds the handguard and works the light.\n"
      "; 0 = the right hand always holds the gun and the left hand takes the magazines.\n"
      "either_hand_guns=1\n"},
+    {"offhand_snap",
+     "\n"
+     "; --- The off hand on the pistol ---\n"
+     "; 1 = when the off hand's controller nearly touches the gun hand's controller, the\n"
+     "; off hand is drawn holding the pistol too (the way a hand snaps onto the pistol\n"
+     "; in its holster). It has two poses, set in the grip editor: one with the gun\n"
+     "; near the chest, one for the rest of the time. The pistol then counts as held\n"
+     "; in two hands (its kick: gun_kick_pistol_two_hands).\n"
+     "; How close the two controllers come for it: pistol_both_hands_cm (it lets go\n"
+     "; 4 cm further out). offhand_chest_cm: the gun this close to the chest takes the\n"
+     "; chest pose.\n"
+     "offhand_snap=1\n"
+     "offhand_chest_cm=35\n"},
     {"rifle_charging_handle_grab_cm",
      "\n"
      "; --- The rifle's charging handle ---\n"
@@ -540,6 +594,49 @@ const Block kBlocks[] = {
      "; while it is lined up; until then it keeps the grab pose).\n"
      "; pistol / rifle = also play the game's pistol or AR reload on the left hand.\n"
      "mag_insert_anim_ar=off\n"},
+    {"mag_seat_last_pistol_cm",
+     "\n"
+     "; --- Reloading: pushing a magazine home ---\n"
+     "; A pistol magazine clicks in by itself from this close to seated (cm; never\n"
+     "; more than half way). mag_seat_last_cm above is the rifle's.\n"
+     "mag_seat_last_pistol_cm=3.5\n"
+     "; Once a magazine's top is inside the magwell the magwell holds it: the hand\n"
+     "; may wander this far (cm) off the magwell's line and still push it in.\n"
+     "mag_hold_side_cm=12\n"
+     "; With the gun in the left hand, a magazine lines up when its top is within\n"
+     "; this far (cm) of the magwell's line (mag_line_up_side_cm with the gun in the\n"
+     "; right hand).\n"
+     "mag_line_up_side_left_gun_cm=5\n"},
+    {"shotgun_smart_reload",
+     "\n"
+     "; --- Shotgun: shells by hand (not tested in the headset yet) ---\n"
+     "; The magazine pouch is the shotgun's shell caddy. Smart reload: a grab gives\n"
+     "; 4 shells when the tube is missing 4 or more, 2 when it is missing 2 or 3, 1\n"
+     "; when it is missing 1. 0 = always shotgun_shells_per_grab (1 to 4).\n"
+     "shotgun_smart_reload=1\n"
+     "shotgun_shells_per_grab=4\n"
+     "; 1 = with the bolt locked open on an empty gun the caddy gives 1 shell, for\n"
+     "; the ejection port (B or a full rack then chambers it).\n"
+     "shotgun_empty_gun_single=1\n"
+     "; 1 = the tube takes no shells while the bolt is locked open (like a Benelli M4).\n"
+     "shotgun_tube_needs_closed_bolt=1\n"
+     "; Loading port: the lead shell's crimp catches this close to the tube's mouth\n"
+     "; (cm) and this close to pointing along the tube (degrees); the hand this far\n"
+     "; off the tube's line (cm) lets go.\n"
+     "shotgun_port_capture_cm=4\n"
+     "shotgun_port_capture_deg=35\n"
+     "shotgun_push_let_go_cm=5\n"
+     "; One push loads two: the first shell clicks in this far into the push (cm),\n"
+     "; the second this far. A shell the tube refuses stops this far in (cm).\n"
+     "shotgun_first_shell_cm=5.5\n"
+     "shotgun_second_shell_cm=12.5\n"
+     "shotgun_blocked_cm=1\n"
+     "; A shell this close (cm) to the ejection port drops in (empty gun, bolt open).\n"
+     "shotgun_ejection_port_cm=4\n"
+     "; Moves the shells in the hand (cm): forward, right, up.\n"
+     "shotgun_hold_forward_cm=0\n"
+     "shotgun_hold_right_cm=0\n"
+     "shotgun_hold_up_cm=0\n"},
     {"fixed_height",
      "\n"
      "; 1 = your in-game height is always the character's, seated or standing\n"
@@ -835,8 +932,22 @@ const Block kBlocks[] = {
      "; Frame times: hand each frame to the headset (xrEndFrame) on a thread of the\n"
      "; mod's own, so the game's Present thread doesn't wait on it. 0 = never,\n"
      "; 1 = always, 2 = decided each run by the GPU cost test (on only if the\n"
-     "; headset missed fewer frames with it).\n"
-     "xr_end_async=2\n"},
+     "; headset missed fewer frames with it). 1 made the picture jitter when\n"
+     "; turning the head (2026-11-08), so 0 is the default.\n"
+     "xr_end_async=0\n"},
+    {"gpu_cost_test",
+     "\n"
+     "; Frame times (diagnostic): 45 s into the first run level, switch render\n"
+     "; features off and on for a minute or two and log what each costs the\n"
+     "; graphics card. 1 = every feature (the picture changes while it runs),\n"
+     "; 2 = only ones that leave the picture as it is, 0 = off.\n"
+     "gpu_cost_test=0\n"},
+    {"dump_in_game",
+     "\n"
+     "; Diagnostic: once a level is loaded, write the game's class list to the\n"
+     "; dump folder (includes the weapon and player classes the start-up dump\n"
+     "; misses). Only needed while the mod is being developed.\n"
+     "dump_in_game=0\n"},
     {"vr_lumen_gi_quality",
      "\n"
      "; Lumen indirect lighting quality in VR. Levels ask for 2; 1 looks nearly the\n"
@@ -844,13 +955,13 @@ const Block kBlocks[] = {
      "vr_lumen_gi_quality=1\n"},
     {"vr_shadow_quality",
      "\n"
-     "; Frame times in VR (72 Hz needs the GPU under about 12 ms a frame):\n"
-     "; shadow quality low / medium / high / epic / game (the game's own, Epic).\n"
-     "; High saves about 0.7 ms a frame against Epic.\n"
-     "vr_shadow_quality=high\n"
+     "; Frame times in VR: shadow quality low / medium / high / epic / game (the\n"
+     "; game's own, Epic). High saves about 0.7 ms of GPU time a frame.\n"
+     "vr_shadow_quality=game\n"
      "; Lumen indirect lighting probes: half (half as many, saves about 0.9 ms a\n"
-     "; frame) / full / game.\n"
-     "vr_lumen_probes=half\n"},
+     "; frame) / full / game. High shadows plus half probes took the Office level\n"
+     "; from about 66 to 71 FPS (2026-11-07).\n"
+     "vr_lumen_probes=game\n"},
     {"process_metrics",
      "\n"
      "; Every 30 s log the game process's memory, handles, CPU and disk use (game\n"

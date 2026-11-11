@@ -43,9 +43,14 @@ struct HandGrab {
     // kGunGrip: kPointHolster = the left hand reaching for the holstered
     // pistol (holster_preview), with its own pose (owner 2026-11-07: the
     // right hand's grip, mirrored, twisted the left arm).
+    // kSupportGrip: kPointOffhand / kPointOffhandChest = the off hand snapped
+    // onto the pistol in the other hand (holster_preview; controls'
+    // offhand_snap): the gun held out, or near the chest. Each hand has its
+    // own pose of each.
     int point = -1;
-    // Visual-only reach onto a seated pistol; never acquires input ownership
-    // or changes the controller. The authored approach clears the shell.
+    // Visual-only reach onto a seated pistol (or the off hand onto the
+    // pistol in the other hand); never acquires input ownership or changes
+    // the controller. The authored approach clears the shell.
     bool holster_preview = false;
     double pose_blend = 1.0;
     // kMagInsert: how far the magazine is in, 0 with its top at the magwell
@@ -67,6 +72,15 @@ inline bool HasHeldObject(const HandGrab& pose, const HandInteraction& access,
 }
 constexpr int kPointChargingHandle = 0;
 constexpr int kPointHolster = 1;
+// Clear of the handguard grip points (vr/interact/grip_points.h, 0..2).
+constexpr int kPointOffhand = 10;
+constexpr int kPointOffhandChest = 11;
+inline bool OffhandPoint(int point) { return point == kPointOffhand || point == kPointOffhandChest; }
+// kMagHeld: shotgun shells in the hand (controls' smart reload), the point
+// is kPointShells + how many the hold was taken as (4 quad, 2 twin, 1
+// single); each hold has its own pose, "shells.quad" etc. (owner poses them).
+constexpr int kPointShells = 20;
+inline bool ShellsPoint(int point) { return point > kPointShells && point <= kPointShells + 4; }
 HandGrab GetGrab(Hand hand);
 // A rifle's charging handle is grabbed at the rear end of its mesh (from
 // 2026-11-04; before, at the handle's origin). shift = the grab point now

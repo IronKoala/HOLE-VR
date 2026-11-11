@@ -26,11 +26,13 @@
 #include "ue/process_event.h"
 #include "ue/reflection.h"
 #include "vr/body/body.h"
+#include "vr/body/hand_walls.h"
 #include "vr/comfort.h"
 #include "vr/comfort_math.h"
 #include "vr/teleport.h"
 #include "ue/names.h"
 #include "vr/hands.h"
+#include "vr/render_fixes.h"
 #include "vr/workbench.h"
 #include "vr/workbench_carry.h"
 #include "vr/drinks.h"
@@ -42,7 +44,9 @@
 #include "vr/interact/holster_audio.h"
 #include "vr/interact/holster_model.h"
 #include "vr/interact/magwell_zone.h"
+#include "vr/interact/offhand_snap.h"
 #include "vr/interact/rifle_carry.h"
+#include "vr/interact/shell_load.h"
 #include "vr/interact/slide.h"
 #include "vr/interact/touch.h"
 #include "vr/ui_panel.h"
@@ -50,6 +54,8 @@
 #include "vr/stereo.h"
 #include "vr/turn_math.h"
 #include "vr/view_lead_math.h"
+#include "vr/gun_walls_math.h"
+#include "vr/wall_shapes.h"
 #include "vr/world_menu.h"
 
 namespace holevr::vr::controls {
@@ -141,7 +147,17 @@ struct Settings {
     double finger_pinch_past_rear = 0.64;
     int slide_hold_log = 30;            // slide holds per run that log their frame-by-frame pull
     bool wall_collision = true;    // keep the gun out of walls
-    double recoil_kick = 1.0;      // scale of the in-hand recoil kick, 0 = off
+    bool whole_gun = true;         // all of the gun and the hands on it, not just the muzzle line (2026-11-07)
+    wall_shapes::Mode wall_shape_mode = wall_shapes::Mode::kNearest;  // what the gun stops at (wall_shape)
+    // In-hand recoil kick strength by gun and grip (VR tab; owner 2026-11-07:
+    // rifle one hand Heavy, two hands Strong; pistol one hand Stronger, two
+    // hands Normal). 1 = Normal, 0 = off. Every other gun (shotgun, sniper
+    // rifle) keeps the one Gun kick (owner, same day: "we still have two
+    // more guns to test").
+    double recoil_kick = 1.0;
+    double kick_pistol_one = 2.4, kick_pistol_two = 1.0;
+    double kick_rifle_one = 3.3, kick_rifle_two = 1.5;
+    double pistol_both_hands_cm = 13.0;  // other controller this near the gun hand's: both hands
     bool game_recoil = false;      // let the game's camera/aim recoil run
     bool camera_shake = false;     // the game's camera shake option
     bool log_grabs = true;
@@ -182,6 +198,12 @@ struct Settings {
     // Either free hand draws a gun (and holds and fires it) or takes a
     // magazine; false: the right hand holds the gun, the left takes magazines.
     bool either_hand = true;
+    // The off hand snaps onto the pistol (vr/interact/offhand_snap.h) when
+    // its controller comes within pistol_both_hands_cm of the gun hand's;
+    // lets go 4 cm further out. The chest pose while the gun is within
+    // offhand_chest of the chest (5 cm hysteresis).
+    bool offhand_snap = true;
+    double offhand_chest_cm = 35.0;
     double handle_grab_radius = 9.0;      // either hand grabs the AR charging handle this close to its rear end, cm
     // Magazines (owner 2026-11-06: the AR's 10 round magazine snapped "way to
     // early"; "make custom sized detection zones for all mags"; 2026-11-07:
@@ -194,9 +216,25 @@ struct Settings {
     double mag_line_up_side = 3.5;        // cm its top may be off the magwell's axis
     double mag_line_up_tilt = 35.0;       // deg it may lean off the magwell's axis
     double mag_seat_last = 1.0;           // pushed this close to seated, it seats itself (at most half its travel), cm
+    // Owner 2026-11-07 on the pistol's small magazine: "i have to push the
+    // mag to far up" (it seated only in the last centimetre; the real
+    // controllers meet under the grip before that). Before 89e1b99 it was 6
+    // cm, half its travel ("snaps in way to early").
+    double mag_seat_last_pistol = 3.5;    // the same for pistols, cm
+    // Once its top is in the magwell, the magwell holds it: the hand may
+    // drift this far off the magwell's line and still push it in (it let go
+    // at 5 cm before; the right hand with the gun in the left hand stays
+    // about 5 cm to the side, so that reload never went in).
+    double mag_hold_side = 12.0;          // cm
+    double mag_line_up_side_left_gun = 5.0;  // mag_line_up_side with the gun in the left hand, cm
     bool mag_exact_seat = true;           // seat each magazine where the game itself puts it (AttachPoint_Mag)
 };
 Settings g_set;
+// Shotgun shells by hand (vr/interact/shell_load.h): smart reload, the hold,
+// the push into the tube. g_shell_nudge moves the hold in the hand (cm, grip
+// frame: forward, right, up).
+interact::shells::Settings g_shell_set;
+FVector g_shell_nudge;
 
 void LoadHolsterSpots();
 
@@ -215,7 +253,15 @@ void LoadSettings() {
     g_set.gun_yaw = config::GetFloat("gun_yaw_offset", 0.f);
     g_set.gun_roll = config::GetFloat("gun_roll_offset", 0.f);
     g_set.wall_collision = config::GetBool("gun_wall_collision", true);
+    g_set.whole_gun = config::GetBool("gun_wall_whole_gun", true);
+    g_set.wall_shape_mode = wall_shapes::ModeSetting();
+    wall_shapes::LoadSettings();
     g_set.recoil_kick = config::GetFloat("gun_recoil_kick", 1.f);
+    g_set.kick_pistol_one = config::GetFloat("gun_kick_pistol_one_hand", 2.4f);
+    g_set.kick_pistol_two = config::GetFloat("gun_kick_pistol_two_hands", 1.f);
+    g_set.kick_rifle_one = config::GetFloat("gun_kick_rifle_one_hand", 3.3f);
+    g_set.kick_rifle_two = config::GetFloat("gun_kick_rifle_two_hands", 1.5f);
+    g_set.pistol_both_hands_cm = config::GetFloat("pistol_both_hands_cm", 13.f);
     g_set.game_recoil = config::GetBool("game_camera_recoil", false);
     g_set.camera_shake = config::GetBool("game_camera_shake", false);
     g_set.gun_forward = config::GetFloat("gun_forward_offset_cm", 0.f);
@@ -264,6 +310,8 @@ void LoadSettings() {
     g_set.grip_point_inset = std::clamp(config::GetFloat("rifle_grip_point_inset_cm", 4.5f), 0.f, 10.f);
     g_set.rifle_right_let_go = config::GetBool("rifle_right_let_go", true);
     g_set.either_hand = config::GetBool("either_hand_guns", true);
+    g_set.offhand_snap = config::GetBool("offhand_snap", true);
+    g_set.offhand_chest_cm = std::clamp(config::GetFloat("offhand_chest_cm", 35.f), 5.f, 100.f);
     g_set.handle_grab_radius = std::clamp(config::GetFloat("rifle_charging_handle_grab_cm", 9.f), 3.f, 15.f);
     // New keys (2026-11-07): ini files keep mag_snap_slack_cm and
     // mag_seat_finish_cm as they were given, and those meant the old zone.
@@ -273,7 +321,29 @@ void LoadSettings() {
     g_set.mag_line_up_side = std::clamp(config::GetFloat("mag_line_up_side_cm", 3.5f), 1.f, 10.f);
     g_set.mag_line_up_tilt = std::clamp(config::GetFloat("mag_line_up_tilt_deg", 35.f), 10.f, 80.f);
     g_set.mag_seat_last = std::clamp(config::GetFloat("mag_seat_last_cm", 1.f), 0.f, 10.f);
+    g_set.mag_seat_last_pistol = std::clamp(config::GetFloat("mag_seat_last_pistol_cm", 3.5f), 0.f, 10.f);
+    g_set.mag_hold_side = std::clamp(config::GetFloat("mag_hold_side_cm", 12.f), 3.f, 30.f);
+    g_set.mag_line_up_side_left_gun =
+        std::clamp(config::GetFloat("mag_line_up_side_left_gun_cm", 5.f), 1.f, 10.f);
     g_set.mag_exact_seat = config::GetBool("mag_exact_seat", true);
+    // Shotgun (2026-11-07, owner's smart reload): new keys, their own block.
+    {
+        interact::shells::Settings& sh = g_shell_set;
+        sh.smart = config::GetBool("shotgun_smart_reload", true);
+        sh.fixed = std::clamp(config::GetInt("shotgun_shells_per_grab", 4), 1, interact::shells::kMaxHeld);
+        sh.empty_gun_single = config::GetBool("shotgun_empty_gun_single", true);
+        sh.tube_needs_closed_bolt = config::GetBool("shotgun_tube_needs_closed_bolt", true);
+        sh.capture_cm = std::clamp(config::GetFloat("shotgun_port_capture_cm", 4.f), 1.f, 15.f);
+        sh.capture_deg = std::clamp(config::GetFloat("shotgun_port_capture_deg", 35.f), 5.f, 80.f);
+        sh.let_go_side_cm = std::clamp(config::GetFloat("shotgun_push_let_go_cm", 5.f), 1.f, 20.f);
+        sh.first_cm = std::clamp(config::GetFloat("shotgun_first_shell_cm", 5.5f), 1.f, 15.f);
+        sh.second_cm = std::clamp(config::GetFloat("shotgun_second_shell_cm", 12.5f), (float)sh.first_cm + 1.f, 30.f);
+        sh.block_cm = std::clamp(config::GetFloat("shotgun_blocked_cm", 1.f), 0.f, 5.f);
+        sh.port_cm = std::clamp(config::GetFloat("shotgun_ejection_port_cm", 4.f), 1.f, 15.f);
+        g_shell_nudge = FVector{std::clamp(config::GetFloat("shotgun_hold_forward_cm", 0.f), -10.f, 10.f),
+                                std::clamp(config::GetFloat("shotgun_hold_right_cm", 0.f), -10.f, 10.f),
+                                std::clamp(config::GetFloat("shotgun_hold_up_cm", 0.f), -10.f, 10.f)};
+    }
     LoadHolsterSpots();
 }
 
@@ -321,6 +391,35 @@ void LoadMagSeats() {
         g_mag_seats[name] = m;
         log::Info("controls: magazine seat for %s from mag-seats.ini (%.1f %.1f %.1f)", name, v[0], v[1], v[2]);
     }
+    fclose(f);
+}
+
+// Cheek weld (owner 2026-11-07): shoulder the rifle, hold B, line the
+// sights up with your eye by moving the rifle, let go of B. Where your eye
+// sat against the rifle is kept per gun in cheek-weld.ini and the shoulder
+// snap puts the rifle back exactly there.
+std::map<std::string, FVector> g_welds;
+std::wstring WeldFile() { return config::Dir() + L"\\cheek-weld.ini"; }
+void LoadWelds() {
+    FILE* f = _wfopen(WeldFile().c_str(), L"r");
+    if (!f) return;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        char name[128] = {};
+        double x, y, z;
+        if (line[0] == ';' || std::sscanf(line, "%127[^=]=%lf %lf %lf", name, &x, &y, &z) != 4) continue;
+        if (std::fabs(x) > 80 || std::fabs(y) > 30 || std::fabs(z) > 40) continue;
+        g_welds[name] = FVector{x, y, z};
+        log::Info("controls: cheek weld for %s from cheek-weld.ini (eye %.1f %.1f %.1f from the grip)", name, x, y, z);
+    }
+    fclose(f);
+}
+void SaveWelds() {
+    FILE* f = _wfopen(WeldFile().c_str(), L"w");
+    if (!f) return;
+    std::fputs("; Where your aiming eye sits against each rifle (gun frame from the grip: forward, right, up; cm),\n"
+               "; set in game: shouldered, hold B, line up the sights, let go. Delete a line to go back.\n", f);
+    for (const auto& [name, v] : g_welds) std::fprintf(f, "%s=%.2f %.2f %.2f\n", name.c_str(), v.X, v.Y, v.Z);
     fclose(f);
 }
 
@@ -531,6 +630,13 @@ double Locomotion(UObject player, const input::Snapshot& s, double dt) {
     if (teleport_now) teleport::Update(player, left, g_set.swap_sticks ? input::kRight : input::kLeft);
     else if (s_teleport_on) teleport::Hide();
     s_teleport_on = teleport_now;
+    // A game menu that doesn't pause the game (area select, results) keeps
+    // the player ticking, and the sticks scroll the menu: don't also walk or
+    // turn (overlap check 2026-11-08).
+    if (ui_panel::MenuOpen()) {
+        comfort::SetMotion(0.0, 0.0);
+        return 0;
+    }
     if (!g_set.teleport && mag > g_set.deadzone) {
         double scale = std::fmin(1.0, (mag - g_set.deadzone) / (1.0 - g_set.deadzone)) / mag;
         if (g_sprint_full && mag > 0.5) scale = 1.0 / mag;
@@ -691,6 +797,7 @@ struct WeaponState {
     // of the upper receiver, a bolt catch on the left, a vertical magwell
     // and a handguard for the support hand.
     bool is_pistol = true;
+    bool is_ar = false;           // BP_AR_*: its own kick rows (the shotgun and sniper rifle use Gun kick)
     double muzzle_dist = 18.0;    // grip to muzzle along the bore, cm
     FVector slide_axis{-1, 0, 0}; // bolt/slide pull direction in its parent's space
     bool two_hand = false;        // support hand on the handguard
@@ -719,6 +826,9 @@ struct WeaponState {
     double support_lost_for = 0;
     bool last_has_mag = false;
     double kick_t0 = -1;          // time of the last shot, for the in-hand kick
+    double release_press_at = -1; // left Y went down (the gun in the left hand: slide release on a tap)
+    double kick_level_for = -1;   // the shot (kick_t0) kick_level was chosen for
+    double kick_level = 0;        // that shot's strength, from the gun and the grip
     double kick_side = 0;         // this shot's random sideways part, -1..1
     // Virtual stock (rifles): gun-frame points, from the grip.
     FVector stock_local;          // middle of the butt pad
@@ -728,6 +838,10 @@ struct WeaponState {
     FQuat edit_gun_rot;
     bool have_stock = false;
     bool shouldered = false;
+    bool have_weld = false;       // cheek weld set by the owner for this gun
+    FVector weld_local;           // the aiming eye in the gun frame, from the grip
+    double weld_hold = 0;         // gun hand's B held, s
+    bool weld_free = false;       // B held: the rifle is off the shoulder snap
     double shouldered_at = -1;    // g_clock when the blend reached full
     double shoulder_blend = 0;    // 0 hands only .. 1 pivoting from the shoulder
     FVector gun_set_loc;          // where HoldGun put the gun this frame
@@ -763,6 +877,22 @@ struct WeaponState {
         bool told_blocked = false;  // logged this squeeze's refused slide grab
     } sd;
     interact::SqueezeGate slide_squeeze;  // only a fresh squeeze grabs the slide
+    // Shotgun (BP_SG_*): shells by hand instead of magazines (ShellHandling,
+    // vr/interact/shell_load.h). The magazine pouch is its shell caddy.
+    bool is_shotgun = false;
+    UObject shell[interact::shells::kMaxHeld] = {};  // shells in the hand, by slot (0, 1: the pair under the thumb)
+    int shell_count = 0;          // shells in the hand
+    int shell_layout = 0;         // the hold they were taken as (4 quad, 2 twin, 1 single)
+    int shell_hand = input::kLeft;
+    interact::shells::Sweep sweep;
+    UObject caddy[interact::shells::kMaxHeld] = {};  // shown at the caddy, ready to take
+    int caddy_hidden[interact::shells::kMaxHeld] = {-1, -1, -1, -1};  // last SetActorHiddenInGame sent (-1: none)
+    double caddy_refill_at = 0;
+    int caddy_spawn_fails = 0;
+    bool have_ports = false;      // loading port and ejection port measured
+    FVector port_mouth;           // the tube's mouth at the loading port, gun frame from the grip
+    FVector eject_port;           // the ejection port, the same way
+    double shell_log_at = 0;
 } W;
 
 // ---- which hand holds the gun ----
@@ -781,7 +911,11 @@ int OtherHand() { return 1 - g_gun_hand; }
 const char* HandName(int h) { return h == input::kLeft ? "left" : "right"; }
 hands::Hand HandOf(int h) { return h == input::kLeft ? hands::kLeft : hands::kRight; }
 input::Hand InputOf(int h) { return h == input::kLeft ? input::kLeft : input::kRight; }
-bool HandHoldsMag(int h) { return W.held_mag && W.mag_hand == h; }
+// A magazine, or the shotgun's shells (either is "a magazine" to the other
+// hand jobs: no slide, support grip or light while holding them).
+bool HandHoldsMag(int h) {
+    return (W.held_mag && W.mag_hand == h) || (W.shell_count > 0 && W.shell_hand == h);
+}
 // The hand holds something of ours: the gun, its slide, a magazine, or the
 // rifle (by itself or on the handguard). Defined with the rifle carry.
 bool ControlsHoldsGrip(int hand);
@@ -974,6 +1108,12 @@ struct WallPushLog {
     double jump_max = 0;        // largest change from one frame to the next, cm
     long long eyes_inside = 0;  // frames the eyes were inside something (no push)
     std::string worst_what;     // what the largest push was against
+    long long near_frames = 0;  // frames something was near the gun (its outline points were looked at)
+    long long looks = 0;        // lines from the eyes to outline points
+    long long by_part[static_cast<int>(gun_walls::Part::kCount)] = {};  // pushed frames by the deepest part
+    int points = 0;             // outline points (last frame)
+    long long strike_frames = 0;  // frames a line met an enemy, mannequin or target (looked past it)
+    int own_gear = 0;           // the player's own things left out of the checks (last frame)
 };
 std::mutex g_push_log_mutex;
 WallPushLog g_push_log;
@@ -985,55 +1125,342 @@ std::string WallPushReport(double) {
         w = g_push_log;
         g_push_log = {};
     }
-    if (w.pushed == 0 && w.eyes_inside == 0) return {};
-    char b[400];
+    if (w.pushed == 0 && w.eyes_inside == 0 && w.strike_frames == 0) return {};
+    char b[900];
     std::snprintf(b, sizeof(b),
                   "gun wall push: the held gun was pushed out of something in %lld of %lld frames (most %.1f cm, "
                   "against %s); the push changed by over 3 cm in a frame %lld times (worst %.1f cm); eyes inside "
-                  "something (no push) %lld frames",
+                  "something (no push) %lld frames; part furthest in: gun %lld, gun hand %lld, magazine %lld, "
+                  "support hand %lld; something near the gun in %lld frames, %d outline points, %.1f looks a frame "
+                  "then; went into an enemy, mannequin or target (not a wall) in %lld frames; %d of your own things "
+                  "(guns, what is fitted to them, magazines) left out",
                   w.pushed, w.frames, w.push_max, w.worst_what.empty() ? "nothing" : w.worst_what.c_str(), w.jumps,
-                  w.jump_max, w.eyes_inside);
+                  w.jump_max, w.eyes_inside, w.by_part[0], w.by_part[1], w.by_part[2], w.by_part[3], w.near_frames, w.points,
+                  w.near_frames ? static_cast<double>(w.looks) / static_cast<double>(w.near_frames) : 0.0,
+                  w.strike_frames, w.own_gear);
     return b;
 }
 
-// One line from the eyes to `to` against the world. True with the first
-// surface's point and normal (and what it belongs to); false when the way
-// is clear. *eyes_inside: the line started inside something.
-bool EyeLine(UObject ksl, UObject gps, UObject player, const FVector& from, const FVector& to,
-             const std::vector<UObject>& ignore, FVector* at, FVector* normal, UObject* what, bool* eyes_inside) {
-    TArrayRaw arr{ignore.data(), static_cast<int32_t>(ignore.size()), static_cast<int32_t>(ignore.size())};
-    ue::Call t(ksl, "LineTraceSingle");
-    t.Set("WorldContextObject", player).Set("Start", from).Set("End", to)
-        .Set("TraceChannel", uint8_t{0}).Set("bTraceComplex", false).Set("ActorsToIgnore", arr)
-        .Set("bIgnoreSelf", true);
-    if (!t.Invoke() || !t.Result<bool>()) return false;
-    int32_t hit_size = 0;
-    uint8_t* hit = t.Raw("OutHit", &hit_size);
-    if (!hit) return false;
-    ue::Call b(gps, "BreakHitResult");
-    int32_t in_size = 0;
-    uint8_t* in = b.Raw("Hit", &in_size);
-    if (!in || in_size != hit_size) return false;
-    std::memcpy(in, hit, static_cast<size_t>(hit_size));
-    if (!b.Invoke() || !b.Get<bool>("bBlockingHit")) return false;
-    if (b.Get<bool>("bInitialOverlap")) {
-        *eyes_inside = true;
+// What the held gun hits rather than stops at: characters (pawns: enemies,
+// the nurse) and anything with the game's bullet-hit event (the hub's
+// mannequins and shooting targets, breakable boards).
+// Owner's run 2026-11-08: swinging at the hub's mannequins pushed the gun up
+// to 40 cm out of them, which threw it about. Per class; the table belongs
+// to the player's level.
+std::map<UObject, bool> g_strike_class;
+UObject g_strike_class_player = 0;
+bool IsStrikeTarget(UObject actor) {
+    if (!actor || !ue::IsLive(actor)) return false;
+    const UObject player = game::Player();
+    if (player != g_strike_class_player) {
+        g_strike_class.clear();
+        g_strike_class_player = player;
+    }
+    if (actor == player) return false;
+    const UObject cls = ue::GetClass(actor);
+    if (!cls) return false;
+    auto it = g_strike_class.find(cls);
+    if (it != g_strike_class.end()) return it->second;
+    bool yes = ue::FindFunction(cls, "BulletHitEvent") != 0;
+    for (UObject s = cls; s && !yes; s = ue::reflection::GetSuper(s))
+        if (ue::GetName(s) == "Pawn") yes = true;
+    if (g_strike_class.size() > 512) g_strike_class.clear();
+    g_strike_class.emplace(cls, yes);
+    return yes;
+}
+// Strike targets the gun's lines met in the last 3 s: left out from the start
+// of each frame, so a mannequin beside the gun costs one extra line once.
+struct SeenTarget {
+    UObject actor = 0;
+    double at = 0;
+};
+std::vector<SeenTarget> g_targets_seen;
+std::vector<UObject> StrikeTargetsSeen() {
+    std::vector<UObject> out;
+    std::vector<SeenTarget> kept;
+    for (const SeenTarget& t : g_targets_seen)
+        if (g_clock - t.at < 3.0 && g_clock >= t.at && ue::IsLive(t.actor)) kept.push_back(t), out.push_back(t.actor);
+    g_targets_seen.swap(kept);
+    return out;
+}
+void SawStrikeTarget(UObject actor) {
+    for (SeenTarget& t : g_targets_seen)
+        if (t.actor == actor) { t.at = g_clock; return; }
+    if (g_targets_seen.size() < 16) g_targets_seen.push_back({actor, g_clock});
+}
+
+// Lines and the near test from the eyes against the world, for one frame:
+// the reflected calls are laid out once and reused for every line (building
+// a call costs more than the trace). Shapes (wall_shape setting): what you
+// see (complex), the game's hit boxes (simple), or both with the nearest hit
+// winning. A line that meets a strike target (IsStrikeTarget) is looked
+// along again without it, so a wall behind a mannequin still counts.
+struct GunWallTraces {
+    ue::Call line, sphere, unpack;
+    int32_t hit_size = 0, radius_size = 0;
+    bool ok = false, sphere_ok = false;
+    wall_shapes::Mode shapes;
+    std::vector<UObject> ignore;
+    int strike_skips = 0;   // lines that met a strike target this frame
+
+    GunWallTraces(UObject ksl, UObject gps, UObject player, const std::vector<UObject>& ignore_list,
+                  wall_shapes::Mode mode)
+        : line(ksl, "LineTraceSingle"), sphere(ksl, "SphereTraceSingle"), unpack(gps, "BreakHitResult"),
+          shapes(mode), ignore(ignore_list) {
+        int32_t in_size = 0;
+        if (!line.Valid() || !unpack.Valid() || !line.Raw("OutHit", &hit_size) || hit_size <= 0 ||
+            !unpack.Raw("Hit", &in_size) || in_size != hit_size)
+            return;
+        line.Set("WorldContextObject", player).Set("TraceChannel", uint8_t{0}).Set("bTraceComplex", false)
+            .Set("bIgnoreSelf", true);
+        ok = true;
+        int32_t sphere_hit = 0;
+        sphere_ok = sphere.Valid() && sphere.Raw("OutHit", &sphere_hit) && sphere_hit == hit_size &&
+                    sphere.Raw("Radius", &radius_size) && (radius_size == 4 || radius_size == 8);
+        if (sphere_ok)
+            sphere.Set("WorldContextObject", player).Set("TraceChannel", uint8_t{0}).Set("bTraceComplex", false)
+                .Set("bIgnoreSelf", true);
+        SetIgnore();
+    }
+
+    // The ignore array points into `ignore`: set again whenever it grows.
+    void SetIgnore() {
+        TArrayRaw arr{ignore.data(), static_cast<int32_t>(ignore.size()), static_cast<int32_t>(ignore.size())};
+        line.Set("ActorsToIgnore", arr);
+        if (sphere_ok) sphere.Set("ActorsToIgnore", arr);
+    }
+
+    // Unpacks the call's hit. False: no usable hit.
+    bool Unpack(ue::Call& call) {
+        int32_t size = 0, in_size = 0;
+        const uint8_t* raw = call.Raw("OutHit", &size);
+        uint8_t* in = unpack.Raw("Hit", &in_size);
+        if (!raw || !in || size != hit_size || in_size != hit_size) return false;
+        std::memcpy(in, raw, static_cast<size_t>(hit_size));
+        return unpack.Invoke() && unpack.Get<bool>("bBlockingHit");
+    }
+
+    gun_walls::Hit Line(const FVector& from, const FVector& to) {
+        return gun_walls::LookPast(
+            [&](const FVector& a, const FVector& b) { return LineOnce(a, b); },
+            [](std::uintptr_t what) { return IsStrikeTarget(static_cast<UObject>(what)); },
+            [&](std::uintptr_t what) {
+                // A strike target: not a wall. Looked along again without it.
+                ++strike_skips;
+                SawStrikeTarget(static_cast<UObject>(what));
+                ignore.push_back(static_cast<UObject>(what));
+                SetIgnore();
+            },
+            from, to);
+    }
+
+    gun_walls::Hit LineOnce(const FVector& from, const FVector& to) {
+        gun_walls::Hit best;
+        if (!ok) return best;
+        line.Set("Start", from).Set("End", to);
+        for (int pass = 0; pass < wall_shapes::Passes(shapes); ++pass) {
+            line.Set("bTraceComplex", wall_shapes::Complex(shapes, pass)).Set("ReturnValue", false);
+            if (!line.Invoke() || !line.Result<bool>() || !Unpack(line)) continue;
+            const UObject what = unpack.Get<UObject>("HitActor");
+            if (unpack.Get<bool>("bInitialOverlap")) {
+                // The eyes inside a mannequin or an enemy are not inside a
+                // wall: look again without it (Line).
+                gun_walls::Hit h;
+                h.eyes_inside = !IsStrikeTarget(what);
+                h.hit = !h.eyes_inside;
+                h.what = what;
+                return h;
+            }
+            const FVector at = unpack.Get<FVector>("ImpactPoint");
+            if (best.hit && Len(at - from) >= Len(best.impact - from)) continue;
+            best.hit = true;
+            best.impact = at;
+            best.normal = unpack.Get<FVector>("ImpactNormal");
+            best.what = what;
+        }
+        return best;
+    }
+
+    // Anything at all in the capsule from the eyes to the sphere round the
+    // gun (every line from the eyes to the gun lies inside it). True when
+    // something is there, or when it can't be told.
+    bool Close(const FVector& eyes, const FVector& centre, double radius) {
+        if (!sphere_ok) return true;
+        FVector to = centre;
+        if (Len(to - eyes) < 1e-3) to = eyes + FVector{0.01, 0, 0};
+        sphere.Set("Start", eyes).Set("End", to).Set("ReturnValue", false);
+        if (radius_size == 4) sphere.Set("Radius", static_cast<float>(radius));
+        else sphere.Set("Radius", radius);
+        for (int pass = 0; pass < wall_shapes::Passes(shapes); ++pass) {
+            sphere.Set("bTraceComplex", wall_shapes::Complex(shapes, pass)).Set("ReturnValue", false);
+            if (!sphere.Invoke() || sphere.Result<bool>()) return true;
+        }
         return false;
     }
-    *at = b.Get<FVector>("ImpactPoint");
-    *normal = b.Get<FVector>("ImpactNormal");
-    *what = b.Get<UObject>("HitActor");
+};
+
+// The gun's parts as boxes in the gun frame (from the grip point), measured
+// from its meshes, the magazine in it and what is fitted to it (light,
+// sight, suppressor). Measured when it is taken and every 4 s while held
+// (attachments change at the bench; the magazine comes and goes).
+struct GunShape {
+    UObject gun = 0;
+    double measured_at = -1e9;  // g_clock
+    std::vector<gun_walls::PartBox> boxes;
+    int gun_boxes = 0, mag_boxes = 0, fitted_boxes = 0;
+    bool logged = false;
+} g_gun_shape;
+perf::Counter g_perf_gun_walls{"gun wall collision"};
+
+std::vector<UObject> AttachedActors(UObject actor) {
+    std::vector<UObject> out;
+    ue::Call c(actor, "GetAttachedActors");
+    if (!c.Valid()) return out;
+    int32_t flag = 0;
+    if (c.Raw("bResetArray", &flag) && flag == 1) c.Set("bResetArray", true);
+    if (c.Raw("bRecursivelyIncludeAttachedActors", &flag) && flag == 1) c.Set("bRecursivelyIncludeAttachedActors", true);
+    if (!c.Invoke()) return out;
+    int32_t size = 0;
+    const uint8_t* raw = c.Raw("OutActors", &size);
+    struct Arr { uintptr_t data; int32_t num, max; } arr{};
+    if (!raw || size < static_cast<int32_t>(sizeof(Arr))) return out;
+    std::memcpy(&arr, raw, sizeof(Arr));
+    if (arr.num < 0 || arr.num > arr.max || arr.num > 4096) return out;
+    for (int i = 0; i < arr.num && i < 32; ++i) {
+        UObject a = mem::ReadOr<uintptr_t>(arr.data + i * sizeof(uintptr_t), 0);
+        if (a && ue::IsLive(a)) out.push_back(a);
+    }
+    return out;
+}
+
+void MeasureGunShape(UObject g, const FVector& actor_loc, const FQuat& actor_rot, const FVector& grip_actor) {
+    if (!W.have_frame) return;
+    GunShape& s = g_gun_shape;
+    if (s.gun != g) s = {};
+    s.gun = g;
+    s.measured_at = g_clock;
+    s.boxes.clear();
+    s.gun_boxes = s.mag_boxes = s.fitted_boxes = 0;
+    const FQuat inv = (actor_rot * W.gun_frame).Inverse();
+    const FVector grip_w = actor_loc + actor_rot.Rotate(grip_actor);
+    auto add = [&](UObject actor, gun_walls::Part part, double max_size, int* count) {
+        for (UObject c : MeshComponents(actor)) {
+            FVector lo, hi;
+            if (!MeshBoxInFrame(c, inv, grip_w, &lo, &hi)) continue;
+            // Helper meshes (a light's beam cone) and anything not on the gun.
+            if (hi.X - lo.X > max_size || hi.Y - lo.Y > max_size || hi.Z - lo.Z > max_size) continue;
+            if (std::max({std::fabs(lo.X), std::fabs(hi.X), std::fabs(lo.Y), std::fabs(hi.Y), std::fabs(lo.Z),
+                          std::fabs(hi.Z)}) > 120.0)
+                continue;
+            s.boxes.push_back({gun_walls::Box{lo, hi}, part});
+            ++*count;
+        }
+    };
+    add(g, gun_walls::Part::kGun, 120.0, &s.gun_boxes);
+    UObject mag = 0;
+    ue::GetProp(g, "MagazineObj", mag);
+    const bool mag_in = mag && mag != W.held_mag && mag != W.pouch_mag && ue::IsLive(mag);
+    if (mag_in) add(mag, gun_walls::Part::kMagazine, 40.0, &s.mag_boxes);
+    for (UObject a : AttachedActors(g))
+        if (a != mag && a != W.held_mag && a != W.pouch_mag) add(a, gun_walls::Part::kGun, 30.0, &s.fitted_boxes);
+    if (!s.gun_boxes) {
+        // No measurable parts: at least the bore from the back of the gun to
+        // the muzzle (what the old muzzle line covered, and more).
+        s.boxes.push_back({gun_walls::Box{FVector{W.is_pistol ? -6.0 : -25.0, -1.5, W.bore_height - 2.0},
+                                          FVector{W.muzzle_dist, 1.5, W.bore_height + 1.5}},
+                           gun_walls::Part::kGun});
+    }
+    if (!s.logged) {
+        s.logged = true;
+        double lo_x = 1e9, hi_x = -1e9, lo_z = 1e9, hi_z = -1e9;
+        for (const auto& pb : s.boxes) {
+            lo_x = std::min(lo_x, pb.box.lo.X), hi_x = std::max(hi_x, pb.box.hi.X);
+            lo_z = std::min(lo_z, pb.box.lo.Z), hi_z = std::max(hi_z, pb.box.hi.Z);
+        }
+        log::Info("gun walls: %s is checked against walls as %d part boxes (%d of the gun, %d of its magazine, "
+                  "%d fitted to it%s), from %.1f to %.1f cm along the barrel and %.1f to %.1f cm up from the grip "
+                  "point, plus the hands on it",
+                  ue::GetName(ue::GetClass(g)).c_str(), static_cast<int>(s.boxes.size()), s.gun_boxes, s.mag_boxes,
+                  s.fitted_boxes, s.gun_boxes ? "" : "; no parts measured, the bore only", lo_x, hi_x, lo_z, hi_z);
+    }
+}
+
+// A hand on the gun as a box in the gun frame, round the visible hand (its
+// palm and back) as the body drew it last frame; false when the body has no
+// recent drawing of it.
+bool HandBoxOnGun(int side, gun_walls::Box* out) {
+    body::HandContacts hc;
+    if (!W.have_pose || !body::GetHandContacts(side, &hc)) return false;
+    const FQuat inv = W.frame_rot.Inverse();
+    // The middle of the fist: half a hand's thickness in from the palm.
+    const FVector mid = inv.Rotate(hc.palm - hc.palm_out * 1.5 - W.grip_world);
+    if (!std::isfinite(mid.X) || !std::isfinite(mid.Y) || !std::isfinite(mid.Z) || Len(mid) > 40.0) return false;
+    *out = gun_walls::Box{mid + FVector{-4.0, -4.5, -4.5}, mid + FVector{4.0, 4.5, 4.5}};
     return true;
 }
 
-// Keeps the held gun out of walls, like Half-Life: Alyx: the line from the
-// eyes to the muzzle finds what is in the way, and the whole gun moves out of
-// it along that surface (view_lead::WallPushOut; the hand on the gun follows
-// it), so against a wall it slides along it instead of coming back toward the
-// face. Twice, for a corner between two surfaces. Returns the offset to add
-// to the gun's location.
-FVector WallPushback(UObject gun, const FQuat& frame, const FVector& grip) {
+// The player's rifle and pistol (RifleCarry's), held or put away.
+void PlayerGuns(UObject* rifle, UObject* pistol);
+
+// The player's own gear: the held gun, both guns (held or put away), the
+// magazines in them, in the hands and in the pouch, and everything fitted to
+// them, which are separate actors (sights, lights, stocks, handguards,
+// rounds). The game gave none of these hit boxes, so the walls checks
+// (hit boxes only) never met them. The shapes you see do have them: owner
+// 2026-11-08, "when I hold a gun it'll jump around like crazy, especially
+// the AR". The gun was pushed out of its own sight and light every few
+// frames, and the empty hand stopped at the rifle on the back. Every wall
+// check leaves all of it out. Found again twice a second and when the held
+// gun changes; only live ones are given out.
+std::vector<UObject> g_own_gear;
+double g_own_gear_at = -1e9;
+UObject g_own_gear_gun = 0, g_own_gear_player = 0;
+
+const std::vector<UObject>& OwnGear() {
+    const UObject player = game::Player();
+    if (g_clock - g_own_gear_at < 0.5 && g_clock >= g_own_gear_at && g_own_gear_gun == W.gun &&
+        g_own_gear_player == player)
+        return g_own_gear;
+    g_own_gear_at = g_clock;
+    g_own_gear_gun = W.gun;
+    g_own_gear_player = player;
+    std::vector<UObject> found;
+    auto add = [&](UObject a) {
+        if (a && ue::IsLive(a) && std::find(found.begin(), found.end(), a) == found.end()) found.push_back(a);
+    };
+    UObject rifle = 0, pistol = 0;
+    PlayerGuns(&rifle, &pistol);
+    std::vector<UObject> roots;
+    for (UObject g : {W.gun, rifle, pistol}) {
+        if (!g || !ue::IsLive(g)) continue;
+        roots.push_back(g);
+        UObject in_mag = 0;
+        if (ue::GetProp(g, "MagazineObj", in_mag) && in_mag) roots.push_back(in_mag);
+    }
+    for (int h = 0; h < 2; ++h)
+        if (UObject held = hands::GetGrab(static_cast<hands::Hand>(h)).object) roots.push_back(held);
+    for (UObject m : {W.held_mag, W.pouch_mag}) roots.push_back(m);
+    for (UObject r : roots) {
+        if (!r || !ue::IsLive(r)) continue;
+        add(r);
+        for (UObject a : AttachedActors(r)) add(a);
+    }
+    g_own_gear.swap(found);
+    return g_own_gear;
+}
+
+// Keeps the held gun out of walls, like Half-Life: Alyx: the gun's outline
+// (its parts, magazine and fitted parts, and the hands on it) is looked at
+// from the eyes; any outline point behind a surface puts the gun in it, and
+// the whole gun moves out along that surface (gun_walls::Solve; the hands on
+// the gun follow it), so against a wall it slides along it instead of
+// coming back toward the face. Twice, for a corner between two surfaces.
+// Owner 2026-11-07: hands and guns sank into the hub's walls: only the line
+// to the muzzle was checked before (gun_wall_whole_gun=0 brings that back).
+// Returns the offset to add to the gun's location.
+FVector WallPushback(UObject gun, const FQuat& frame, const FVector& grip, bool two) {
     if (!g_set.wall_collision) return FVector{};
+    perf::Scope timer(g_perf_gun_walls);
     // Looked up once: FindObject is a full object scan, too slow per frame.
     static UObject ksl = 0, gps = 0;
     static int lookups = 0;
@@ -1046,30 +1473,85 @@ FVector WallPushback(UObject gun, const FQuat& frame, const FVector& grip) {
     hands::Pose head;
     UObject player = game::Player();
     if (!ksl || !gps || !player || !hands::Head(&head)) return FVector{};
-    const FVector muzzle = grip + frame.Rotate(FVector{W.muzzle_dist, 0, 0});
-    // Not the gun or what the hands hold, and not the forearm menu or wrist
-    // HUD (they sit in front of the eyes whenever the left wrist is up).
+    // Not the gun or what the hands hold, not the forearm menu or wrist HUD
+    // (they sit in front of the eyes whenever the left wrist is up), and not
+    // the player or what hangs on it (body::hand_walls' list).
+    // Also all of the player's gear (OwnGear: both guns, what is fitted to
+    // them, magazines and what the hands hold): the gun must never be pushed
+    // out of its own sight or light, or the lines to a gun held low stopped
+    // by the other gun in its holster.
+    // Only actors that still exist go to the engine: it reads each one, and
+    // the lists kept between frames can hold the last level's (owner
+    // 2026-11-08 16:12, "fatal error" on Retry/Home after dying: on the new
+    // level's first frame the body's list still had the old level's player
+    // and gear, freed by the level change, because the body is made again
+    // only after the gun is first placed).
     std::vector<UObject> ignore{gun};
-    if (W.held_mag) ignore.push_back(W.held_mag);
-    if (W.pouch_mag) ignore.push_back(W.pouch_mag);
-    const hands::HandGrab other = hands::GetGrab(HandOf(OtherHand()));
-    if (other.object && other.object != gun) ignore.push_back(other.object);
-    if (UObject holder = static_cast<UObject>(world_menu::PanelHolder())) ignore.push_back(holder);
-    constexpr double kClearanceCm = 1.0, kMaxPushCm = 40.0;
-    FVector push;
-    bool eyes_inside = false;
-    UObject what = 0;
-    for (int pass = 0; pass < 2; ++pass) {
-        FVector at, normal;
-        UObject hit_what = 0;
-        if (!EyeLine(ksl, gps, player, head.location, muzzle + push, ignore, &at, &normal, &hit_what, &eyes_inside))
-            break;
-        const FVector more = view_lead::WallPushOut(muzzle + push, at, normal, kClearanceCm, kMaxPushCm);
-        if (Len(more) < 0.01) break;
-        push = push + more;
-        if (!what) what = hit_what;
+    auto ignore_too = [&](UObject a) {
+        if (a && ue::IsLive(a) && std::find(ignore.begin(), ignore.end(), a) == ignore.end()) ignore.push_back(a);
+    };
+    for (UObject a : OwnGear()) ignore_too(a);
+    // This frame's (OwnGear is found twice a second).
+    ignore_too(W.held_mag);
+    ignore_too(W.pouch_mag);
+    UObject in_mag = 0;
+    if (ue::GetProp(gun, "MagazineObj", in_mag)) ignore_too(in_mag);
+    ignore_too(hands::GetGrab(HandOf(OtherHand())).object);
+    if (UObject holder = static_cast<UObject>(world_menu::PanelHolder())) ignore_too(holder);
+    for (UObject a : body::hand_walls::IgnoredActors()) ignore_too(a);
+    // Enemies, mannequins and targets met lately (GunWallTraces: the gun is
+    // not pushed out of what it can hit).
+    for (UObject a : StrikeTargetsSeen()) ignore_too(a);
+
+    // The outline, gun frame.
+    std::vector<gun_walls::PartBox> boxes;
+    if (g_set.whole_gun && g_gun_shape.gun == gun) {
+        boxes = g_gun_shape.boxes;
+        gun_walls::Box hand_box;
+        if (!HandBoxOnGun(GunHand(), &hand_box)) {
+            // Where a fist sits on a grip: its web just under the slide.
+            const FVector mid{-1.0, 0.0, W.bore_height - 7.0};
+            hand_box = gun_walls::Box{mid + FVector{-4.0, -4.5, -4.5}, mid + FVector{4.0, 4.5, 4.5}};
+        }
+        boxes.push_back({hand_box, gun_walls::Part::kFiringHand});
+        gun_walls::Box support_box;
+        if (two && HandBoxOnGun(OtherHand(), &support_box))
+            boxes.push_back({support_box, gun_walls::Part::kSupportHand});
+        else if (two)
+            boxes.push_back({gun_walls::SupportHandBox(W.support_id >= 0 ? W.support_draw : W.support_local),
+                             gun_walls::Part::kSupportHand});
     }
-    if (Len(push) > kMaxPushCm) push = push * (kMaxPushCm / Len(push));
+    std::vector<gun_walls::Point> outline;
+    if (!boxes.empty()) outline = gun_walls::Outline(boxes, 1.0, 20.0, 48);
+    else outline.push_back({FVector{W.muzzle_dist, 0, 0}, gun_walls::Part::kGun});  // the muzzle only (before)
+    std::vector<FVector> points;
+    std::vector<gun_walls::Part> parts;
+    for (const gun_walls::Point& p : outline) {
+        points.push_back(grip + frame.Rotate(p.at));
+        parts.push_back(p.part);
+    }
+    // A rifle's points in groups along it (about 30 cm each): a wall by one
+    // end only has that end's points looked at.
+    const std::vector<int> groups = gun_walls::GroupsAlongBarrel(outline, 30.0, 3);
+    constexpr double kClearanceCm = 1.0, kMaxPushCm = 40.0;
+    GunWallTraces traces(ksl, gps, player, ignore, g_set.wall_shape_mode);
+    gun_walls::Result r;
+    if (traces.ok)
+        r = gun_walls::Solve(
+            head.location, points, parts, [&](const FVector& a, const FVector& b) { return traces.Line(a, b); },
+            kClearanceCm, kMaxPushCm, 2, groups,
+            [&](const FVector& a, const FVector& c, double radius) { return traces.Close(a, c, radius); });
+    const bool close = r.groups_close > 0;
+    FVector push = r.push;
+    // Where the game's hit box is against what you see, on the line to the
+    // part furthest in (the "wall shapes" log line).
+    if (r.deepest >= 0 && static_cast<size_t>(r.deepest) < points.size()) {
+        const FVector to = points[r.deepest];
+        const FVector dir = to - head.location;
+        const double len = Len(dir);
+        if (len > 1.0)
+            wall_shapes::Compare(player, head.location, to + dir * (3.0 / len), traces.ignore, wall_shapes::kGun);
+    }
     // For the log.
     static FVector s_last;
     static double s_last_clock = -1;
@@ -1082,15 +1564,22 @@ FVector WallPushback(UObject gun, const FQuat& frame, const FVector& grip) {
     {
         std::lock_guard<std::mutex> lock(g_push_log_mutex);
         ++g_push_log.frames;
-        if (eyes_inside) ++g_push_log.eyes_inside;
-        if (size > 0) ++g_push_log.pushed;
+        g_push_log.points = static_cast<int>(points.size());
+        g_push_log.own_gear = static_cast<int>(OwnGear().size());
+        if (traces.strike_skips > 0) ++g_push_log.strike_frames;
+        if (close) ++g_push_log.near_frames, g_push_log.looks += r.queries;
+        if (r.eyes_inside) ++g_push_log.eyes_inside;
+        if (size > 0) {
+            ++g_push_log.pushed;
+            ++g_push_log.by_part[static_cast<int>(r.deepest_part)];
+        }
         if (step > 3.0) ++g_push_log.jumps;
         if (step > g_push_log.jump_max) g_push_log.jump_max = step;
         most = size > g_push_log.push_max;
         if (most) g_push_log.push_max = size;
     }
     if (most) {
-        const std::string name = what ? ue::GetName(what) : std::string("something");
+        const std::string name = r.what ? ue::GetName(r.what) : std::string("something");
         std::lock_guard<std::mutex> lock(g_push_log_mutex);
         if (g_push_log.push_max == size) g_push_log.worst_what = name;
     }
@@ -1248,6 +1737,36 @@ FQuat OneHandFrame(const hands::HandState& h, int hand) {
            ToQuat(FRotator{kBasePitch + g_set.gun_pitch, side * (kBaseYaw + g_set.gun_yaw), side * g_set.gun_roll});
 }
 
+bool OffhandOnPistol();  // below, with the off hand's snap
+
+// The pistol counts as held in both hands while the other controller is
+// "basically touching" the gun hand's (owner 2026-11-07) and that hand holds
+// nothing: grip centres closer than pistol_both_hands_cm. With offhand_snap
+// on, exactly while the off hand is drawn on the pistol (the same distance,
+// letting go 4 cm further out), so the kick matches what you see.
+bool PistolInBothHands(const hands::HandState& gun_hand, const hands::HandState& other) {
+    if (g_set.offhand_snap) return OffhandOnPistol();
+    if (!gun_hand.valid || !other.valid || HandHoldsMag(OtherHand())) return false;
+    const hands::Hand oh = HandOf(OtherHand());
+    if (hands::GetInteraction(oh).owner != hands::GripOwner::kNone) return false;
+    if (hands::HeldGrabKind(hands::GetGrab(oh)) != hands::GrabKind::kNone) return false;
+    return Len(other.grip.location - gun_hand.grip.location) < g_set.pistol_both_hands_cm;
+}
+
+// The first shots, and every change of gun or grip after, log the strength
+// they kicked with (and how far apart the hands were, to tune the pistol's
+// both-hands distance).
+void LogKickLevel(const char* gun, bool both, double level, double apart_cm) {
+    static int shots = 0;
+    static std::string last;
+    const std::string kind = std::string(gun) + (both ? "2" : "1");
+    if (++shots > 3 && kind == last) return;
+    last = kind;
+    char apart[48] = "the other hand not tracked";
+    if (apart_cm >= 0) std::snprintf(apart, sizeof(apart), "hands %.0f cm apart", apart_cm);
+    log::Info("controls: gun kick %.1f (%s, %s; %s)", level, gun, both ? "both hands" : "one hand", apart);
+}
+
 void HoldGun(game::Gun& gun, const hands::HandState& rh) {
     UObject g = gun.Object();
     UObject main = 0;
@@ -1261,6 +1780,9 @@ void HoldGun(game::Gun& gun, const hands::HandState& rh) {
     FVector rel = actor_rot.Inverse().Rotate(main_world.translation - actor_loc);
 
     if (!W.have_frame) LearnGunFrame(g, actor_loc, actor_rot, main_world.translation);
+    // The gun's parts for keeping it out of walls: when taken, then every 4 s.
+    if (W.have_frame && (g_gun_shape.gun != g || g_clock - g_gun_shape.measured_at > 4.0))
+        MeasureGunShape(g, actor_loc, actor_rot, rel);
     // The controller's pointing ray sits about 30 degrees above a pistol's
     // bore in a natural grip (second headset test: barrel at 10 o'clock
     // instead of 9 seen from the side), so pitch down by that first.
@@ -1289,7 +1811,40 @@ void HoldGun(game::Gun& gun, const hands::HandState& rh) {
     // small wobbles no longer move the back of the gun. Pull it well away
     // to let go.
     FVector pocket;
-    if (!W.is_pistol && W.have_stock && g_set.virtual_stock && ShoulderPocket(&pocket)) {
+    FVector weld_eye;
+    if (W.weld_free) {
+        // Setting the cheek weld: the hands alone place the rifle.
+        W.shouldered = false;
+        W.shoulder_blend = 0;
+    } else if (!W.is_pistol && W.have_weld && g_set.virtual_stock && AimingEye(&weld_eye)) {
+        // Saved cheek weld: snaps when the rifle's eye point comes near your
+        // eye, and holds it exactly there, aiming toward the support hand.
+        double d = Len(grip_w + hand.Rotate(W.weld_local) - weld_eye);
+        if (!W.shouldered && d < g_set.stock_snap) {
+            W.shouldered = true;
+            input::Haptic(InputOf(GunHand()), 0.2f, 0.03f);
+            log::Info("controls: rifle shouldered on your cheek weld (%.1f cm from it)", d);
+        } else if (W.shouldered && d > g_set.stock_release) {
+            W.shouldered = false;
+            log::Info("controls: rifle off the shoulder");
+        }
+        W.shoulder_blend += (W.shouldered ? 1.0 : -1.0) * g_dt / 0.12;
+        W.shoulder_blend = std::fmax(0.0, std::fmin(1.0, W.shoulder_blend));
+        if (W.shoulder_blend > 0) {
+            const FVector anchor = W.weld_local;
+            FVector front_local = two ? W.support_local : hand.Inverse().Rotate(rh.grip.location - grip_w);
+            FVector front_w = two ? lh2.grip.location : rh.grip.location;
+            FVector gun_dir = Norm(hand.Rotate(front_local - anchor));
+            FVector want = front_w - weld_eye;
+            if (Len(want) > 5.0) {
+                FQuat hs = FromTo(gun_dir, Norm(want)) * hand;
+                FVector gs = weld_eye - hs.Rotate(anchor);
+                hand = Nlerp(hand, hs, W.shoulder_blend);
+                grip_w = grip_w + (gs - grip_w) * W.shoulder_blend;
+            }
+        }
+        ShoulderCapture(hand, grip_w);
+    } else if (!W.is_pistol && W.have_stock && g_set.virtual_stock && ShoulderPocket(&pocket)) {
         double d = Len(grip_w + hand.Rotate(W.stock_local) - pocket);
         if (!W.shouldered && d < g_set.stock_snap) {
             W.shouldered = true;
@@ -1333,11 +1888,22 @@ void HoldGun(game::Gun& gun, const hands::HandState& rh) {
     // back, then returns (about 20 ms up, 100 ms back). A pistol in one
     // hand flips hard; a rifle less with two hands and least on the shoulder,
     // where it pivots from the butt and mostly pushes straight back.
+    // Its strength is chosen once a shot, by the gun and how it is held then.
     double kick = 0;
-    if (W.kick_t0 >= 0 && g_set.recoil_kick > 0) {
+    if (W.kick_t0 >= 0) {
+        if (W.kick_level_for != W.kick_t0) {
+            W.kick_level_for = W.kick_t0;
+            const double apart = lh2.valid ? Len(lh2.grip.location - rh.grip.location) : -1.0;
+            const bool both = W.is_pistol ? PistolInBothHands(rh, lh2) : two;
+            W.kick_level = W.is_pistol ? (both ? g_set.kick_pistol_two : g_set.kick_pistol_one)
+                           : W.is_ar   ? (both ? g_set.kick_rifle_two : g_set.kick_rifle_one)
+                                       : g_set.recoil_kick;
+            LogKickLevel(W.is_pistol ? "pistol" : W.is_ar ? "rifle" : "other gun (Gun kick)", both, W.kick_level,
+                         apart);
+        }
         double t = g_clock - W.kick_t0;
         if (t > 0.4) W.kick_t0 = -1;
-        else kick = g_set.recoil_kick * (1.0 - std::exp(-t / 0.012)) * std::exp(-t / 0.07) * 1.6;
+        else if (W.kick_level > 0) kick = W.kick_level * (1.0 - std::exp(-t / 0.012)) * std::exp(-t / 0.07) * 1.6;
     }
     if (kick > 0) {
         double up, back, side;
@@ -1353,7 +1919,7 @@ void HoldGun(game::Gun& gun, const hands::HandState& rh) {
     }
     FQuat rot = W.have_frame ? hand * W.gun_frame.Inverse() : hand;
     FVector loc = grip_w - rot.Rotate(rel);
-    FVector push = WallPushback(g, hand, grip_w);
+    FVector push = WallPushback(g, hand, grip_w, two);
     loc = loc + push;
     W.grip_world = grip_w + push;
     W.have_support_point = two;
@@ -1985,6 +2551,10 @@ void RefillPouch(game::Gun& gun, UObject player, const FVector& loc, const FQuat
 // AR-15's magwell is square to the bore.
 double MagwellRake() { return W.is_pistol ? 18.0 : 0.0; }
 double MagLineUpOut() { return W.is_pistol ? g_set.mag_line_up_out_pistol : g_set.mag_line_up_out; }
+double MagSeatLast() { return W.is_pistol ? g_set.mag_seat_last_pistol : g_set.mag_seat_last; }
+double MagLineUpSide() {
+    return GunHand() == input::kLeft ? g_set.mag_line_up_side_left_gun : g_set.mag_line_up_side;
+}
 
 bool MeshBoxInFrame(UObject c, const FQuat& frame_inv, const FVector& grip_w, FVector* lo, FVector* hi);
 std::vector<UObject> MeshComponents(UObject actor);
@@ -2160,9 +2730,9 @@ const interact::MagwellZone& MagwellZoneFor(UObject g, UObject mag, const FVecto
                   "%.1f cm, and the reload plays from lining up to there",
                   mag_cls.c_str(), gun_cls.c_str(), W.zone.top, -W.zone.bottom, W.zone.part.c_str(),
                   std::fabs(W.zone.opening), W.zone.opening < 0 ? "below" : "above", W.zone.insert,
-                  MagLineUpOut(), g_set.mag_line_up_side, g_set.mag_line_up_tilt,
+                  MagLineUpOut(), MagLineUpSide(), g_set.mag_line_up_tilt,
                   interact::LineUpBelow(W.zone, MagLineUpOut(), old_below),
-                  interact::SeatLast(W.zone, g_set.mag_seat_last));
+                  interact::SeatLast(W.zone, MagSeatLast()));
     } else {
         std::string list;
         char buf[160];
@@ -2222,6 +2792,8 @@ FQuat PouchRotation(UObject g) {
 
 // hs / in: both hands (in: the grip as the magazine sees it, grip toggle
 // applied); rin: the gun hand's buttons.
+void ShellHandling(game::Gun& gun, UObject player, const hands::HandState hs[2], const input::HandInput in[2]);
+
 void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState hs[2], const input::HandInput in[2],
                       const input::HandInput& rin) {
     // The gun hand's A / X (primary): magazine release.
@@ -2285,13 +2857,34 @@ void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState hs[
             log::Info("controls: slide stop pushed up, slide will stay open");
         }
     }
-    if (rin.secondary.pressed && !W.slide.Held() && W.in_hand) {
+    // With the gun in the LEFT hand its Y is also the grip editor (held
+    // 1 s): the release is taken when Y comes back up after a tap (under
+    // 0.4 s, like left Y's weapon switch), so holding Y to pose a left-hand
+    // grip leaves a locked slide locked. The right hand's B releases on the
+    // press. (A press made while the editor or a menu had the buttons is
+    // long past by its release, so it never counts as a tap.)
+    bool release = rin.secondary.pressed;
+    if (GunHand() == input::kLeft) {
+        release = false;
+        if (rin.secondary.pressed) W.release_press_at = g_clock;
+        if (rin.secondary.released && W.release_press_at >= 0) {
+            release = g_clock - W.release_press_at < 0.4;
+            if (!release && gun.State().slide_locked)
+                log::Info("controls: left Y held %.1f s: no slide release (a hold is the grip editor; tap to release)",
+                          g_clock - W.release_press_at);
+            W.release_press_at = -1;
+        }
+    } else {
+        W.release_press_at = -1;
+    }
+    if (release && !W.slide.Held() && W.in_hand) {
         game::GunState st = gun.State();
         // An empty magazine's follower holds the lever up: B can't drop it.
-        if (st.slide_locked && st.has_magazine && st.magazine == 0) {
+        if (st.slide_locked && st.has_magazine && st.magazine == 0 && !W.is_shotgun) {
             log::Info("controls: slide release blocked by the empty magazine");
         } else if (st.slide_locked) {
-            log::Info("controls: slide release (B), before: %s", st.Describe().c_str());
+            log::Info("controls: slide release (%s), before: %s", GunHand() == input::kLeft ? "left Y tap" : "B",
+                      st.Describe().c_str());
             gun.ReleaseSlideCatch();
             W.dead_trigger = false;
             W.end_charging_at = g_clock + 0.4;
@@ -2299,12 +2892,18 @@ void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState hs[
             input::Haptic(gun_in, 0.5f, 0.04f);
         }
     }
-    if (rin.primary.pressed && W.in_hand && gun.State().has_magazine) {
+    // The shotgun's tube is part of the gun: A does nothing on it (spec 4.5).
+    if (rin.primary.pressed && W.in_hand && !W.is_shotgun && gun.State().has_magazine) {
         log::Info("controls: mag release (%s hand), before: %s", HandName(GunHand()), gun.State().Describe().c_str());
         gun.DropMagazine();
         input::Haptic(gun_in, 0.4f, 0.04f);
     }
 
+    // The shotgun loads shells by hand instead (the pouch is its caddy).
+    if (W.is_shotgun) {
+        ShellHandling(gun, player, hs, in);
+        return;
+    }
     // A spare magazine always sits in its holster (the pouch), wherever it
     // was placed on the VR body. The late tick places it there each frame
     // (PlacePouchMag); here a free hand takes it out or puts it back.
@@ -2501,7 +3100,7 @@ void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState hs[
                                                 ? MagwellZoneFor(gun.Object(), W.held_mag, seat, seat_rot, out)
                                                 : kNoZone;
         const double max_below = interact::LineUpBelow(zone, MagLineUpOut(), old_below);
-        const double finish = interact::SeatLast(zone, g_set.mag_seat_last);
+        const double finish = interact::SeatLast(zone, MagSeatLast());
 
         if (W.mag_seating) {
             double t = std::fmin(1.0, (g_clock - W.seat_t0) / 0.1);
@@ -2576,7 +3175,7 @@ void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState hs[
         const double probe_below = zone.ok ? top.below : along;
         const double probe_side = zone.ok ? top.side : lateral;
         const double probe_tilt = zone.ok ? top.tilt : aim_off_deg;
-        const double max_lat = zone.ok ? g_set.mag_line_up_side : W.is_pistol ? 5.5 : 7.5;
+        const double max_lat = zone.ok ? MagLineUpSide() : W.is_pistol ? 5.5 : 7.5;
         const double max_aim = zone.ok ? g_set.mag_line_up_tilt : W.is_pistol ? 40.0 : 60.0;
         if (!W.mag_engaged && g_clock >= W.magwell_log_at && Len(p) < 35.0) {
             W.magwell_log_at = g_clock + 0.5;
@@ -2602,14 +3201,12 @@ void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState hs[
                               "window %.1f cm, not measured)",
                               along, lateral, aim_off_deg, max_below);
             }
-        } else if (probe_side > max_lat + 1.5 || along - W.mag_push_offset > max_below + 3.0 ||
-                   probe_tilt > max_aim + 10.0) {
+        } else if (const char* why = interact::LetGoWhy(zone, along - W.mag_push_offset, max_below, probe_side,
+                                                        probe_tilt, max_lat, max_aim, g_set.mag_hold_side)) {
             W.mag_engaged = false;
             log::Info("controls: magazine came off the magwell (%s): it got to %.1f cm from seated (it seats itself "
                       "from %.1f); its top %.1f cm off the axis, leaning %.0f deg%s",
-                      probe_side > max_lat + 1.5 ? "too far off the axis"
-                      : probe_tilt > max_aim + 10.0 ? "leaning too far" : "pulled back out",
-                      W.mag_deepest, finish, probe_side, probe_tilt,
+                      why, W.mag_deepest, finish, probe_side, probe_tilt,
                       GunHand() == input::kLeft ? " (gun in the left hand)" : "");
         }
         if (W.mag_engaged) {
@@ -2622,6 +3219,9 @@ void MagazineHandling(game::Gun& gun, UObject player, const hands::HandState hs[
                 W.mag_seating = true;
                 W.seat_from = a;
                 W.seat_t0 = g_clock;
+                log::Info("controls: magazine pushed to %.1f cm from seated (it seats itself from %.1f): seating; "
+                          "the hand's magazine top %.1f cm off the axis, leaning %.0f deg%s",
+                          a, finish, probe_side, probe_tilt, GunHand() == input::kLeft ? " (gun in the left hand)" : "");
             }
         }
     } else {
@@ -2736,6 +3336,552 @@ bool ActorBoxInFrame(UObject actor, const FQuat& inv, const FVector& grip_w, FVe
         have = true;
     }
     return have;
+}
+
+// ---- shotgun shells by hand (vr/interact/shell_load.h) ----
+// Owner 2026-11-07: "smart reload". The magazine pouch is the shotgun's
+// shell caddy: it shows (and gives) as many shells as the tube needs, 4, 2 or
+// 1. They are held as a quad, twin or single and pushed into the loading
+// port under the receiver two per push. Each shell that clicks in goes into
+// the game's tube through the game's own shell reload (Gun::LoadOneShell), so
+// the counts, sounds and lifter are the game's. The shells drawn in the hand
+// and at the caddy are our own actors of the gun's AmmoClass (never loaded).
+// Nothing here has run in the headset yet: the shotgun is not unlocked.
+
+// The shell actor's own shape: which local axis runs from its rim to its
+// crimp, where its rim is. Measured from its mesh once per ammo class;
+// until then the game's capsule says +Z from the origin (BP_AmmoBase_C's
+// construction script puts its collision capsule there).
+struct ShellShape {
+    UObject cls = 0;
+    FVector axis{0, 0, 1};
+    FVector base;
+    double length = interact::shells::kLength;
+} g_shell_shape;
+
+bool IsAmmoActor(UObject a) {
+    if (!LiveObject(a)) return false;
+    UObject c = ue::GetClass(a);
+    for (int i = 0; c && i < 16; ++i, c = ue::reflection::GetSuper(c))
+        if (ue::GetName(c) == "BP_AmmoBase_C") return true;
+    return false;
+}
+
+void MeasureShellShape(UObject a) {
+    const UObject cls = ue::GetClass(a);
+    if (!cls || g_shell_shape.cls == cls) return;
+    g_shell_shape = ShellShape{};
+    g_shell_shape.cls = cls;
+    FVector lo, hi;
+    if (!ActorBoxInFrame(a, ActorRotation(a).Inverse(), ActorLocation(a), &lo, &hi)) {
+        log::Info("controls: shell %s: no mesh box; using its capsule's +Z axis", ue::GetName(cls).c_str());
+        return;
+    }
+    const double l[3] = {lo.X, lo.Y, lo.Z}, h[3] = {hi.X, hi.Y, hi.Z};
+    int k = 0;
+    for (int i = 1; i < 3; ++i)
+        if (h[i] - l[i] > h[k] - l[k]) k = i;
+    const double len = h[k] - l[k];
+    if (len < 4.0 || len > 12.0) {
+        log::Info("controls: shell %s: mesh box %.1f x %.1f x %.1f cm is not shell-shaped; using its capsule's +Z axis",
+                  ue::GetName(cls).c_str(), h[0] - l[0], h[1] - l[1], h[2] - l[2]);
+        return;
+    }
+    // The rim is the end nearer the actor's origin.
+    const bool nose_plus = std::fabs(h[k]) >= std::fabs(l[k]);
+    double ax[3] = {0, 0, 0};
+    ax[k] = nose_plus ? 1.0 : -1.0;
+    double b[3] = {(l[0] + h[0]) * 0.5, (l[1] + h[1]) * 0.5, (l[2] + h[2]) * 0.5};
+    b[k] = nose_plus ? l[k] : h[k];
+    g_shell_shape.axis = FVector{ax[0], ax[1], ax[2]};
+    g_shell_shape.base = FVector{b[0], b[1], b[2]};
+    g_shell_shape.length = len;
+    log::Info("controls: shell %s: %.1f cm long along its %s%c axis, rim at (%.1f %.1f %.1f) in the actor",
+              ue::GetName(cls).c_str(), len, nose_plus ? "+" : "-", "XYZ"[k], b[0], b[1], b[2]);
+}
+
+// Draws a shell with its rim at `base` (world) and its crimp pointing along
+// `nose` in `frame` (a hand's grip frame, or the gun frame).
+void PlaceShell(UObject a, const FVector& base, const FQuat& frame, const FVector& nose) {
+    const FQuat r = frame * FromTo(Norm(g_shell_shape.axis), Norm(nose));
+    SetActorTransform(a, base - r.Rotate(g_shell_shape.base), r);
+}
+
+UObject SpawnShell(UObject player, UObject cls, const FVector& at) {
+    UObject a = SpawnMagazine(player, cls, at, FQuat{});
+    if (!a) return 0;
+    // Drawn only: no collision with the player, the gun or the world.
+    ue::Call c(a, "SetActorEnableCollision");
+    c.Set("bNewActorEnableCollision", false);
+    c.Invoke();
+    MeasureShellShape(a);
+    return a;
+}
+
+// Gone at once: loaded, put back in the caddy, or the gun put away.
+void RemoveShell(UObject a) {
+    if (!IsAmmoActor(a)) return;
+    ue::Call c(a, "Ammo_Clear");
+    c.Invoke();
+    ue::Call k(a, "K2_DestroyActor");
+    k.Invoke();
+}
+
+// Dropped shells fall to the floor (the game's own Ammo_Drop) and are
+// removed after a few seconds.
+struct DroppedShell { UObject a = 0; double remove_at = 0; };
+DroppedShell g_dropped_shells[16];
+
+void DropShell(UObject a) {
+    if (!IsAmmoActor(a)) return;
+    ue::Call c(a, "SetActorEnableCollision");
+    c.Set("bNewActorEnableCollision", true);
+    c.Invoke();
+    ue::Call d(a, "Ammo_Drop");
+    d.Invoke();
+    DroppedShell* slot = &g_dropped_shells[0];
+    for (DroppedShell& s : g_dropped_shells) {
+        if (!s.a) { slot = &s; break; }
+        if (s.remove_at < slot->remove_at) slot = &s;
+    }
+    if (slot->a) RemoveShell(slot->a);
+    *slot = DroppedShell{a, g_clock + 6.0};
+}
+
+void TidyDroppedShells() {
+    for (DroppedShell& s : g_dropped_shells) {
+        if (!s.a || g_clock < s.remove_at) continue;
+        RemoveShell(s.a);
+        s = DroppedShell{};
+    }
+}
+
+int FirstShell() {
+    for (int i = 0; i < interact::shells::kMaxHeld; ++i)
+        if (W.shell[i]) return i;
+    return -1;
+}
+
+// After a push: the shells left move up under the thumb (owner's quad: the
+// second pair takes the first pair's place).
+void RepackShells() {
+    int n = 0;
+    for (int i = 0; i < interact::shells::kMaxHeld; ++i)
+        if (W.shell[i]) {
+            UObject a = W.shell[i];
+            W.shell[i] = 0;
+            W.shell[n++] = a;
+        }
+    W.shell_count = n;
+}
+
+void ForgetShell(int slot) {
+    W.shell[slot] = 0;
+    W.shell_count = 0;
+    for (UObject a : W.shell)
+        if (a) ++W.shell_count;
+}
+
+void ClearHeldShells(bool drop, const char* why) {
+    int n = 0;
+    for (UObject& a : W.shell) {
+        if (!a) continue;
+        if (drop) DropShell(a);
+        else RemoveShell(a);
+        a = 0;
+        ++n;
+    }
+    W.shell_count = 0;
+    W.sweep = interact::shells::Sweep{};
+    if (n) log::Info("controls: %d shell(s) %s (%s)", n, drop ? "dropped" : "put away", why);
+}
+
+void ClearCaddy() {
+    for (UObject& a : W.caddy) {
+        RemoveShell(a);
+        a = 0;
+    }
+}
+
+// The game destroyed one (level change): forget it.
+void ForgetDeadShells() {
+    for (UObject& a : W.shell)
+        if (a && !LiveObject(a)) a = 0;
+    for (UObject& a : W.caddy)
+        if (a && !LiveObject(a)) a = 0;
+    int n = 0;
+    for (UObject a : W.shell)
+        if (a) ++n;
+    if (n != W.shell_count) {
+        log::Info("controls: %d of the held shells were destroyed by the game", W.shell_count - n);
+        W.shell_count = n;
+        RepackShells();
+        W.sweep = interact::shells::Sweep{};
+    }
+}
+
+// The tube as the shell code sees it, from the game's counts.
+interact::shells::Tube ShellTube(const game::GunState& st) {
+    interact::shells::Tube t;
+    t.capacity = st.capacity;
+    t.in_tube = st.magazine > 0 ? st.magazine : 0;
+    t.chamber = st.chamber;
+    t.bolt_open = st.slide_locked;
+    return t;
+}
+
+// Where the shells go in, measured once the gun is in hand: the tube's
+// mouth at the loading port (the front of the lifter, GunParts_ShellCarrier,
+// at the tube's height) and the ejection port (the gun's own
+// EjectShellDirection, where spent hulls leave). Gun frame from the grip.
+void MeasureShellPorts(game::Gun& gun) {
+    W.have_ports = true;
+    const UObject g = gun.Object();
+    const FQuat inv = W.frame_rot.Inverse();
+    UObject lifter = 0, tube = 0, well = 0, eject = 0;
+    ue::GetProp(g, "GunParts_ShellCarrier", lifter);
+    ue::GetProp(g, "MagazineObj", tube);
+    ue::GetProp(g, "MagazinePoint", well);
+    ue::GetProp(g, "EjectShellDirection", eject);
+    FVector llo, lhi, tlo, thi;
+    const bool have_lifter = lifter && MeshBoxInFrame(lifter, inv, W.grip_world, &llo, &lhi);
+    const bool have_tube = tube && ActorBoxInFrame(tube, inv, W.grip_world, &tlo, &thi);
+    const FVector well_g = well ? inv.Rotate(ComponentToWorld(well).translation - W.grip_world) : FVector{};
+    FVector mouth = well_g;
+    const char* x_from = "the magazine point";
+    const char* yz_from = "the magazine point";
+    if (have_lifter) {
+        mouth.X = lhi.X;
+        x_from = "the lifter's front";
+        mouth.Y = (llo.Y + lhi.Y) * 0.5;
+        mouth.Z = llo.Z + 1.0;
+        yz_from = "the lifter's bottom";
+    } else if (have_tube) {
+        mouth.X = tlo.X;
+        x_from = "the tube's rear";
+    }
+    if (have_tube) {
+        mouth.Y = (tlo.Y + thi.Y) * 0.5;
+        mouth.Z = (tlo.Z + thi.Z) * 0.5;
+        yz_from = "the tube's middle";
+    }
+    W.port_mouth = mouth;
+    if (eject) {
+        W.eject_port = inv.Rotate(ComponentToWorld(eject).translation - W.grip_world);
+    } else {
+        // Not found: the right side of the receiver above the lifter.
+        W.eject_port = FVector{have_lifter ? (llo.X + lhi.X) * 0.5 : mouth.X - 6.0, 2.5, W.bore_height};
+    }
+    log::Info("controls: shotgun %s: loading port mouth (%.1f %.1f %.1f) cm from the grip (forward, right, up), "
+              "forward from %s, height from %s; ejection port (%.1f %.1f %.1f) from %s; lifter %s (%.1f..%.1f "
+              "forward, %.1f..%.1f up), tube %s (%.1f..%.1f forward, %.1f..%.1f up), bore %.1f up",
+              gun.ClassName().c_str(), mouth.X, mouth.Y, mouth.Z, x_from, yz_from, W.eject_port.X, W.eject_port.Y,
+              W.eject_port.Z, eject ? "EjectShellDirection" : "a guess (no EjectShellDirection)",
+              have_lifter ? "measured" : "not measured", have_lifter ? llo.X : 0.0, have_lifter ? lhi.X : 0.0,
+              have_lifter ? llo.Z : 0.0, have_lifter ? lhi.Z : 0.0, have_tube ? "measured" : "not measured",
+              have_tube ? tlo.X : 0.0, have_tube ? thi.X : 0.0, have_tube ? tlo.Z : 0.0, have_tube ? thi.Z : 0.0,
+              W.bore_height);
+    // What the game says about its shell reload (spec section 6, check 2).
+    int32_t one_max = -1, mag_type = -1;
+    uint8_t type_byte = 0;
+    ue::GetProp(g, "OneReloadMaxShell", one_max);
+    if (ue::GetProp(g, "MagazineType", type_byte)) mag_type = type_byte;
+    const game::GunState st = gun.State();
+    log::Info("controls: shotgun tube %d/%d, chamber %d, bolt %s; the game's OneReloadMaxShell %d, MagazineType %d, "
+              "bolt travel %.1f cm (catch at %.1f)",
+              st.magazine, st.capacity, st.chamber, st.slide_locked ? "locked open" : "closed", one_max, mag_type,
+              gun.SlideBackLength(), gun.SlideStopLength());
+}
+
+// The caddy (the magazine pouch spot): shows as many shells as a grab would
+// give now, crimps down, in the hold they would be taken as. Late tick.
+void PlaceCaddyShells(UObject player, game::Gun& gun) {
+    if (!W.is_shotgun || !g_hw.valid) return;
+    const UObject cls = gun.AmmoClass();
+    if (!cls) return;
+    for (UObject& a : W.caddy) {
+        // The workbench changed the ammo: new shells.
+        if (a && (!LiveObject(a) || ue::GetClass(a) != cls)) {
+            RemoveShell(a);
+            a = 0;
+        }
+    }
+    const int n = interact::shells::SmartCount(g_shell_set, ShellTube(gun.State()));
+    const FVector spot = g_hw.spot[kMagSpot];
+    if (g_clock >= W.caddy_refill_at) {
+        for (int i = 0; i < n; ++i) {
+            if (W.caddy[i]) continue;
+            W.caddy[i] = SpawnShell(player, cls, spot);
+            if (!W.caddy[i]) {
+                if (W.caddy_spawn_fails++ < 5)
+                    log::Warn("controls: could not spawn a %s for the shell caddy", ue::GetName(cls).c_str());
+                W.caddy_refill_at = g_clock + 1.0;
+                break;
+            }
+        }
+    }
+    // Crimps down, rims up, in the anchor's frame (tilting with the chest or
+    // thigh it rides on).
+    const FQuat an = g_hw.spot_anchor_rot[kMagSpot];
+    const FQuat frame = FromAxes(an.Rotate(FVector{0, 0, 1}), an.Rotate(FVector{0, 1, 0}), an.Rotate(FVector{-1, 0, 0}));
+    for (int i = 0; i < interact::shells::kMaxHeld; ++i) {
+        UObject a = W.caddy[i];
+        if (!a) {
+            W.caddy_hidden[i] = -1;
+            continue;
+        }
+        const bool shown = i < n;
+        if (W.caddy_hidden[i] != (shown ? 0 : 1)) {
+            W.caddy_hidden[i] = shown ? 0 : 1;
+            ue::Call h(a, "SetActorHiddenInGame");
+            h.Set("bNewHidden", !shown);
+            h.Invoke();
+        }
+        if (shown)
+            PlaceShell(a, spot + frame.Rotate(interact::shells::HoldBase(n, i, FVector{})), frame,
+                       interact::shells::HoldNoseDir());
+    }
+}
+
+// A free hand closing on the caddy takes what it shows.
+bool TakeShells(game::Gun& gun, UObject player, int n, int hand) {
+    const UObject cls = gun.AmmoClass();
+    if (!cls) return false;
+    const FVector at = g_hw.spot[kMagSpot];
+    for (int i = 0; i < n; ++i) {
+        UObject a = W.caddy[i];
+        W.caddy[i] = 0;
+        W.caddy_hidden[i] = -1;
+        if (!a || !LiveObject(a) || ue::GetClass(a) != cls) {
+            RemoveShell(a);
+            a = SpawnShell(player, cls, at);
+        }
+        if (!a) {
+            for (UObject& s : W.shell) {
+                RemoveShell(s);
+                s = 0;
+            }
+            W.shell_count = 0;
+            return false;
+        }
+        ue::Call h(a, "SetActorHiddenInGame");
+        h.Set("bNewHidden", false);
+        h.Invoke();
+        W.shell[i] = a;
+    }
+    W.shell_count = n;
+    W.shell_layout = n;
+    W.shell_hand = hand;
+    W.sweep = interact::shells::Sweep{};
+    W.caddy_refill_at = g_clock + 0.3;
+    return true;
+}
+
+// One shell into the game's tube. False: the game refused (logged).
+bool LoadShellIntoGun(game::Gun& gun, const char* how) {
+    const game::GunState before = gun.State();
+    std::string why;
+    const bool ok = gun.LoadOneShell(&why);
+    const game::GunState after = gun.State();
+    if (!ok) {
+        log::Warn("controls: shell %s refused: %s (tube %d/%d)", how, why.c_str(), before.magazine, before.capacity);
+        return false;
+    }
+    if (after.magazine != before.magazine + 1)
+        log::Warn("controls: shell %s: the tube went from %d to %d (expected one more)", how, before.magazine,
+                  after.magazine);
+    else
+        log::Info("controls: shell %s: tube %d/%d, chamber %d", how, after.magazine, after.capacity, after.chamber);
+    return true;
+}
+
+// Grip editor: the hand poses around the first shell (the body moves it
+// with the hand); the others keep their places in the hold around it.
+void ShellsFollowLead() {
+    const int lead = FirstShell();
+    if (lead < 0 || W.shell_count < 2 || !LiveObject(W.shell[lead])) return;
+    const FQuat lead_rot = ActorRotation(W.shell[lead]);
+    const FQuat in_hand = FromTo(Norm(g_shell_shape.axis), interact::shells::HoldNoseDir());
+    const FQuat hr = lead_rot * in_hand.Inverse();
+    const FVector lead_base = ActorLocation(W.shell[lead]) + lead_rot.Rotate(g_shell_shape.base);
+    const FVector at = interact::shells::HoldBase(W.shell_layout, lead, g_shell_nudge);
+    for (int i = 0; i < interact::shells::kMaxHeld; ++i) {
+        if (!W.shell[i] || i == lead) continue;
+        const FVector d = interact::shells::HoldBase(W.shell_layout, i, g_shell_nudge) - at;
+        PlaceShell(W.shell[i], lead_base + hr.Rotate(d), hr, interact::shells::HoldNoseDir());
+    }
+}
+
+void ShellHandling(game::Gun& gun, UObject player, const hands::HandState hs[2], const input::HandInput in[2]) {
+    namespace sh = interact::shells;
+    ForgetDeadShells();
+    TidyDroppedShells();
+    if (!W.have_ports && W.have_pose && W.in_hand) MeasureShellPorts(gun);
+    const sh::Tube tube = ShellTube(gun.State());
+    const bool have_pouch = g_hw.valid;
+    const FVector pouch_loc = g_hw.spot[kMagSpot];
+    const double pouch_radius = g_spots[kMagSpot].radius;
+
+    // An empty hand closing on the caddy takes 4, 2 or 1 (smart reload).
+    if (W.shell_count == 0) {
+        auto may_take = [&](int h) {
+            return (g_set.either_hand || h == OtherHand()) && hs[h].valid && !ControlsHoldsGrip(h);
+        };
+        int take = -1;
+        double take_dist = 1e9;
+        for (int h : {input::kLeft, input::kRight}) {
+            const bool can = have_pouch && may_take(h);
+            const double d = hs[h].valid ? Len(hs[h].grip.location - pouch_loc) : 1e9;
+            if (W.mag_zone[h].Update(d, pouch_radius, can)) input::Haptic(InputOf(h), 0.15f, 0.015f);
+            if (can && in[h].grip_button.pressed && d <= pouch_radius && d < take_dist) {
+                take = h;
+                take_dist = d;
+            }
+        }
+        if (take < 0) return;
+        const int n = sh::SmartCount(g_shell_set, tube);
+        if (n <= 0) {
+            input::Haptic(InputOf(take), 0.6f, 0.06f);
+            log::Info("controls: shell caddy: nothing to take (tube %d/%d, chamber %d, bolt %s)", tube.in_tube,
+                      tube.capacity, tube.chamber, tube.bolt_open ? "locked open: press B first" : "closed");
+            return;
+        }
+        if (!TakeShells(gun, player, n, take)) {
+            log::Warn("controls: shell caddy: could not make %d shell(s) of %s", n,
+                      ue::GetName(gun.AmmoClass()).c_str());
+            return;
+        }
+        input::Haptic(InputOf(take), 0.4f, 0.04f);
+        log::Info("controls: %s hand took %d shell(s) as a %s from the caddy (%.1f cm from it): tube %d/%d, chamber "
+                  "%d, bolt %s%s",
+                  HandName(take), n, sh::HoldName(n), take_dist, tube.in_tube, tube.capacity, tube.chamber,
+                  tube.bolt_open ? "locked open" : "closed",
+                  tube.bolt_open && g_shell_set.empty_gun_single ? " (one for the ejection port)" : "");
+    }
+
+    const int hand_i = W.shell_hand;
+    const hands::HandState& hand = hs[hand_i];
+    const input::HandInput& hin = in[hand_i];
+    if (!hand.valid) {
+        if (hin.grip_button.released || !hin.grip_button.down)
+            ClearHeldShells(true, "let go while the controller had no tracking");
+        return;
+    }
+    // Let go: at the caddy they go back, anywhere else they fall.
+    if (hin.grip_button.released || !hin.grip_button.down) {
+        const double d = Len(hand.grip.location - pouch_loc);
+        if (have_pouch && d <= pouch_radius) {
+            input::Haptic(InputOf(hand_i), 0.4f, 0.04f);
+            ClearHeldShells(false, "put back in the caddy");
+        } else {
+            ClearHeldShells(true, W.sweep.captured ? "let go in the loading port before they clicked in" : "let go");
+        }
+        return;
+    }
+
+    const FQuat hr = hand.grip.rotation;
+    auto held_base = [&](int slot) {
+        return hand.grip.location + hr.Rotate(sh::HoldBase(W.shell_layout, slot, g_shell_nudge));
+    };
+    const FVector nose_w = hr.Rotate(sh::HoldNoseDir());
+    // Only into the gun in the other hand.
+    const bool at_gun = W.have_pose && W.in_hand && W.have_ports && hand_i != GunHand();
+    FVector mouth, axis;
+    if (at_gun) {
+        mouth = W.grip_world + W.frame_rot.Rotate(W.port_mouth);
+        axis = W.frame_rot.Rotate(FVector{1, 0, 0});
+        int lead = FirstShell();
+        // An empty gun with its bolt locked open takes one shell through the
+        // ejection port (B or a rack then chambers it).
+        if (!W.sweep.captured && lead >= 0 && sh::PortOpen(tube)) {
+            const FVector middle = held_base(lead) + nose_w * (sh::kLength * 0.5);
+            const FVector port = W.grip_world + W.frame_rot.Rotate(W.eject_port);
+            if (sh::AtEjectionPort(middle, port, g_shell_set)) {
+                if (LoadShellIntoGun(gun, "dropped in the ejection port")) {
+                    RemoveShell(W.shell[lead]);
+                    ForgetShell(lead);
+                    RepackShells();
+                    input::Haptic(InputOf(hand_i), 0.5f, 0.04f);
+                    log::Info("controls: the shell is on the lifter: B (or a full rack) chambers it");
+                } else {
+                    input::Haptic(InputOf(hand_i), 0.6f, 0.06f);
+                }
+            }
+        }
+        sh::StepIn si;
+        si.nose = held_base(0) + nose_w * sh::kLength - mouth;
+        si.nose_dir = nose_w;
+        si.axis = axis;
+        si.held = W.shell_count;
+        si.room = sh::TubeRoom(tube);
+        si.locked = sh::TubeLocked(g_shell_set, tube);
+        if (!W.sweep.captured && g_clock >= W.shell_log_at && Len(si.nose) < 25.0) {
+            W.shell_log_at = g_clock + 0.5;
+            const double along = DotV(si.nose, axis);
+            log::Info("controls: shells near the loading port: lead nose %.1f cm %s the mouth along the tube, %.1f cm "
+                      "off its line, %.0f deg off it (catches within %.1f cm and %.0f deg)",
+                      std::fabs(along), along < 0 ? "behind" : "past", Len(si.nose - axis * along),
+                      std::acos(std::clamp(DotV(nose_w, axis), -1.0, 1.0)) * 180.0 / 3.14159265358979,
+                      g_shell_set.capture_cm, g_shell_set.capture_deg);
+        }
+        switch (sh::Advance(W.sweep, g_shell_set, si)) {
+            case sh::Step::kCaptured:
+                input::Haptic(InputOf(hand_i), 0.2f, 0.02f);
+                log::Info("controls: shells in the loading port: pushing %d (%d in the hand), tube %d/%d%s",
+                          W.sweep.pair, W.shell_count, tube.in_tube, tube.capacity,
+                          si.locked ? ", but the bolt is locked open: the tube is locked (press B first)" : "");
+                break;
+            case sh::Step::kCommit: {
+                lead = FirstShell();
+                if (lead >= 0 && LoadShellIntoGun(gun, W.sweep.loaded == 1 ? "1 of the push in" : "2 of the push in")) {
+                    RemoveShell(W.shell[lead]);
+                    ForgetShell(lead);
+                    // The spring pushes back harder as the tube fills.
+                    const float k = tube.capacity > 0 ? static_cast<float>(tube.in_tube + 1) / tube.capacity : 0.5f;
+                    input::Haptic(InputOf(hand_i), 0.3f + 0.4f * k, 0.03f);
+                } else {
+                    gun.PlayShellBlocked();
+                    input::Haptic(InputOf(hand_i), 0.8f, 0.08f);
+                    W.sweep.captured = false;
+                }
+                if (!W.sweep.captured) {
+                    RepackShells();
+                    log::Info("controls: push done: %d shell(s) left in the hand", W.shell_count);
+                }
+                break;
+            }
+            case sh::Step::kBlocked:
+                gun.PlayShellBlocked();
+                input::Haptic(InputOf(hand_i), 0.8f, 0.08f);
+                log::Info("controls: shell blocked: %s", si.locked ? "the bolt is locked open (press B first)"
+                                                                     : "the tube is full");
+                break;
+            case sh::Step::kLetGo:
+                log::Info("controls: shells came out of the loading port (%d still in the hand)", W.shell_count);
+                RepackShells();
+                break;
+            default:
+                break;
+        }
+    } else if (W.sweep.captured) {
+        W.sweep = sh::Sweep{};
+        RepackShells();
+    }
+    if (W.shell_count == 0) return;
+
+    // Draw them: the one being pushed on the tube's line, the rest in the hand.
+    const int lead = FirstShell();
+    for (int i = 0; i < sh::kMaxHeld; ++i) {
+        UObject a = W.shell[i];
+        if (!a) continue;
+        DetachIfAttached(a);
+        if (at_gun && W.sweep.captured && i == lead) {
+            const FVector nose = mouth + axis * sh::ShownDepth(W.sweep, g_shell_set);
+            PlaceShell(a, nose - axis * g_shell_shape.length, W.frame_rot, FVector{1, 0, 0});
+        } else {
+            PlaceShell(a, held_base(i), hr, sh::HoldNoseDir());
+        }
+    }
 }
 
 // Measures the parts; `found` lists what was used, for the log.
@@ -3007,11 +4153,71 @@ void SupportGrip(const hands::HandState& lh, const input::HandInput& lin, double
     input::Haptic(InputOf(OtherHand()), 0.35f, 0.03f);
 }
 
-// Right stick click: fire selector (safe / semi / auto, as the gun allows).
-void FireSelector(game::Gun& gun, const input::HandInput& rin) {
-    // Rifles only: a Glock has no selector, and a stray click on the turn
-    // stick must never put the pistol on safe.
-    if (W.is_pistol || !rin.stick_click.pressed) return;
+// Fire selector (safe / semi / auto, as the gun allows): left X with the
+// rifle in the right hand. Owner 2026-11-07: it shared the right stick click
+// with the kick, so a rifle could not kick. With the rifle in the left hand
+// (left X is its magazine release, left Y its bolt release, right A the only
+// weapon switch) it is right B, which otherwise only shows objective markers.
+// The right stick click is the kick with every gun in either hand.
+bool SelectorOnRightB() { return GunHand() == input::kLeft; }
+
+bool AimingEye(FVector* out);
+// The gun hand's B (Y in the left hand), held with a rifle: past 0.4 s (a
+// tap is still the bolt release) the rifle comes off the shoulder snap and
+// follows the hands, so the sights can be lined up by eye. Let go after at
+// least 2 s and the eye's place against the rifle is saved.
+void CheekWeldButton(game::Gun& gun, const input::HandInput& gin) {
+    // Right hand only: the left hand's Y held 1 s opens the grip editor.
+    if (W.is_pistol || !W.in_hand || !W.have_pose || GunHand() != input::kRight) {
+        W.weld_hold = 0;
+        W.weld_free = false;
+        return;
+    }
+    if (gin.secondary.down && !W.slide.Held()) {
+        const double before = W.weld_hold;
+        W.weld_hold += g_dt;
+        if (before < 0.4 && W.weld_hold >= 0.4) {
+            W.weld_free = true;
+            input::Haptic(InputOf(GunHand()), 0.3f, 0.03f);
+            log::Info("controls: cheek weld: B held, the rifle follows your hands; line up the sights and let go");
+        }
+        if (before < 2.0 && W.weld_hold >= 2.0) input::Haptic(InputOf(GunHand()), 0.5f, 0.05f);  // long enough
+        return;
+    }
+    if (W.weld_free && W.weld_hold >= 2.0) {
+        FVector eye;
+        if (AimingEye(&eye)) {
+            const FVector e = W.frame_rot.Inverse().Rotate(eye - W.grip_world);
+            const bool sane = e.X > -60 && e.X < 20 && std::fabs(e.Y) < 20 && e.Z > -5 && e.Z < 35;
+            if (sane) {
+                W.have_weld = true;
+                W.weld_local = e;
+                W.shouldered = true;
+                W.shoulder_blend = 1.0;
+                g_welds[gun.ClassName()] = e;
+                SaveWelds();
+                input::Haptic(InputOf(GunHand()), 0.9f, 0.12f);
+                log::Info("controls: cheek weld saved for %s: eye %.1f cm behind the grip, %.1f right, %.1f up "
+                          "(sight point %.1f %.1f %.1f: eye %.1f cm behind it, %.1f right, %.1f up)",
+                          gun.ClassName().c_str(), -e.X, e.Y, e.Z, W.ads_local.X, W.ads_local.Y, W.ads_local.Z,
+                          W.ads_local.X - e.X, e.Y - W.ads_local.Y, e.Z - W.ads_local.Z);
+            } else {
+                log::Info("controls: cheek weld not saved: the eye was not behind the rifle (%.1f %.1f %.1f)", e.X, e.Y,
+                          e.Z);
+            }
+        }
+    } else if (W.weld_free) {
+        log::Info("controls: cheek weld cancelled (B let go after %.1f s; hold it 2 s)", W.weld_hold);
+    }
+    W.weld_hold = 0;
+    W.weld_free = false;
+}
+void FireSelector(game::Gun& gun, const input::Snapshot& s) {
+    // Rifles only: a Glock has no selector.
+    if (W.is_pistol) return;
+    const bool pressed = SelectorOnRightB() ? s.hand[input::kRight].secondary.pressed
+                                            : s.hand[input::kLeft].primary.pressed;
+    if (!pressed) return;
     ue::Call c(gun.Object(), "Gun_SwitchFireMode");
     c.Invoke();
     uint8_t mode = 0;
@@ -3317,7 +4523,10 @@ void PhysicalCrouchAndJump(UObject player) {
 //   Left stick            move; click: sprint on/off (ends when you stop)
 //   Left Y                tap: switch weapon (slide release with the gun in the left hand); hold 1 s: grip editor
 //   Left X                magazine release with the gun in the left hand
-//   Right stick           left/right turn, up jump, down crouch / stand; click: kick (fire selector on a rifle)
+//   Right stick           left/right turn, up jump, down crouch / stand; click: kick
+//   Left X                rifle fire selector with the rifle in the right hand (right B with it in the left)
+//   Right B held          rifle in the right hand: cheek weld (rifle follows the hands while held;
+//                         let go after 2 s to save where the eye sits; a tap is still the bolt release)
 //   Gun hand's trigger    fire
 //   Other trigger         weapon light with that hand right next to the gun, else interact (any empty hand)
 //   Right A / B           magazine release / slide release with the gun in the right hand;
@@ -4108,7 +5317,8 @@ void GameActions(UObject player, const input::Snapshot& s) {
     // gun in the left hand Y is its slide release instead.
     if (l.secondary.pressed) GA.y_down_at = g_clock;
     if (l.secondary.released && GA.y_down_at > 0) {
-        if (g_clock - GA.y_down_at < 0.4 && !left_has_gun) {
+        if (g_clock - GA.y_down_at < 0.4 && !left_has_gun &&
+            hands::GetInteraction(hands::kLeft).owner == hands::GripOwner::kNone) {
             ue::Call c(player, "PlayerInput_ScrollWeapon");
             c.Set("IsUp", true);
             c.Invoke();
@@ -4132,20 +5342,23 @@ void GameActions(UObject player, const input::Snapshot& s) {
     // the left hand): switch weapon / objective markers. With the gun in the
     // right hand they are the magazine release and the slide release
     // (MagazineHandling).
-    if (!right_has_gun && r.primary.pressed) {
+    // Overlap check 2026-11-08: not while that hand holds anything (a
+    // magazine, the slide, a drink, an attachment): a stray press switched
+    // weapon (and removed the put-away gun's spare magazines).
+    const bool right_busy = hands::GetInteraction(hands::kRight).owner != hands::GripOwner::kNone;
+    if (!right_has_gun && !right_busy && r.primary.pressed) {
         ue::Call c(player, "PlayerInput_ScrollWeapon");
         c.Set("IsUp", true);
         c.Invoke();
         log::Info("controls: switch weapon (right A, hand empty)");
     }
-    if (!right_has_gun && r.secondary.pressed) {
+    if (!right_has_gun && !right_busy && !(left_has_gun && GunIsRifle(player)) && r.secondary.pressed) {
         FireEvent(player, GA.nav);
         log::Info("controls: objective markers (right B, hand empty)");
     }
 
-    // Right stick click: kick (the game's melee). On a rifle it is the fire
-    // selector instead (FireSelector).
-    if (r.stick_click.pressed && !GunIsRifle(player) && g_clock >= GA.melee_ready_at) {
+    // Right stick click: kick (the game's melee), with any gun in either hand.
+    if (r.stick_click.pressed && g_clock >= GA.melee_ready_at) {
         BeginKick(player);
         ue::Call c(player, "PlayerInput_MeleeAttack");
         c.Set("Press Released", false);
@@ -4227,6 +5440,11 @@ struct RifleCarryState {
     bool logged_guns = false;
 } g_rc;
 
+void PlayerGuns(UObject* rifle, UObject* pistol) {
+    *rifle = g_rc.rifle;
+    *pistol = g_rc.pistol;
+}
+
 bool GunIsRifle(UObject player) {
     game::Gun gun = game::Gun::Current(player);
     return gun.Valid() && gun.Object() == W.gun && !W.is_pistol;
@@ -4262,6 +5480,14 @@ interact::HolsterVisual g_holster_visual;
 interact::HolsterFeedback g_holster_feedback;
 hands::HandGrab g_holster_reach;
 int g_holster_reach_hand = input::kRight;   // the hand the holster's hand snap is for
+// The off hand drawn holding the pistol in the other hand (offhand_snap,
+// UpdateOffhandSnap): published on OtherHand() when it holds nothing.
+interact::OffhandSnap g_offhand;
+hands::HandGrab g_offhand_reach;
+
+// The off hand is drawn on the pistol: it is held in both hands
+// (PistolInBothHands, for its kick).
+bool OffhandOnPistol() { return g_offhand.TwoHands(); }
 UObject g_holster_owner = 0;
 void UpdateHolsterVisual(UObject player, const hands::HandState hs[2]);
 void DrawHolsterModel(UObject player);
@@ -4306,6 +5532,15 @@ void PublishGrabs(game::Gun& gun, const hands::HandState hs[2]) {
         g[gh].point = hands::kPointChargingHandle;
     }
     auto mag_grab = [&](int mh) {
+        if (W.shell_count > 0 && W.shell_hand == mh) {
+            // Shotgun shells: the first one left, with the hold's own pose.
+            const int lead = FirstShell();
+            g[mh].kind = hands::GrabKind::kMagHeld;
+            g[mh].object = lead >= 0 ? W.shell[lead] : 0;
+            g[mh].target = hs[mh].grip;
+            g[mh].point = hands::kPointShells + W.shell_layout;
+            return;
+        }
         g[mh].kind = hands::GrabKind::kMagHeld;
         g[mh].object = W.held_mag;
         g[mh].target = hs[mh].grip;
@@ -4355,6 +5590,9 @@ void PublishGrabs(game::Gun& gun, const hands::HandState hs[2]) {
     // grab, including a gun-hand charging handle, wins.
     const int sh = g_holster_reach_hand;
     if (g[sh].kind == hands::GrabKind::kNone && hs[sh].valid && !ControlsHoldsGrip(sh)) g[sh] = g_holster_reach;
+    // The off hand snapped onto the pistol in the gun hand (offhand_snap).
+    if (g_offhand_reach.object && g[oh].kind == hands::GrabKind::kNone && lh.valid && !ControlsHoldsGrip(oh))
+        g[oh] = g_offhand_reach;
     std::lock_guard<std::mutex> lock(g_hands_mutex);
     g_grab[0] = g[0];
     g_grab[1] = g[1];
@@ -6364,6 +7602,91 @@ void UpdateHolsterVisual(UObject player, const hands::HandState hs[2]) {
     }
 }
 
+// The off hand on the pistol (owner 2026-11-07): when the off hand's
+// controller nearly touches the gun hand's, the off hand is drawn holding the
+// pistol too, the way a hand snaps onto the pistol in its holster. Two poses,
+// both posed by the owner in the grip editor: the gun near the chest, and
+// the rest of the time (BP_HG_C.offhand-chest-left / BP_HG_C.offhand-left).
+// Presentation only: the controller and the gun are not moved, and any real
+// grab (slide, magazine, light) takes the hand. While it is on the pistol
+// counts as held in two hands (PistolHeldInTwoHands).
+void UpdateOffhandSnap(game::Gun& gun, const hands::HandState hs[2]) {
+    g_offhand_reach = {};
+    const int G = GunHand(), O = OtherHand();
+    const hands::HandState& gh = hs[G];
+    const hands::HandState& oh = hs[O];
+    const bool pistol = gun.Valid() && gun.Object() == W.gun && W.is_pistol && W.in_hand && W.have_pose;
+    const bool free = oh.valid && !ControlsHoldsGrip(O) && !workbench::HoldsGrip(O) && !drinks::HoldsGrip(O) &&
+                      hands::GetInteraction(HandOf(O)).AllowsControls();
+    interact::OffhandSnapInput in;
+    in.allowed = g_set.offhand_snap && pistol && gh.valid && free && !ui_panel::MenuOpen() &&
+                 hands::EditorHand() < 0 && !body::CalibrationActive() && !W.edit_frozen;
+    in.hands_apart = gh.valid && oh.valid ? Len(oh.grip.location - gh.grip.location) : 1e9;
+    // From the gun hand's controller, not the drawn gun, which a kick or a
+    // wall push moves (2026-11-08 run: the gun pushed off its own sight
+    // flipped the pose every frame).
+    in.gun_to_chest = g_hw.valid && gh.valid
+        ? Len(gh.grip.location - g_hw.anchor[static_cast<int>(interact::HolsterAnchor::kChest)].location) : 1e9;
+    // One distance for the snap and for the pistol's two-hand kick.
+    in.snap_cm = g_set.pistol_both_hands_cm;
+    in.release_cm = g_set.pistol_both_hands_cm + 4.0;
+    in.chest_cm = g_set.offhand_chest_cm;
+    in.chest_release_cm = g_set.offhand_chest_cm + 5.0;
+    in.dt = g_dt;
+    const bool was_near = g_offhand.Near(), was_chest = g_offhand.Chest();
+    g_offhand.Update(in);
+    // The log says how close the controllers came, so the distance can be
+    // set from a run (pistol_both_hands_cm).
+    // armed: the hands have been 25 cm apart since the last snap, so
+    // pulling away after one is not counted as a near miss.
+    static double since = 0, closest = 1e9, told_closest_at = -1e9;
+    static bool armed = true;
+    if (g_offhand.Near() != was_near) {
+        if (!g_offhand.Near()) armed = false;
+        if (g_offhand.Near()) {
+            since = g_clock;
+            log::Info("controls: %s hand on the pistol (controllers %.1f cm apart, snaps within %.0f); gun hand %.0f "
+                      "cm from the chest: %s pose",
+                      HandName(O), in.hands_apart, in.snap_cm, in.gun_to_chest < 1e8 ? in.gun_to_chest : -1.0,
+                      g_offhand.Chest() ? "chest" : "held-out");
+        } else {
+            log::Info("controls: %s hand off the pistol after %.1f s (controllers %.1f cm apart%s)", HandName(O),
+                      g_clock - since, in.hands_apart < 1e8 ? in.hands_apart : -1.0,
+                      in.allowed ? "" : "; the hand took something, a menu or the editor opened, or tracking was lost");
+        }
+    } else if (g_offhand.Near() && g_offhand.Chest() != was_chest) {
+        log::Info("controls: %s hand on the pistol: %s pose (gun hand %.0f cm from the chest, changes at %.0f)",
+                  HandName(O), g_offhand.Chest() ? "chest" : "held-out", in.gun_to_chest, in.chest_cm);
+    }
+    if (in.hands_apart >= 25.0) armed = true;
+    if (armed && in.allowed && !g_offhand.Near() && in.hands_apart < 25.0) {
+        closest = std::fmin(closest, in.hands_apart);
+    } else if (closest < 1e8) {
+        // Came near without snapping: worth knowing if the snap distance is
+        // too small for these controllers (at most every 10 s).
+        if (!g_offhand.Near() && g_clock - told_closest_at > 10.0) {
+            told_closest_at = g_clock;
+            log::Info("controls: %s controller came within %.1f cm of the gun hand's without snapping (snaps within "
+                      "%.0f, pistol_both_hands_cm)",
+                      HandName(O), closest, in.snap_cm);
+        }
+        closest = 1e9;
+    }
+    if (!in.allowed || g_offhand.Blend() <= 0 || !W.gun) return;
+    g_offhand_reach.kind = hands::GrabKind::kSupportGrip;
+    g_offhand_reach.object = W.gun;
+    // The gun frame at its grip point: the pose is stored relative to it.
+    g_offhand_reach.target = {W.grip_world, W.frame_rot};
+    g_offhand_reach.point = g_offhand.Chest() ? hands::kPointOffhandChest : hands::kPointOffhand;
+    g_offhand_reach.holster_preview = true;
+    g_offhand_reach.pose_blend = g_offhand.Blend();
+}
+
+void ClearOffhandSnap() {
+    g_offhand.Reset();
+    g_offhand_reach = {};
+}
+
 // Named parts of the holster work, so the 10 s perf report says which part
 // costs time (tick 3 alone was 8 ms a frame on 2026-11-06).
 perf::Counter g_perf_holster_place{"holsters: guns and pouch placed"};
@@ -6393,6 +7716,7 @@ void OnLateTick(UObject player, float) {
         game::Gun gun(W.gun);
         if (W.uses_holster && !W.in_hand && !W.edit_frozen) PlaceGunInHolster(gun);
         PlacePouchMag(W.gun);
+        PlaceCaddyShells(player, gun);
         if (!W.edit_frozen) PlaceSparePistol();
         PlaceRifleInHolster();
     }
@@ -6403,6 +7727,17 @@ void OnLateTick(UObject player, float) {
 void OnTick(UObject player, float dt) {
     g_clock += dt;
     ++g_controls_frame;
+    // The hands and fingers leave the player's guns and what is fitted to
+    // them out of their wall checks too.
+    body::hand_walls::SetOwnGear(OwnGear());
+    {
+        // Gun scopes draw their view only while at the aiming eye
+        // (vr_scope_view; render_fixes::UpdateScopes).
+        hands::Pose head;
+        FVector eye;
+        const bool have = hands::Head(&head) && AimingEye(&eye);
+        render_fixes::UpdateScopes(have, eye, have ? head.rotation.Rotate(FVector{1, 0, 0}) : FVector{}, g_clock);
+    }
     RefreshKick(player);
     g_dt = dt;
     HookGameAxes(player);
@@ -6416,6 +7751,7 @@ void OnTick(UObject player, float dt) {
         if (body::CalibrationActive()) body::SetCalibrationTriggers(false, false, false);
         InvalidateHands();
         ClearHolsterVisual();
+        ClearOffhandSnap();
         ResolveHandOwnership(false);
         ReleaseTrigger(player);
         ReleaseModalActions(player, "tracking unavailable");
@@ -6426,6 +7762,7 @@ void OnTick(UObject player, float dt) {
     UpdateHands(s);
     if (body::CalibrationActive()) {
         ClearHolsterVisual();
+        ClearOffhandSnap();
         // Keep raw tracked poses available to calibration, but give this pose
         // sequence exclusive input ownership. It must not sprint, shoot, grab,
         // crouch or turn the tracking frame while collecting measurements.
@@ -6504,16 +7841,28 @@ void OnTick(UObject player, float dt) {
             if (DestroyMagazine(m)) removed++;
         }
         if (removed) log::Info("controls: removed %d spare magazine(s) of the gun put away", removed);
+        // The shotgun's shells (in the hand and at the caddy) go with it.
+        ClearHeldShells(false, "the shotgun was put away");
+        ClearCaddy();
         W = WeaponState();
         W.gun = gun.Object();
         if (gun.Valid()) {
             W.is_pistol = gun.ClassName().find("HG") != std::string::npos;
+            W.is_ar = gun.ClassName().find("BP_AR") != std::string::npos;
+            // HOLE's shotgun (BP_SG_C, "Tombo12"): loaded by hand, shell by shell.
+            W.is_shotgun = gun.ClassName().rfind("BP_SG", 0) == 0;
             W.uses_holster = W.is_pistol && g_set.holster_pistol && g_spots[kPistolSpot].enabled;
             W.holster.Configure(g_spots[kPistolSpot].radius,
                                 g_set.holster_toggle ? interact::DrawMode::kToggle : interact::DrawMode::kHold);
             W.holster.Reset(interact::HolsterState::kHolstered);
             W.in_hand = !W.uses_holster;
-            log::Info("controls: holding %s (%s)", gun.ClassName().c_str(), W.is_pistol ? "pistol" : "rifle");
+            log::Info("controls: holding %s (%s)", gun.ClassName().c_str(),
+                      W.is_pistol ? "pistol" : W.is_shotgun ? "shotgun: shells by hand from the caddy" : "rifle");
+            auto weld = g_welds.find(gun.ClassName());
+            if (weld != g_welds.end()) {
+                W.have_weld = true;
+                W.weld_local = weld->second;
+            }
             auto seat = g_mag_seats.find(gun.ClassName());
             if (seat != g_mag_seats.end()) {
                 W.seat_offset = seat->second.offset;
@@ -6529,6 +7878,7 @@ void OnTick(UObject player, float dt) {
     if (!gun.Valid()) {
         g_late_ok = false;
         ClearHolsterVisual();
+        ClearOffhandSnap();
         const hands::HandState none[2];
         PublishGrabs(gun, none);
         return;
@@ -6636,6 +7986,7 @@ void OnTick(UObject player, float dt) {
             c.Invoke();
             W.trigger_sent = false;
         }
+        ShellsFollowLead();
     } else if (ui_panel::MenuOpen()) {
         // A game menu is up: the trigger is a laser-pointer click, so no
         // firing, grabbing or gun buttons. Let go of anything held.
@@ -6687,14 +8038,15 @@ void OnTick(UObject player, float dt) {
         input::HandInput osup = ofree;
         if (toggle_drop[O]) osup.grip_button.pressed = false;  // that squeeze let go of the magazine
         SupportGrip(lh, osup, dt);
-        // The fire selector stays on the right stick's click (the left one sprints).
-        FireSelector(gun, s.hand[input::kRight]);
+        FireSelector(gun, s);
+        CheekWeldButton(gun, s.hand[GunHand()]);
         RifleCarry(player, rh, lh, s.hand[O], s.hand[G], dt, true);
     }
     {
         perf::Scope t(g_perf_holster_visual);
         UpdateHolsterVisual(player, hs);
     }
+    UpdateOffhandSnap(gun, hs);
     PublishGrabs(gun, hs);
     RackTrace(gun, dt);
 }
@@ -6755,6 +8107,7 @@ void RequestHolsterMove() {
 void Init() {
     LoadSettings();
     LoadMagSeats();
+    LoadWelds();
     holster_audio::Init(config::Dir());
     config::AddChangeListener(&ReloadSettings);
     game::AddTickListener(&OnTick);

@@ -1289,6 +1289,16 @@ const hands::HandGrab& GunGrab(const hands::HandGrab grab[2], const hands::HandG
     return grab[kR];
 }
 
+// A visual-only snap with the hand's own pose, posed by the owner: the left
+// hand reaching for the holstered pistol (kPointHolster), the off hand on the
+// pistol in the other hand (kPointOffhand*). (The right hand reaching for the
+// holster uses its gun grip, fitted by holster_pose::Fit.)
+bool OwnReach(const hands::HandGrab& grab) {
+    if (!grab.holster_preview) return false;
+    return (grab.kind == hands::GrabKind::kGunGrip && grab.point == hands::kPointHolster) ||
+           (grab.kind == hands::GrabKind::kSupportGrip && hands::OffhandPoint(grab.point));
+}
+
 bool ObjectFrame(const hands::HandGrab& grab, const hands::HandGrab& right, hands::Pose* out) {
     if ((grab.kind == hands::GrabKind::kMagHeld || grab.kind == hands::GrabKind::kMagInsert) && PinnedObject(grab, out))
         return true;
@@ -1387,6 +1397,12 @@ int PickSlideHold(const hands::HandState& h, const hands::Pose& gun, UObject gun
 }
 
 std::string BaseRecordKey(int side, const hands::HandGrab& grab) {
+    // Shotgun shells in the hand: one pose per hold, whatever the ammo type
+    // (controls' smart reload: quad, twin, single).
+    if (grab.kind == hands::GrabKind::kMagHeld && hands::ShellsPoint(grab.point)) {
+        const int n = grab.point - hands::kPointShells;
+        return std::string("shells.") + (n >= 4 ? "quad" : n >= 2 ? "twin" : "single");
+    }
     std::string cls = grab.object ? ue::GetName(ue::GetClass(grab.object)) : "unknown";
     switch (grab.kind) {
         // A hand reaching for the holstered pistol with its own pose
@@ -1400,7 +1416,11 @@ std::string BaseRecordKey(int side, const hands::HandGrab& grab) {
             if (grab.point >= 0) return cls + ".charging-" + (side == kL ? "left" : "right");
             return cls + ".slide-" + kSlideHoldKey[g_slide_hold[side]];
         // One pose per grip point on the handguard (vr/interact/grip_points.h).
+        // The off hand snapped onto the pistol in the other hand (controls'
+        // offhand_snap): one pose with the gun held out, one near the chest.
         case hands::GrabKind::kSupportGrip:
+            if (grab.point == hands::kPointOffhand) return cls + ".offhand";
+            if (grab.point == hands::kPointOffhandChest) return cls + ".offhand-chest";
             return grab.point >= 0 ? cls + ".support-" + interact::PointKey(grab.point) : cls + ".support";
         // Stage 2: the magazine lined up with the magwell, going in.
         case hands::GrabKind::kMagInsert: return cls + ".mag-insert";
@@ -1419,9 +1439,13 @@ std::string RecordKey(int side, const hands::HandGrab& grab) {
     const bool charging = grab.kind == hands::GrabKind::kSlideGrab && grab.point >= 0;
     // The reach for the holstered pistol always has the hand's own name
     // (BP_HG_C.holster-left): GripRecord never mirrors it from the other hand.
+    // So does the off hand on the pistol (BP_HG_C.offhand-left,
+    // BP_HG_C.offhand-chest-left).
     const bool holster = grab.kind == hands::GrabKind::kGunGrip && grab.point == hands::kPointHolster;
+    const bool offhand = grab.kind == hands::GrabKind::kSupportGrip && hands::OffhandPoint(grab.point);
     const int usual = grab.kind == hands::GrabKind::kGunGrip ? kR : kL;
-    return gr::SideKey(BaseRecordKey(side, grab), side == kR, !holster && (charging || side == usual));
+    return gr::SideKey(BaseRecordKey(side, grab), side == kR,
+                       !holster && !offhand && (charging || side == usual));
 }
 
 std::wstring RecordPath(const std::string& key) { return ModPath(L"grips\\" + Widen(key) + L".ini"); }
@@ -1984,7 +2008,33 @@ bool GripRecord(int side, hands::GrabKind kind, UObject object, const std::strin
                           key.c_str());
         }
     }
-    if (!found && usual != key && !holster) {
+    // The off hand on the pistol (BP_HG_C.offhand[-chest]-left): this
+    // hand's other pose until both are posed, then the other hand's (the
+    // gun is in the other hand too, so its pose mirrored fits).
+    const bool offhand = kind == hands::GrabKind::kSupportGrip && gr::OffhandKey(usual);
+    if (!found && offhand) {
+        static std::set<std::string> told;
+        bool mirrored = false;
+        for (const gr::Fallback& f : gr::OffhandFallbacks(key)) {
+            if (!ReadText(RecordPath(f.key), &text)) continue;
+            found = true;
+            file_key = f.key;
+            mirrored = f.other_hand;
+            break;
+        }
+        if (told.insert(key).second) {
+            if (found)
+                log::Info("body: %s not posed yet: using %s%s (to pose it: off hand on the pistol, hold left Y 1 s, "
+                          "pose it with the other controller, tap Y to save)",
+                          key.c_str(), file_key.c_str(), mirrored ? ", mirrored" : "");
+            else
+                log::Info("body: %s not posed yet: the off hand stays on its controller near the pistol (to pose "
+                          "it: bring the off hand's controller against the gun hand's, hold left Y 1 s, pose it "
+                          "with the other controller, tap Y to save)",
+                          key.c_str());
+        }
+    }
+    if (!found && usual != key && !holster && !offhand) {
         found = ReadText(RecordPath(usual), &text);
         if (found) {
             file_key = usual;
@@ -2395,19 +2445,21 @@ void UpdateEditor(const hands::HandGrab grab[2], const hands::HandState hs[2], c
     // a gun by its grip (right hand, then left). The other controller edits.
     // Either hand can hold either (controls' either_hand_guns); each hand's
     // pose is saved under its own name (RecordKey).
-    // The left hand reaching for the holstered pistol (its own pose,
-    // kPointHolster) comes before the gun grips, once it is fully on it.
+    // A hand snapped onto a pistol with its own pose (the left hand reaching
+    // for the holstered pistol, kPointHolster; the off hand on the pistol in
+    // the other hand, kPointOffhand*) comes before the gun grips, once it is
+    // fully on it.
     int side = -1;
     const auto left_kind = hands::HeldGrabKind(grab[kL]), right_kind = hands::HeldGrabKind(grab[kR]);
-    auto holster_reach = [&](int s) {
-        return grab[s].holster_preview && grab[s].kind == hands::GrabKind::kGunGrip &&
-               grab[s].point == hands::kPointHolster && grab[s].object && grab[s].pose_blend > 0.95;
+    auto own_reach = [&](int s) {
+        return OwnReach(grab[s]) && grab[s].object && grab[s].pose_blend > 0.95;
     };
     if (g_editor.Active() && g_edit_side >= 0 && IsGrab(grab[g_edit_side].kind)) side = g_edit_side;
     else if (right_kind == hands::GrabKind::kSlideGrab) side = kR;
     else if (IsGrab(left_kind) && left_kind != hands::GrabKind::kGunGrip) side = kL;
     else if (IsGrab(right_kind) && right_kind != hands::GrabKind::kGunGrip) side = kR;
-    else if (holster_reach(kL)) side = kL;
+    else if (own_reach(kL)) side = kL;
+    else if (own_reach(kR)) side = kR;
     else if (right_kind == hands::GrabKind::kGunGrip) side = kR;
     else if (left_kind == hands::GrabKind::kGunGrip) side = kL;
     if (g_editor.Active() && (side != g_edit_side || side < 0 || G.grip[side].object != grab[side].object)) {
@@ -2456,12 +2508,17 @@ void UpdateEditor(const hands::HandGrab grab[2], const hands::HandState hs[2], c
         g_freeze.on = true;
         for (int i = 0; i < 2; ++i) g_freeze.hs[i] = hs[i], g_freeze.grab[i] = grab[i];
         if (g_freeze.grab[side].holster_preview) {
-            // Posing the reach for the holstered pistol: show the pose itself
-            // (not the blend toward it) while editing.
+            // Posing a snap (the reach for the holstered pistol, the off
+            // hand on the pistol): show the pose itself (not the blend
+            // toward it) while editing.
             g_freeze.grab[side].holster_preview = false;
             g_freeze.grab[side].pose_blend = 1.0;
-            log::Info("body: grip editor: posing the %s hand's reach for the holstered pistol (%s)",
-                      side == kL ? "left" : "right", RecordKey(side, grab[side]).c_str());
+            const int pt = grab[side].point;
+            log::Info("body: grip editor: posing the %s hand's %s (%s)", side == kL ? "left" : "right",
+                      pt == hands::kPointHolster ? "reach for the holstered pistol"
+                      : pt == hands::kPointOffhandChest ? "hold on the pistol with the gun near the chest"
+                      : "hold on the pistol with the gun held out",
+                      RecordKey(side, grab[side]).c_str());
         }
         log::Info("body: grip editor: hands and %s frozen in place; the %s controller's grab point is live",
                   is_mag ? "magazine" : "gun", ctrl == kR ? "right" : "left");
@@ -3764,10 +3821,11 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
     }
     hands::Pose obj;
     const bool recorded = g.have && rig.ok && ObjectFrame(grab, right_grab, &obj);
-    // The left hand's own reach for the holstered pistol (kPointHolster) is
-    // posed by the owner on the holstered pistol: shown as posed, not fitted
-    // like the right hand's gun grip (holster_pose::Fit is for that hold).
-    const bool own_reach = grab.holster_preview && grab.point == hands::kPointHolster;
+    // The left hand's own reach for the holstered pistol (kPointHolster) and
+    // the off hand on the pistol (kPointOffhand*) are posed by the owner:
+    // shown as posed, not fitted like the right hand's gun grip reaching for
+    // the holster (holster_pose::Fit is for that hold).
+    const bool own_reach = OwnReach(grab);
     if (recorded && grab.holster_preview && !own_reach && !g.approach_ready) {
         g.approach = holster_pose::Fit(g.rec, rig.chain, g.hand_rot, g.hand_pos, S.finger_radius);
         g.approach_ready = true;
@@ -3829,8 +3887,9 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
         FQuat free_rot;
         FVector free_pos;
         FreeHand(side, h, h.grip.location, &free_rot, &free_pos);
-        // Not posed (the left hand's own reach, BP_HG_C.holster-left): the
-        // hand stays where the controller is.
+        // Not posed (the left hand's own reach, BP_HG_C.holster-left; the
+        // off hand on the pistol, BP_HG_C.offhand-left): the hand stays
+        // where the controller is.
         const double blend = recorded ? std::clamp(grab.pose_blend, 0.0, 1.0) : 0.0;
         hand_pos = free_pos + (hand_pos - free_pos) * blend;
         hand_rot = Normalized(Scale(hand_rot * free_rot.Inverse(), blend) * free_rot);
@@ -4235,7 +4294,7 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
             FingerBounds(rig, hand_pose::kThumb));
     }
     if (grab.holster_preview) {
-        if (recorded && grab.point != hands::kPointHolster) {
+        if (recorded && !OwnReach(grab)) {
             for (int f = 0; f < hand_pose::kFingerCount; ++f) want[f] = g.approach.finger[f];
         }
         const hand_pose::Curl free_curl = hand_pose::Target(hands::GrabKind::kNone, hands::GetFingers(hs));
@@ -4288,6 +4347,13 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
         p.index = inv.Rotate(g_joint_world[side][hand_pose::kIndex][1].translation - g_raw_grip[side].location);
         p.ms = perf::NowMs();
         p.valid = true;
+    } else if (grab.holster_preview) {
+        // A visual-only snap (onto the holstered pistol, or the off hand onto
+        // the pistol in the other hand): the hand is still empty. Its last
+        // pinch, carried by the controller, stays in use, so a slide grab
+        // starting from the snap still finds the fingers (PinchPoint).
+        std::lock_guard<std::mutex> lock(g_pinch_mutex);
+        if (g_pinch[side].valid) g_pinch[side].ms = perf::NowMs();
     }
     {
         HandContacts hc;
