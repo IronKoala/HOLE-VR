@@ -149,6 +149,17 @@ void Bounds(const std::vector<FVector>& points, FVector* centre, double* radius)
     for (const FVector& p : points) *radius = std::max(*radius, Len(p - *centre));
 }
 
+Hit LookPast(const LineFn& once, const SkipFn& skip, const LeaveOutFn& leave_out, const FVector& from,
+             const FVector& to, int tries) {
+    if (!once) return Hit{};
+    for (int i = 0; i < tries; ++i) {
+        const Hit h = once(from, to);
+        if (!h.hit || h.eyes_inside || !skip || !skip(h.what)) return h;
+        if (leave_out) leave_out(h.what);
+    }
+    return Hit{};
+}
+
 std::vector<int> GroupsAlongBarrel(const std::vector<Point>& points, double group_cm, int max_groups) {
     std::vector<int> out(points.size(), 0);
     if (points.empty() || !(group_cm > 1.0) || max_groups <= 1) return out;

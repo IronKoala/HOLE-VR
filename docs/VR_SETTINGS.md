@@ -495,6 +495,30 @@ Two causes, both fixed:
   `wall_shape=game` only the hit boxes (before 2026-11-07); the older
   `hand_world_trace_complex=1` with `wall_shape=game` means visible.
 
+Fixed 2026-11-08, after the owner's first run with it ("when I hold a gun
+it'll jump around like crazy, especially the AR"):
+
+- **The gun was pushed out of its own parts.** A gun's sights, light, stock
+  and handguard are separate actors fitted to it. The game gave them no hit
+  boxes, so the old checks never met them, but their shapes you see do have
+  triangles. The lines from the eyes met the gun's own rear sight and light.
+  Those sit where the gun was drawn last frame, so the gun was pushed out of
+  them, then missed them and came back, every frame. The run's log has it:
+  pushes "against BPC_IronSight_HG_C" and "BPC_WeaponLight_Long_AR_C" (the
+  held gun's own), up to 40 cm, changing by over 3 cm in 583 of 650 frames
+  with the AR. The empty hand also stopped at the rifle on the back and at
+  the held gun's fitted parts. Now every wall check (the gun's lines, the
+  hand proxy and the fingers) leaves out all the player's own gear: both
+  guns, held or put away, everything fitted to them, the magazines (in them,
+  in the hands, in the pouch) and what the hands hold. The list is found
+  twice a second and when the held gun changes.
+- **The gun was thrown out of mannequins.** Swinging at the hub's mannequins
+  pushed the gun up to 40 cm out of them. Characters (pawns) and anything
+  with the game's bullet-hit event (mannequins, shooting targets, enemies)
+  are not walls for the held gun any more. A
+  line that meets one is looked along again without it, so a wall behind a
+  mannequin still counts. Hands still stop at them.
+
 Log lines:
 
 - `wall shapes: hands and the held gun stop at whichever comes first, the
@@ -505,8 +529,13 @@ Log lines:
   Z cm up from the grip point, plus the hands on it`, once per gun taken.
 - `gun wall push: ... in N of M frames (most X cm, against <thing>) ...; part
   furthest in: gun N, gun hand N, magazine N, support hand N; something near
-  the gun in N frames, N outline points, N looks a frame then`, every 10 s
-  while it pushed. "gun hand" pushes are the ones the old check missed.
+  the gun in N frames, N outline points, N looks a frame then; went into an
+  enemy, mannequin or target (not a wall) in N frames; N of your own things
+  (guns, what is fitted to them, magazines) left out`, every 10 s while it
+  pushed. "gun hand" pushes are the ones the old check missed. "against"
+  should never name one of the held gun's parts (BPC_IronSight_...,
+  BPC_WeaponLight_...); "changed by over 3 cm" should be a few times while
+  the gun is against a wall, not most frames.
 - `wall shapes (where the hands and gun touched things; the game's hit box vs
   the shape you see): | <mesh>: N looks (hands N, gun N); hit box X cm behind
   the surface N times (worst X); hit box X cm in front of it N times; same

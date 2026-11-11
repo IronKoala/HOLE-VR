@@ -262,6 +262,23 @@ controller-to-wrist offset remain assumptions. Correlated joint motion can
 imitate a different segment length. A clean residual or successful repeat does
 not prove anatomical accuracy. Confidence/provenance remains explicit.
 
+A fitted split must also be one a human arm has: the forearm 40-53% of
+shoulder-to-wrist reach (adult joint centres run about 41-47%; the avatar uses
+47%). The owner's 2026-11-06 setup fitted the left forearm at 20.8 cm of 59.4
+(35%) while the right arm kept 47% (29.4 of 62.6): an elbow that moved during the
+bend. That short forearm put the left elbow too far from the shoulder, so the
+left wrist bent past its range in roughly a quarter of empty-hand poses and the
+two-hand pistol elbow crossed the chest. A new setup now rejects such a bend
+fit (`PlausibleSplit`, that side keeps the prior split). A profile already saved
+with one is drawn with 47% of the same reach (`UsableSegments`, used by
+`MapArmTarget`); the file is not rewritten, and the log says so at load
+("arm's saved split ... is outside a human arm's 40-53%"). Replaying the 11-07
+and 11-08 logs with it: left wrist past its range by more than 10 deg went from
+35 to 13 of 148 empty-hand pistol samples (worst 101 to 24 deg), 4 to 1 of 12
+left gun-hand samples, 24 to 18 of 37 rifle-support samples (worst 90 to 48),
+forearm turn past range 9 to 0, and the two-hand pistol support elbow no longer
+crosses the head's midline in live play (5 of 13 before).
+
 All tracked inputs share an OpenXR sample time and physical centimetres. Duplicate
 timestamps do not count. Tracking loss clears the current sample window and confirmation,
 preserves accepted stages, and requires both triggers released before a fresh hold; recentering, height-mode/posture changes or invalid

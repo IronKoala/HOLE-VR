@@ -83,6 +83,14 @@ const Block kBlocks[] = {
      "; 1 = only while one of those screens is up (the same pictures, less GPU\n"
      "; work while you play). 0 = as the game runs it.\n"
      "vr_kill_shot_camera_when_shown=0\n"},
+    {"vr_scope_view",
+     "\n"
+     "; A gun scope's lens shows a second picture of the level, and the game\n"
+     "; draws it whenever the gun moves, which in a headset is every frame, even\n"
+     "; with the gun on your back. near_eye = only while the scope is at your\n"
+     "; aiming eye (the lens keeps its last picture otherwise). always = as the\n"
+     "; game does.\n"
+     "vr_scope_view=near_eye\n"},
     {"vr_anti_aliasing",
      "\n"
      "; --- Anti-aliasing and console variables ---\n"
@@ -889,39 +897,6 @@ const Block kBlocks[] = {
      "; empty can lies on the floor this long (s).\n"
      "drinks_hide_game_can_s=6\n"
      "drinks_empty_can_s=30\n"},
-    {"gun_melee",
-     "\n"
-     "; --- Hitting with your guns (pistol hammer-fist, rifle butt) ---\n"
-     "; 1 = a gun in your hand hits what you really swing it into: the bottom of\n"
-     "; the pistol's grip, the butt of a rifle, shotgun or sniper rifle. No\n"
-     "; button and no gesture: it has to touch the target while moving this fast\n"
-     "; (metres a second; slower is just a touch), and is a full hit from the\n"
-     "; second speed up.\n"
-     "gun_melee=1\n"
-     "gun_melee_min_speed=2.0\n"
-     "gun_melee_full_speed=4.5\n"
-     "; Damage of a full hit: this share of the enemy's own max HP (0.15 = 15%),\n"
-     "; then the game's own body-part multiplier (the one its bullets use).\n"
-     "gun_melee_pistol_damage=0.15\n"
-     "gun_melee_long_gun_damage=0.25\n"
-     "; Stun of a full hit, as a share of your kick's stun.\n"
-     "gun_melee_pistol_stun=0.7\n"
-     "gun_melee_long_gun_stun=1.2\n"
-     "; The same gun hits the same target at most this often (seconds).\n"
-     "gun_melee_cooldown_s=0.45\n"},
-    {"butt_strike_pose",
-     "\n"
-     "; Butt-strike hand pose: with a rifle, shotgun or sniper rifle, bring your\n"
-     "; main hand near your head with the off hand up high (not aiming: the barrel\n"
-     "; this many degrees or more off where you look) and the main hand takes its\n"
-     "; own pose. Pose it in the grip editor while in that stance (hold left Y 1 s).\n"
-     "; It stays for hold_s after you leave the stance, so the strike keeps it.\n"
-     "; Only a hand pose: it starts nothing. 0 = off.\n"
-     "butt_strike_pose=1\n"
-     "butt_strike_pose_near_head_cm=30\n"
-     "butt_strike_pose_off_hand_above_cm=10\n"
-     "butt_strike_pose_barrel_off_view_deg=50\n"
-     "butt_strike_pose_hold_s=0.5\n"},
     {"paired_capture_enabled",
      "\n"
      "; White squares (diagnostic): when the square watch sees dots in one eye, save\n"
@@ -957,8 +932,9 @@ const Block kBlocks[] = {
      "; Frame times: hand each frame to the headset (xrEndFrame) on a thread of the\n"
      "; mod's own, so the game's Present thread doesn't wait on it. 0 = never,\n"
      "; 1 = always, 2 = decided each run by the GPU cost test (on only if the\n"
-     "; headset missed fewer frames with it).\n"
-     "xr_end_async=1\n"},
+     "; headset missed fewer frames with it). 1 made the picture jitter when\n"
+     "; turning the head (2026-11-08), so 0 is the default.\n"
+     "xr_end_async=0\n"},
     {"gpu_cost_test",
      "\n"
      "; Frame times (diagnostic): 45 s into the first run level, switch render\n"

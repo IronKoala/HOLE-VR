@@ -47,21 +47,39 @@ void ChestPose() {
     in.gun_to_chest = 50;
     Run(s, in, 10);
     CHECK(s.Near() && !s.Chest());
+    // On the gun, a change of pose waits 0.15 s.
     in.gun_to_chest = 34;
-    s.Update(in);
+    Run(s, in, 10);
+    CHECK(!s.Chest());
+    Run(s, in, 2);
     CHECK(s.Chest());
     in.gun_to_chest = 39;
-    s.Update(in);
+    Run(s, in, 20);
     CHECK(s.Chest());
     in.gun_to_chest = 41;
-    s.Update(in);
+    Run(s, in, 12);
     CHECK(!s.Chest());
+    // A gun jumping across the line every frame (2026-11-08 run: 33 and 44
+    // cm by turns, the gun pushed off its own sight) keeps its pose.
+    for (int f = 0; f < 100; ++f) {
+        in.gun_to_chest = f % 2 ? 33 : 44;
+        s.Update(in);
+        CHECK(!s.Chest());
+    }
     in.gun_to_chest = 1e9;  // no chest (body not ready): the other pose
-    s.Update(in);
+    Run(s, in, 12);
     CHECK(!s.Chest());
     in.gun_to_chest = std::numeric_limits<double>::quiet_NaN();
-    s.Update(in);
+    Run(s, in, 12);
     CHECK(!s.Chest() && s.Near());
+    // Snapping on takes the right pose at once.
+    s.Reset();
+    in.hands_apart = 30;
+    in.gun_to_chest = 20;
+    Run(s, in, 3);
+    in.hands_apart = 5;
+    s.Update(in);
+    CHECK(s.Near() && s.Chest());
 }
 
 // A menu, a held item or tracking loss lets go at once; bad numbers never

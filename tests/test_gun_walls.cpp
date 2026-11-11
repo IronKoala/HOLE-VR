@@ -274,7 +274,124 @@ static void TestGroups() {
     for (int g : GroupsAlongBarrel(pistol, 30.0, 3)) EXPECT(g == 0);
 }
 
+// A line against a box (world): where it first enters it and the face's
+// normal. Eyes inside: eyes_inside.
+static LineFn BoxThing(const Box& b, std::uintptr_t id) {
+    return [=](const FVector& from, const FVector& to) {
+        Hit h;
+        const double f[3] = {from.X, from.Y, from.Z}, d[3] = {to.X - from.X, to.Y - from.Y, to.Z - from.Z};
+        const double lo[3] = {b.lo.X, b.lo.Y, b.lo.Z}, hi[3] = {b.hi.X, b.hi.Y, b.hi.Z};
+        double t0 = 0, t1 = 1;
+        int axis = -1;
+        double sign = 0;
+        for (int i = 0; i < 3; ++i) {
+            if (std::fabs(d[i]) < 1e-12) {
+                if (f[i] < lo[i] || f[i] > hi[i]) return h;
+                continue;
+            }
+            double a = (lo[i] - f[i]) / d[i], c = (hi[i] - f[i]) / d[i];
+            double s = -1;
+            if (a > c) std::swap(a, c), s = 1;
+            if (a > t0) t0 = a, axis = i, sign = s;
+            t1 = std::min(t1, c);
+            if (t0 > t1) return h;
+        }
+        if (axis < 0) { h.eyes_inside = true; return h; }
+        h.hit = true;
+        h.impact = from + (to - from) * t0;
+        h.normal = FVector{axis == 0 ? sign : 0, axis == 1 ? sign : 0, axis == 2 ? sign : 0};
+        h.what = id;
+        return h;
+    };
+}
+
+// The owner's run 2026-11-08 ("when I hold a gun it'll jump around like
+// crazy, especially the AR"): the lines from the eyes met the gun's own rear
+// sight. The game places the sight where the gun was drawn last frame, so
+// the gun was pushed out of its own sight, then (moved) missed it and came
+// back, then was pushed again: tens of cm every frame. Here the gun is held
+// still, aimed, with the eyes behind and above it.
+static void TestOwnSightThrowsTheGun() {
+    const FVector eyes{-40, 0, 6};
+    const Box rear_sight{{-6, -1, 3.5}, {-4, 1, 5}};  // on the slide, gun frame = world (gun at the origin)
+    const auto outline = Outline(Pistol(), 1.0, 20.0, 48);
+    std::vector<FVector> pts;
+    std::vector<Part> parts;
+    World(outline, &pts, &parts);
+    FVector last;
+    int jumps = 0;
+    double worst = 0;
+    for (int frame = 0; frame < 12; ++frame) {
+        const Box sight_now{rear_sight.lo + last, rear_sight.hi + last};  // where it was drawn
+        const Result r = Solve(eyes, pts, parts, BoxThing(sight_now, 9), 1.0, 40.0, 2);
+        const double step = Len(r.push - last);
+        if (step > 3.0) ++jumps;
+        worst = std::max(worst, step);
+        last = r.push;
+    }
+    EXPECT(jumps >= 6);     // the log: the push changed by over 3 cm in most frames
+    EXPECT(worst > 15.0);   // and by up to 40 cm
+    // Left out of the lines (the fix: the player's own gear is ignored), the
+    // still gun stays still.
+    last = FVector{};
+    const LineFn nothing = [](const FVector&, const FVector&) { return Hit{}; };
+    for (int frame = 0; frame < 12; ++frame) {
+        const Result r = Solve(eyes, pts, parts, nothing, 1.0, 40.0, 2);
+        EXPECT(Len(r.push) == 0.0);
+    }
+}
+
+// A mannequin (something the gun hits, not a wall) is looked past: alone it
+// gives no hit, in front of a wall the wall still counts.
+static void TestLookPastMannequin() {
+    const Box mannequin{{20, -20, -50}, {40, 20, 50}};
+    const LineFn wall = Wall({60, 0, 0}, {-1, 0, 0}, 7);
+    std::vector<std::uintptr_t> left_out;
+    auto world = [&](const FVector& a, const FVector& b) {
+        Hit m = std::find(left_out.begin(), left_out.end(), 5u) == left_out.end() ? BoxThing(mannequin, 5)(a, b) : Hit{};
+        Hit w = wall(a, b);
+        if (!m.hit) return w;
+        if (!w.hit) return m;
+        return Len(m.impact - a) <= Len(w.impact - a) ? m : w;
+    };
+    const SkipFn is_target = [](std::uintptr_t what) { return what == 5; };
+    const LeaveOutFn leave = [&](std::uintptr_t what) { left_out.push_back(what); };
+    // To a point inside the mannequin: nothing.
+    Hit h = LookPast(world, is_target, leave, FVector{0, 0, 0}, FVector{30, 0, 0});
+    EXPECT(!h.hit && !h.eyes_inside);
+    EXPECT(left_out.size() == 1);
+    // To a point past the wall, through the mannequin: the wall.
+    left_out.clear();
+    h = LookPast(world, is_target, leave, FVector{0, 0, 0}, FVector{70, 0, 0});
+    EXPECT(h.hit && h.what == 7 && std::fabs(h.impact.X - 60) < 1e-6);
+    // Nothing to skip: the first hit as it is, nothing left out.
+    left_out.clear();
+    h = LookPast(wall, is_target, leave, FVector{0, 0, 0}, FVector{70, 0, 0});
+    EXPECT(h.hit && h.what == 7 && left_out.empty());
+    // Something that keeps answering with a target: gives up, no hit.
+    int calls = 0;
+    const LineFn stubborn = [&](const FVector&, const FVector&) { ++calls; Hit x; x.hit = true; x.what = 5; x.normal = {-1, 0, 0}; return x; };
+    h = LookPast(stubborn, is_target, leave, FVector{0, 0, 0}, FVector{70, 0, 0}, 3);
+    EXPECT(!h.hit && calls == 3);
+    // Solve with the gun pushed into a mannequin: no push.
+    left_out.clear();
+    const auto outline = Outline(Pistol(), 1.0, 20.0, 48);
+    std::vector<FVector> pts;
+    std::vector<Part> parts;
+    World(outline, &pts, &parts);
+    for (FVector& p : pts) p = p + FVector{30, 0, 0};  // the gun in the mannequin
+    const Result r = Solve(FVector{-20, 0, 5}, pts, parts,
+                           [&](const FVector& a, const FVector& b) { return LookPast(world, is_target, leave, a, b); },
+                           1.0, 40.0, 2);
+    EXPECT(Len(r.push) == 0.0);
+    // The same gun without the look-past: thrown out of the mannequin.
+    const Result old = Solve(FVector{-20, 0, 5}, pts, parts, BoxThing(mannequin, 5), 1.0, 40.0, 2);
+    EXPECT(Len(old.push) > 10.0);
+}
+
 int main() {
+    TestOwnSightThrowsTheGun();
+    TestLookPastMannequin();
     TestGroups();
     TestPistolOutline();
     TestRifleSlices();

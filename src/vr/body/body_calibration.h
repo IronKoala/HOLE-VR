@@ -215,9 +215,24 @@ bool Parse(const std::string& text, Profile* out);
 // input leaves *out unchanged. previous==nullptr starts a new profile.
 bool MergeProfile(const Profile* previous, const Profile& result, Profile* out);
 
+// The forearm's share of shoulder-to-wrist reach that a human arm can have.
+// Adult joint-centre proportions run about .41-.47; the range is widened for
+// the controller-based wrist point and the avatar's .47. An elbow fit outside
+// it means the elbow moved during the bend (it read one owner's forearm as
+// 20.8 cm against 29.4 on the other arm), so it is not used.
+constexpr double kMinForearmShare = .40, kMaxForearmShare = .53;
+// The split that replaces an implausible one, on the same total reach.
+constexpr double kDefaultForearmShare = .47;
+bool PlausibleSplit(double upper_cm, double forearm_cm);
+// The upper/forearm lengths the body uses for this arm: the saved ones, or,
+// when their split is not plausible, kDefaultForearmShare of the same reach.
+// Returns false when it had to replace the saved split.
+bool UsableSegments(const Arm& arm, double* upper_cm, double* forearm_cm);
+
 // Convert the persisted physical fit to this frame's world targets. The
 // tracking scale applies once; avatar mesh scale must not resize the user.
 // body_yaw is the body's world yaw, independent of mesh bone orientation.
+// Upper and forearm come from UsableSegments.
 // Failure leaves every output unchanged.
 bool MapArmTarget(const Profile& profile, int side, const FVector& head_world,
                   const FQuat& body_yaw, double tracking_scale,

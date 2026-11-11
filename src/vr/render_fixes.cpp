@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -15,6 +16,7 @@
 #include "core/config.h"
 #include "core/log.h"
 #include "core/memory.h"
+#include "core/perf.h"
 #include "ue/call.h"
 #include "ue/objects.h"
 #include "ue/reflection.h"
@@ -204,6 +206,10 @@ std::vector<Target> g_live_captures;
 std::vector<Target> g_paused_captures;
 std::vector<Target> g_seen_live;
 std::string g_live_names;
+// Gun scopes' lens cameras (BPC_Scope_*), as of the last Apply; under
+// g_captures_mutex. UpdateScopes (game thread) switches them.
+std::vector<Target> g_scopes;
+bool g_scope_near_eye = true;  // vr_scope_view=near_eye
 // The last list of scene captures logged (background thread only).
 std::string g_census_logged;
 std::unordered_map<UObject, Kind> g_kinds;
@@ -326,6 +332,21 @@ bool IsKillShotCapture(UObject comp) {
     return ue::GetName(ue::GetClass(outer)).rfind("LCBP_DeadReviewRoom", 0) == 0;
 }
 
+// A gun scope's lens camera (BPC_Scope_2x_AR_C and the like): it draws the
+// level a second time, with all its shadows and lighting, into the lens
+// picture (RT_Scope 512x512) whenever it moves. In a headset a gun moves
+// every frame, held or on your back, so that is every frame. The scope's
+// Blueprint (BP_ScopeBase) never asks for pictures itself: these flags are
+// all that drive it. Owner's run 2026-11-08 22:56 local, the first with a 2x
+// scope on the rifle: the GPU frame in the home base was 14.3-15.5 ms against
+// a 13.9 ms budget, 10-12 ms in the 09:20 run without it (the likely cause;
+// the "scope view" report line and the GPU frame show whether it is).
+bool IsScopeCapture(UObject comp) {
+    UObject outer = ue::GetOuter(comp);
+    if (!outer) return false;
+    return ue::GetName(ue::GetClass(outer)).rfind("BPC_Scope", 0) == 0;
+}
+
 bool Bit(UObject obj, const refl::PropertyInfo& p) {
     return p.valid() && p.bool_mask && (mem::ReadOr<uint8_t>(obj + p.offset, 0) & p.bool_mask) != 0;
 }
@@ -337,7 +358,9 @@ bool Alive(const Target& t) {
 
 // One scene capture for the log: "LCBP_DeadReviewRoom_C_1.SceneCaptureComponent2D
 // shown, every frame, into DeadReviewCamera 1280x544, source 2".
-std::string DescribeCapture(UObject obj, bool every, bool stopped) {
+// moving_as: -1 reads the capture's own flag; 0/1 says what the game set
+// (a scope's, which UpdateScopes switches, so the census doesn't change).
+std::string DescribeCapture(UObject obj, bool every, bool stopped, int moving_as = -1) {
     UObject outer = ue::GetOuter(obj), target = 0;
     ue::GetProp(obj, "TextureTarget", target);
     int32_t sx = 0, sy = 0;
@@ -347,7 +370,7 @@ std::string DescribeCapture(UObject obj, bool every, bool stopped) {
         ue::GetProp(target, "SizeX", sx);
         ue::GetProp(target, "SizeY", sy);
     }
-    const bool moving = Bit(obj, g_capture_on_movement);
+    const bool moving = moving_as >= 0 ? moving_as != 0 : Bit(obj, g_capture_on_movement);
     char b[320];
     std::snprintf(b, sizeof(b), "%s.%s (%s) %s, %s, into %s %dx%d, source %d%s",
                   outer ? ue::GetName(outer).c_str() : "?", ue::GetName(obj).c_str(),
@@ -390,6 +413,11 @@ bool Init() {
     }
     g_disable_player_capture = config::GetBool("vr_disable_player_scene_capture", true);
     g_kill_shot_camera_when_shown = config::GetBool("vr_kill_shot_camera_when_shown", false);
+    {
+        std::string v = config::GetString("vr_scope_view", "near_eye");
+        for (char& ch : v) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        g_scope_near_eye = v != "always" && v != "game";
+    }
     {
         int found = 0;
         for (Field* f : {&g_exp_method, &g_exp_bias, &g_exp_physical, &g_exp_fstop, &g_exp_shutter, &g_exp_iso}) {
@@ -502,7 +530,7 @@ void Apply() {
     // pass, or most reads ask Windows again (2026-11-03 performance pass).
     mem::ScopedRegionCache region_cache;
     Counts c;
-    std::vector<Target> targets, captures, live, paused_now;
+    std::vector<Target> targets, captures, live, paused_now, scopes;
     std::vector<std::string> census;
     std::string live_names;
     {
@@ -539,6 +567,14 @@ void Apply() {
                                                 [&](const Target& t) { return t.obj == obj; });
                 const bool every = paused || Bit(obj, g_capture_every_frame);
                 const bool shown = !g_component_visible.valid() || Bit(obj, g_component_visible);
+                if (IsScopeCapture(obj)) {
+                    scopes.push_back({obj, index, 0});
+                    if (g_scope_near_eye) {
+                        census.push_back(DescribeCapture(obj, every, false, 1) +
+                                         ", its view drawn only at the eye (vr_scope_view)");
+                        return;
+                    }
+                }
                 census.push_back(DescribeCapture(obj, every, false));
                 if (every && shown && !paused) {
                     live.push_back({obj, index, 0});
@@ -567,6 +603,7 @@ void Apply() {
         g_captures.swap(captures);
         g_live_captures.swap(live);
         g_live_names = live_names;
+        g_scopes.swap(scopes);
     }
     // Every scene capture in the world: each one that takes a picture every
     // frame draws the level again, with its own shadows, lighting and post
@@ -759,6 +796,115 @@ Exposure ReadExposure(UObject obj) {
     e.stops = e.bias - (e.physical ? e.camera_ev100 : 0.f);
     e.ok = true;
     return e;
+}
+
+namespace {
+// Game thread state for UpdateScopes.
+struct ScopeState {
+    UObject obj = 0;
+    int index = -1;
+    bool off = false;          // we switched its capture off
+    double near_at = -1e9;     // last time it was at the eye
+};
+std::vector<ScopeState> g_scope_state;
+std::atomic<int> g_scope_frames{0}, g_scope_drawn_frames{0}, g_scope_switches{0};
+int g_scope_logged = 0;
+
+struct alignas(16) Xform {
+    FQuat rotation;
+    FVector translation;
+    double pad0 = 0;
+    FVector scale{1, 1, 1};
+    double pad1 = 0;
+};
+static_assert(sizeof(Xform) == 0x60, "FTransform layout");
+
+double Length(const FVector& v) { return std::sqrt(v.X * v.X + v.Y * v.Y + v.Z * v.Z); }
+
+std::string ScopeReport(double) {
+    const int frames = g_scope_frames.exchange(0), drawn = g_scope_drawn_frames.exchange(0);
+    const int switches = g_scope_switches.exchange(0);
+    if (frames <= 0) return {};
+    char b[200];
+    std::snprintf(b, sizeof(b), "scope view: drawn in %d of %d frames, switched %d times (%s)", drawn, frames,
+                  switches, g_scope_near_eye ? "only at the eye, vr_scope_view=near_eye" : "always, as the game does");
+    return b;
+}
+}  // namespace
+
+void UpdateScopes(bool have_eye, const FVector& eye, const FVector& look, double now_s) {
+    static const bool registered = [] {
+        perf::AddReportLine(&ScopeReport);
+        return true;
+    }();
+    (void)registered;
+    if (!g_ready || !g_capture_on_movement.bool_mask) return;
+    std::vector<Target> scopes;
+    {
+        std::lock_guard<std::mutex> lock(g_captures_mutex);
+        scopes = g_scopes;
+    }
+    // Forget scopes that are gone (a new level, a scope taken off at the bench).
+    g_scope_state.erase(std::remove_if(g_scope_state.begin(), g_scope_state.end(),
+                                       [](const ScopeState& st) { return !Alive({st.obj, st.index, 0}); }),
+                        g_scope_state.end());
+    if (scopes.empty()) return;
+    const double look_len = Length(look);
+    bool any_drawn = false;
+    for (const Target& t : scopes) {
+        if (!Alive(t)) continue;
+        auto it = std::find_if(g_scope_state.begin(), g_scope_state.end(),
+                               [&](const ScopeState& st) { return st.obj == t.obj; });
+        if (it == g_scope_state.end()) {
+            g_scope_state.push_back({t.obj, t.index, false, -1e9});
+            it = g_scope_state.end() - 1;
+        }
+        ScopeState& st = *it;
+        bool want = true;
+        if (g_scope_near_eye) {
+            // At the eye: the lens camera within 40 cm of the aiming eye and
+            // pointing within 35 degrees of where the head looks. Kept on for
+            // 0.3 s after, so a wobble at the edge doesn't switch it.
+            bool at_eye = false;
+            if (have_eye && look_len > 1e-6) {
+                ue::Call c(t.obj, "K2_GetComponentToWorld");
+                if (c.Invoke()) {
+                    const Xform x = c.Result<Xform>();
+                    const FVector fwd = x.rotation.Rotate(FVector{1, 0, 0});
+                    const double cosine =
+                        (fwd.X * look.X + fwd.Y * look.Y + fwd.Z * look.Z) / (Length(fwd) * look_len + 1e-9);
+                    at_eye = Length(x.translation - eye) < 40.0 && cosine > 0.82;
+                }
+            }
+            if (at_eye) st.near_at = now_s;
+            want = now_s - st.near_at < 0.3 && now_s >= st.near_at;
+        }
+        bool switched = false;
+        if (want) {
+            if (st.off) {
+                SetBool(t.obj + g_capture_on_movement.offset, g_capture_on_movement.bool_mask, true);
+                st.off = false;
+                switched = true;
+            }
+        } else if (!st.off && Bit(t.obj, g_capture_on_movement)) {
+            // Only what the game left on, so it is put back as it was.
+            SetBool(t.obj + g_capture_on_movement.offset, g_capture_on_movement.bool_mask, false);
+            st.off = true;
+            switched = true;
+        }
+        if (switched) {
+            ++g_scope_switches;
+            if (g_scope_logged < 6) {
+                ++g_scope_logged;
+                log::Info("render fixes: %s's view %s", ue::GetName(ue::GetOuter(t.obj)).c_str(),
+                          st.off ? "stopped (the scope is away from the eye; its lens keeps the last picture)"
+                                 : "drawn again (the scope is at the eye, or vr_scope_view=always)");
+            }
+        }
+        if (!st.off && Bit(t.obj, g_capture_on_movement)) any_drawn = true;
+    }
+    ++g_scope_frames;
+    if (any_drawn) ++g_scope_drawn_frames;
 }
 
 std::string ExposureReport() {

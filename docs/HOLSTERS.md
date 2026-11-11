@@ -138,7 +138,9 @@ magazines, as before).
 - **Two roles instead of two hands.** The gun hand holds the current gun by
   its grip: its trigger fires, its A / X drops the magazine, its B / Y
   releases the slide (the left Y tap no longer switches weapons while the left
-  hand holds the gun). The other hand racks, reloads, holds the handguard,
+  hand holds the gun). The left Y releases on a tap, when it comes back up
+  under 0.4 s: holding it 1 s is the grip editor, which must not drop a
+  locked slide first (2026-11-08). The right B releases on the press. The other hand racks, reloads, holds the handguard,
   works the light (its trigger next to the gun) or holds the rifle by itself.
   `GunHand()` / `OtherHand()` in `controls.cpp`; the weapon code reads the
   same whichever hand has the gun.
@@ -208,12 +210,17 @@ chest and one for the rest of the time."
   `tests/test_offhand_snap.cpp`), `controls::UpdateOffhandSnap`, published by
   `PublishGrabs` as a `kSupportGrip` preview at `hands::kPointOffhand` /
   `kPointOffhandChest`, framed on the gun's grip point.
-- Two poses per hand: the gun within `offhand_chest_cm` (35) of the chest
-  anchor takes `grips/BP_HG_C.offhand-chest-left.ini`, beyond it +5 cm the
-  held-out pose `grips/BP_HG_C.offhand-left.ini` (`-right` when the gun is in
+- Two poses per hand: the gun hand's controller within `offhand_chest_cm`
+  (35) of the chest anchor takes `grips/BP_HG_C.offhand-chest-left.ini`,
+  beyond it +5 cm the held-out pose `grips/BP_HG_C.offhand-left.ini` (`-right` when the gun is in
   the left hand). Until a pose is set the hand uses that hand's other pose,
   then the other hand's, mirrored (`grip_record::OffhandFallbacks`); with
-  none set it stays on its controller. Shown as posed, not fitted.
+  none set it stays on its controller. Shown as posed, not fitted. While the
+  hand is on the gun a change of pose waits until the other side has held
+  0.15 s, and it is measured from the controller, not the drawn gun: in the
+  owner's 2026-11-08 run the gun, pushed off its own front sight by the wall
+  check, crossed the line every frame (33 / 44 cm) and the pose flipped with
+  it.
 - To pose: bring the off hand's controller against the gun hand's with the
   gun where you want (near the chest, or held out), hold left Y 1 s (the
   hands freeze), pose it with the other controller, tap Y to save. Do it
@@ -227,7 +234,7 @@ chest and one for the rest of the time."
   hand's last pinch (carried by the controller) in use while a hand is
   snapped.
 - Log: `controls: left hand on the pistol (controllers 8.4 cm apart, snaps
-  within 13); gun 27 cm from the chest: chest pose`, `controls: left hand on
+  within 13); gun hand 27 cm from the chest: chest pose`, `controls: left hand on
   the pistol: held-out pose`, `controls: left hand off the pistol after 3.2 s`,
   `controls: left controller came within 12.5 cm of the gun hand's without
   snapping` (raise `pistol_both_hands_cm` if that is a real two-hand hold), `body:

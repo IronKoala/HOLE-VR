@@ -652,6 +652,18 @@ void LoadMeasure() {
             log::Info("body: %s loaded (profile v%u; standing %.1f, seated %.1f, unclassified %.1f cm)",
                       M.calibrated ? "calibrated arms" : "height-only profile, keeping legacy/default arms",
                       M.profile.version, M.profile.standing_eye_cm, M.profile.seated_eye_cm, M.profile.legacy_eye_cm);
+            for (int s = 0; M.calibrated && s < 2; ++s) {
+                const auto& arm = M.profile.arm[s];
+                double upper = 0, forearm = 0;
+                if (!body_calibration::UsableSegments(arm, &upper, &forearm))
+                    log::Info("body: %s arm's saved split (upper %.1f, forearm %.1f cm, forearm %.0f%% of the arm) is "
+                              "outside a human arm's %.0f-%.0f%%: the elbow moved during setup's bend. Using upper %.1f, "
+                              "forearm %.1f cm (same %.1f cm reach); the saved file is unchanged",
+                              s == kL ? "left" : "right", arm.upper_cm, arm.forearm_cm,
+                              100.0 * arm.forearm_cm / (arm.upper_cm + arm.forearm_cm),
+                              100.0 * body_calibration::kMinForearmShare, 100.0 * body_calibration::kMaxForearmShare,
+                              upper, forearm, upper + forearm);
+            }
             if (M.profile.standing_eye_cm > 0) {
                 M.standing_eye_cm = M.profile.standing_eye_cm;
                 if (xr::StandingSpace()) stereo::SetStandingEyeHeight(M.standing_eye_cm / 100.0);
@@ -1395,10 +1407,7 @@ std::string BaseRecordKey(int side, const hands::HandGrab& grab) {
     switch (grab.kind) {
         // A hand reaching for the holstered pistol with its own pose
         // (kPointHolster): one per hand, see RecordKey.
-        // The main hand on a long gun pulled back for a butt strike
-        // (kPointButtStrike, gun_melee::ButtStrikeStance): its own pose.
         case hands::GrabKind::kGunGrip:
-            if (grab.point == hands::kPointButtStrike) return cls + ".butt-strike";
             return grab.point == hands::kPointHolster ? cls + ".holster" : cls + ".grip";
         // A rifle's charging handle (grab.point = kPointChargingHandle): one
         // pose for each hand (owner, 2026-11-04: "one for left hand, one for
@@ -2036,27 +2045,6 @@ bool GripRecord(int side, hands::GrabKind kind, UObject object, const std::strin
                           key.c_str(), usual.c_str(), key.c_str());
         }
     }
-    // The butt-strike pose (kPointButtStrike) not posed yet: this hand's gun
-    // grip on that gun (its own, else the usual hand's mirrored), so the hand
-    // looks as it did until the owner poses it.
-    const std::string butt_tail = ".butt-strike";
-    if (!found && kind == hands::GrabKind::kGunGrip && usual.size() > butt_tail.size() &&
-        usual.compare(usual.size() - butt_tail.size(), butt_tail.size(), butt_tail) == 0) {
-        const std::string grip_usual = usual.substr(0, usual.size() - butt_tail.size()) + ".grip";
-        const std::string grip_own = gr::SideKey(grip_usual, side == kR, side == kR);
-        for (const std::string& k : {grip_own, grip_usual}) {
-            if (!ReadText(RecordPath(k), &text)) continue;
-            found = true;
-            file_key = k;
-            break;
-        }
-        static std::set<std::string> told;
-        if (told.insert(key).second)
-            log::Info("body: %s not posed yet: using %s (to pose it: hold the gun in the butt-strike stance, main "
-                      "hand by your head and the off hand up high, hold left Y 1 s, pose the main hand with the "
-                      "other controller, tap Y to save)",
-                      key.c_str(), found ? file_key.c_str() : "the built-in grip");
-    }
     // A slide grip saved before there were three slide holds: use it for any
     // hold not posed yet.
     if (!found && kind == hands::GrabKind::kSlideGrab && object && usual.find(".charging-") == std::string::npos) {
@@ -2466,13 +2454,8 @@ void UpdateEditor(const hands::HandGrab grab[2], const hands::HandState hs[2], c
     auto own_reach = [&](int s) {
         return OwnReach(grab[s]) && grab[s].object && grab[s].pose_blend > 0.95;
     };
-    // The main hand in its butt-strike pose comes before the off hand on the
-    // handguard (the off hand is the one up high, holding the gun).
-    auto butt = [&](int s) { return grab[s].kind == hands::GrabKind::kGunGrip && grab[s].point == hands::kPointButtStrike; };
     if (g_editor.Active() && g_edit_side >= 0 && IsGrab(grab[g_edit_side].kind)) side = g_edit_side;
     else if (right_kind == hands::GrabKind::kSlideGrab) side = kR;
-    else if (butt(kR)) side = kR;
-    else if (butt(kL)) side = kL;
     else if (IsGrab(left_kind) && left_kind != hands::GrabKind::kGunGrip) side = kL;
     else if (IsGrab(right_kind) && right_kind != hands::GrabKind::kGunGrip) side = kR;
     else if (own_reach(kL)) side = kL;
@@ -2537,9 +2520,6 @@ void UpdateEditor(const hands::HandGrab grab[2], const hands::HandState hs[2], c
                       : "hold on the pistol with the gun held out",
                       RecordKey(side, grab[side]).c_str());
         }
-        if (butt(side))
-            log::Info("body: grip editor: posing the %s hand's butt-strike pose (%s)", side == kL ? "left" : "right",
-                      RecordKey(side, grab[side]).c_str());
         log::Info("body: grip editor: hands and %s frozen in place; the %s controller's grab point is live",
                   is_mag ? "magazine" : "gun", ctrl == kR ? "right" : "left");
         g_edit_side = side;
@@ -2694,10 +2674,8 @@ std::mutex g_calibration_hud_mutex;
 CalibrationHud g_calibration_hud;
 double g_calibration_hud_until = 0;
 body_calibration::Session g_calibration;
-double g_measure_hold = 0;
 XrTime g_measure_sample_time = 0;
 double g_measure_sample_seen_ms = 0;
-bool g_measure_hotkey_armed = true;
 bool g_measure_height_only = false;
 double g_measure_scale = 1;
 unsigned g_measure_attempt = 0;
@@ -2753,8 +2731,6 @@ void EndCalibration(const char* reason) {
     g_calibration_skip_arms = false;
     g_calibration_trigger_bits = 0; g_calibration_trigger_interrupted = false;
     g_calibration_trigger_hold.Reset(); StopCalibrationHaptics();
-    g_measure_hold = 0;
-    g_measure_hotkey_armed = false;
     g_calibration.Reset();
     CalibrationText("Body setup stopped", reason, "Previous fit kept.", "Retry in VR Options.", 0, 7);
     log::Warn("body calibration: %s; previous fit retained", reason);
@@ -2772,18 +2748,12 @@ bool SaveCalibration(const body_calibration::Profile& profile) {
     return MoveFileExW(temporary.c_str(), destination.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
 }
 
-void StepMeasure(double dt) {
+void StepMeasure(double /*dt*/) {
     const double now = perf::NowMs();
-    const auto buttons = hands::GetEditButtons();
-    if (!buttons.left_stick_down) g_measure_hotkey_armed = true;
-    if (g_measure_hotkey_armed && !g_calibration_active && !ui_panel::MenuOpen() && !g_editor.Active()) {
-        g_measure_hold = buttons.left_stick_down ? g_measure_hold + dt : 0;
-        if (g_measure_hold >= 2.0) {
-            g_measure_requested = true;
-            g_measure_hold = 0;
-            g_measure_hotkey_armed = false;
-        }
-    }
+    // Body setup starts only from the VR tab (Calibrate body). Holding the
+    // left stick click 2 s used to start it too, but that click also sprints
+    // (or kicks with move_stick=right), so a held sprint mid-level started
+    // setup and took every button (2026-11-08 button-overlap check).
     if (g_calibration_cancel.exchange(false)) {
         EndCalibration("Cancelled.");
         return;
@@ -2913,7 +2883,8 @@ void StepMeasure(double dt) {
         if(M.calibrated && sum>0) {
             sample.prior_shoulder[h]=arm.shoulder; sample.prior_reach_cm[h]=sum;
         }
-        if(M.calibrated && M.profile.version>=5 && arm.segments_measured && sum>0) {
+        if(M.calibrated && M.profile.version>=5 && arm.segments_measured && sum>0 &&
+           body_calibration::PlausibleSplit(arm.upper_cm,arm.forearm_cm)) {
             sample.prior_forearm_fraction[h]=arm.forearm_cm/sum;
         } else if(G.arm_ref[h].valid) {
             const auto& frame=G.arm_ref[h];
@@ -3040,7 +3011,6 @@ void StepMeasure(double dt) {
             input::SetCalibrationCapture(false);
             g_calibration_skip_arms = false;
             g_calibration_trigger_bits = 0; g_calibration_trigger_interrupted = false;
-            g_measure_hold = 0;
             if (!arms_measured && !height_measured) {
                 CalibrationText("Existing fit kept", sample.height_mode == body_calibration::HeightMode::Fixed ? "Character height stays fixed." : "No new height reference recorded.", "Arm poses were skipped.", "Nothing was changed.", 0, 9);
                 log::Info("body calibration: arms skipped, no new posture reference; existing profile unchanged");
@@ -4426,7 +4396,9 @@ void FitLog(double dt, double yaw_lag) {
                           "(flex/side), applied forearm roll mean-abs %.0f deg, elbow swing %+.0f deg, controller offset %.1f cm / %.0f deg",
                           s == kL ? "left" : "right",
                           S.arm_scale_override > 0 ? "override" : M.calibrated
-                              ? (M.profile.arm[s].segments_measured ? "fitted upper and forearm" : M.profile.arm[s].forearm_measured
+                              ? (!body_calibration::PlausibleSplit(M.profile.arm[s].upper_cm, M.profile.arm[s].forearm_cm)
+                                  ? "usual proportions; saved split not human"
+                                  : M.profile.arm[s].segments_measured ? "fitted upper and forearm" : M.profile.arm[s].forearm_measured
                                   ? "fitted forearm; estimated upper" : "estimated proportions") : "avatar proportions",
                           100.0 * G.fit_reach[s] / n, G.fit_gap[s] / n, G.max_gap[s],
                           G.fit_flex[s] / n, G.fit_dev[s] / n, G.fit_twist[s] / n, G.fit_swivel[s] / n,
