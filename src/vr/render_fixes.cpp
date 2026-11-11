@@ -188,7 +188,7 @@ struct Kind {
     bool is_capture = false;
 };
 
-UObject g_cls_pp_component = 0, g_cls_pp_volume = 0, g_cls_camera = 0, g_cls_capture = 0;
+UObject g_cls_pp_component = 0, g_cls_pp_volume = 0, g_cls_camera = 0, g_cls_capture = 0, g_cls_capture_2d = 0;
 int32_t g_pp_component_settings = -1, g_pp_volume_settings = -1, g_camera_settings = -1;
 refl::PropertyInfo g_capture_every_frame, g_capture_on_movement, g_component_visible, g_capture_fov;
 bool g_disable_player_capture = true;
@@ -409,7 +409,13 @@ bool Init() {
         g_capture_on_movement = refl::FindProperty(g_cls_capture, "bCaptureOnMovement");
         if (!g_capture_every_frame.bool_mask) g_capture_every_frame = {};
         if (!g_capture_on_movement.bool_mask) g_capture_on_movement = {};
-        g_capture_fov = refl::FindProperty(g_cls_capture, "FOVAngle");
+    }
+    // The lens view angle belongs to the 2D capture, not to every kind (the
+    // 8914320 runs on 2026-11-11 looked it up on SceneCaptureComponent, found
+    // nothing, and the scope zoom never ran).
+    g_cls_capture_2d = ue::FindObject("Class /Script/Engine.SceneCaptureComponent2D");
+    if (g_cls_capture_2d) {
+        g_capture_fov = refl::FindProperty(g_cls_capture_2d, "FOVAngle");
         if (g_capture_fov.type != "FloatProperty" || g_capture_fov.element_size != 4) g_capture_fov = {};
     }
     if (UObject scene_component = ue::FindObject("Class /Script/Engine.SceneComponent")) {
@@ -426,6 +432,11 @@ bool Init() {
         for (char& ch : z) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
         g_scope_zoom_eye = z != "game";
         g_scope_zoom_flat = z == "flat";
+        if (g_scope_zoom_eye && !g_capture_fov.valid())
+            log::Warn("render fixes: the 2D scene capture's FOVAngle was not found: scopes keep the game's zoom");
+        else if (g_scope_zoom_eye)
+            log::Info("render fixes: scope zoom follows your eye (vr_scope_zoom=%s; lens view angle at 0x%x)",
+                      g_scope_zoom_flat ? "flat" : "eye", static_cast<unsigned>(g_capture_fov.offset));
     }
     {
         int found = 0;
@@ -897,6 +908,7 @@ bool MeasureLens(UObject capture, const Xform& cap, ScopeState& st) {
         }
         return false;
     };
+    if (!g_cls_capture_2d || !refl::IsA(capture, g_cls_capture_2d)) return fail("its lens camera is not a 2D capture");
     double m = 0, k = 0;
     if (!scope || !ue::GetProp(scope, "LensMagnificationFactor", m) ||
         !ue::GetProp(scope, "LensMagnificationFactor_ByEyeRelief", k))
