@@ -397,8 +397,16 @@ void LoadMagSeats() {
 // Cheek weld (owner 2026-11-07): shoulder the rifle, hold B, line the
 // sights up with your eye by moving the rifle, let go of B. Where your eye
 // sat against the rifle is kept per gun in cheek-weld.ini and the shoulder
-// snap puts the rifle back exactly there.
-std::map<std::string, FVector> g_welds;
+// snap puts the rifle back exactly there. With it is kept the fitted
+// sight's aiming point at the time, so a different sight moves the eye up,
+// down or sideways onto its own line (owner 2026-11-11: lined up with the
+// 2x scope, off with the irons).
+struct Weld {
+    FVector eye;              // the aiming eye, gun frame from the grip
+    bool has_sight = false;   // set with a known sight point (older lines have none)
+    FVector sight;            // that sight point, gun frame from the grip
+};
+std::map<std::string, Weld> g_welds;
 std::wstring WeldFile() { return config::Dir() + L"\\cheek-weld.ini"; }
 void LoadWelds() {
     FILE* f = _wfopen(WeldFile().c_str(), L"r");
@@ -406,11 +414,18 @@ void LoadWelds() {
     char line[256];
     while (fgets(line, sizeof(line), f)) {
         char name[128] = {};
-        double x, y, z;
-        if (line[0] == ';' || std::sscanf(line, "%127[^=]=%lf %lf %lf", name, &x, &y, &z) != 4) continue;
+        double x, y, z, sx, sy, sz;
+        if (line[0] == ';') continue;
+        const int n = std::sscanf(line, "%127[^=]=%lf %lf %lf @ %lf %lf %lf", name, &x, &y, &z, &sx, &sy, &sz);
+        if (n != 4 && n != 7) continue;
         if (std::fabs(x) > 80 || std::fabs(y) > 30 || std::fabs(z) > 40) continue;
-        g_welds[name] = FVector{x, y, z};
-        log::Info("controls: cheek weld for %s from cheek-weld.ini (eye %.1f %.1f %.1f from the grip)", name, x, y, z);
+        Weld w;
+        w.eye = FVector{x, y, z};
+        w.has_sight = n == 7 && std::fabs(sx) < 80 && std::fabs(sy) < 30 && std::fabs(sz) < 40;
+        if (w.has_sight) w.sight = FVector{sx, sy, sz};
+        g_welds[name] = w;
+        log::Info("controls: cheek weld for %s from cheek-weld.ini (eye %.1f %.1f %.1f from the grip, %s)", name, x, y,
+                  z, w.has_sight ? "follows the fitted sight" : "set before it followed the sight: kept as it is");
     }
     fclose(f);
 }
@@ -418,8 +433,16 @@ void SaveWelds() {
     FILE* f = _wfopen(WeldFile().c_str(), L"w");
     if (!f) return;
     std::fputs("; Where your aiming eye sits against each rifle (gun frame from the grip: forward, right, up; cm),\n"
-               "; set in game: shouldered, hold B, line up the sights, let go. Delete a line to go back.\n", f);
-    for (const auto& [name, v] : g_welds) std::fprintf(f, "%s=%.2f %.2f %.2f\n", name.c_str(), v.X, v.Y, v.Z);
+               "; set in game: shouldered, hold B, line up the sights, let go. Delete a line to go back.\n"
+               "; After the @: the fitted sight's aiming point then; another sight moves the eye onto its line.\n",
+               f);
+    for (const auto& [name, w] : g_welds) {
+        if (w.has_sight)
+            std::fprintf(f, "%s=%.2f %.2f %.2f @ %.2f %.2f %.2f\n", name.c_str(), w.eye.X, w.eye.Y, w.eye.Z,
+                         w.sight.X, w.sight.Y, w.sight.Z);
+        else
+            std::fprintf(f, "%s=%.2f %.2f %.2f\n", name.c_str(), w.eye.X, w.eye.Y, w.eye.Z);
+    }
     fclose(f);
 }
 
@@ -832,14 +855,19 @@ struct WeaponState {
     double kick_side = 0;         // this shot's random sideways part, -1..1
     // Virtual stock (rifles): gun-frame points, from the grip.
     FVector stock_local;          // middle of the butt pad
-    FVector ads_local;            // the game's aiming eye point (DefaultADSPoint)
+    FVector ads_local;            // aiming eye point: the fitted sight's height and side, default along the barrel
+    FVector default_ads_local;    // the gun's DefaultADSPoint (the same whatever sight is fitted)
+    UObject sight_point = 0;      // the fitted sight's aiming point (the gun's ActiveADSPoint), 0 if none
+    FVector sight_local;          // where it is, gun frame from the grip
+    double sight_checked_at = -1; // g_clock of the last look at it
     bool edit_frozen = false;     // grip editor running: gun held still
     FVector edit_gun_loc;
     FQuat edit_gun_rot;
     bool have_stock = false;
     bool shouldered = false;
     bool have_weld = false;       // cheek weld set by the owner for this gun
-    FVector weld_local;           // the aiming eye in the gun frame, from the grip
+    FVector weld_local;           // the aiming eye in the gun frame, from the grip (for the fitted sight)
+    Weld weld_saved;              // as saved in cheek-weld.ini
     double weld_hold = 0;         // gun hand's B held, s
     bool weld_free = false;       // B held: the rifle is off the shoulder snap
     double shouldered_at = -1;    // g_clock when the blend reached full
@@ -970,6 +998,7 @@ FQuat Nlerp(const FQuat& a, FQuat b, double t) {
 }
 
 void MeasureStock(UObject g, const FVector& actor_loc, const FQuat& actor_rot, const FVector& grip, UObject sight);
+void RefreshSight(UObject g, const FVector& actor_loc, const FQuat& actor_rot, const FVector& grip);
 bool MeshBoxInFrame(UObject c, const FQuat& frame_inv, const FVector& grip_w, FVector* lo, FVector* hi);
 std::vector<UObject> MeshComponents(UObject actor);
 
@@ -1645,8 +1674,68 @@ void MeasureStock(UObject g, const FVector& actor_loc, const FQuat& actor_rot, c
         if (a.Z > W.bore_height && a.Z < W.bore_height + 15.0 && a.X > -back) W.ads_local = a;
     }
     W.have_stock = true;
+    W.default_ads_local = W.ads_local;
     log::Info("controls: rifle stock %s at %.1f cm behind the grip (%d parts), aim point (%.1f %.1f %.1f)",
               measured ? "measured" : "assumed", back, counted, W.ads_local.X, W.ads_local.Y, W.ads_local.Z);
+    RefreshSight(g, actor_loc, actor_rot, grip);
+}
+
+// The saved cheek weld for the fitted sight: moved up/down and sideways by
+// how far this sight's line sits from the one it was set with. Along the
+// barrel it stays where it was set (the cheek doesn't slide on the stock).
+void WeldForSight() {
+    if (!W.have_weld) return;
+    W.weld_local = W.weld_saved.eye;
+    if (W.weld_saved.has_sight && W.have_stock)
+        W.weld_local = W.weld_local + FVector{0, W.ads_local.Y - W.weld_saved.sight.Y,
+                                              W.ads_local.Z - W.weld_saved.sight.Z};
+}
+
+// The fitted sight's aiming point: the gun's ActiveADSPoint, which the game
+// sets to the fitted sight's own ADSPoint and puts the flat-screen camera on
+// when aiming. The gun's DefaultADSPoint, which the shoulder snap used
+// before, is the same whatever sight is fitted (the same point in every log
+// since 11-04, irons and 2x scope): it lines up with the 2x scope but not
+// with the irons (owner 2026-11-11). The aiming eye now takes the fitted
+// sight's height and side; along the barrel it keeps the gun's default, so
+// the rifle sits as far forward on the shoulder as before. Looked at when
+// the rifle is taken and every second after (a sight changed at the bench).
+void RefreshSight(UObject g, const FVector& actor_loc, const FQuat& actor_rot, const FVector& grip) {
+    W.sight_checked_at = g_clock;
+    if (W.is_pistol || !W.have_stock || !W.have_frame) return;
+    UObject p = 0;
+    if (!ue::GetProp(g, "ActiveADSPoint", p) || !p || !ue::IsLive(p)) p = 0;
+    FVector s = W.default_ads_local;
+    const char* why = "the gun has no fitted sight point (ActiveADSPoint empty)";
+    if (p) {
+        const FVector a = W.gun_frame.Inverse().Rotate(
+            actor_rot.Inverse().Rotate(ComponentToWorld(p).translation - actor_loc) - grip);
+        // Over the bore, near the middle, between the butt and the muzzle.
+        if (a.Z > W.bore_height && a.Z < W.bore_height + 15.0 && std::fabs(a.Y - W.default_ads_local.Y) < 6.0 &&
+            a.X > W.stock_local.X && a.X < W.muzzle_dist) {
+            s = a;
+            why = nullptr;
+        } else {
+            why = "the fitted sight point is not over the bore";
+        }
+    }
+    const bool changed = p != W.sight_point || Len(s - W.sight_local) > 0.3;
+    W.sight_point = p;
+    W.sight_local = s;
+    W.ads_local = FVector{W.default_ads_local.X, s.Y, s.Z};
+    if (!changed) return;
+    WeldForSight();
+    UObject part = p ? ue::GetOuter(p) : 0;
+    const std::string name = part ? ue::GetName(ue::GetClass(part)) : std::string("none");
+    if (why)
+        log::Info("controls: sight %s: %s; the shouldered eye lines up with the gun's default point (%.1f %.1f %.1f)",
+                  name.c_str(), why, W.ads_local.X, W.ads_local.Y, W.ads_local.Z);
+    else
+        log::Info("controls: sight %s: aiming point (%.1f %.1f %.1f) from the grip, %.1f cm right and %.1f up of the "
+                  "gun's default (%.1f %.1f %.1f); the shouldered eye lines up with it%s",
+                  name.c_str(), s.X, s.Y, s.Z, s.Y - W.default_ads_local.Y, s.Z - W.default_ads_local.Z,
+                  W.default_ads_local.X, W.default_ads_local.Y, W.default_ads_local.Z,
+                  W.have_weld && W.weld_saved.has_sight ? ", and so does your cheek weld" : "");
 }
 
 // The aiming eye in the world: the headset's own view for that eye (owner
@@ -1780,6 +1869,7 @@ void HoldGun(game::Gun& gun, const hands::HandState& rh) {
     FVector rel = actor_rot.Inverse().Rotate(main_world.translation - actor_loc);
 
     if (!W.have_frame) LearnGunFrame(g, actor_loc, actor_rot, main_world.translation);
+    if (W.have_stock && g_clock - W.sight_checked_at > 1.0) RefreshSight(g, actor_loc, actor_rot, rel);
     // The gun's parts for keeping it out of walls: when taken, then every 4 s.
     if (W.have_frame && (g_gun_shape.gun != g || g_clock - g_gun_shape.measured_at > 4.0))
         MeasureGunShape(g, actor_loc, actor_rot, rel);
@@ -4192,14 +4282,17 @@ void CheekWeldButton(game::Gun& gun, const input::HandInput& gin) {
             if (sane) {
                 W.have_weld = true;
                 W.weld_local = e;
+                W.weld_saved = Weld{e, W.have_stock, W.ads_local};
                 W.shouldered = true;
                 W.shoulder_blend = 1.0;
-                g_welds[gun.ClassName()] = e;
+                g_welds[gun.ClassName()] = W.weld_saved;
                 SaveWelds();
                 input::Haptic(InputOf(GunHand()), 0.9f, 0.12f);
+                UObject part = W.sight_point ? ue::GetOuter(W.sight_point) : 0;
                 log::Info("controls: cheek weld saved for %s: eye %.1f cm behind the grip, %.1f right, %.1f up "
-                          "(sight point %.1f %.1f %.1f: eye %.1f cm behind it, %.1f right, %.1f up)",
+                          "(sight point %.1f %.1f %.1f of %s: eye %.1f cm behind it, %.1f right, %.1f up)",
                           gun.ClassName().c_str(), -e.X, e.Y, e.Z, W.ads_local.X, W.ads_local.Y, W.ads_local.Z,
+                          part ? ue::GetName(ue::GetClass(part)).c_str() : "the gun's default",
                           W.ads_local.X - e.X, e.Y - W.ads_local.Y, e.Z - W.ads_local.Z);
             } else {
                 log::Info("controls: cheek weld not saved: the eye was not behind the rifle (%.1f %.1f %.1f)", e.X, e.Y,
@@ -7732,10 +7825,12 @@ void OnTick(UObject player, float dt) {
     body::hand_walls::SetOwnGear(OwnGear());
     {
         // Gun scopes draw their view only while at the aiming eye
-        // (vr_scope_view; render_fixes::UpdateScopes).
+        // (vr_scope_view; render_fixes::UpdateScopes), sized for it
+        // (vr_scope_zoom).
         hands::Pose head;
         FVector eye;
-        const bool have = hands::Head(&head) && AimingEye(&eye);
+        const bool have_head = hands::Head(&head);
+        const bool have = have_head && AimingEye(&eye);
         render_fixes::UpdateScopes(have, eye, have ? head.rotation.Rotate(FVector{1, 0, 0}) : FVector{}, g_clock);
     }
     RefreshKick(player);
@@ -7861,7 +7956,8 @@ void OnTick(UObject player, float dt) {
             auto weld = g_welds.find(gun.ClassName());
             if (weld != g_welds.end()) {
                 W.have_weld = true;
-                W.weld_local = weld->second;
+                W.weld_saved = weld->second;
+                W.weld_local = weld->second.eye;   // moved onto the fitted sight's line once it is measured
             }
             auto seat = g_mag_seats.find(gun.ClassName());
             if (seat != g_mag_seats.end()) {
