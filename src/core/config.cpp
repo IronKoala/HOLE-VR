@@ -100,6 +100,12 @@ const Block kBlocks[] = {
      "; marked (a 2x scope shows things twice as big as beside it); flat = as\n"
      "; much as the game's flat-screen view does. game = as the game sets it.\n"
      "vr_scope_zoom=eye\n"},
+    {"vr_audio_listener",
+     "\n"
+     "; Where the game hears from. head = your head, turned as your head is, so\n"
+     "; sounds stay where they are when you look round. game = the game's own\n"
+     "; camera, which turns only with the stick.\n"
+     "vr_audio_listener=head\n"},
     {"vr_anti_aliasing",
      "\n"
      "; --- Anti-aliasing and console variables ---\n"

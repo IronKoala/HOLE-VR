@@ -32,6 +32,7 @@
 #include "vr/teleport.h"
 #include "ue/names.h"
 #include "vr/hands.h"
+#include "vr/audio_listener.h"
 #include "vr/render_fixes.h"
 #include "vr/workbench.h"
 #include "vr/workbench_carry.h"
@@ -7826,12 +7827,13 @@ void OnTick(UObject player, float dt) {
     {
         // Gun scopes draw their view only while at the aiming eye
         // (vr_scope_view; render_fixes::UpdateScopes), sized for it
-        // (vr_scope_zoom).
+        // (vr_scope_zoom). The game hears from your head (vr_audio_listener).
         hands::Pose head;
         FVector eye;
         const bool have_head = hands::Head(&head);
         const bool have = have_head && AimingEye(&eye);
         render_fixes::UpdateScopes(have, eye, have ? head.rotation.Rotate(FVector{1, 0, 0}) : FVector{}, g_clock);
+        audio_listener::Update(player, have_head, head.location, head.rotation, g_clock);
     }
     RefreshKick(player);
     g_dt = dt;
