@@ -21,7 +21,9 @@ struct WorldSection {
 };
 struct Palm {
     bool fitted = false;
-    FVector centre{}, axis[3]{}, half{}; // hand-local X across, Y forward, Z palmward
+    // hand-local X across, Y forward, Z palmward. No "{}" on axis[3]: FVector
+    // zero-initialises itself, and GCC 13 rejects "return {}" for Palm with it.
+    FVector centre{}, axis[3], half{};
 };
 // Converts the local palm to an orthonormal world box enclosing every scaled corner.
 Palm TransformPalm(const Palm& local, const skel::Xf& hand);
