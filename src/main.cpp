@@ -14,6 +14,7 @@
 #include "core/process_metrics.h"
 #include "core/sampler.h"
 #include "game/game.h"
+#include "game/spawn_report.h"
 #include "game/weapon_lab.h"
 #include "proxy/dxgi_proxy.h"
 #include "build_id.h"
@@ -118,15 +119,17 @@ void StartVr() {
 // Bytecode listings (dump/script/<Class>.txt) of the game's Blueprints whose
 // path contains one of the comma-separated dump_script_classes words: the
 // weapons, their parts, the workbench, the player, the save data, the
-// hub's drink machine and the footstep (teleport landings play it). Empty
-// turns it off.
+// hub's drink machine, the footstep (teleport landings play it), and the
+// level manager with its enemy spawners, "object" events (the flying TVs)
+// and the levels' own scripts (what decides when TVs come). Empty turns it
+// off.
 void DumpScripts(const std::wstring& mod_dir) {
     using namespace holevr;
     const std::string list = config::GetString(
         "dump_script_classes",
         "/Game/Weapons/,BP_Player,BPC_WeaponManager,LCBP_Weapon,UIM_WeaponCustom,BPC_WeaponCustom,"
         "BP_GameInstance,SGO_SaveData,UIP_WeaponModel,BPC_InventoryManager,LCBP_SkillUpgrade,"
-        "AnimNotifys/Footstep_AnimNotify");
+        "AnimNotifys/Footstep_AnimNotify,SYS_LevelManager,LCBP_EnemySpawner,/Game/Objects/,/Game/Maps/");
     std::vector<std::string> filters;
     size_t start = 0;
     while (start <= list.size()) {
@@ -191,6 +194,7 @@ DWORD WINAPI InitThread(LPVOID) {
         vr::vr_options::InitGame();
         vr::comfort::InitGame();
         vr::hole_watch::InitGame();
+        game::spawn_report::InitGame();  // read only: enemy spawns and object events (TVs) in the log
         vr::menu_study::InitGame();
         vr::ui_panel::InitGame();
         vr::watch::InitGame();  // after body/input/menu owners: solved wrist + visible fingertip

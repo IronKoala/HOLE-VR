@@ -98,6 +98,7 @@ add_library(hole_vr SHARED
     src/ue/call.cpp
     src/game/game.cpp
     src/game/gun.cpp
+    src/game/spawn_report.cpp
     src/game/weapon_custom.cpp
     src/game/weapon_lab.cpp
     src/vr/render_fixes.cpp

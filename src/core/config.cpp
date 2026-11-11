@@ -963,6 +963,12 @@ const Block kBlocks[] = {
      "; dump folder (includes the weapon and player classes the start-up dump\n"
      "; misses). Only needed while the mod is being developed.\n"
      "dump_in_game=0\n"},
+    {"spawn_report",
+     "\n"
+     "; Diagnostic, read only: log the game's own enemy spawns (enemies up\n"
+     "; against its limit, every 10 s in a run) and its object events, like the\n"
+     "; flying TVs (\"spawns:\" lines). Changes nothing in the game. 0 = off.\n"
+     "spawn_report=1\n"},
     {"vr_lumen_gi_quality",
      "\n"
      "; Lumen indirect lighting quality in VR. Levels ask for 2; 1 looks nearly the\n"
