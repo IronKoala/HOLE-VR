@@ -1,7 +1,7 @@
 #pragma once
 // Numerical finger reference transforms from the local WhiteMan skeleton metadata.
 // Side 0 left, 1 right; digit order thumb/index/middle/ring/pinky. No mesh asset.
-#include "vr/body/finger_contact.h"
+#include "vr/body/controller_pose.h"
 namespace white_man_hands {
 using namespace holevr::vr;
 inline const skel::Xf local[2][5][3] = {
@@ -60,7 +60,7 @@ inline const skel::Xf local[2][5][3] = {
 },
 },
 };
-inline void Build(int side,fingers::Chain chains[5],finger_contact::Bounds bounds[5],FVector* normal=nullptr) {
+inline void Build(int side,fingers::Chain chains[5],controller_pose::Bounds bounds[5],FVector* normal=nullptr) {
     using namespace ik;
     const FVector across=local[side][1][0].translation-local[side][4][0].translation;
     const FVector middle=local[side][2][0].translation;
@@ -71,7 +71,7 @@ inline void Build(int side,fingers::Chain chains[5],finger_contact::Bounds bound
         joints[1]=skel::Compose(local[side][f][1],joints[0]);
         joints[2]=skel::Compose(local[side][f][2],joints[1]);
         chains[f]=fingers::Build(joints,palm,local[side][4][0].translation,f==0);
-        bounds[f]=finger_contact::MakeBounds(chains[f],f);
+        bounds[f]=controller_pose::MakeBounds(chains[f],f);
     }
 }
 } // namespace white_man_hands

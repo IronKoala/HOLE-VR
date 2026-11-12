@@ -26,7 +26,7 @@
 #include "ue/process_event.h"
 #include "ue/reflection.h"
 #include "vr/body/body.h"
-#include "vr/body/hand_walls.h"
+#include "vr/collision_ignore.h"
 #include "vr/comfort.h"
 #include "vr/comfort_math.h"
 #include "vr/teleport.h"
@@ -1505,7 +1505,7 @@ FVector WallPushback(UObject gun, const FQuat& frame, const FVector& grip, bool 
     if (!ksl || !gps || !player || !hands::Head(&head)) return FVector{};
     // Not the gun or what the hands hold, not the forearm menu or wrist HUD
     // (they sit in front of the eyes whenever the left wrist is up), and not
-    // the player or what hangs on it (body::hand_walls' list).
+    // the player or what hangs on it (collision_ignore' list).
     // Also all of the player's gear (OwnGear: both guns, what is fitted to
     // them, magazines and what the hands hold): the gun must never be pushed
     // out of its own sight or light, or the lines to a gun held low stopped
@@ -1528,7 +1528,7 @@ FVector WallPushback(UObject gun, const FQuat& frame, const FVector& grip, bool 
     if (ue::GetProp(gun, "MagazineObj", in_mag)) ignore_too(in_mag);
     ignore_too(hands::GetGrab(HandOf(OtherHand())).object);
     if (UObject holder = static_cast<UObject>(world_menu::PanelHolder())) ignore_too(holder);
-    for (UObject a : body::hand_walls::IgnoredActors()) ignore_too(a);
+    for (UObject a : collision_ignore::IgnoredActors()) ignore_too(a);
     // Enemies, mannequins and targets met lately (GunWallTraces: the gun is
     // not pushed out of what it can hit).
     for (UObject a : StrikeTargetsSeen()) ignore_too(a);
@@ -7823,7 +7823,7 @@ void OnTick(UObject player, float dt) {
     ++g_controls_frame;
     // The hands and fingers leave the player's guns and what is fitted to
     // them out of their wall checks too.
-    body::hand_walls::SetOwnGear(OwnGear());
+    collision_ignore::SetOwnGear(OwnGear());
     {
         // Gun scopes draw their view only while at the aiming eye
         // (vr_scope_view; render_fixes::UpdateScopes), sized for it

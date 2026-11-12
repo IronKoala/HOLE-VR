@@ -7,7 +7,7 @@
 
 using namespace holevr::vr;
 using namespace holevr::vr::ik;
-namespace fc = holevr::vr::finger_contact;
+namespace fc = holevr::vr::controller_pose;
 namespace tp = holevr::vr::thumb_pose;
 namespace jl = holevr::vr::joint_limits;
 static int failures = 0;
@@ -44,7 +44,8 @@ int main() {
     const auto pinch=tp::Target(c,palm,index,{0,1,false},b);
     Bounded(c,open,b); Bounded(c,wrap,b); Bounded(c,pinch,b);
     const auto base=jl::Decompose(b.axes[0],pinch.extra[0]);
-    EXPECT(std::fabs(base.side)>0.02);
+    // A reference-aligned pinch can have zero side angle. Its functional
+    // opposition is verified by pad alignment, not a mandatory side offset.
     EXPECT(std::fabs(base.twist)>0.02);
     auto no_opposition=pinch;
     auto plain=base; plain.twist=0;
@@ -54,9 +55,12 @@ int main() {
     std::printf("thumb pad toward index: without base axial rotation %.3f, with opposition %.3f\n",before,after);
     // Pinch and power wrapping use distinct MCP/IP configurations.
     EXPECT(std::fabs(jl::Decompose(b.axes[1],pinch.extra[1]).flex-jl::Decompose(b.axes[1],wrap.extra[1]).flex)>0.1);
-    // Full opposition endpoints retain the original input curves.
-    EXPECT(std::fabs(jl::Decompose(b.axes[0],wrap.extra[0]).flex-35*kDegToRad)<1e-7);
-    EXPECT(std::fabs(jl::Decompose(b.axes[0],pinch.extra[0]).flex-25*kDegToRad)<1e-7);
+    // Power grip keeps its anatomical MCP/IP bend while its CMC aims
+    // outside the closed fingers. Pinch retains its separate joint bend.
+    EXPECT(std::fabs(jl::Decompose(b.axes[1],wrap.extra[1]).flex+b.limits[1].ref_bend-50*kDegToRad)<1e-7);
+    EXPECT(std::fabs(jl::Decompose(b.axes[2],wrap.extra[2]).flex+b.limits[2].ref_bend-45*kDegToRad)<1e-7);
+    EXPECT(std::fabs(jl::Decompose(b.axes[1],pinch.extra[1]).flex+b.limits[1].ref_bend-29*kDegToRad)<1e-7);
+    EXPECT(std::fabs(jl::Decompose(b.axes[2],pinch.extra[2]).flex+b.limits[2].ref_bend-25*kDegToRad)<1e-7);
 
     // Curves remain continuous and bounded as trigger/grip vary.
     auto last=open;
@@ -122,6 +126,42 @@ int main() {
         EXPECT(Length(joints[0].translation-chains[0].ref[0].translation)<1e-9);
         EXPECT(std::fabs(root-2.1335)<.001);
         EXPECT(*std::max_element(stations,stations+4)<=root+.30);
+        const auto fist=tp::Target(chains[0],normal,chains[1].ref[0].translation,{1,1,false},bounds[0]);
+        const auto grip_only=tp::Target(chains[0],normal,chains[1].ref[0].translation,{1,0,false},bounds[0]);
+        const auto fist_base=jl::Decompose(bounds[0].axes[0],fist.extra[0]);
+        const auto grip_base=jl::Decompose(bounds[0].axes[0],grip_only.extra[0]);
+        // Original weighted thenar triangles require at least 22 degrees
+        // on the left / 20 on the right beside the closing index. A tall
+        // thumb tip alone did not prevent the base pad from intersecting.
+        EXPECT((side==0 ? -1 : 1)*fist_base.side>22*kDegToRad);
+        // Grip-only now also retains more of the outside neutral saddle.
+        // The combined grip must keep its absolute thenar clearance, without
+        // requiring an artificial twelve-degree gap from that safer grip.
+        EXPECT(std::fabs(fist_base.side)>=std::fabs(grip_base.side));
+        Bounded(chains[0],fist,bounds[0]);
+        // All generated closing routes retain a modest saddle side/roll
+        // excursion; broad anatomical limits alone allowed the old guide to
+        // saturate axial roll and reverse the side across the palm.
+        for(int mode=0;mode<3;++mode)for(int step=0;step<=100;++step) {
+            const double amount=step/100.;
+            const auto released=tp::Target(chains[0],normal,chains[1].ref[0].translation,
+                {mode!=1?amount:0,mode!=0?amount:0,false},bounds[0]);
+            const auto pressed=tp::Target(chains[0],normal,chains[1].ref[0].translation,
+                {mode!=1?amount:0,mode!=0?amount:0,true},bounds[0]);
+            const auto actual=jl::Decompose(bounds[0].axes[0],released.extra[0]);
+            const double side_allowance=mode==0?10*kDegToRad:std::max(10*kDegToRad,std::fabs(base.side));
+            EXPECT(std::fabs(actual.side-base.side)<=side_allowance+1e-8);
+            EXPECT(actual.side*base.side>=-1e-8); // pinch may reach, not cross, reference
+            if(base.side<0)EXPECT(actual.side>=base.side-10*kDegToRad-1e-8);
+            else EXPECT(actual.side<=base.side+10*kDegToRad+1e-8);
+            EXPECT(std::fabs(actual.twist-base.twist)<=6*kDegToRad+1e-8);
+            const auto delta=Normalized(pressed.extra[0]*released.extra[0].Inverse());
+            EXPECT(std::fabs(delta.W)>1-1e-12); // button never steers the saddle
+            Bounded(chains[0],released,bounds[0]);Bounded(chains[0],pressed,bounds[0]);
+        }
+        const auto full_pinch=tp::Target(chains[0],normal,chains[1].ref[0].translation,{0,1,false},bounds[0]);
+        const auto pinch_base=jl::Decompose(bounds[0].axes[0],full_pinch.extra[0]);
+        EXPECT(std::fabs(pinch_base.side)<1e-8); // do not force the web outward during pinch
         EXPECT(std::fabs(jl::Decompose(bounds[0].axes[1],pose.extra[1]).flex+bounds[0].limits[1].ref_bend-5*kDegToRad)<1e-7);
         EXPECT(std::fabs(jl::Decompose(bounds[0].axes[2],pose.extra[2]).flex+bounds[0].limits[2].ref_bend-3*kDegToRad)<1e-7);
         // Changing thumb intention cannot mutate the other chains or their
@@ -129,12 +169,12 @@ int main() {
         skel::Xf other_before[3],other_after[3]; FVector before_tip,after_tip;
         const auto other=fc::CurlTarget(chains[1],0,bounds[1]);
         fingers::Fk(chains[1],other,other_before,&before_tip);
-        for(int mode=0;mode<2;++mode) {
+        for(int mode=0;mode<3;++mode) {
             auto previous=pose;
             for(int step=1;step<=200;++step) {
                 const double amount=step/200.0;
                 const auto current=tp::Target(chains[0],normal,chains[1].ref[0].translation,
-                    {mode==0?amount:0,mode==1?amount:0,false},bounds[0]);
+                    {mode!=1?amount:0,mode!=0?amount:0,false},bounds[0]);
                 Bounded(chains[0],current,bounds[0]);
                 for(int j=0;j<3;++j) {
                     const auto delta=Normalized(current.extra[j]*previous.extra[j].Inverse());

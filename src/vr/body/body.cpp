@@ -1,4 +1,5 @@
 #include "vr/body/body.h"
+#include "vr/body/skin_model.h"
 
 #include <windows.h>
 
@@ -29,15 +30,9 @@
 #include "vr/body/finger_solve.h"
 #include "vr/body/grip_editor.h"
 #include "vr/body/grip_record.h"
-#include "vr/body/finger_rest.h"
-#include "vr/body/finger_contact.h"
-#include "vr/body/hand_rigid_contact.h"
-#include "vr/body/hand_contact_staging.h"
-#include "vr/body/hand_collision_shape.h"
-#include "vr/body/finger_self.h"
-#include "vr/body/finger_world.h"
-#include "vr/body/thumb_pose.h"
-#include "vr/body/hand_walls.h"
+#include "vr/body/finger_intent.h"
+#include "vr/body/controller_pose.h"
+#include "vr/collision_ignore.h"
 #include "vr/body/hand_pose.h"
 #include "vr/body/holster_pose.h"
 #include "vr/body/ik_math.h"
@@ -117,11 +112,7 @@ struct Settings {
     double reach_gun = 22.0;       // pointer ahead of a gun-holding editing hand, cm
     bool gun_wrist_straight = true;
     bool fit_log = true;
-    bool fingers_rest = true;  // fingers give way against walls an empty hand is against
     bool thumb_opposition = true;
-    bool press_flat = true;    // an empty hand pushed against a wall settles flat on it
-    double press_push = 4.0;   // cm the real hand goes on past where it touched until the hand is flat
-    double finger_drag = 1.0;  // fingertips trail along a surface the hand slides on (0 = off, 1 = normal)
     // A magazine lined up with the magwell (owner 2026-11-06): its own hand
     // pose (stage 2), the game's reload hold until it is posed, and the
     // game's own left-hand reload animation played by how far it is in.
@@ -176,11 +167,7 @@ void LoadSettings() {
     S.reach_gun = std::clamp<double>(config::GetFloat("hand_editor_gun_hand_reach_cm", 22.f), 3.0, 60.0);
     S.gun_wrist_straight = config::GetBool("body_gun_wrist_straight", true);
     S.fit_log = config::GetBool("body_fit_log", true);
-    S.fingers_rest = config::GetBool("hand_fingers_rest_on_walls", true);
     S.thumb_opposition = config::GetBool("hand_thumb_opposition", true);
-    S.press_flat = config::GetBool("hand_press_flat_on_walls", true);
-    S.press_push = std::clamp<double>(config::GetFloat("hand_press_flat_push_cm", 4.f), 0.5, 20.0);
-    S.finger_drag = std::clamp<double>(config::GetFloat("hand_finger_drag", 1.f), 0.0, 3.0);
     S.mag_insert_anim = config::GetBool("mag_insert_anim", true);
     {
         // A new key: mag_insert_anim_rifle (pistol by default) was the first
@@ -526,7 +513,6 @@ struct HandRig {
     FVector palm_centre;  // hand space
     FVector forearm_dir;  // reference: elbow -> wrist, in hand space
     FVector palm_h, across_h;
-    hand_collision_shape::Palm collision_palm;
     // Human joint ranges for posed fingers, per finger and joint (joint_limits.h).
     jl::Axes axes[hand_pose::kFingerCount][3];
     jl::Limits limits[hand_pose::kFingerCount][3];
@@ -842,7 +828,7 @@ void ApplyShadows() {
 }
 
 void StopEditor();
-void ResetHandPhysics(int side = -1);
+void ResetHandTracking(int side = -1);
 
 void Activate() {
     if (G.active || !G.pose_comp) return;
@@ -865,8 +851,9 @@ void Activate() {
 }
 
 void Deactivate() {
+    skin_model::Hide();
     g_slots_valid = false;
-    ResetHandPhysics();
+    ResetHandTracking();
     StopEditor();
     if (!G.active) return;
     for (UObject f : G.followers) SetLeader(f, G.source);
@@ -889,7 +876,8 @@ bool Setup(UObject player) {
     if (player == G.player && source == G.source && G.pose_comp) return true;
     if (G.failed && player == G.player && source == G.source) return false;
     StopEditor();
-    ResetHandPhysics();
+    ResetHandTracking();
+    skin_model::Reset();
     G = State();
     G.player = player;
     G.source = source;
@@ -1125,7 +1113,6 @@ void BuildRig(int side, const skel::Pose& refp) {
         r.chain[f] = fingers::Build(j[f], r.palm_h, mcp_p, f == hand_pose::kThumb);
         lengths[f] = r.chain[f].length;
     }
-    hand_collision_shape::FitWhiteMan(r.chain, r.palm_h, &r.collision_palm);
     double check = Dot(Normalize(Cross(r.geo.across, r.palm_h)), r.geo.fingers);
     r.ok = r.frame.valid && (side == kR ? check > 0.5 : check < -0.5);
     // Joint ranges: anatomical, shifted by how bent each joint already is in
@@ -1146,9 +1133,9 @@ void BuildRig(int side, const skel::Pose& refp) {
     log::Info("body: %s hand joint limits %s: reference pose bends (deg, base/middle/tip, thumb..pinky) %s",
               side == kL ? "left" : "right", S.joint_limits ? "on" : "OFF (hand_joint_limits=0)", bends.c_str());
     log::Info("body: %s hand: middle knuckle %.1f cm from the wrist, fingers %.1f %.1f %.1f %.1f %.1f cm "
-              "(thumb..pinky), handedness %.2f, %s collision%s",
+              "(thumb..pinky), handedness %.2f%s",
               side == kL ? "left" : "right", Length(mcp_m), lengths[0], lengths[1], lengths[2], lengths[3], lengths[4],
-              check, r.collision_palm.fitted ? "fitted mesh" : "fallback",
+              check,
               r.ok ? "" : " (FAILED: no stored grips for this hand)");
 }
 
@@ -1164,6 +1151,7 @@ void CaptureReference() {
     skel::Pose refp;
     refp.Init(G.engine.parent);
     refp.SetAllLocal(G.ref.data(), static_cast<int>(G.ref.size()));
+    skin_model::Prepare(G.player,G.source,G.pose_comp,G.engine.name_str,G.engine.parent,G.ref);
     for (int side = 0; side < 2; ++side) BuildRig(side, refp);
     PrewarmGrips();
     const Skeleton& k = G.skel;
@@ -2252,7 +2240,7 @@ struct PinchNote {
     double ms = 0;         // perf::NowMs when taken
 };
 PinchNote g_pinch[2];
-hands::Pose g_raw_grip[2];  // controller grip before hand_walls moved the drawn hand
+hands::Pose g_raw_grip[2];  // unmodified controller grip for editor and interaction offsets
 std::mutex g_pinch_mutex;
 // What each visible hand touches things with (GetHandContacts), under g_pinch_mutex.
 struct ContactNote {
@@ -3138,54 +3126,6 @@ void FreeHand(int side, const hands::HandState& h, const FVector& fist_at, FQuat
     *pos = rig.frame.valid ? fist - hand_rot.Rotate(rig.frame.fist) : fist;
 }
 
-// Build the palm collision volume from the same calibrated mapping used to
-// draw the empty hand. The controller origin is not the palm centre.
-hand_motion::PalmShape CollisionPalm(int side, const hands::HandState& h) {
-    hand_motion::PalmShape shape;
-    const auto& rig = G.rig[side];
-    if (!h.valid || !rig.ok) return shape;
-    FQuat rotation; FVector wrist;
-    FreeHand(side, h, h.grip.location, &rotation, &wrist);
-    Xf hand = WX(G.skel.hand[side]);
-    hand.rotation = rotation; hand.translation = wrist;
-    if (rig.collision_palm.fitted) {
-        const auto fitted = hand_collision_shape::TransformPalm(rig.collision_palm, hand);
-        if (!fitted.fitted) return shape;
-        const auto inverse = h.grip.rotation.Inverse();
-        shape.centre = inverse.Rotate(fitted.centre - h.grip.location);
-        shape.rotation = Normalized(inverse * AlignFrames({0,0,1}, {0,1,0}, fitted.axis[2], fitted.axis[1]));
-        shape.half = fitted.half;
-        shape.flatten = S.press_flat;
-        shape.press_cm = S.press_push;
-        shape.valid = true;
-        return shape;
-    }
-    const auto point = [&](const FVector& p) { return skel::Apply(hand, p); };
-    const FVector origin = point({});
-    if (!std::isfinite(Length(hand.scale)) || std::fabs(hand.scale.X) < 1e-6 ||
-        std::fabs(hand.scale.Y) < 1e-6 || std::fabs(hand.scale.Z) < 1e-6) return shape;
-    // Plane normals use the inverse transpose, including nonuniform scale.
-    const FVector local_normal{rig.palm_h.X / hand.scale.X, rig.palm_h.Y / hand.scale.Y,
-                               rig.palm_h.Z / hand.scale.Z};
-    const FVector palm = Normalize(hand.rotation.Rotate(local_normal));
-    const FVector forward = Normalize(Reject(point(rig.geo.fingers) - origin, palm));
-    const double thickness = 1.5 / Length(local_normal);
-    const FVector centre = point(rig.palm_centre) - palm * thickness;
-    const double width = Length(point(rig.chain[hand_pose::kIndex].ref[0].translation) -
-                                point(rig.chain[hand_pose::kPinky].ref[0].translation));
-    const double length = Length(point(rig.chain[hand_pose::kMiddle].ref[0].translation) - origin);
-    const double across_scale = Length(point(rig.across_h) - origin);
-    const FQuat inverse = h.grip.rotation.Inverse();
-    shape.centre = inverse.Rotate(centre - h.grip.location);
-    shape.rotation = Normalized(inverse * AlignFrames({0,0,1}, {0,1,0}, palm, forward));
-    shape.half = {width * 0.5 + 0.8 * across_scale, length * 0.45, thickness};
-    shape.flatten = S.press_flat;
-    shape.press_cm = S.press_push;
-    shape.valid = std::isfinite(Length(shape.centre)) && std::isfinite(Length(shape.half)) &&
-                  shape.half.X > 0.1 && shape.half.Y > 0.1 && shape.half.Z > 0.1;
-    return shape;
-}
-
 // ---- built-in slide holds (owner's description, 2026-11-02) ----
 // Front and rear overhand: hand flat, the thumb's pad against the slide.
 // Rear pinch: a fist with the thumb straight out, the side of the index
@@ -3460,257 +3400,37 @@ bool BuildSlidePreset(int side, const hands::HandState& h, const hands::Pose& ob
     return true;
 }
 
-// An empty hand pushed against a wall, table or door settles flat on it
-// (owner 2026-11-03 14:14: the fingers "would close and make a fist, in real
-// life people tend to press their hand against the wall"). Reworked after
-// the owner's hand-physics reference (SentientArt/TheBasement, ragdoll hands
-// sprung toward the controller): the hand keeps the controller's angle until
-// it really touches the surface (its ball is stopped, or its fingertips
-// reach it), then turns flat as the real hand goes on toward it, flat once
-// it is press_push cm past where the ball stops. Only a palm or
-// fingertips-first touch turns it: the back of the hand, or its side (a
-// karate chop), keeps its angle. The palm is set on the surface, but never
-// pulled toward it from further than the real hand has gone past the drawn
-// one. Returns how flat, 0..1.
-// h: the hand as drawn (after the wall check).
-constexpr double kNoTouch = 1e9;
-bool g_was_flat[2] = {false, false};      // for the log: flat last frame
-double g_flat[2] = {0.0, 0.0};            // eased flatness
-double g_touch_d[2] = {kNoTouch, kNoTouch};  // real fist height above the surface when it touched, this touch
-
-double PressFlat(int side, const hands::HandState& h, FQuat* rot, FVector* pos, double dt) {
-    double& eased = g_flat[side];
-    double& touch_d = g_touch_d[side];
-    const HandRig& rig = G.rig[side];
-    FVector at, out;
-    const hands::HandState real = hands::Get(side == kL ? hands::kLeft : hands::kRight);
-    if (!S.press_flat || !rig.ok || !real.valid || !hand_walls::Contact(side, &at, &out)) {
-        touch_d = kNoTouch;
-        return eased = 0.0;
-    }
-    const double d = Dot(real.grip.location - at, out);  // the real fist centre's height above the surface
-    // Remember where it touched; forget once the hand is pulled 2 cm back off it.
-    if (hand_walls::Touching(side)) {
-        if (touch_d == kNoTouch) touch_d = d;
-    } else if (touch_d != kNoTouch && d > touch_d + 2.0) {
-        touch_d = kNoTouch;
-    }
-    const FVector palm = Normalize(rot->Rotate(rig.palm_h));
-    const FVector across = Normalize(rot->Rotate(rig.across_h));
-    const FVector into = out * -1.0;
-    // From where it touched (the fingertips may touch 15 cm before the fist
-    // does) to press_push past where the hand's ball stops at the surface.
-    const double flat_at = hand_walls::Radius() - S.press_push;
-    double target =
-        touch_d == kNoTouch ? 0.0 : std::clamp((touch_d - d) / std::max(0.5, touch_d - flat_at), 0.0, 1.0);
-    // The back of the hand (palm 100-115 deg or more off the surface) and the
-    // side of it (across the knuckles pointing into the surface) keep their
-    // angle; faded, so the hand never pops between the two.
-    const double facing = Dot(palm, into);
-    const double c100 = std::cos(100.0 * kDegToRad), c115 = std::cos(115.0 * kDegToRad);
-    target *= std::clamp((facing - c115) / (c100 - c115), 0.0, 1.0);
-    target *= std::clamp((0.85 - std::fabs(Dot(across, into))) / 0.25, 0.0, 1.0);
-    // Ease in (about 0.07 s), so the hand turns rather than snaps; let go at once.
-    eased = target < eased ? target : eased + (target - eased) * (1.0 - std::exp(-dt / 0.07));
-    const double w = eased;
-    if (w <= 0.001) return 0.0;
-    // Log the first 10 presses (flat after not being flat).
-    static int logged = 0;
-    const bool now_flat = w >= 0.99;
-    if (now_flat && !g_was_flat[side] && logged < 10) {
-        ++logged;
-        log::Info("body: %s hand pressed flat on a surface (palm turned %.0f deg to face it; it touched with the real "
-                  "fist %.1f cm off the surface, now %.1f cm)",
-                  side == kL ? "left" : "right", std::acos(std::clamp(facing, -1.0, 1.0)) * kRadToDeg, touch_d, d);
-    }
-    g_was_flat[side] = now_flat;
-    *rot = Normalized(Scale(Arc(palm, into), w) * *rot);
-    // The palm's middle onto the surface (0.3 cm off it), never into it, and
-    // pulled toward it no further than the wall check held the hand back.
-    constexpr double kSkin = 0.3;
-    const FVector c = *pos + rot->Rotate(rig.palm_centre);
-    const double dc = Dot(c - at, out);
-    const double held = std::max(0.0, Dot(h.grip.location - real.grip.location, out));
-    const double shift = dc < kSkin ? kSkin - dc : -std::min((dc - kSkin) * w, held);
-    *pos = *pos + out * shift;
-    return w;
-}
-
-// Fingers against a surface, from frame to frame: each finger moves from
-// where it was (a sprung finger can't jump through a wall).
-struct FingerWall {
-    bool on = false;  // the hand was against a surface last frame
-    FVector last_hand{0, 0, 0};
-    double bend[hand_pose::kFingerCount] = {};
-    int dir[hand_pose::kFingerCount] = {};
-    double drag_bend[hand_pose::kFingerCount] = {}, drag_spread[hand_pose::kFingerCount] = {};
-};
-FingerWall g_finger_wall[2];
-finger_contact::State g_finger_contact[2][hand_pose::kFingerCount];
-Xf g_contact_wrist[2];
-fingers::Angles g_contact_pose[2][hand_pose::kFingerCount];
-bool g_contact_wrist_valid[2]{};
-Xf g_pending_wrist[2];
-fingers::Angles g_pending_pose[2][hand_pose::kFingerCount];
-bool g_pending_wrist_valid[2]{};
-hand_contact_staging::Intent g_pending_intent[2];
-double g_pending_started_ms[2]{};
-bool g_precise_fingers[2]{};
-perf::Counter g_perf_finger_contact{"body individual finger contacts"};
-
-void ResetFingerContacts(int side) {
-    finger_world::Reset(side);
-    g_contact_wrist_valid[side] = false;
-    g_pending_wrist_valid[side] = false;
-    for (auto& state : g_finger_contact[side]) finger_contact::Reset(state);
-    g_finger_wall[side] = {};
-    g_precise_fingers[side] = false;
-    g_flat[side] = 0;
-    g_touch_d[side] = kNoTouch;
-    g_was_flat[side] = false;
-}
-
-void ResetHandPhysics(int side) {
-    hand_walls::Reset(side);
-    for (int s = 0; s < 2; ++s) {
-        if (side >= 0 && side != s) continue;
-        ResetFingerContacts(s);
-        G.twist_state[s].support = {};
-        G.cur_init[s] = false;
-        g_tips_valid[s] = false;
-        std::lock_guard<std::mutex> lock(g_pinch_mutex);
-        g_pinch[s] = {};
-        g_contact[s] = {};
-    }
-}
-
-void SuppressUnverifiedHand(int side) {
-    // Each body frame begins from copied game animation. Returning without
-    // posing would expose that unchecked hand, not hold our previous drawing.
-    // Use the same finite scale suppression as the first-person head until a
-    // checked full wrist/finger pose is available; tracking/input is untouched.
-    const int bone = G.skel.hand[side];
-    if (bone >= 0) {
-        Xf local = G.pose.L(bone);
-        local.scale = {0.001, 0.001, 0.001};
-        G.pose.SetL(bone, local);
-    }
+// Clear published interaction points whenever tracking or the owning body is lost.
+void ClearHandInteraction(int side) {
     g_tips_valid[side] = false;
-    G.watch_arm_ms[side] = 0;
     std::lock_guard<std::mutex> lock(g_pinch_mutex);
     g_pinch[side] = {};
     g_contact[side] = {};
 }
 
-bool FreeContactAllowed(int side, const hands::HandGrab& grab) {
+void ResetHandTracking(int side) {
+    if (side < 0) collision_ignore::Reset();
+    for (int s = 0; s < 2; ++s) {
+        if (side >= 0 && side != s) continue;
+        G.twist_state[s].support = {};
+        G.cur_init[s] = false;
+        ClearHandInteraction(s);
+    }
+}
+
+bool FreeControllerPoseAllowed(int side, const hands::HandGrab& grab) {
     const auto interaction = hands::GetInteraction(side == kL ? hands::kLeft : hands::kRight);
     return grab.kind == hands::GrabKind::kNone && interaction.actions_allowed &&
            interaction.owner == hands::GripOwner::kNone && !g_freeze.on && !CalibrationActive();
 }
 
-finger_contact::Bounds FingerBounds(const HandRig& rig, int finger) {
-    finger_contact::Bounds bounds;
+controller_pose::Bounds FingerBounds(const HandRig& rig, int finger) {
+    controller_pose::Bounds bounds;
     for (int j = 0; j < 3; ++j) {
         bounds.axes[j] = rig.axes[finger][j];
         bounds.limits[j] = rig.limits[finger][j];
     }
     return bounds;
-}
-
-// Report the entire observation interval: a single frame every five seconds
-// hid contacts and centimetres of unresolved clipping during playtests.
-void NotePreciseFingers(int side, const finger_world::Stats& queries, int contacts,
-                        double residual, double self_residual, double angular_step, double ik_gap,
-                        double root_cm = 0, bool held = false, bool guard_failed = false) {
-    struct Interval {
-        double start_ms = 0, worst_world = 0, worst_self = 0, worst_angle = 0, worst_ik_gap = 0;
-        int frames = 0, contact_frames = 0, unavailable = 0, resets = 0;
-        int casts = 0, displayed = 0, temporal = 0, expired = 0, failures = 0, budget = 0;
-        int primary_hits = 0, broad_misses = 0, recovered = 0, recovery_failed = 0, conflicts = 0;
-        int engine_calls = 0, cache_hits = 0, unresolved = 0, held_frames = 0, rejected = 0;
-        double root_cm = 0;
-    };
-    static Interval totals[2];
-    auto& n = totals[side];
-    const double now = perf::NowMs();
-    if (!n.start_ms) n.start_ms = now;
-    ++n.frames;
-    n.contact_frames += contacts > 0;
-    n.unavailable += !queries.available;
-    n.resets += queries.reset;
-    n.casts += queries.casts; n.displayed += queries.displayed_casts; n.temporal += queries.temporal_casts;
-    n.expired += queries.expired; n.failures += queries.failures; n.budget += queries.budget_limited;
-    n.primary_hits += queries.primary_hits; n.broad_misses += queries.broad_false_clear;
-    n.recovered += queries.recovered_overlaps; n.recovery_failed += queries.failed_recovery;
-    n.conflicts += queries.conflicting_contacts;
-    n.engine_calls += queries.engine_calls; n.cache_hits += queries.cache_hits;
-    n.unresolved += queries.unresolved_mask != 0; n.held_frames += held; n.rejected += guard_failed;
-    n.root_cm = std::max(n.root_cm, root_cm);
-    n.worst_world = std::max(n.worst_world, residual);
-    n.worst_self = std::max(n.worst_self, self_residual);
-    n.worst_angle = std::max(n.worst_angle, angular_step * kRadToDeg);
-    n.worst_ik_gap = std::max(n.worst_ik_gap, ik_gap);
-    if (now - n.start_ms < 5000) return;
-    log::Info("hand contacts %s interval: frames=%d touching=%d queries=%d displayed=%d temporal=%d "
-              "hits=%d coarse_misses=%d overlap_recovered=%d recovery_failed=%d conflicts=%d "
-              "expired=%d failures=%d budget_frames=%d unavailable=%d resets=%d "
-              "worst_world=%.3f cm worst_self=%.3f cm max_joint_step=%.2f deg max_ik_gap=%.3f cm "
-              "engine_calls=%d cache_hits=%d unresolved=%d held=%d rejected=%d max_root=%.3f cm",
-              side == kL ? "left" : "right", n.frames, n.contact_frames, n.casts, n.displayed, n.temporal,
-              n.primary_hits, n.broad_misses, n.recovered, n.recovery_failed, n.conflicts,
-              n.expired, n.failures, n.budget, n.unavailable, n.resets,
-              n.worst_world, n.worst_self, n.worst_angle, n.worst_ik_gap,
-              n.engine_calls, n.cache_hits, n.unresolved, n.held_frames, n.rejected, n.root_cm);
-    n = {}; n.start_ms = now;
-}
-
-// Log line for fingertips dragging: the first 6 times in a run that a tip
-// trailed 1 cm or more, at most every 3 s per hand.
-void NoteFingerDrag(int side, double speed, double trail) {
-    static int logged = 0;
-    static double last_ms[2] = {-1e12, -1e12};
-    if (trail < 1.0 || logged >= 6 || perf::NowMs() - last_ms[side] < 3000.0) return;
-    ++logged;
-    last_ms[side] = perf::NowMs();
-    log::Info("fingers: %s fingertips drag along the surface (hand sliding %.0f cm/s, a tip trails %.1f cm)",
-              side == kL ? "left" : "right", speed, trail);
-}
-
-// Log lines for fingers giving way on a wall: the first 10 times in a run
-// that the wall changed a finger's bend noticeably, at most every 2 s per hand.
-struct FingerRestNote {
-    bool any = false;
-    double want[hand_pose::kFingerCount] = {}, rest[hand_pose::kFingerCount] = {};
-};
-FingerRestNote g_rest_note[2];
-int g_rest_logged = 0;
-double g_rest_last_ms[2] = {-1e12, -1e12};
-
-void NoteFingerRest(int side, int f, double want, double rest) {
-    FingerRestNote& n = g_rest_note[side];
-    n.want[f] = want;
-    n.rest[f] = rest;
-    if (std::fabs(rest - want) >= 0.15) n.any = true;
-}
-
-void FlushFingerRest(int side) {
-    FingerRestNote& n = g_rest_note[side];
-    if (n.any && g_rest_logged < 10 && perf::NowMs() - g_rest_last_ms[side] > 2000.0) {
-        ++g_rest_logged;
-        g_rest_last_ms[side] = perf::NowMs();
-        static const char* names[hand_pose::kFingerCount] = {"thumb", "index", "middle", "ring", "pinky"};
-        std::string list;
-        for (int f = 0; f < hand_pose::kFingerCount; ++f) {
-            char buf[64];
-            std::snprintf(buf, sizeof(buf), "%s%s %.2f->%.2f", list.empty() ? "" : ", ", names[f], n.want[f],
-                          n.rest[f]);
-            list += buf;
-        }
-        log::Info("fingers: %s hand's fingers give way against the surface (bend wanted->used, below 0 = bent back "
-                  "past straight: %s)",
-                  side == kL ? "left" : "right", list.c_str());
-    }
-    n = FingerRestNote{};
 }
 
 // Which rear pinch record to draw. Owner 2026-11-03 14:14: "i couldn't pinch
@@ -3775,112 +3495,6 @@ int PickRearPinch(int side, const hands::HandState& h, const hands::Pose& obj, c
     return pick;
 }
 
-// The finger intention is prepared before querying. Contact may stop that
-// movement, but may not invent a different curl to escape a stationary wall.
-// Any remaining penetration belongs to the rigid hand root, including the
-// thumb's fixed CMC origin (1.104 cm beyond the old palm face in WhiteMan).
-struct PreciseHandFrame {
-    fingers::Angles pose[hand_pose::kFingerCount]{};
-    finger_contact::Bounds bounds[hand_pose::kFingerCount]{};
-    finger_contact::Contacts contacts[hand_pose::kFingerCount]{};
-    finger_world::Stats query;
-    finger_world_query::Geometry queried_geometry;
-    finger_self::Result separation;
-    hand_rigid_contact::Plane support[hand_pose::kFingerCount * finger_contact::kMaxContacts]{};
-    FVector support_local[hand_pose::kFingerCount * finger_contact::kMaxContacts]{};
-    double support_age[hand_pose::kFingerCount * finger_contact::kMaxContacts]{};
-    int support_count = 0;
-    int active = 0;
-    double residual = 0, angular_step = 0, root_cm = 0;
-    bool held = false;
-};
-void FreezeFingerSupports(int side, PreciseHandFrame& frame, const Xf& hand) {
-    frame.support_count = 0;
-    for (int f = 0; f < hand_pose::kFingerCount; ++f)
-        for (int n = 0; n < frame.contacts[f].count; ++n) {
-            const auto& contact = frame.contacts[f].items[n];
-            const auto w = finger_contact::EvaluateContact(G.rig[side].chain[f], frame.pose[f], hand, contact);
-            if (!w.active) continue;
-            const int i = frame.support_count++;
-            frame.support[i] = {w.surface, w.normal, w.center, w.radius_cm};
-            const auto local = hand.rotation.Inverse().Rotate(w.center - hand.translation);
-            frame.support_local[i] = {local.X / hand.scale.X, local.Y / hand.scale.Y, local.Z / hand.scale.Z};
-            frame.support_age[i] = contact.age_seconds;
-        }
-}
-void MoveFingerSupports(PreciseHandFrame& frame, const Xf& hand) {
-    frame.residual = 0;
-    for (int i = 0; i < frame.support_count; ++i) {
-        auto& support = frame.support[i];
-        support.sample = skel::Apply(hand, frame.support_local[i]);
-        frame.residual = std::max(frame.residual,
-            support.radius - Dot(support.sample - support.point, support.normal));
-    }
-    frame.active = frame.support_count;
-}
-PreciseHandFrame PreparePreciseHand(int side, const hands::FingerInput& fin, const Xf& hand, double dt,
-                                   const fingers::Angles* pending = nullptr) {
-    perf::Scope timer(g_perf_finger_contact);
-    PreciseHandFrame frame;
-    const auto& rig = G.rig[side];
-    const auto curl = hand_pose::Target(hands::GrabKind::kNone, fin);
-    finger_contact::Contacts empty[hand_pose::kFingerCount]{};
-    for (int f = 0; f < hand_pose::kFingerCount; ++f) {
-        frame.bounds[f] = FingerBounds(rig, f);
-        // The legacy animation adds a relaxed curl even with both controls
-        // released. Physical fingers need a fully extended open target;
-        // trigger touch may still express a lightly resting index finger.
-        const double amount = f == hand_pose::kThumb ? curl.finger[f] :
-            f == hand_pose::kIndex ? std::max<double>(fin.trigger, fin.trigger_touch ? 0.22 : 0.0) : fin.grip;
-        auto intention = finger_contact::CurlTarget(rig.chain[f],
-            std::clamp(amount * S.finger_scale, 0.0, 1.2), frame.bounds[f]);
-        if (f == hand_pose::kThumb && S.thumb_opposition)
-            intention = thumb_pose::Target(rig.chain[f], rig.palm_h,
-                rig.chain[hand_pose::kIndex].ref[0].translation,
-                {fin.grip, fin.trigger, fin.thumb_touch}, frame.bounds[f]);
-        if (pending) intention = pending[f];
-        frame.pose[f] = finger_contact::Prepare(rig.chain[f], intention, g_finger_contact[side][f],
-                                                frame.bounds[f], dt, false, pending != nullptr);
-    }
-    // Query only the feasible, rate-bounded pose we could actually display.
-    frame.separation = finger_self::Resolve(rig.chain, frame.pose, g_finger_contact[side], hand,
-                                            frame.bounds, empty, S.finger_radius, dt);
-    frame.queried_geometry = finger_world_query::MakeGeometry(rig.chain, frame.pose, hand, S.finger_radius);
-    frame.query = finger_world::Update(G.player, side, rig.chain, frame.pose, hand,
-                                       S.finger_radius, dt, frame.contacts);
-    bool recheck_separation = false;
-    for (int f = 0; f < hand_pose::kFingerCount; ++f) {
-        auto& state = g_finger_contact[side][f];
-        if (!frame.query.available || (frame.query.unresolved_mask & (1u << f))) {
-            recheck_separation = true;
-            frame.pose[f] = state.frame_start;
-            state.pose = frame.pose[f];
-            state.angular_velocity = {};
-            state.initialized = true;
-        } else if (frame.contacts[f].count) {
-            recheck_separation = true;
-            const auto solved = finger_contact::ResolvePrepared(rig.chain[f], frame.pose[f], state, hand,
-                                                                 frame.bounds[f], frame.contacts[f]);
-            frame.pose[f] = solved.pose;
-        } else {
-            // The first self check already synchronized this exact pose
-            // and velocity. An empty world result adds no joint constraint.
-            state.initialized = true;
-        }
-    }
-    // Self contact is a hard feasibility gate; its world debt is paid below
-    // by moving the wrist, never by letting adjacent fingers cross.
-    if (recheck_separation)
-        frame.separation = finger_self::Resolve(rig.chain, frame.pose, g_finger_contact[side], hand,
-                                                frame.bounds, frame.contacts, S.finger_radius, dt);
-    FreezeFingerSupports(side, frame, hand);
-    return frame;
-}
-hand_rigid_contact::Result FingerBackpressure(PreciseHandFrame& frame, const Xf& hand,
-                                             const FVector& shoulder, double maximum_reach) {
-    MoveFingerSupports(frame, hand);
-    return hand_rigid_contact::Resolve(frame.support, frame.support_count, {}, {hand.translation, shoulder, maximum_reach});
-}
 // The hand moving between a magazine's grab pose and its pose in the
 // magwell (stage 2), and back: over a short moment instead of a jump.
 struct MagStageBlend {
@@ -3897,7 +3511,7 @@ bool IsMagKind(hands::GrabKind k) { return k == hands::GrabKind::kMagHeld || k =
 void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, const hands::HandGrab& right_grab,
               const FVector& body_fwd, const FVector& body_right, double dt) {
     const Skeleton& k = G.skel;
-    if (!k.arms_ok[side]) { ResetHandPhysics(side); return; }
+    if (!k.arms_ok[side]) { ResetHandTracking(side); return; }
     const HandRig& rig = G.rig[side];
     const hands::Hand hs = side == kL ? hands::kLeft : hands::kRight;
     // Capture before any parent edits. Segment length scale must not leak
@@ -3982,11 +3596,7 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
     }
     hands::Pose obj;
     const bool recorded = g.have && rig.ok && ObjectFrame(grab, right_grab, &obj);
-    const bool free_contact = !recorded && FreeContactAllowed(side, grab);
-    const bool segment_contact = S.hand_poses && rig.ok && free_contact && hand_walls::Enabled() &&
-                                 S.fingers_rest && finger_world::Enabled();
-    if (!segment_contact && g_precise_fingers[side]) ResetFingerContacts(side);
-    PreciseHandFrame precise;
+    const bool free_pose = !recorded && FreeControllerPoseAllowed(side, grab);
     // The left hand's own reach for the holstered pistol (kPointHolster) and
     // the off hand on the pistol (kPointOffhand*) are posed by the owner:
     // shown as posed, not fitted like the right hand's gun grip reaching for
@@ -4000,7 +3610,6 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
     // Where the hand goes.
     FQuat hand_rot;
     FVector hand_pos;
-    double flat = 0.0;  // how flat an empty hand is pressed on a wall
     if (recorded) {
         FQuat in_rot = g.hand_rot;
         FVector in_pos = g.hand_pos;
@@ -4038,16 +3647,6 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
             hand_pos = grab.target.location + hv.grip.rotation.Rotate(FVector{S.hand_offset[0], S.hand_offset[1], S.hand_offset[2]})
                        - hand_rot.Rotate(rig.frame.fist);
         }
-        // The precise path gets its flattening from the checked oriented
-        // palm proxy; no translation or rotation is added after that check.
-        if (FreeContactAllowed(side, grab) &&
-            !hand_walls::Motion(side).palm_shape) {
-            flat = PressFlat(side, hv, &hand_rot, &hand_pos, dt);
-        } else {
-            flat = FreeContactAllowed(side, grab) ? hand_walls::Motion(side).flatness : 0.0;
-            g_flat[side] = flat;
-            g_touch_d[side] = kNoTouch;
-        }
     }
     if (grab.holster_preview) {
         FQuat free_rot;
@@ -4060,14 +3659,13 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
         hand_pos = free_pos + (hand_pos - free_pos) * blend;
         hand_rot = Normalized(Scale(hand_rot * free_rot.Inverse(), blend) * free_rot);
     }
-    if (flat < 0.99) g_was_flat[side] = false;
     const double hand_norm = hand_rot.X*hand_rot.X + hand_rot.Y*hand_rot.Y + hand_rot.Z*hand_rot.Z + hand_rot.W*hand_rot.W;
     if (!std::isfinite(Length(hand_pos)) || !std::isfinite(hand_norm) || hand_norm < 1e-9) {
-        ResetHandPhysics(side); return;
+        ResetHandTracking(side); return;
     }
 
     const arm_pose::Reference& reference = G.arm_ref[side];
-    if (!reference.valid) { ResetHandPhysics(side); return; }
+    if (!reference.valid) { ResetHandTracking(side); return; }
     const double tracking_scale = stereo::TrackingScale();
     FVector calibrated_shoulder;
     double calibrated_upper = 0, calibrated_lower = 0;
@@ -4089,7 +3687,7 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
                                   : reference.upper_length * mesh_scale * ArmScale();
     const double lower = measured ? calibrated_lower
                                   : reference.forearm_length * mesh_scale * ArmScale();
-    if (upper < 1.0 || lower < 1.0) { ResetHandPhysics(side); return; }
+    if (upper < 1.0 || lower < 1.0) { ResetHandTracking(side); return; }
     const double reach = upper + lower;
 
     // A measured shoulder is authoritative. Legacy clavicle reach assistance
@@ -4148,163 +3746,9 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
     posture_input.shoulder_twist_share = S.shoulder_twist_share;
     posture_input.radial_axis_hand = rig.across_h;
     posture_input.dt = dt;
-    // Trial solves start from one temporal state; a collision correction must
-    // not advance elbow hysteresis twice or apply twist smoothing twice.
     auto next_posture_state = G.posture_state[side];
     auto posture = arm_posture::Solve(posture_input, &next_posture_state);
-    if (!posture.valid) { ResetHandPhysics(side); return; }
-    if (segment_contact) {
-        Xf candidate = WX(k.hand[side]);
-        candidate.rotation = hand_rot;
-        candidate.translation = posture.solved.end;
-        candidate.scale = hand_skin_scale;
-        const hand_contact_staging::Intent live_intent{g_raw_grip[side].location, g_raw_grip[side].rotation,
-            fin.grip, fin.trigger, fin.thumb_touch, fin.trigger_touch};
-        const double pending_now = perf::NowMs();
-        if (g_pending_wrist_valid[side] && !hand_contact_staging::Compatible(g_pending_intent[side], live_intent,
-                (pending_now - g_pending_started_ms[side]) / 1000.0)) g_pending_wrist_valid[side] = false;
-        const bool staged = g_pending_wrist_valid[side];
-        if (staged) candidate = g_pending_wrist[side];
-        g_pending_wrist_valid[side] = false;
-        // Yield anchors and search state belong to the displayed pose.
-        // A budget-limited trial must not advance this state.
-        const auto displayed_state = std::to_array(g_finger_contact[side]);
-        precise = PreparePreciseHand(side, fin, candidate, dt, staged ? g_pending_pose[side] : nullptr);
-        const Xf queried_hand = candidate;
-        const FQuat mapping_rotation = hand_rot;
-        const bool complete = precise.query.available && precise.query.unresolved_mask == 0 && precise.separation.feasible;
-        // Only a checked final wrist may be published. Trial IK uses one
-        // copied temporal state, and the forearm/twist update runs once below.
-        auto guard_and_solve = [&](Xf& target) {
-            hands::HandState proposed = h;
-            const FQuat turn = Normalized(target.rotation * mapping_rotation.Inverse());
-            proposed.grip.rotation = Normalized(turn * h.grip.rotation);
-            proposed.palm_normal = turn.Rotate(h.palm_normal);
-            FQuat mapped_rotation; FVector mapped_position;
-            FreeHand(side, proposed, proposed.grip.location, &mapped_rotation, &mapped_position);
-            proposed.grip.location = proposed.grip.location + target.translation - mapped_position;
-            const auto guarded = hand_walls::ConstrainFinal(side, proposed.grip);
-            if (!guarded.valid) return false;
-            const FQuat guard_turn = Normalized(guarded.rotation * proposed.grip.rotation.Inverse());
-            proposed.palm_normal = guard_turn.Rotate(proposed.palm_normal);
-            proposed.grip.rotation = guarded.rotation;
-            proposed.grip.location = guarded.position;
-            FreeHand(side, proposed, proposed.grip.location, &target.rotation, &target.translation);
-            posture_input.wrist = target.translation;
-            posture_input.hand_rotation = target.rotation;
-            auto trial_state = G.posture_state[side];
-            auto corrected = arm_posture::Solve(posture_input, &trial_state);
-            if (!corrected.valid) return false;
-            const bool checked = Length(corrected.solved.end - target.translation) < 0.005;
-            target.translation = corrected.solved.end;
-            if (!checked) return false;
-            posture = corrected;
-            next_posture_state = trial_state;
-            return true;
-        };
-        bool accepted = false, held = false, final_verified = false, root_guarded = false;
-        // Partial observations can move a *staged* target out of known
-        // penetration. They cannot authorize rendering it. This lets the
-        // next frame audit a corrected target instead of repeatedly spending
-        // the entire budget on the same deeply buried starting pose.
-        if (precise.query.available && precise.separation.feasible) for (int pass = 0; pass < 2; ++pass) {
-            const auto pressure = FingerBackpressure(precise, candidate, shoulder,
-                reach + posture_input.max_stretch_cm - 0.02);
-            if (!pressure.valid || !pressure.feasible) break;
-            candidate.translation = candidate.translation + pressure.translation;
-            if (!guard_and_solve(candidate)) continue;
-            root_guarded = true;
-            MoveFingerSupports(precise, candidate);
-            if (precise.residual <= 0.015) { accepted = true; break; }
-        }
-        auto verify_geometry = [&](const Xf& target) {
-            const auto verification = finger_world::VerifyGeometry(G.player, side, rig.chain, precise.pose,
-                                                                   target, S.finger_radius);
-            precise.query.casts += verification.casts;
-            precise.query.engine_calls += verification.engine_calls;
-            precise.query.budget_limited |= verification.budget_limited;
-            return verification;
-        };
-        auto queue_candidate = [&] {
-            g_pending_wrist[side] = candidate;
-            for (int f = 0; f < hand_pose::kFingerCount; ++f) g_pending_pose[side][f] = precise.pose[f];
-            g_pending_wrist_valid[side] = true;
-            if (!staged) {
-                g_pending_intent[side] = live_intent;
-                g_pending_started_ms[side] = pending_now;
-            }
-        };
-        if (accepted) {
-            const auto actual = finger_world_query::MakeGeometry(rig.chain, precise.pose, candidate, S.finger_radius);
-            final_verified = complete && precise.query.geometry_clear &&
-                finger_world_query::MaxDelta(precise.queried_geometry, actual) <= 0.001;
-            if (!final_verified) {
-                const auto verification = verify_geometry(candidate);
-                final_verified = verification.available && verification.clear;
-            }
-            if (!final_verified) {
-                queue_candidate();
-                accepted = false;
-            }
-        }
-        if (!accepted && root_guarded &&
-            Length(candidate.translation - queried_hand.translation) > 0.001) {
-            queue_candidate();
-        }
-        if (!accepted && g_contact_wrist_valid[side]) {
-            // Missing evidence never advances an unchecked wrist or relaxes
-            // a finger. Keep the matching previous full pose, recheck the
-            // palm and all currently observed frozen supports, and retry on
-            // the next frame. This does not renew old observation lifetimes.
-            for (int f = 0; f < hand_pose::kFingerCount; ++f)
-                precise.pose[f] = g_contact_pose[side][f];
-            FreezeFingerSupports(side, precise, queried_hand);
-            candidate = g_contact_wrist[side];
-            if (guard_and_solve(candidate)) {
-                MoveFingerSupports(precise, candidate);
-                accepted = precise.residual <= 0.015 &&
-                    finger_self::Depth(rig.chain, precise.pose, candidate, S.finger_radius) <= 0.001;
-                if (accepted) {
-                    const auto verification = verify_geometry(candidate);
-                    // Unknown evidence may hold an unchanged prior drawing,
-                    // but never certify it or advance a new pose. An observed
-                    // obstruction rejects even this fallback.
-                    accepted = verification.available ? verification.clear :
-                        finger_world_query::MaxDelta(
-                            finger_world_query::MakeGeometry(rig.chain, g_contact_pose[side], g_contact_wrist[side], S.finger_radius),
-                            finger_world_query::MakeGeometry(rig.chain, precise.pose, candidate, S.finger_radius)) <= 0.001;
-                    held = accepted;
-                }
-            }
-        }
-        if (!accepted || held) {
-            std::copy(displayed_state.begin(), displayed_state.end(), g_finger_contact[side]);
-            for (auto& state : g_finger_contact[side]) state.angular_velocity = {};
-        }
-        if (!accepted) {
-            // No feasible fully checked arm is available. Do not publish the
-            // failed trial or certify its geometry as the rendered baseline.
-            // Query observations still describe the staged candidate. Keep
-            // them so its next-frame audit can make budgeted progress.
-            NotePreciseFingers(side, precise.query, precise.active, precise.residual,
-                precise.separation.residual_cm, 0, Length(posture.solved.end - posture_input.wrist), 0, false, true);
-            SuppressUnverifiedHand(side);
-            return;
-        }
-        hand_rot = candidate.rotation;
-        hand_pos = candidate.translation;
-        precise.held = held;
-        precise.root_cm = Length(candidate.translation - queried_hand.translation);
-        if (final_verified && !held && (precise.root_cm > 0.001 ||
-            std::fabs((Normalized(candidate.rotation * queried_hand.rotation.Inverse())).W) < 1-1e-9))
-            finger_world::InvalidateGeometry(side);
-        if (final_verified && !held) {
-            g_contact_wrist[side] = candidate;
-            for (int f = 0; f < hand_pose::kFingerCount; ++f) g_contact_pose[side][f] = precise.pose[f];
-            g_contact_wrist_valid[side] = true;
-            hand_walls::SetRigidSupports(side, precise.support, precise.support_age, precise.support_count);
-        }
-    }
+    if (!posture.valid) { ResetHandTracking(side); return; }
 
     G.posture_state[side] = next_posture_state;
     const auto& sol = posture.solved;
@@ -4342,7 +3786,10 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
                   "(90 = thumb up); skin twist %.2f at the elbow, %.2f at mid-forearm, all at the wrist",
                   side == kL ? "left" : "right", rest_turn * kRadToDeg, S.twist_at_elbow, S.twist_at_middle);
     }
-    auto twist = arm_pose::FollowTwist(posture.raw_roll, dt, S.twist_at_elbow, S.twist_at_middle,
+    // These shares are part of the approved mesh's weight layout. Apply
+    // only after its actual live skeleton has been verified and bound.
+    const bool refined_skin=skin_model::Ready();
+    auto twist = arm_pose::FollowTwist(posture.raw_roll, dt, refined_skin?.5:S.twist_at_elbow, refined_skin?1.0:S.twist_at_middle,
                                        &G.twist_state[side], twist_center, S.forearm_roll_share);
     // The authored support palm remains planted on the rifle. The wrist
     // display's share of its turn must not choose a new half-roll branch when
@@ -4448,18 +3895,16 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
 
     // Fingers.
     if (!S.hand_poses || !rig.ok) {
-        ResetFingerContacts(side);
+        G.cur_init[side] = false;
+        ClearHandInteraction(side);
         return;
     }
     fingers::Angles want[hand_pose::kFingerCount];
-    FVector wall_at, wall_out;
-    bool contact_solved = false;
     // Index: off the trigger -> resting on it (touch) -> pulled (analog).
     const double follow = 1.0 - std::exp(-dt / 0.06);
     G.index_touch[side] += ((fin.trigger_touch || fin.trigger > 0.05f ? 1.0 : 0.0) - G.index_touch[side]) * follow;
     G.index_pull[side] = std::clamp<double>(fin.trigger, 0.0, 1.0);
     if (recorded) {
-        g_finger_wall[side].on = false;
         want[hand_pose::kThumb] = g.tip_angles[gr::kThumb];
         want[hand_pose::kMiddle] = g.tip_angles[gr::kMiddle];
         want[hand_pose::kRing] = g.tip_angles[gr::kRing];
@@ -4475,94 +3920,28 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
             for (int f = 0; f < hand_pose::kFingerCount && f < reload_anim::kFingers; ++f)
                 for (int j = 0; j < 3; ++j) want[f].extra[j] = Normalized(want[f].extra[j] * turn.joint[f][j]);
         }
-    } else if (segment_contact) {
+    } else if (free_pose) {
+        // Controller-driven animation only: reference-curved idle, independent
+        // trigger/index and grip curls, with the existing thumb closing guide.
+        const auto curl = hand_pose::Target(hands::GrabKind::kNone, fin);
         for (int f = 0; f < hand_pose::kFingerCount; ++f) {
-            want[f] = precise.pose[f];
-            if (G.cur_init[side]) for (int j = 0; j < 3; ++j) {
-                const FQuat before = fingers::LocalRotation(rig.chain[f], j, G.cur[side][f]);
-                const FQuat after = fingers::LocalRotation(rig.chain[f], j, want[f]);
-                const FQuat delta = Normalized(after * before.Inverse());
-                precise.angular_step = std::max(precise.angular_step,
-                    2 * std::acos(std::clamp(std::fabs(delta.W), 0.0, 1.0)));
+            const auto bounds = FingerBounds(rig, f);
+            if (f == hand_pose::kThumb) {
+                want[f] = S.thumb_opposition
+                    ? finger_intent::FreeThumbTarget(rig.chain[f], rig.palm_h,
+                        rig.chain[hand_pose::kIndex].ref[0].translation, fin, bounds)
+                    : controller_pose::CurlTarget(rig.chain[f],
+                        std::clamp(curl.finger[f] * S.finger_scale, 0.0, 1.2), bounds);
+            } else {
+                want[f] = finger_intent::FreeTarget(rig.chain[f], f, fin, bounds, S.finger_scale);
             }
         }
-        g_precise_fingers[side] = true;
-        g_finger_wall[side].on = false;
-        NotePreciseFingers(side, precise.query, precise.active, precise.residual,
-            precise.separation.residual_cm, precise.angular_step, Length(hand.translation - hand_pos), precise.root_cm, precise.held);
     } else {
-        hand_pose::Curl c = hand_pose::Target(grab.kind, fin);
-        // An empty hand against a wall or table: each finger moves toward the
-        // controller's curl like a sprung finger and gives way where the
-        // surface stops it (vr/body/finger_rest), and fingertips on the
-        // surface trail behind as the hand slides along it.
-        const bool on_wall = free_contact && S.fingers_rest &&
-                             hand_walls::Contact(side, &wall_at, &wall_out);
-        contact_solved = on_wall;
-        FingerWall& fw = g_finger_wall[side];
-        FVector slide{0, 0, 0};  // the hand's speed along the surface, cm/s
-        if (on_wall && fw.on && dt > 1e-4) {
-            const FVector v = (hand.translation - fw.last_hand) * (1.0 / dt);
-            slide = v - wall_out * Dot(v, wall_out);
-            const double sp = Length(slide);
-            if (sp > 150.0) slide = slide * (150.0 / sp);
-        }
-        fw.last_hand = hand.translation;
-        const double drag_follow = 1.0 - std::exp(-dt / 0.06);
-        const double spread_max = 12.0 * kDegToRad;
-        double trail = 0.0;  // furthest a fingertip trails this frame, cm (for the log)
-        for (int f = 0; f < hand_pose::kFingerCount; ++f) {
-            const fingers::Chain& ch = rig.chain[f];
-            const fingers::Limits lim = fingers::DefaultLimits(f == hand_pose::kThumb);
-            // Pressed flat on a wall: the fingers open with it.
-            const double curl = std::clamp(c.finger[f] * S.finger_scale, 0.0, 1.2) * (1.0 - flat);
-            if (!on_wall) {
-                want[f] = fingers::Curl(ch, curl, lim);
-                fw.bend[f] = curl;
-                fw.dir[f] = 0;
-                fw.drag_bend[f] = fw.drag_spread[f] = 0.0;
-                continue;
-            }
-            const fingers::Push p = fingers::PushFromPlane(ch, lim, hand, fw.on ? fw.bend[f] : curl, curl, 1.2, wall_at,
-                                                           wall_out, S.finger_radius, fw.on ? fw.dir[f] : 0);
-            NoteFingerRest(side, f, curl, p.bend);
-            fw.bend[f] = p.bend;
-            fw.dir[f] = p.dir;
-            // Drag: a fingertip on the surface (within 1 cm) trails where the
-            // hand was 0.05 s ago, as far as small bends and spreads allow.
-            double tb = 0.0, ts = 0.0;
-            if (S.finger_drag > 0.0 && Length(slide) > 2.0) {
-                const FVector tip = fingers::TipWorld(ch, fingers::Bend(ch, p.bend, lim), hand);
-                if (Dot(tip - wall_at, wall_out) - S.finger_radius < 1.0)
-                    fingers::DragTip(ch, lim, hand, p.bend, slide * (-0.05 * S.finger_drag), &tb, &ts);
-            }
-            fw.drag_bend[f] += (tb - fw.drag_bend[f]) * drag_follow;
-            fw.drag_spread[f] += (std::clamp(ts, -spread_max, spread_max) - fw.drag_spread[f]) * drag_follow;
-            fingers::Angles a = fingers::Bend(ch, p.bend + fw.drag_bend[f], lim);
-            a.spread = fw.drag_spread[f];
-            // Never dragged into the surface: drop what would put it in.
-            const double allowed = p.depth + 0.05;
-            if (fingers::PlaneDepth(ch, a, hand, wall_at, wall_out, S.finger_radius) > allowed) {
-                a = fingers::Bend(ch, p.bend, lim);
-                a.spread = fw.drag_spread[f];
-                if (fingers::PlaneDepth(ch, a, hand, wall_at, wall_out, S.finger_radius) > allowed) a.spread = 0.0;
-            }
-            if (fw.drag_bend[f] != 0.0 || fw.drag_spread[f] != 0.0)
-                trail = std::max(trail, Length(fingers::TipWorld(ch, a, hand) -
-                                               fingers::TipWorld(ch, fingers::Bend(ch, p.bend, lim), hand)));
-            want[f] = a;
-        }
-        fw.on = on_wall;
-        if (on_wall) {
-            FlushFingerRest(side);
-            NoteFingerDrag(side, Length(slide), trail);
-        }
-    }
-    if (free_contact && !segment_contact && !contact_solved && S.thumb_opposition) {
-        want[hand_pose::kThumb] = thumb_pose::Target(rig.chain[hand_pose::kThumb], rig.palm_h,
-            rig.chain[hand_pose::kIndex].ref[0].translation,
-            {fin.grip * (1.0 - flat), fin.trigger * (1.0 - flat), fin.thumb_touch && flat < 0.5},
-            FingerBounds(rig, hand_pose::kThumb));
+        const auto curl = hand_pose::Target(grab.kind, fin);
+        for (int f = 0; f < hand_pose::kFingerCount; ++f)
+            want[f] = fingers::Curl(rig.chain[f],
+                std::clamp(curl.finger[f] * S.finger_scale, 0.0, 1.2),
+                fingers::DefaultLimits(f == hand_pose::kThumb));
     }
     if (grab.holster_preview) {
         if (recorded && !OwnReach(grab)) {
@@ -4575,22 +3954,16 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
             want[f] = fingers::Blend(free_angles, want[f], std::clamp(grab.pose_blend, 0.0, 1.0));
         }
     }
-    // Contact solving already eased before enforcing constraints. Authored
-    // grips keep their existing blend and immediate trigger-index behavior.
+    // Authored grips keep their existing blend and immediate trigger-index behavior.
     const double ease = 1.0 - std::exp(-dt / 0.04);
     for (int f = 0; f < hand_pose::kFingerCount; ++f) {
-        if (segment_contact || !G.cur_init[side] || f == hand_pose::kIndex)
+        if (!G.cur_init[side] || f == hand_pose::kIndex)
             G.cur[side][f] = want[f];
-        else if (contact_solved)
-            G.cur[side][f] = fingers::BlendOnPlane(rig.chain[f], G.cur[side][f], want[f], ease,
-                                                  hand, wall_at, wall_out, S.finger_radius);
         else
             G.cur[side][f] = fingers::Blend(G.cur[side][f], want[f], ease);
     }
     G.cur_init[side] = true;
     PoseFingers(side, G.cur[side]);
-    if (segment_contact) finger_world::Commit(side, rig.chain, G.cur[side], hand, S.finger_radius);
-
     // Fingertips and palm in the world, for the editor.
     Xf hw = WX(k.hand[side]);
     for (int t = 0; t < gr::kTipCount; ++t) {
@@ -4628,8 +4001,12 @@ void SolveArm(int side, const hands::HandState& h, const hands::HandGrab& grab, 
     }
     {
         HandContacts hc;
-        for (int f = 0; f < hand_pose::kFingerCount && f < 5; ++f)
-            hc.tip[f] = fingers::TipWorld(rig.chain[f], G.cur[side][f], hw);
+        for (int f = 0; f < hand_pose::kFingerCount && f < 5; ++f) {
+            Xf joints[3];
+            FVector tip;
+            fingers::Fk(rig.chain[f], G.cur[side][f], joints, &tip);
+            hc.tip[f] = skel::Apply(hw, tip);
+        }
         hc.tip_radius = S.finger_radius;
         hc.palm = g_palm_world[side];
         hc.palm_out = Normalize(hw.rotation.Rotate(rig.palm_h));
@@ -4778,7 +4155,6 @@ void OnTick(UObject player, float dt_f) {
         perf::Register(&g_perf_engine);
         perf::Register(&g_perf_solve);
         perf::Register(&g_perf_grip);
-        perf::Register(&g_perf_finger_contact);
         perf::Register(&g_perf_legs);
         perf::Register(&g_perf_arms);
         perf::Register(&g_perf_calibration);
@@ -4795,7 +4171,7 @@ void OnTick(UObject player, float dt_f) {
     hands::Pose head;
     const bool vr = hands::Head(&head);
     if (!S.enabled || !vr) {
-        ResetHandPhysics();
+        ResetHandTracking();
         if(!S.enabled && (g_calibration_active || g_measure_requested)) EndCalibration("Turn on the VR body first.");
         else if(g_calibration_active) {
             if(g_measure_player!=player) EndCalibration("Player changed.");
@@ -4809,13 +4185,13 @@ void OnTick(UObject player, float dt_f) {
     }
     if (!M.loaded) LoadMeasure();
     if (!Setup(player)) {
-        ResetHandPhysics();
+        ResetHandTracking();
         if (g_calibration_active || g_measure_requested) EndCalibration("Avatar is not ready. Retry.");
         return;
     }
     Activate();
     if (!G.active) {
-        ResetHandPhysics();
+        ResetHandTracking();
         if (g_calibration_active || g_measure_requested) EndCalibration("VR body is unavailable.");
         return;
     }
@@ -4829,7 +4205,7 @@ void OnTick(UObject player, float dt_f) {
             return copy.Invoke();
         };
         if (!copy_pose()) {
-            ResetHandPhysics();
+            ResetHandTracking();
             if (g_calibration_active || g_measure_requested) EndCalibration("Avatar pose is unavailable.");
             return;
         }
@@ -4844,7 +4220,7 @@ void OnTick(UObject player, float dt_f) {
             copy_pose();
         }
         if (!G.engine.Read(&G.frame_local)) {
-            ResetHandPhysics();
+            ResetHandTracking();
             if (g_calibration_active || g_measure_requested) EndCalibration("Avatar pose read failed.");
             return;
         }
@@ -4932,7 +4308,7 @@ void OnTick(UObject player, float dt_f) {
         (G.last_tick_ms > 0 && tick_ms - G.last_tick_ms > 250) || !std::isfinite(dt_f) || dt_f <= 0 || dt_f > 0.15f ||
         (G.have_actor && Length(actor_at - G.last_actor) > 100);
     if (reset_motion) {
-        ResetHandPhysics();
+        ResetHandTracking();
         legs::Reset(G.legs);
         G.leg_probe = {};
         for (int side = 0; side < 2; ++side) {
@@ -5164,20 +4540,12 @@ void OnTick(UObject player, float dt_f) {
 
     if (!CalibrationActive()) UpdateEditor(grab, hs, live, dt);
     for (int side = 0; side < 2; ++side) g_raw_grip[side] = hs[side].grip;
-    if (!g_freeze.on && !CalibrationActive()) {
-        for (int side = 0; side < 2; ++side) hand_walls::SetPalmShape(side, CollisionPalm(side, hs[side]));
-        hand_walls::Apply(player, head, hs, grab, dt);
-    } else ResetHandPhysics();
+    collision_ignore::Refresh(player, grab, dt);
     const double t_arms = perf::NowMs();
     for (int side = 0; side < 2; ++side) {
         if (!hs[side].valid) {
-            ResetHandPhysics(side);
-            if (hand_walls::Enabled() && FreeContactAllowed(side, grab[side])) SuppressUnverifiedHand(side);
+            ResetHandTracking(side);
             G.arm_tracked[side] = false; G.posture_state[side] = {}; G.twist_state[side] = {}; continue;
-        }
-        if (hand_walls::Motion(side).reset) {
-            ResetFingerContacts(side);
-            G.cur_init[side] = false;
         }
         if (!G.arm_tracked[side]) {
             G.posture_state[side] = {}; G.twist_state[side] = {};
@@ -5218,6 +4586,7 @@ void OnTick(UObject player, float dt_f) {
         perf::Scope t(g_perf_engine);
         written = G.engine.Write(G.pose);
     }
+    skin_model::Update(G.pose,g_w,S.shadow==2);
     FitLog(dt, NormalizeAxis(head_rel - G.body_yaw));
     if (G.frames == 1 || G.frames % 3000 == 0)
         log::Info("body: frame %d, %d bones written (%s path), yaw %.0f, lean %.0f", G.frames, written,
@@ -5306,12 +4675,8 @@ CalibrationHud GetCalibrationHud() {
 
 void Init() {
     LoadSettings();
-    hand_walls::LoadSettings();
-    finger_world::LoadSettings();
     config::AddChangeListener(&LoadSettings);
-    config::AddChangeListener(&hand_walls::LoadSettings);
-    config::AddChangeListener(&finger_world::LoadSettings);
-    config::AddChangeListener([] { ResetHandPhysics(); });
+    config::AddChangeListener([] { ResetHandTracking(); });
     game::AddTickListener(&OnTick);
     NotifyStudyInit();
     log::Info("body: ready (%s; F9 toggles; grip editor: hold left Y 1 s while holding the gun)",
