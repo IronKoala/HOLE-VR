@@ -80,20 +80,18 @@ add_library(hole_vr SHARED
     src/vr/body/hand_pose.cpp
     src/vr/body/holster_pose.cpp
     src/vr/body/skeleton.cpp
+    src/vr/body/skin_mesh.cpp
+    src/vr/body/skin_model.cpp
     src/vr/body/finger_solve.cpp
     src/vr/body/joint_limits.cpp
     src/vr/body/reload_anim.cpp
-    src/vr/body/finger_rest.cpp
-    src/vr/body/finger_contact.cpp
-    src/vr/body/finger_self.cpp
-    src/vr/body/finger_world.cpp
-    src/vr/body/finger_world_query.cpp
+    src/vr/body/finger_intent.cpp
+    src/vr/body/controller_pose.cpp
+    src/vr/collision_ignore.cpp
     src/vr/body/thumb_pose.cpp
-    src/vr/body/hand_motion.cpp
     src/vr/body/grip_record.cpp
     src/vr/body/grip_editor.cpp
     src/vr/body/body.cpp
-    src/vr/body/hand_walls.cpp
     src/ue/process_event.cpp
     src/ue/call.cpp
     src/game/game.cpp
@@ -101,6 +99,7 @@ add_library(hole_vr SHARED
     src/game/weapon_custom.cpp
     src/game/weapon_lab.cpp
     src/vr/render_fixes.cpp
+    src/vr/audio_listener.cpp
     src/vr/cvars.cpp
     src/vr/ui_panel.cpp
     src/vr/world_menu.cpp
@@ -121,6 +120,8 @@ add_custom_command(TARGET hole_vr POST_BUILD
             ${CMAKE_SOURCE_DIR}/assets/watch $<TARGET_FILE_DIR:hole_vr>/hole-vr/watch
     COMMAND ${CMAKE_COMMAND} -E copy_directory
             ${CMAKE_SOURCE_DIR}/assets/holster-sounds $<TARGET_FILE_DIR:hole_vr>/hole-vr/sounds/holster
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+            ${CMAKE_SOURCE_DIR}/assets/body $<TARGET_FILE_DIR:hole_vr>/hole-vr/body
     VERBATIM)
 target_compile_definitions(hole_vr PRIVATE __USE_MINGW_ANSI_STDIO=1 WIDL_EXPLICIT_AGGREGATE_RETURNS WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
 
@@ -260,7 +261,7 @@ if(HOLEVR_BUILD_TESTS)
 endif()
 
 if(HOLEVR_BUILD_TESTS)
-    foreach(case finger_rest joint_limits slide_pose)
+    foreach(case joint_limits slide_pose)
         add_executable(test_${case} tests/test_${case}.cpp)
         target_include_directories(test_${case} PRIVATE src)
         if(MSVC)
@@ -270,35 +271,28 @@ if(HOLEVR_BUILD_TESTS)
         endif()
         add_test(NAME ${case} COMMAND test_${case})
     endforeach()
-    foreach(case finger_rest joint_limits)
+    foreach(case joint_limits)
         target_sources(test_${case} PRIVATE src/vr/body/${case}.cpp src/vr/body/finger_solve.cpp
                        src/vr/body/skeleton.cpp src/vr/body/ik_math.cpp)
     endforeach()
-    foreach(case finger_contact finger_self thumb_pose finger_world hand_motion hand_contact_pipeline)
-        add_executable(test_${case} tests/test_${case}.cpp src/vr/body/ik_math.cpp)
+    foreach(case finger_intent thumb_pose)
+        add_executable(test_${case} tests/test_${case}.cpp src/vr/body/ik_math.cpp
+            src/vr/body/finger_solve.cpp src/vr/body/skeleton.cpp src/vr/body/controller_pose.cpp
+            src/vr/body/joint_limits.cpp src/vr/body/thumb_pose.cpp src/vr/body/finger_intent.cpp)
         target_include_directories(test_${case} PRIVATE src)
-        if(MSVC)
-            target_compile_options(test_${case} PRIVATE /W4 /EHsc)
-        else()
-            target_compile_options(test_${case} PRIVATE -Wall -Wextra -Wpedantic)
-        endif()
         add_test(NAME ${case} COMMAND test_${case})
     endforeach()
-    foreach(case finger_contact finger_self thumb_pose finger_world hand_contact_pipeline)
-        target_sources(test_${case} PRIVATE src/vr/body/finger_solve.cpp src/vr/body/skeleton.cpp)
-    endforeach()
-    foreach(case finger_contact finger_self thumb_pose hand_contact_pipeline)
-        target_sources(test_${case} PRIVATE src/vr/body/finger_contact.cpp src/vr/body/joint_limits.cpp)
-    endforeach()
-    foreach(case thumb_pose hand_contact_pipeline)
-        target_sources(test_${case} PRIVATE src/vr/body/thumb_pose.cpp)
-    endforeach()
-    foreach(case finger_world hand_contact_pipeline)
-        target_sources(test_${case} PRIVATE src/vr/body/finger_world_query.cpp)
-    endforeach()
-    target_sources(test_finger_self PRIVATE src/vr/body/finger_self.cpp)
-    target_sources(test_hand_contact_pipeline PRIVATE src/vr/body/finger_self.cpp)
-    target_sources(test_hand_motion PRIVATE src/vr/body/hand_motion.cpp)
+
+endif()
+
+# ---- Approved wrist mesh and calibrated watch fixtures ----
+if(HOLEVR_BUILD_TESTS)
+    add_executable(test_skin_mesh tests/test_skin_mesh.cpp src/vr/body/skin_mesh.cpp src/vr/body/skeleton.cpp src/vr/body/ik_math.cpp)
+    target_include_directories(test_skin_mesh PRIVATE src)
+    add_test(NAME refined_wrist_skin COMMAND test_skin_mesh ${CMAKE_SOURCE_DIR}/assets/body/refined-whiteman.skin ${CMAKE_SOURCE_DIR}/tests/fixtures/refined-wrist-poses.bin)
+    add_executable(test_skin_watch tests/test_skin_watch.cpp src/vr/body/skin_mesh.cpp src/vr/body/skeleton.cpp src/vr/body/ik_math.cpp src/vr/body/arm_pose.cpp src/vr/watch_math.cpp)
+    target_include_directories(test_skin_watch PRIVATE src)
+    add_test(NAME refined_wrist_watch COMMAND test_skin_watch ${CMAKE_SOURCE_DIR}/assets/body/refined-whiteman.skin ${CMAKE_SOURCE_DIR}/tests/fixtures/wrist-watch-fit.bin)
 endif()
 
 # ---- Release dxgi.dll: the same DLL without its debug data ----
@@ -338,7 +332,7 @@ configure_file(installer/setup.rc.in ${CMAKE_BINARY_DIR}/setup.rc @ONLY)
 add_executable(hole_vr_setup WIN32 installer/setup.cpp ${CMAKE_BINARY_DIR}/setup.rc)
 add_dependencies(hole_vr_setup hole_vr_release)
 set_source_files_properties(${CMAKE_BINARY_DIR}/setup.rc PROPERTIES
-    OBJECT_DEPENDS "${DXGI_DLL};${SETUP_MANIFEST};${CMAKE_SOURCE_DIR}/assets/watch/dial.png;${CMAKE_SOURCE_DIR}/assets/watch/timer-atlas.png;${CMAKE_SOURCE_DIR}/assets/holster-sounds/draw.wav;${CMAKE_SOURCE_DIR}/assets/holster-sounds/holster.wav;${CMAKE_SOURCE_DIR}/assets/holster-sounds/hood_open.wav;${CMAKE_SOURCE_DIR}/assets/holster-sounds/hood_close.wav")
+    OBJECT_DEPENDS "${DXGI_DLL};${SETUP_MANIFEST};${CMAKE_SOURCE_DIR}/assets/watch/dial.png;${CMAKE_SOURCE_DIR}/assets/watch/timer-atlas.png;${CMAKE_SOURCE_DIR}/assets/holster-sounds/draw.wav;${CMAKE_SOURCE_DIR}/assets/holster-sounds/holster.wav;${CMAKE_SOURCE_DIR}/assets/holster-sounds/hood_open.wav;${CMAKE_SOURCE_DIR}/assets/holster-sounds/hood_close.wav;${CMAKE_SOURCE_DIR}/assets/body/refined-whiteman.skin")
 target_include_directories(hole_vr_setup PRIVATE src)
 set_target_properties(hole_vr_setup PROPERTIES OUTPUT_NAME "HOLE-VR-Setup")
 target_compile_definitions(hole_vr_setup PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE _WIN32_WINNT=0x0A00)

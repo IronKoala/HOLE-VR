@@ -117,15 +117,16 @@ void StartVr() {
 
 // Bytecode listings (dump/script/<Class>.txt) of the game's Blueprints whose
 // path contains one of the comma-separated dump_script_classes words: the
-// weapons, their parts, the workbench, the player, the save data and the
-// hub's drink machine. Empty
+// weapons, their parts, the workbench, the player, the save data, the
+// hub's drink machine and the footstep (teleport landings play it). Empty
 // turns it off.
 void DumpScripts(const std::wstring& mod_dir) {
     using namespace holevr;
     const std::string list = config::GetString(
         "dump_script_classes",
         "/Game/Weapons/,BP_Player,BPC_WeaponManager,LCBP_Weapon,UIM_WeaponCustom,BPC_WeaponCustom,"
-        "BP_GameInstance,SGO_SaveData,UIP_WeaponModel,BPC_InventoryManager,LCBP_SkillUpgrade");
+        "BP_GameInstance,SGO_SaveData,UIP_WeaponModel,BPC_InventoryManager,LCBP_SkillUpgrade,"
+        "AnimNotifys/Footstep_AnimNotify");
     std::vector<std::string> filters;
     size_t start = 0;
     while (start <= list.size()) {

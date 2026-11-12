@@ -6,6 +6,7 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -14,7 +15,9 @@
 #include "core/memory.h"
 #include "game/gun.h"
 #include "ue/call.h"
+#include "ue/names.h"
 #include "ue/objects.h"
+#include "ue/reflection.h"
 #include "vr/comfort.h"
 #include "vr/hands.h"
 #include "vr/math.h"
@@ -101,10 +104,37 @@ ue::ObjectRef g_walk_step[2] = {
                   "AnimationExamples/Base/Locomotion/ALS_N_Walk_F.ALS_N_Walk_F:Footstep_Notify_C_1", 5.0),
 };
 
+// The walking footstep's volume is cut by the character animation's
+// Mask_FootstepSound curve (the locomotion system's footstep: volume x
+// (1 - curve)) unless the footstep's own OverrideMaskCurve is set. Walking,
+// the walk animation keeps the curve at 0; standing, as you are when you
+// teleport, it can be up to 1: the step then plays silent (owner
+// 2026-11-11: "i could not hear any footsteps"; the 11-10 run called it 13
+// times without a fault). Read for the log, once the name is known.
+float MaskCurve(UObject mesh) {
+    static bool looked = false;
+    static ue::FName name{};
+    static bool have_name = false;
+    if (!looked) {
+        looked = true;
+        have_name = ue::names::Find("Mask_FootstepSound", &name);
+    }
+    if (!have_name) return -1.f;
+    ue::Call ai(mesh, "GetAnimInstance");
+    UObject anim = ai.Invoke() ? ai.Result<UObject>() : 0;
+    if (!anim) return -1.f;
+    ue::Call cv(anim, "GetCurveValue");
+    cv.Set("CurveName", name);
+    return cv.Invoke() ? cv.Result<float>() : -1.f;
+}
+
 // One footstep, foot 0 or 1, as walking makes it. Returns false (and logs
 // why, a few times) when the game's footstep or the player's Mesh is missing.
+// The footstep belongs to the walk animation, so its OverrideMaskCurve is set
+// only for this call and put back.
 bool Footstep(UObject player, int foot) {
     static int complaints = 0;
+    static int told = 0;
     UObject notify = g_walk_step[foot & 1].Get();
     UObject mesh = 0;
     const bool have_mesh = ue::GetProp(player, "Mesh", mesh) && mesh;
@@ -114,10 +144,26 @@ bool Footstep(UObject player, int foot) {
                       !notify ? "the game's walking footstep is not loaded" : "the player has no Mesh");
         return false;
     }
+    const ue::reflection::PropertyInfo over = ue::reflection::FindProperty(ue::GetClass(notify), "OverrideMaskCurve");
+    const bool can_override = over.valid() && over.bool_mask && over.type == "BoolProperty";
+    uint8_t before = 0;
+    const bool read = can_override && mem::Read(notify + over.offset, before);
+    const float mask = told < 4 ? MaskCurve(mesh) : -1.f;
+    if (read) mem::Write<uint8_t>(notify + over.offset, static_cast<uint8_t>(before | over.bool_mask));
     ue::Call c(notify, "Received_Notify");
     c.Set("MeshComp", mesh).Set("Animation", ue::GetOuter(notify));
     const bool ok = c.Invoke();
+    if (read) mem::Write<uint8_t>(notify + over.offset, before);
     if (!ok && complaints++ < 3) log::Info("teleport: the game's footstep could not be called");
+    if (ok && told < 4) {
+        ++told;
+        char m[64] = "unknown";
+        if (mask >= 0)
+            std::snprintf(m, sizeof(m), "%.2f%s", mask, mask > 0.99f ? " (walking's step would be silent)" : "");
+        log::Info("teleport: landing footstep %d: the footstep mask here is %s; played %s", foot & 1, m,
+                  read ? "at walking's full volume (mask ignored for this step)"
+                       : "as walking would (no OverrideMaskCurve found)");
+    }
     return ok;
 }
 

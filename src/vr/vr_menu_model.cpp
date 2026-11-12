@@ -137,9 +137,6 @@ const std::vector<Row>& Rows() {
         {"Gun stops at walls", K::kChoice,
          {{"On", {{"gun_wall_collision", "1"}}}, {"Off", {{"gun_wall_collision", "0"}}}}, 0,
          "The gun in your hand stops at walls and tables instead of going through them."},
-        {"Hands stop at walls", K::kChoice,
-         {{"On", {{"hand_wall_collision", "1"}}}, {"Off", {{"hand_wall_collision", "0"}}}}, 0,
-         "Empty hands stop at walls and tables, and their fingers give way against them."},
         // Gun kick by gun and grip (owner 2026-11-07: "when the AR is being
         // one handed i want the recoil at heavy, when its two handed set to
         // strong. when the pistol is being one handed, stronger, when the gun

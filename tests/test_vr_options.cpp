@@ -281,11 +281,6 @@ static void TestDefaultsAndActions() {
             if (std::string(kv.key) == "head_wall_fade") sets_on = std::string(kv.value) == "1";
         EXPECT(sets_on == (std::string(c.text) != "Off"));
     }
-    // Empty hands stop at walls unless turned off.
-    const Row& hand_walls = RowNamed("Hands stop at walls");
-    EXPECT(std::string(hand_walls.choices[static_cast<size_t>(CurrentChoice(hand_walls, get))].text) == "On");
-    ini["hand_wall_collision"] = "0";
-    EXPECT(std::string(hand_walls.choices[static_cast<size_t>(CurrentChoice(hand_walls, get))].text) == "Off");
 }
 
 int main() {

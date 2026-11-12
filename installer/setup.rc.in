@@ -10,6 +10,7 @@
 105 RCDATA "@CMAKE_SOURCE_DIR@/assets/holster-sounds/holster.wav"
 106 RCDATA "@CMAKE_SOURCE_DIR@/assets/holster-sounds/hood_close.wav"
 107 RCDATA "@CMAKE_SOURCE_DIR@/assets/holster-sounds/hood_open.wav"
+108 RCDATA "@CMAKE_SOURCE_DIR@/assets/body/refined-whiteman.skin"
 
 VS_VERSION_INFO VERSIONINFO
 FILEVERSION HOLEVR_VERSION_MAJOR, HOLEVR_VERSION_MINOR, HOLEVR_VERSION_PATCH, 0

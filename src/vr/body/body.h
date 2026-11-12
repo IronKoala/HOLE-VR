@@ -67,8 +67,7 @@ bool SlideMarks(uintptr_t gun, FVector* rear_sight, FVector* rear_end, FVector* 
 bool PinchPoint(int side, FVector* thumb_in_grip, FVector* index_in_grip);
 
 // What the visible hand can touch things with, in the world, as drawn on the
-// body's last frame: after empty hands stop at walls, fingers give way on
-// surfaces and the palm settles flat (hand_walls, finger_world, finger_contact). For
+// body's last frame, using controller animation or an authored grip. For
 // pressing buttons with the hand the player sees, not the controller.
 struct HandContacts {
     FVector tip[5];            // fingertips: thumb, index, middle, ring, pinky

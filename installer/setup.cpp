@@ -211,13 +211,14 @@ bool DefaultAsset(const std::wstring& path, int resource) {
 }
 
 Result InstallAccessoryDefaults(const std::wstring& bin) {
-    for (const wchar_t* relative : {L"\\hole-vr", L"\\hole-vr\\watch", L"\\hole-vr\\sounds", L"\\hole-vr\\sounds\\holster"})
+    for (const wchar_t* relative : {L"\\hole-vr", L"\\hole-vr\\watch", L"\\hole-vr\\sounds", L"\\hole-vr\\sounds\\holster", L"\\hole-vr\\body"})
         if (!DefaultDirectory(bin + relative)) return {false, L"Could not prepare the watch or holster data folder. The mod DLL was left unchanged."};
     struct Asset { const wchar_t* relative; int resource; };
     const Asset assets[] = {
         {L"\\hole-vr\\watch\\dial.png",102}, {L"\\hole-vr\\watch\\timer-atlas.png",103},
         {L"\\hole-vr\\sounds\\holster\\draw.wav",104}, {L"\\hole-vr\\sounds\\holster\\holster.wav",105},
-        {L"\\hole-vr\\sounds\\holster\\hood_close.wav",106}, {L"\\hole-vr\\sounds\\holster\\hood_open.wav",107}
+        {L"\\hole-vr\\sounds\\holster\\hood_close.wav",106}, {L"\\hole-vr\\sounds\\holster\\hood_open.wav",107},
+        {L"\\hole-vr\\body\\refined-whiteman.skin",108}
     };
     for (const auto& asset : assets)
         if (!DefaultAsset(bin + asset.relative, asset.resource))

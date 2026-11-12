@@ -101,7 +101,12 @@ void WristMount() {
     // Twist-bone rest axes must not add a roll at zero skin weight.
     a.has_twist=true;a.ref_twist.rotation=a.ref_lower.rotation*AxisAngle({1,0,0},.4);
     a.twist.rotation=a.lower.rotation*AxisAngle({1,0,0},1.2);
-    EXPECT(Rotation(Mount(a,local,mesh::kTwistSkinWeight).rotation,a.lower.rotation*local.rotation));
+    EXPECT(Rotation(Mount(a,local,0).rotation,a.lower.rotation*local.rotation));
+    // Revision 3 paints the distal skin to the full-roll helper. Follow its
+    // anatomical roll, removing the helper's reference-axis offset.
+    EXPECT(Near(mesh::kTwistSkinWeight,1.0));
+    EXPECT(Rotation(Mount(a,local,mesh::kTwistSkinWeight).rotation,
+                    a.lower.rotation*AxisAngle({1,0,0},.8)*local.rotation));
     a.twist.rotation=a.lower.rotation*(a.ref_lower.rotation.Inverse()*a.ref_twist.rotation);
     EXPECT(Rotation(Mount(a,local,1).rotation,a.lower.rotation*local.rotation));
 }

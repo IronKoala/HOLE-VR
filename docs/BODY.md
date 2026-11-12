@@ -468,7 +468,8 @@ Performance counters include `body calibration`, `body legs and ground`, and
 
 Empty hands now have separate requested, contact-resolved and displayed poses.
 `hand_walls` advances a bounded damped spring toward the tracked controller and
-sweeps a fist sphere through the game's collision geometry. Blocking surfaces
+sweeps the rig-mapped palm box through the game's collision geometry
+(with a fist sphere fallback when the rig is unavailable). Blocking surfaces
 remove inward motion while allowing a checked tangential slide. Virtual force,
 torque, linear/angular speed and integration steps are bounded. A stationary
 proxy still queries, so an approaching object cannot inherit an old clear result.
@@ -478,48 +479,80 @@ initial placement skips that body's arm solve. Actual controller input is unchan
 This is a collision-constrained kinematic spring, not a Chaos rigid body, and
 does not apply forces to props.
 
-`finger_world` queries all fifteen requested phalanx segments using sphere sweeps,
-then shares a bounded budget among displayed phalanxes, motion samples and
-overlap recovery. The persistent work cursor prevents continuous controller
-movement from starving the displayed fingers. A conservative whole-hand
-envelope avoids detailed checks far from objects. Both endpoint movement and
-elapsed time invalidate clear results; stationary clearance is refreshed within
-50 ms. Contact evidence expires, failed observations clear it, and budgeted
-recovery work rotates among digits. The default limit is 32 engine queries per
-hand per update. Reducing that budget trades displayed-pose and fast-motion
-coverage for query cost; the minimum 16 can cover only the requested segments.
-Initial overlap is recast from outside to recover a real surface;
-an unrecoverable overlap never manufactures a contact point. Queries use the
-engine's simple collision geometry, which can differ from the visible mesh.
-If the entire query path is unavailable, previously displayed finger angles
-hold until new observations return; this does not preserve stale contact planes.
-Swept endpoint samples are bounded motion sampling, not exact continuous
-collision detection for a rotating capsule.
+`finger_world` queries the anatomically and temporally bounded candidate pose,
+including all fifteen phalanx interiors. Contact acquisition and overlap recovery
+share a strict 32 logical-sweep budget per hand per frame. The current
+`wall_shape=nearest` mode runs both game collision and visible-shape traces
+for each sweep. Logs count those engine calls separately. Redundant broad, displayed and
+motion casts are coalesced when they describe the same checked feature. A validated
+rigid static-mesh component transform can transport a finite contact patch; it
+never renews the original geometry observation's 50 ms lifetime. Unsupported,
+deforming, dead or malformed components require real casts. Unknown observations
+are distinct from clear space and identify the affected fingers.
 
-`finger_contact` independently adjusts each joint's flexion plus base side motion
-and twist within the rig's reference-relative limits. DIP/PIP coupling is a soft
-pose preference. Nearby surface patches constrain only their implicated digit.
-Smoothing happens before contact resolution and the result is displayed directly,
-so a later animation blend cannot undo the constraint. The bounded local solver
-reports residual penetration when geometry or joint limits prevent resolution;
-it is not a guarantee of globally penetration-free poses.
-The solver uses at most six iterations and checks the preceding displayed pose
-against current evidence, so bounded optimization cannot progressively worsen
-an already feasible pose. Segment interiors are tested within each surface patch;
-the first-touch sweep sample alone would miss the part penetrating beyond it.
+`finger_contact` arrests movement along the requested joint trajectory. Stationary
+world pressure cannot accumulate arbitrary curl, spread or twist. Each digit can
+stop independently, while movement that clears its contact remains possible.
+Smoothing and the shared angular budget precede contact resolution; no later
+unconstrained blend changes the accepted pose. Palm flattening no longer overrides
+the user's squeeze intention. Self-contact allows bounded cooperative opening
+and small local yielding while certifying separation throughout each accepted
+path. Each pair of finger segments uses its own travel distance when checking
+a movement. This lets a fingertip uncurl while two knuckles remain close.
+World pressure that the joints cannot resolve is handed
+to the rigid wrist response.
+
+The shipped player hand uses a fitted palm box and individual segment radii
+for world queries. Self-contact uses the measured widths and depths of the
+fingers, including offsets where bones sit off-center in the skin. The shared
+web at the base of adjacent fingers belongs to one continuous surface and
+is excluded from their self-contact checks. The reference joint layout and
+bone lengths identify the fitted mesh. Other rigs use `hand_finger_radius_cm`
+for empty-hand collision.
+
+`hand_rigid_contact` projects fresh, frozen capsule supports onto a bounded wrist
+translation, constrained by arm reach. This includes immutable finger roots: in
+the actual WhiteMan rig, the thumb CMC capsule extends 1.104 cm beyond the former
+palm-only stopping plane. No amount of finger curling can clear that root.
+`hand_walls::ConstrainFinal` checks the resulting mapped grip and the final IK wrist;
+the arm is solved again from one copied temporal state, rather than moving only
+the hand bone. Accepted supports prevent repeated spring re-entry for only the
+remaining lifetime of their original observations.
+
+Changed final finger geometry is checked against actual world collisions using
+the remainder of the same frame budget. If that verification cannot finish, the
+corrected wrist and finger pose are staged for the next frame's query. A
+controller withdrawal or a change of grip cancels stale work. Unknown
+geometry cannot authorize a new drawing. A previous full wrist/finger pose may
+hold without renewing its evidence; an observed obstruction rejects even that
+fallback. If no checked drawing or unchanged prior hold is available, the hand
+is temporarily suppressed rather than exposing the freshly copied game-animation
+pose. Frozen supports remain constraints when a translated sample leaves a
+finite patch, so dropping a patch cannot falsely erase unresolved depth.
+
+These are discrete capsule/box checks against the game's collision shapes, not
+triangle-accurate skin collision or exact continuous detection for rotating
+capsules. Endpoint verification prevents a root correction from placing a finger
+inside a previously unobserved second obstacle; it does not certify every point
+on an arbitrarily fast rotational path. Simple collision meshes may differ from
+visible walls. The system is kinematic and does not apply forces to dynamic props.
 
 `thumb_pose` generates separate open, wrap and pinch-like thumb intentions,
 combining base flexion, side motion and pad-facing axial rotation. Signs follow
 the reference rig geometry for mirrored or rolled bones. These are engineering
-curves, not claims of measured human motion. Saved grips retain their authored
+curves, not claims of measured human motion. The open base direction is fitted
+to the rig's palm tangent plane; the thumb's neutral tip no longer projects
+7.308 cm through the palm-facing direction. Non-thumb open intentions remove
+reference-pose curl and the legacy idle-curl bias. Saved grips retain their authored
 thumb and trigger poses.
 
 Held objects, reserved interactions, grip editing and calibration bypass empty-hand
 contacts. Tracking loss, player/body changes, origin changes, teleport, long frame
-gaps and settings changes reset relevant contact history. IK9 body and wrist
-calibration remains in this source baseline. Performance counters separately
+gaps and settings changes reset relevant contact history. IK13 dual-trigger calibration and AR support-hand wrist continuity
+remain in this source baseline. Performance counters separately
 report proxy collision, finger geometry queries and finger contact solving;
-`hand contacts` logs query budgets, failures and residual depth.
+`hand contacts` logs actual reflected engine calls, cache reuse, incomplete
+observations, held/rejected frames, final residuals and root corrections.
 
 Settings added for this path: `hand_individual_finger_collision=1`,
 `hand_finger_query_budget=32`, `hand_finger_contact_refresh_ms=50`,
