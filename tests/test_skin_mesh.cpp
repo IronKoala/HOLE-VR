@@ -34,6 +34,11 @@ int main(int argc,char** argv) {
     bad=bytes;uint16_t bone=1000;std::memcpy(bad.data()+32+m.bones.size()*148+12,&bone,2);Hash(bad);Check(!Decode(bad,&m),"reject out-of-range bone");
     auto wrong=local;wrong[1].translation.X+=1;Check(!Bind(m,names,parents,wrong,&binding),"reject different reference skeleton");
     auto wrong_names=names;wrong_names[4]="other_bone";Check(!Bind(m,wrong_names,parents,local,&binding),"reject missing named bone");
+    // The live game rig spells the head bone "Head"; the export has "head".
+    auto live_names=names;bool renamed=false;
+    for(auto& n:live_names)if(n=="head"){n="Head";renamed=true;}
+    Check(renamed,"approved export has a head bone");
+    Check(Bind(m,live_names,parents,local,&binding,&error),"bind ignores bone-name letter case like Unreal");
     Check(Bind(m,names,parents,local,&binding),"restore binding");
     const auto fixture=Read(argv[2]);size_t at=0;using Magic=std::array<char,8>;const auto magic=Item<Magic>(fixture,at);Check(!std::memcmp(magic.data(),"HWPOSE3\0",8),"fixture magic");
     const auto cases=Item<uint32_t>(fixture,at),bones=Item<uint32_t>(fixture,at),points=Item<uint32_t>(fixture,at);Check(bones==m.bones.size()&&points==m.points.size(),"fixture counts");

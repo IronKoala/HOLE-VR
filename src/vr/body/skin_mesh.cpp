@@ -1,5 +1,6 @@
 #include "vr/body/skin_mesh.h"
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <map>
@@ -7,6 +8,10 @@
 namespace holevr::vr::skin_mesh {
 namespace {
 bool Fail(std::string* error,const char* why) { if(error)*error=why;return false; }
+// Unreal bone names (FName) ignore letter case: the live WhiteMan rig calls the
+// head bone "Head" while the approved export has "head". Exact matching made
+// every in-game bind fail ("rig bone missing", runs of 2026-11-12).
+std::string Folded(std::string s) { for(char& c:s) c=char(std::tolower(static_cast<unsigned char>(c))); return s; }
 bool Finite(const FVector& p) { return std::isfinite(p.X)&&std::isfinite(p.Y)&&std::isfinite(p.Z); }
 bool Valid(const skel::Xf& p) {
     const auto& q=p.rotation;const double n=q.X*q.X+q.Y*q.Y+q.Z*q.Z+q.W*q.W;
@@ -98,12 +103,12 @@ bool Bind(const Mesh& mesh,const std::vector<std::string>& names,const std::vect
     for(const auto& b:mesh.bones){sp.push_back(b.parent);sl.push_back(b.local);}
     if(!live.Init(parents)||!source.Init(sp))return Fail(error,"invalid rig hierarchy");
     live.SetAllLocal(local.data(),int(local.size()));source.SetAllLocal(sl.data(),int(sl.size()));
-    std::map<std::string,int> lookup;for(size_t i=0;i<names.size();++i)if(!lookup.emplace(names[i],i).second)return Fail(error,"duplicate rig names");
+    std::map<std::string,int> lookup;for(size_t i=0;i<names.size();++i)if(!lookup.emplace(Folded(names[i]),i).second)return Fail(error,"duplicate rig names");
     Binding binding;
     for(size_t i=0;i<mesh.bones.size();++i) {
-        const auto& b=mesh.bones[i];const auto found=lookup.find(b.name);if(found==lookup.end())return Fail(error,"rig bone missing");
+        const auto& b=mesh.bones[i];const auto found=lookup.find(Folded(b.name));if(found==lookup.end())return Fail(error,"rig bone missing");
         int j=found->second;const std::string expected=b.parent<0?"":mesh.bones[b.parent].name;
-        if((parents[j]<0?"":names[parents[j]])!=expected)return Fail(error,"rig parent differs");
+        if(Folded(parents[j]<0?"":names[parents[j]])!=Folded(expected))return Fail(error,"rig parent differs");
         const auto& a=source.C(int(i));const auto& c=live.C(j);const auto dq=a.rotation.Inverse()*c.rotation;
         if(!Valid(c)||ik::Length(a.translation-c.translation)>.02||std::fabs(dq.W)<.99999||ik::Length(a.scale-c.scale)>.001)return Fail(error,"reference rig differs");
         binding.bones.push_back(j);binding.inverse_rest.push_back(InverseRest(a));
